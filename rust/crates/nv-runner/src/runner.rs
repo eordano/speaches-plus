@@ -53,26 +53,6 @@ impl GreedyRunner {
         anyhow::bail!("nv-runner requires --features cuda")
     }
 
-    pub fn from_assembled(
-        model: Qwen3,
-        tokenizer: nv_tokenizer::Tokenizer,
-        device: &Device,
-    ) -> Result<Self> {
-        let cache = KvCache::new(
-            model.config(),
-            model.config().max_position_embeddings.min(8192),
-            device,
-            DType::BF16,
-        )?;
-        Ok(Self {
-            model,
-            tokenizer,
-            cache,
-            device: device.clone(),
-            dtype: DType::BF16,
-        })
-    }
-
     pub fn device(&self) -> &Device {
         &self.device
     }

@@ -29,7 +29,6 @@ export function rebuildBands(events) {
   };
 }
 
-// Greedy interval packing: each tts_chunk goes on the lowest row whose
 // previous band ended before its t0. Returns the row count.
 function assignTtsChunkRows(bands) {
   const chunks = bands.filter(b => b.lane === 'tts_chunk');
@@ -213,7 +212,6 @@ export function rebuildTurns(events) {
   return turns;
 }
 
-// Band labels -- what text shows on each band. Pulled from the legacy
 // timeline.bandLabel for parity. Returns '' when nothing useful to show.
 export function bandLabel(band, ttsPhraseTexts) {
   const o = band.open;

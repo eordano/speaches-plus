@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::{pack_u16_pairs as pack_u16, unpack_u16_pairs as unpack_u16};
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
@@ -157,24 +155,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn u16_word_packing_round_trips() {
-        let src: Vec<u16> = (0u16..64).map(|i| i.wrapping_mul(7919)).collect();
-        let words = pack_u16(&src);
-        assert_eq!(words.len(), src.len() / 2);
-        assert_eq!(words[3], src[6] as u32 | ((src[7] as u32) << 16));
-        let mut back = vec![0u16; src.len()];
-        unpack_u16(&words, &mut back);
-        assert_eq!(back, src);
-    }
-
-    #[test]
-    fn shape_mismatch_is_reported() {
-        check_shapes(8, 8, 4, 8, 2, 4).unwrap();
-        let e = check_shapes(8, 7, 4, 8, 2, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-        let e = check_shapes(8, 8, 3, 8, 2, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-        let e = check_shapes(8, 8, 4, 6, 2, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+    fn u16_word_packing_round_trips_and_shape_mismatch_is_reported() {
+        {
+            let src: Vec<u16> = (0u16..64).map(|i| i.wrapping_mul(7919)).collect();
+            let words = pack_u16(&src);
+            assert_eq!(words.len(), src.len() / 2);
+            assert_eq!(words[3], src[6] as u32 | ((src[7] as u32) << 16));
+            let mut back = vec![0u16; src.len()];
+            unpack_u16(&words, &mut back);
+            assert_eq!(back, src);
+        }
+        {
+            check_shapes(8, 8, 4, 8, 2, 4).unwrap();
+            let e = check_shapes(8, 7, 4, 8, 2, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+            let e = check_shapes(8, 8, 3, 8, 2, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+            let e = check_shapes(8, 8, 4, 6, 2, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
     }
 }

@@ -143,7 +143,7 @@ pub fn evolve(
     let mut sigma = 0.35f32;
     let mut history: Vec<f32> = Vec::new();
     let mut stop = "budget";
-    for gen in 0..cfg.budget {
+    for generation in 0..cfg.budget {
         let mut gen_best: Option<(f32, Vec<f32>)> = None;
         for _ in 0..cfg.population.max(2) {
             let cand: Vec<f32> = w.iter().map(|x| x + sigma * rng.normal()).collect();
@@ -168,7 +168,7 @@ pub fn evolve(
             best_w = w.clone();
         }
         on_generation(&StyleFitEvent {
-            generation: gen,
+            generation,
             validation,
             best: es.best,
         });

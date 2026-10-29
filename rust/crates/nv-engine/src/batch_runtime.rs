@@ -38,6 +38,8 @@ impl BatchStepper for Box<dyn BatchStepper> {
     }
 }
 
+pub const REPLY_EVENTS_BESIDE_TOKENS_ARE_STARTED_ERROR_AND_DONE: usize = 3;
+
 enum Command {
     Submit(GenRequest),
     Abort(u64),
@@ -77,7 +79,11 @@ impl BatchEngineHandle {
         eos_token_ids: Vec<u32>,
         sampling: crate::batch_engine::SamplingConfig,
     ) -> mpsc::Receiver<EngineEvent> {
-        let (reply, rx) = mpsc::channel(256);
+        let (reply, rx) = mpsc::channel(
+            max_new_tokens
+                .saturating_add(REPLY_EVENTS_BESIDE_TOKENS_ARE_STARTED_ERROR_AND_DONE)
+                .min(tokio::sync::Semaphore::MAX_PERMITS),
+        );
         let _ = self.tx.send(Command::Submit(GenRequest {
             prompt_tokens,
             max_new_tokens,
@@ -196,6 +202,81 @@ mod tests {
         }
     }
 
+    struct ReleaseSignallingStepper {
+        counting: CountingStepper,
+        released: std::sync::mpsc::Sender<u64>,
+    }
+
+    impl BatchStepper for ReleaseSignallingStepper {
+        fn prefill(&mut self, items: &[PrefillInput]) -> Result<Vec<StepResult>> {
+            self.counting.prefill(items)
+        }
+        fn decode(&mut self, items: &[SeqInput]) -> Result<Vec<StepResult>> {
+            self.counting.decode(items)
+        }
+        fn release(&mut self, seq_id: u64) {
+            let _ = self.released.send(seq_id);
+        }
+    }
+
+    #[test]
+    fn a_reader_that_reads_nothing_until_the_engine_is_idle_still_gets_every_token_and_done() {
+        const MAX_NEW_TOKENS_PAST_THE_OLD_FIXED_256_EVENT_REPLY_CHANNEL: usize = 300;
+        let (released_tx, released) = std::sync::mpsc::channel();
+        let handle = BatchEngineHandle::spawn(
+            SchedulerConfig {
+                max_batch_size: 4,
+                max_batched_tokens: 4096,
+                block_size: 4,
+                num_blocks: 128,
+            },
+            Duration::ZERO,
+            move || ReleaseSignallingStepper {
+                counting: CountingStepper { next: 1000 },
+                released: released_tx,
+            },
+        );
+        let mut rx = handle.submit(
+            vec![1, 2, 3],
+            MAX_NEW_TOKENS_PAST_THE_OLD_FIXED_256_EVENT_REPLY_CHANNEL,
+            vec![],
+            SamplingConfig::default(),
+        );
+        released
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the engine never finished the request");
+        drop(handle);
+
+        let mut tokens = Vec::new();
+        let mut done = None;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                EngineEvent::Token { token, .. } => tokens.push(token),
+                EngineEvent::Done {
+                    reason,
+                    completion_tokens,
+                    ..
+                } => done = Some((reason, completion_tokens)),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            tokens,
+            (1000..1000 + MAX_NEW_TOKENS_PAST_THE_OLD_FIXED_256_EVENT_REPLY_CHANNEL as u32)
+                .collect::<Vec<u32>>(),
+            "a reader that falls behind must still receive every token in order, not lose the ones \
+             past a fixed channel bound"
+        );
+        assert_eq!(
+            done,
+            Some((
+                FinishReason::MaxTokens,
+                MAX_NEW_TOKENS_PAST_THE_OLD_FIXED_256_EVENT_REPLY_CHANNEL as u32
+            )),
+            "a dropped Done turns the engine's stop reason into the reader's guess"
+        );
+    }
+
     struct PoisonedStepper;
 
     impl BatchStepper for PoisonedStepper {
@@ -264,51 +345,5 @@ mod tests {
             joined.is_finished(),
             "run_loop never returned: it did not park in blocking_recv after the failure"
         );
-    }
-
-    #[test]
-    fn boxed_stepper_runs_to_completion() {
-        let boxed: Box<dyn BatchStepper> = Box::new(CountingStepper { next: 1000 });
-        let mut engine = BatchEngine::new(
-            SchedulerConfig {
-                max_batch_size: 4,
-                max_batched_tokens: 4096,
-                block_size: 4,
-                num_blocks: 64,
-            },
-            boxed,
-        );
-        let (tx, mut rx) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: vec![1, 2, 3],
-            max_new_tokens: 3,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx,
-        });
-        let mut guard = 0;
-        while engine.has_work() && guard < 100 {
-            engine.step().unwrap();
-            guard += 1;
-        }
-        let mut tokens = 0;
-        let mut done = false;
-        while let Ok(ev) = rx.try_recv() {
-            match ev {
-                EngineEvent::Token { .. } => tokens += 1,
-                EngineEvent::Done {
-                    reason,
-                    completion_tokens,
-                    ..
-                } => {
-                    assert_eq!(reason, FinishReason::MaxTokens);
-                    assert_eq!(completion_tokens, 3);
-                    done = true;
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(tokens, 3);
-        assert!(done);
     }
 }

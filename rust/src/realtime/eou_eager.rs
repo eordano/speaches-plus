@@ -43,7 +43,7 @@ pub(super) async fn try_eager_dispatch(
         session.stt_language(),
     );
     let llm_runner_opt = if session.intent == Intent::Conversation {
-        if let Some(llm_cfg) = session.llm_config.clone() {
+        if let Some(llm_cfg) = session.llm_config_for_turn() {
             let instructions = session.instructions().await;
             let messages = session.build_chat_messages(instructions.as_deref()).await;
             Some(super::eou_predicted::spawn_predicted_llm_after_stt(

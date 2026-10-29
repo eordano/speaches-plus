@@ -42,14 +42,6 @@ pub fn fold_scales_for_e4m3_shift_decode(scales: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-pub fn fold_scales_for_e2m1_shift_decode(scales: &[f32]) -> Vec<f32> {
-    scales
-        .iter()
-        .copied()
-        .map(fold_scale_for_e2m1_shift_decode)
-        .collect()
-}
-
 pub fn e4m3_code_shift_decodes_to_f32_subnormal_which_ftz_multipliers_flush(byte: u8) -> bool {
     byte & 0x78 == 0 && byte & 7 != 0
 }

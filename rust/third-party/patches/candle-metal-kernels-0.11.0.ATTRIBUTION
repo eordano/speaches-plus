@@ -1,0 +1,17 @@
+candle-metal-kernels-0.11.0.patch carries two things on top of the crates.io
+0.11.0 release of candle-metal-kernels (MIT OR Apache-2.0, huggingface/candle):
+
+1. The upstream tree at huggingface/candle rev
+   4761e00bfb687cc2666e30be7726077f9e2c4456 (src/kernel.rs,
+   src/metal/commands.rs, src/metal/residency_set.rs,
+   src/metal_src/reduce.metal, src/tests.rs), verbatim.
+2. The split-k GEMM path: the gemm_splitk and gemm_splitk_accum kernels in
+   src/metal_src/mlx_gemm.metal and their routing rule and partition count in
+   src/kernels/mlx_gemm.rs are adapted from mlx 0.32.2
+   (mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_splitk.h and
+   steel_gemm_splitk_axpby in mlx/backend/metal/matmul.cpp), MIT,
+   Copyright Apple Inc. Source: https://github.com/ml-explore/mlx
+   The MIT text is rust/third-party/mlx-steel-attn/LICENSE.
+   The switch that enables that routing is this repository's own and has no
+   MLX counterpart: CANDLE_METAL_GEMM_SPLITK, and the thread-local scope
+   with_split_k_on_this_thread_unless_the_environment_decides.

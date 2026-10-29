@@ -57,13 +57,6 @@ impl Tensor {
         }
     }
 
-    pub fn step_f32(&self, t: usize) -> Result<&[f32], Error> {
-        match &self.buf {
-            Buf::F32(f) => Ok(&f[t * self.d..(t + 1) * self.d]),
-            Buf::I8(_) => Err(Error::Network("expected float tensor, got int8".into())),
-        }
-    }
-
     pub fn write_step(&mut self, t: usize, vals: &[f32]) {
         let off = t * self.d;
         match &mut self.buf {
@@ -550,46 +543,24 @@ mod tests {
     }
 
     #[test]
-    fn maxpool_1px_wide_strip_does_not_collapse() {
+    fn maxpool_on_degenerate_strips_does_not_collapse_and_an_empty_input_errors() {
         let vals: Vec<f32> = (0..48).map(|i| i as f32).collect();
-        let t = strip(48, 1, &vals);
-        let out = maxpool_forward(&t, 3, 3).expect("degenerate strip must not error");
-        assert_eq!((out.h, out.w, out.d), (16, 1, 1));
-        if let Buf::F32(b) = &out.buf {
+        for (h, w, want_hw) in [(48usize, 1usize, (16usize, 1usize)), (1, 48, (1, 16))] {
+            let t = strip(h, w, &vals);
+            let out = maxpool_forward(&t, 3, 3).expect("degenerate strip must not error");
+            assert_eq!((out.h, out.w, out.d), (want_hw.0, want_hw.1, 1), "{h}x{w}");
+            let Buf::F32(b) = &out.buf else {
+                panic!("expected f32 output");
+            };
             assert_eq!(b[0], 2.0);
             assert_eq!(b[15], 47.0);
-        } else {
-            panic!("expected f32 output");
         }
-    }
-
-    #[test]
-    fn maxpool_1px_tall_strip_does_not_collapse() {
-        let vals: Vec<f32> = (0..48).map(|i| i as f32).collect();
-        let t = strip(1, 48, &vals);
-        let out = maxpool_forward(&t, 3, 3).expect("degenerate strip must not error");
-        assert_eq!((out.h, out.w, out.d), (1, 16, 1));
-        if let Buf::F32(b) = &out.buf {
-            assert_eq!(b[0], 2.0);
-            assert_eq!(b[15], 47.0);
-        } else {
-            panic!("expected f32 output");
-        }
-    }
-
-    #[test]
-    fn maxpool_1x1_input_survives() {
-        let t = strip(1, 1, &[5.0]);
-        let out = maxpool_forward(&t, 3, 3).unwrap();
+        let out = maxpool_forward(&strip(1, 1, &[5.0]), 3, 3).unwrap();
         assert_eq!((out.h, out.w, out.d), (1, 1, 1));
         if let Buf::F32(b) = &out.buf {
             assert_eq!(b[0], 5.0);
         }
+        assert!(maxpool_forward(&Tensor::zeros(0, 4, 1, false), 3, 3).is_err());
     }
 
-    #[test]
-    fn maxpool_empty_input_errors() {
-        let t = Tensor::zeros(0, 4, 1, false);
-        assert!(maxpool_forward(&t, 3, 3).is_err());
-    }
 }

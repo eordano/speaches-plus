@@ -241,7 +241,6 @@ fn pli_slice_mul(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn layer_forward(
     ctx: &WgpuContext,
     layer: &E4bLayer,
@@ -359,7 +358,6 @@ pub(super) async fn layer_forward(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn layer_backward(
     ctx: &WgpuContext,
     layer: &E4bLayer,
@@ -470,7 +468,6 @@ fn head_chunk_rows(ctx: &WgpuContext, n: usize) -> usize {
     (per_dim * WORKGROUP_SIZE as usize / n).clamp(1, HEAD_CE_CHUNK_ROWS)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn head_ce_rows(
     ctx: &WgpuContext,
     head: &W4Head,

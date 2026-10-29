@@ -9,6 +9,18 @@
 #include "nvk_gdn_conv.cuh"
 #include "nvk_pdl.cuh"
 
+static __constant__ int nvk_gdn_decode_output_gate_sigmoid_because_qwen4_exp_gates_norm_with_sigmoid_not_silu = 0;
+
+__device__ __forceinline__ float gdn_output_gate_bf16_rounded(float zv) {
+    float s = 1.f / (1.f + expf(-zv));
+    float g = nvk_gdn_decode_output_gate_sigmoid_because_qwen4_exp_gates_norm_with_sigmoid_not_silu ? s : zv * s;
+    return __bfloat162float(__float2bfloat16(g));
+}
+
+extern "C" int nv_kernels_gdn_decode_output_gate_sigmoid_set(int on) {
+    return (int)cudaMemcpyToSymbol(nvk_gdn_decode_output_gate_sigmoid_because_qwen4_exp_gates_norm_with_sigmoid_not_silu, &on, sizeof(int));
+}
+
 __device__ inline float gdn_softplus_safe(float x) {
     if (x > 20.0f) return x;
     if (x < -20.0f) return expf(x);
@@ -245,7 +257,7 @@ __device__ __forceinline__ void gdn_decode_token_ab_scalars(
     float normed = __bfloat162float(__float2bfloat16(
         core / denom * __bfloat162float(norm_w[tid])));
     float zv = __bfloat162float(z[(size_t)h * d_v + tid]);
-    float gate = __bfloat162float(__float2bfloat16(zv / (1.f + expf(-zv))));
+    float gate = gdn_output_gate_bf16_rounded(zv);
     out[(size_t)h * d_v + tid] = __float2bfloat16(normed * gate);
 }
 
@@ -527,88 +539,6 @@ __global__ void gdn_decode_split_step_lanecol_kernel(
     }
 }
 
-
-template <int K_DIM, int V_DIM, int COLS, int SUBS>
-__global__ void gdn_decode_split_step_group_lanecol_kernel(
-    const float* __restrict__ qn,
-    const float* __restrict__ kn,
-    const __nv_bfloat16* __restrict__ mixed,
-    const float* __restrict__ g_exp,
-    const float* __restrict__ beta,
-    GdnGroupRecurrentStatePack states,
-    __nv_bfloat16* __restrict__ core,
-    int n_k, int n_v
-) {
-    const int VSPLIT = V_DIM / COLS;
-    const int KPS = K_DIM / SUBS;
-    __shared__ float red[COLS * SUBS];
-    int vblock = blockIdx.x % VSPLIT;
-    int h = blockIdx.x / VSPLIT;
-    int lane = blockIdx.y;
-    int v_per_k = n_v / n_k;
-    int kh = h / v_per_k;
-    int key_dim = n_k * K_DIM;
-    size_t mixed_lane_stride = (size_t)2 * key_dim + (size_t)n_v * V_DIM;
-    int tid = threadIdx.x;
-    int col = tid % COLS;
-    int sub = tid / COLS;
-    int v_glob = vblock * COLS + col;
-
-    float* g_state = states.p[lane] + (size_t)h * K_DIM * V_DIM;
-    float st[KPS];
-#pragma unroll
-    for (int j = 0; j < KPS; ++j) {
-        st[j] = g_state[(size_t)(sub * KPS + j) * V_DIM + v_glob];
-    }
-
-    const float* q_head = qn + (size_t)lane * key_dim + (size_t)kh * K_DIM;
-    const float* k_head = kn + (size_t)lane * key_dim + (size_t)kh * K_DIM;
-    float ge = g_exp[(size_t)lane * n_v + h];
-    float bt = beta[(size_t)lane * n_v + h];
-    float v_t = __bfloat162float(
-        mixed[(size_t)lane * mixed_lane_stride + (size_t)2 * key_dim
-              + (size_t)h * V_DIM + v_glob]);
-
-    float kv = 0.f;
-#pragma unroll
-    for (int j = 0; j < KPS; ++j) {
-        float s = st[j] * ge;
-        st[j] = s;
-        kv += s * k_head[sub * KPS + j];
-    }
-    red[sub * COLS + col] = kv;
-    __syncthreads();
-#pragma unroll
-    for (int off = SUBS / 2; off > 0; off >>= 1) {
-        if (sub < off) red[sub * COLS + col] += red[(sub + off) * COLS + col];
-        __syncthreads();
-    }
-    kv = red[col];
-    __syncthreads();
-    float delta = (v_t - kv) * bt;
-    float ov = 0.f;
-#pragma unroll
-    for (int j = 0; j < KPS; ++j) {
-        float s = st[j] + k_head[sub * KPS + j] * delta;
-        st[j] = s;
-        ov += s * q_head[sub * KPS + j];
-    }
-    red[sub * COLS + col] = ov;
-    __syncthreads();
-#pragma unroll
-    for (int off = SUBS / 2; off > 0; off >>= 1) {
-        if (sub < off) red[sub * COLS + col] += red[(sub + off) * COLS + col];
-        __syncthreads();
-    }
-    if (sub == 0) {
-        core[(size_t)lane * n_v * V_DIM + (size_t)h * V_DIM + v_glob] =
-            __float2bfloat16(red[col]);
-    }
-#pragma unroll
-    for (int j = 0; j < KPS; ++j) {
-        g_state[(size_t)(sub * KPS + j) * V_DIM + v_glob] = st[j];
-    }
-}
 
 template <int K_DIM, int V_DIM, int COLS, int SUBS>
 __global__ void gdn_decode_split_step_group_lanecol_vec4_kernel(
@@ -901,7 +831,7 @@ __global__ void gdn_decode_step_one_launch_bf16_kernel(
         float normed = __bfloat162float(__float2bfloat16(
             c / denom * __bfloat162float(norm_w[tid])));
         float zv = __bfloat162float(z[(size_t)h * V_DIM + tid]);
-        float gate = __bfloat162float(__float2bfloat16(zv / (1.f + expf(-zv))));
+        float gate = gdn_output_gate_bf16_rounded(zv);
         out[(size_t)h * V_DIM + tid] = __float2bfloat16(normed * gate);
     }
 }
@@ -1181,7 +1111,7 @@ __global__ void gdn_decode_chunk_split_gate_kernel(
     float normed = __bfloat162float(__float2bfloat16(
         c / denom * __bfloat162float(norm_w[tid])));
     float zv = __bfloat162float(z[base]);
-    float gate = __bfloat162float(__float2bfloat16(zv / (1.f + expf(-zv))));
+    float gate = gdn_output_gate_bf16_rounded(zv);
     out[base] = __float2bfloat16(normed * gate);
     NVK_PDL_EPILOG();
 }
@@ -1509,8 +1439,6 @@ extern "C" int nv_kernels_gdn_decode_step_split_bf16(
         qn_scratch, kn_scratch, g_exp_scratch, beta_scratch,
         n_k, n_v, d_k, d_v, n_v);
     }
-    static const bool lanecol_off_env_nv_q38_gdn_step_v1 =
-        getenv("NV_Q38_GDN_STEP_V1") != nullptr;
     int single_lane_vec4_arm =
         gdn_single_lane_vec4_arm_opt_in_env_only_because_the_2026_09_02_arm3_default_signoff_covered_the_group_launcher_not_this_one();
     if (d_k == 128 && single_lane_vec4_arm >= 1 && single_lane_vec4_arm <= 3) {
@@ -1543,17 +1471,9 @@ extern "C" int nv_kernels_gdn_decode_step_split_bf16(
                     reinterpret_cast<__nv_bfloat16*>(core_scratch),
                     n_k, n_v);
         }
-    } else if (d_k == 128 && !lanecol_off_env_nv_q38_gdn_step_v1) {
+    } else if (d_k == 128) {
         gdn_decode_split_step_lanecol_kernel<128, 128, 32, 8>
             <<<n_v * (128 / 32), 256, 0, s>>>(
-                qn_scratch, kn_scratch,
-                reinterpret_cast<const __nv_bfloat16*>(mixed),
-                g_exp_scratch, beta_scratch, state,
-                reinterpret_cast<__nv_bfloat16*>(core_scratch),
-                n_k, n_v);
-    } else if (d_k == 128) {
-        gdn_decode_split_step_kernel<128, 128, 16, 8>
-            <<<n_v * (128 / 16), 128, 0, s>>>(
                 qn_scratch, kn_scratch,
                 reinterpret_cast<const __nv_bfloat16*>(mixed),
                 g_exp_scratch, beta_scratch, state,
@@ -1643,14 +1563,13 @@ extern "C" int nv_kernels_gdn_conv_decode_silu_fp8_weights(
 
 static int gdn_group_step_vec4_arm_unset_until_env_or_setter_is_read = -1;
 
-static const int GDN_STEP_VEC4_ARM_3_IS_THE_BIT_EXACT_DEFAULT_SIGNED_OFF_2026_09_02_ENV_0_RESTORES_THE_PRE_FLIP_LANECOL_MAP = 3;
+static const int GDN_STEP_VEC4_ARM_3_IS_THE_BIT_EXACT_DEFAULT_SIGNED_OFF_2026_09_02 = 3;
 
-static int gdn_group_step_vec4_arm_defaults_to_3_signed_off_2026_09_02_and_zero_restores_the_shipped_lanecol_map() {
+static int gdn_group_step_vec4_arm_defaults_to_3_signed_off_2026_09_02() {
     if (gdn_group_step_vec4_arm_unset_until_env_or_setter_is_read < 0) {
         const char* e = getenv("NV_Q38_GDN_STEP_VEC4");
         gdn_group_step_vec4_arm_unset_until_env_or_setter_is_read =
-            e ? atoi(e)
-              : GDN_STEP_VEC4_ARM_3_IS_THE_BIT_EXACT_DEFAULT_SIGNED_OFF_2026_09_02_ENV_0_RESTORES_THE_PRE_FLIP_LANECOL_MAP;
+            e ? atoi(e) : GDN_STEP_VEC4_ARM_3_IS_THE_BIT_EXACT_DEFAULT_SIGNED_OFF_2026_09_02;
     }
     return gdn_group_step_vec4_arm_unset_until_env_or_setter_is_read;
 }
@@ -1721,7 +1640,7 @@ extern "C" int nv_kernels_gdn_decode_step_split_group_bf16(
         qn_scratch, kn_scratch, g_exp_scratch, beta_scratch,
         n_k, n_v, d_k, d_v, ab_lane_stride);
     }
-    int vec4_arm = gdn_group_step_vec4_arm_defaults_to_3_signed_off_2026_09_02_and_zero_restores_the_shipped_lanecol_map();
+    int vec4_arm = gdn_group_step_vec4_arm_defaults_to_3_signed_off_2026_09_02();
     dim3 lanes_dim = dim3(0u, (unsigned)lanes);
     if (vec4_arm == 1) {
         lanes_dim.x = (unsigned)(n_v * (128 / 32));
@@ -1741,18 +1660,9 @@ extern "C" int nv_kernels_gdn_decode_step_split_group_bf16(
                 g_exp_scratch, beta_scratch, pack,
                 reinterpret_cast<__nv_bfloat16*>(core_scratch),
                 n_k, n_v);
-    } else if (vec4_arm == 3) {
+    } else {
         lanes_dim.x = (unsigned)n_v;
         gdn_decode_split_step_group_lanecol_vec4_kernel<128, 128, 128, 8>
-            <<<lanes_dim, 256, 0, s>>>(
-                qn_scratch, kn_scratch,
-                reinterpret_cast<const __nv_bfloat16*>(mixed),
-                g_exp_scratch, beta_scratch, pack,
-                reinterpret_cast<__nv_bfloat16*>(core_scratch),
-                n_k, n_v);
-    } else {
-        lanes_dim.x = (unsigned)(n_v * (128 / 32));
-        gdn_decode_split_step_group_lanecol_kernel<128, 128, 32, 8>
             <<<lanes_dim, 256, 0, s>>>(
                 qn_scratch, kn_scratch,
                 reinterpret_cast<const __nv_bfloat16*>(mixed),

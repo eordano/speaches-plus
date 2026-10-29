@@ -200,10 +200,10 @@ fn main() -> Result<()> {
     }
 
     if let Some(b) = args.buckets.as_ref() {
-        std::env::set_var("NV_DSOCR_BSN_BUCKETS", b);
+        unsafe { std::env::set_var("NV_DSOCR_BSN_BUCKETS", b) };
     }
     if let Some(f) = args.front {
-        std::env::set_var("NV_OCR_BSN_FRONT", f.to_string());
+        unsafe { std::env::set_var("NV_OCR_BSN_FRONT", f.to_string()) };
     }
 
     let engine = match args.arm.as_str() {
@@ -213,7 +213,6 @@ fn main() -> Result<()> {
                 slots: args.slots,
                 prep_threads: args.slots.max(2),
                 queue_depth: 256,
-                loop_retry: true,
             },
         )),
         #[cfg(feature = "cuda")]

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -306,7 +305,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepare_audio_pads_leading_when_short() {
+    fn prepare_audio_pads_truncates_and_clamps() {
         let audio: Vec<f32> = (0..1600).map(|i| (i as f32 + 1.0) / 2000.0).collect();
         let prepared = prepare_audio(&audio, 8000, AudioPadAlignment::Leading);
         assert_eq!(prepared.len(), TARGET_SAMPLES);
@@ -323,75 +322,60 @@ mod tests {
                 audio[i]
             );
         }
-    }
-
-    #[test]
-    fn prepare_audio_pads_trailing_when_configured() {
-        let audio: Vec<f32> = (0..1600).map(|i| (i as f32 + 1.0) / 2000.0).collect();
-        let prepared = prepare_audio(&audio, 8000, AudioPadAlignment::Trailing);
-        assert_eq!(prepared.len(), TARGET_SAMPLES);
-        for i in 0..1600 {
+        {
+            let audio: Vec<f32> = (0..1600).map(|i| (i as f32 + 1.0) / 2000.0).collect();
+            let prepared = prepare_audio(&audio, 8000, AudioPadAlignment::Trailing);
+            assert_eq!(prepared.len(), TARGET_SAMPLES);
+            for i in 0..1600 {
+                assert!(
+                    (prepared[i] - audio[i]).abs() < 1e-6,
+                    "mismatch at {} got {} want {}",
+                    i,
+                    prepared[i],
+                    audio[i]
+                );
+            }
+            for i in 1600..TARGET_SAMPLES {
+                assert_eq!(prepared[i], 0.0);
+            }
+        }
+        {
+            let mut audio: Vec<f32> = vec![0.0f32; TARGET_SAMPLES + 10000];
+            for i in 0..audio.len() {
+                audio[i] = (((i as f32) % 1000.0) - 500.0) / 1000.0;
+            }
+            let prepared = prepare_audio(&audio, 8000, AudioPadAlignment::Leading);
+            assert_eq!(prepared.len(), TARGET_SAMPLES);
+            let want_first = audio[audio.len() - TARGET_SAMPLES];
             assert!(
-                (prepared[i] - audio[i]).abs() < 1e-6,
-                "mismatch at {} got {} want {}",
-                i,
-                prepared[i],
-                audio[i]
+                (prepared[0] - want_first).abs() < 1e-9,
+                "got {} want {}",
+                prepared[0],
+                want_first
             );
+            let want_last = audio[audio.len() - 1];
+            assert!((prepared[TARGET_SAMPLES - 1] - want_last).abs() < 1e-9);
         }
-        for i in 1600..TARGET_SAMPLES {
-            assert_eq!(prepared[i], 0.0);
-        }
-    }
-
-    #[test]
-    fn prepare_audio_truncates_to_last_window() {
-        let mut audio: Vec<f32> = vec![0.0f32; TARGET_SAMPLES + 10000];
-        for i in 0..audio.len() {
-            audio[i] = (((i as f32) % 1000.0) - 500.0) / 1000.0;
-        }
-        let prepared = prepare_audio(&audio, 8000, AudioPadAlignment::Leading);
-        assert_eq!(prepared.len(), TARGET_SAMPLES);
-        let want_first = audio[audio.len() - TARGET_SAMPLES];
-        assert!(
-            (prepared[0] - want_first).abs() < 1e-9,
-            "got {} want {}",
-            prepared[0],
-            want_first
-        );
-        let want_last = audio[audio.len() - 1];
-        assert!((prepared[TARGET_SAMPLES - 1] - want_last).abs() < 1e-9);
-    }
-
-    #[test]
-    fn prepare_audio_clamps_out_of_range_samples() {
-        let mut audio = vec![0.0_f32; 5];
-        audio[0] = 5.0;
-        audio[1] = -3.0;
-        audio[2] = f32::NAN;
-        audio[3] = 0.5;
-        audio[4] = f32::INFINITY;
-        let prepared = prepare_audio(&audio, 8000, AudioPadAlignment::Leading);
-        assert_eq!(prepared.len(), TARGET_SAMPLES);
-        let tail = &prepared[TARGET_SAMPLES - audio.len()..];
-        assert_eq!(tail[0], 1.0);
-        assert_eq!(tail[1], -1.0);
-        assert_eq!(tail[2], 0.0);
-        assert!((tail[3] - 0.5).abs() < 1e-6);
-        assert_eq!(tail[4], 0.0);
-    }
-
-    #[test]
-    fn mel_filters_are_finite_and_non_negative() {
-        let filters = crate::mel_scale::build_mel_filters(N_MELS, N_FFT, SAMPLE_RATE as usize);
-        for (i, v) in filters.iter().enumerate() {
-            assert!(v.is_finite(), "filter[{}] not finite", i);
-            assert!(*v >= 0.0, "filter[{}] negative: {}", i, v);
+        {
+            let mut audio = vec![0.0_f32; 5];
+            audio[0] = 5.0;
+            audio[1] = -3.0;
+            audio[2] = f32::NAN;
+            audio[3] = 0.5;
+            audio[4] = f32::INFINITY;
+            let prepared = prepare_audio(&audio, 8000, AudioPadAlignment::Leading);
+            assert_eq!(prepared.len(), TARGET_SAMPLES);
+            let tail = &prepared[TARGET_SAMPLES - audio.len()..];
+            assert_eq!(tail[0], 1.0);
+            assert_eq!(tail[1], -1.0);
+            assert_eq!(tail[2], 0.0);
+            assert!((tail[3] - 0.5).abs() < 1e-6);
+            assert_eq!(tail[4], 0.0);
         }
     }
 
     #[test]
-    fn log_mel_shape_is_correct() {
+    fn mel_filters_are_finite_and_log_mel_has_the_right_shape() {
         let hann = crate::mel_scale::hann_window(N_FFT);
         let filters = crate::mel_scale::build_mel_filters(N_MELS, N_FFT, SAMPLE_RATE as usize);
         let audio = vec![0.1f32; TARGET_SAMPLES];
@@ -400,23 +384,30 @@ mod tests {
         for v in &mel {
             assert!(v.is_finite());
         }
+        {
+            let filters = crate::mel_scale::build_mel_filters(N_MELS, N_FFT, SAMPLE_RATE as usize);
+            for (i, v) in filters.iter().enumerate() {
+                assert!(v.is_finite(), "filter[{}] not finite", i);
+                assert!(*v >= 0.0, "filter[{}] negative: {}", i, v);
+            }
+        }
     }
 
     #[test]
-    fn try_load_skips_when_model_path_unset() {
-        std::env::remove_var(defaults::env::EOU_AUDIO_MODEL_PATH);
+    fn try_load_skips_when_model_path_unset_or_absent() {
+        unsafe { std::env::remove_var(defaults::env::EOU_AUDIO_MODEL_PATH) };
         assert!(try_load_from_env(8000, AudioPadAlignment::Leading).is_none());
-    }
-
-    #[test]
-    fn try_load_skips_when_model_absent() {
-        std::env::set_var(
-            defaults::env::EOU_AUDIO_MODEL_PATH,
-            "/this/does/not/exist/smart-turn.onnx",
-        );
-        let m = try_load_from_env(8000, AudioPadAlignment::Leading);
-        assert!(m.is_none());
-        std::env::remove_var(defaults::env::EOU_AUDIO_MODEL_PATH);
+        {
+            unsafe {
+                std::env::set_var(
+                    defaults::env::EOU_AUDIO_MODEL_PATH,
+                    "/this/does/not/exist/smart-turn.onnx",
+                )
+            };
+            let m = try_load_from_env(8000, AudioPadAlignment::Leading);
+            assert!(m.is_none());
+            unsafe { std::env::remove_var(defaults::env::EOU_AUDIO_MODEL_PATH) };
+        }
     }
 
     #[test]

@@ -33,7 +33,6 @@ pub struct BsnOptions {
     pub prep_threads: usize,
     pub front_threads: usize,
     pub queue_depth: usize,
-    pub loop_retry: bool,
     pub fill_target: usize,
     pub fill_wait_ms: u64,
 }
@@ -45,9 +44,6 @@ impl BsnOptions {
             prep_threads: env_usize("NV_OCR_BSN_PREP_THREADS", 4).max(1),
             front_threads: env_usize("NV_OCR_BSN_FRONT", 2).max(1),
             queue_depth: env_usize("NV_OCR_BSN_QUEUE", 256).max(1),
-            loop_retry: std::env::var("NV_DSOCR_LOOP_RETRY")
-                .map(|v| v != "0")
-                .unwrap_or(true),
             cap: std::env::var("NV_DSOCR_BSN_CAP")
                 .ok()
                 .and_then(|v| v.parse().ok()),
@@ -70,7 +66,6 @@ impl Default for BsnOptions {
             prep_threads: 4,
             front_threads: 2,
             queue_depth: 256,
-            loop_retry: true,
             fill_target: usize::MAX,
             fill_wait_ms: 250,
         }
@@ -567,7 +562,7 @@ fn decode_loop(
         }
         for (j, f) in finished {
             graph.release_slot(j);
-            complete(f, &pipeline, opts.loop_retry, &mut pending_retry);
+            complete(f, &pipeline, &mut pending_retry);
         }
     }
     if stats {
@@ -659,12 +654,7 @@ fn install(
     Ok(Some(seq))
 }
 
-fn complete(
-    f: Finished,
-    pipeline: &DeepSeekOcr2Pipeline,
-    loop_retry: bool,
-    pending: &mut Vec<Seq>,
-) {
+fn complete(f: Finished, pipeline: &DeepSeekOcr2Pipeline, pending: &mut Vec<Seq>) {
     let Finished {
         mut seq,
         looped,
@@ -674,7 +664,7 @@ fn complete(
         if let Some(d) = detect_loop(&seq.generated) {
             seq.generated.truncate(d.onset);
         }
-        if loop_retry && !seq.retry && seq.prompt.trim() == PROMPT_FREE_OCR.trim() {
+        if !seq.retry && seq.prompt.trim() == PROMPT_FREE_OCR.trim() {
             seq.prev_best = Some(seq.generated.clone());
             pending.push(seq);
             return;

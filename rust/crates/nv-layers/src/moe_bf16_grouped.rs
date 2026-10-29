@@ -139,7 +139,6 @@ mod tests {
         v / (1.0 + (-v).exp())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn reference(
         x: &[f32],
         gate_up: &[f32],

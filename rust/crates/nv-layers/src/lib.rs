@@ -8,6 +8,7 @@ pub mod attn;
 pub mod backend;
 pub mod block;
 pub mod conv;
+pub mod cpu_qmatvec;
 pub mod cuda_stream;
 #[cfg(feature = "cuda")]
 pub mod embedding;
@@ -27,6 +28,8 @@ pub mod moe_train;
 #[cfg(feature = "wgpu")]
 pub mod moe_wgpu;
 pub mod norm;
+#[cfg(feature = "cuda")]
+pub mod pinned_host;
 pub mod prof_events;
 pub mod rope;
 pub mod sampler;

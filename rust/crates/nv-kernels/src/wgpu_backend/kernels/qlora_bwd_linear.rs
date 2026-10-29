@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
@@ -137,7 +135,6 @@ pub async fn dx_w4_f32_arm(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn gemm(
     ctx: &WgpuContext,
     entry: &'static str,
@@ -183,27 +180,6 @@ async fn gemm(
     Ok(())
 }
 
-pub fn gemm_nn_f32(
-    ctx: &WgpuContext,
-    p: &[f32],
-    q: &[f32],
-    out: &mut [f32],
-    m: usize,
-    i: usize,
-    j: usize,
-) -> Result<()> {
-    dispatch::drive_blocking(gemm_nn_f32_arm(
-        ctx,
-        p,
-        q,
-        out,
-        m,
-        i,
-        j,
-        dispatch::ReadbackArm::Blocking,
-    ))
-}
-
 pub async fn gemm_nn_f32_arm(
     ctx: &WgpuContext,
     p: &[f32],
@@ -229,27 +205,6 @@ pub async fn gemm_nn_f32_arm(
         arm,
     )
     .await
-}
-
-pub fn gemm_tn_f32(
-    ctx: &WgpuContext,
-    p: &[f32],
-    q: &[f32],
-    out: &mut [f32],
-    m: usize,
-    i: usize,
-    j: usize,
-) -> Result<()> {
-    dispatch::drive_blocking(gemm_tn_f32_arm(
-        ctx,
-        p,
-        q,
-        out,
-        m,
-        i,
-        j,
-        dispatch::ReadbackArm::Blocking,
-    ))
 }
 
 pub async fn gemm_tn_f32_arm(
@@ -350,22 +305,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uniform_structs_keep_sixteen_byte_multiples() {
-        assert_eq!(std::mem::size_of::<DxParams>(), 32);
-        assert_eq!(std::mem::size_of::<GemmParams>(), 16);
-    }
-
-    #[test]
-    fn dx_source_dequants_in_kernel_via_the_shared_prelude() {
-        let src = compose(DX_WGSL);
-        assert!(src.contains("fn u4_unpack("));
-        assert!(src.contains("fn qlora_bwd_dx_w4("));
-    }
-
-    #[test]
-    fn gemm_source_declares_both_layouts() {
-        let src = compose(GEMM_WGSL);
-        assert!(src.contains("fn qlora_bwd_gemm_nn("));
-        assert!(src.contains("fn qlora_bwd_gemm_tn("));
+    fn uniform_structs_and_both_sources_follow_the_shader_contract() {
+        {
+            assert_eq!(std::mem::size_of::<DxParams>(), 32);
+            assert_eq!(std::mem::size_of::<GemmParams>(), 16);
+        }
+        {
+            let src = compose(DX_WGSL);
+            assert!(src.contains("fn u4_unpack("));
+            assert!(src.contains("fn qlora_bwd_dx_w4("));
+        }
+        {
+            let src = compose(GEMM_WGSL);
+            assert!(src.contains("fn qlora_bwd_gemm_nn("));
+            assert!(src.contains("fn qlora_bwd_gemm_tn("));
+        }
     }
 }

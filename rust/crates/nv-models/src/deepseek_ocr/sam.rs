@@ -184,10 +184,8 @@ extern "C" __global__ void sam_relpos_softmax_bf16(
         }
         let ptx = cudarc::nvrtc::compile_ptx(SRC).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let ctx: Arc<cudarc::driver::CudaContext> = dev.cuda_stream().context().clone();
-        let module = ctx.load_module(ptx).map_err(|e| anyhow::anyhow!(e))?;
-        let f = module
-            .load_function("sam_relpos_softmax_bf16")
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let module = ctx.load_module(ptx)?;
+        let f = module.load_function("sam_relpos_softmax_bf16")?;
         *slot = Some(f.clone());
         Ok(f)
     }
@@ -205,13 +203,8 @@ extern "C" __global__ void sam_relpos_softmax_bf16(
         Ok(p)
     }
 
-    fn enabled() -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_SAM_FUSED")
-    }
-
     pub fn supported(scores: &Tensor, rel_h: &Tensor, rel_w: &Tensor) -> bool {
-        enabled()
-            && matches!(scores.device(), Device::Cuda(_))
+        scores.device().is_cuda()
             && scores.dtype() == DType::BF16
             && rel_h.dtype() == DType::BF16
             && rel_w.dtype() == DType::BF16
@@ -243,7 +236,7 @@ extern "C" __global__ void sam_relpos_softmax_bf16(
         let s_ptr = ptr(scores, &stream)?;
         let h_ptr = ptr(rel_h, &stream)?;
         let w_ptr = ptr(rel_w, &stream)?;
-        let mut out = unsafe { stream.alloc::<bf16>(n).map_err(|e| anyhow::anyhow!(e))? };
+        let mut out = unsafe { stream.alloc::<bf16>(n)? };
         let block: u32 = if hw >= 512 { 256 } else { 128 };
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
@@ -263,7 +256,7 @@ extern "C" __global__ void sam_relpos_softmax_bf16(
                 .arg(&hi)
                 .arg(&wi)
                 .arg(&hwi);
-            unsafe { lb.launch(cfg) }.map_err(|e| anyhow::anyhow!(e))?;
+            unsafe { lb.launch(cfg) }?;
         }
         let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
         Ok(Tensor::from_storage(
@@ -378,10 +371,8 @@ extern "C" __global__ void sam_flash_relpos_bf16(
         }
         let ptx = cudarc::nvrtc::compile_ptx(SRC).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let ctx: Arc<cudarc::driver::CudaContext> = dev.cuda_stream().context().clone();
-        let module = ctx.load_module(ptx).map_err(|e| anyhow::anyhow!(e))?;
-        let f = module
-            .load_function("sam_flash_relpos_bf16")
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let module = ctx.load_module(ptx)?;
+        let f = module.load_function("sam_flash_relpos_bf16")?;
         *slot = Some(f.clone());
         Ok(f)
     }
@@ -407,7 +398,7 @@ extern "C" __global__ void sam_flash_relpos_bf16(
 
     pub fn supported(q: &Tensor, k: &Tensor, v: &Tensor, rel_h: &Tensor, rel_w: &Tensor) -> bool {
         let bf = |t: &Tensor| t.dtype() == DType::BF16 && t.is_contiguous();
-        matches!(q.device(), Device::Cuda(_))
+        q.device().is_cuda()
             && bf(q)
             && bf(k)
             && bf(v)
@@ -452,7 +443,7 @@ extern "C" __global__ void sam_flash_relpos_bf16(
         let rh_ptr = ptr(rel_h, &stream)?;
         let rw_ptr = ptr(rel_w, &stream)?;
         let n = b_nh * hw * hd;
-        let mut out = unsafe { stream.alloc::<bf16>(n).map_err(|e| anyhow::anyhow!(e))? };
+        let mut out = unsafe { stream.alloc::<bf16>(n)? };
         let cfg = LaunchConfig {
             grid_dim: (hw as u32, b_nh as u32, 1),
             block_dim: (64, 1, 1),
@@ -475,7 +466,7 @@ extern "C" __global__ void sam_flash_relpos_bf16(
                 .arg(&wi)
                 .arg(&hdi)
                 .arg(&sc);
-            unsafe { lb.launch(cfg) }.map_err(|e| anyhow::anyhow!(e))?;
+            unsafe { lb.launch(cfg) }?;
         }
         let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
         Ok(Tensor::from_storage(
@@ -985,8 +976,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_partition_roundtrip_with_padding() {
+    fn window_partition_roundtrips_with_padding_and_layer_norm_normalizes_the_last_dim() {
         let dev = Device::Cpu;
+        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 4), &dev).unwrap();
+        let w = Tensor::ones(4, DType::F32, &dev).unwrap();
+        let b = Tensor::zeros(4, DType::F32, &dev).unwrap();
+        let y = layer_norm(&x, &w, &b, 1e-6).unwrap();
+        let v: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
+        let mean: f32 = v.iter().sum::<f32>() / 4.0;
+        assert!(mean.abs() < 1e-5);
+        assert!((v[3] - 1.3416).abs() < 1e-3);
         let x = Tensor::arange(0f32, (2 * 5 * 7 * 3) as f32, &dev)
             .unwrap()
             .reshape((2, 5, 7, 3))
@@ -1001,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn rel_pos_exact_when_size_matches() {
+    fn rel_pos_is_exact_when_size_matches_and_interpolates_when_rows_differ() {
         let dev = Device::Cpu;
         let table = Tensor::arange(0f32, (7 * 2) as f32, &dev)
             .unwrap()
@@ -1015,11 +1014,6 @@ mod tests {
         assert_eq!(v, vec![12.0, 13.0]);
         let v: Vec<f32> = sel.i((0, 3, ..)).unwrap().to_vec1().unwrap();
         assert_eq!(v, vec![0.0, 1.0]);
-    }
-
-    #[test]
-    fn rel_pos_interpolates_when_rows_differ() {
-        let dev = Device::Cpu;
         let table = Tensor::arange(0f32, 127f32, &dev)
             .unwrap()
             .reshape((127, 1))
@@ -1031,36 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn rel_cache_stays_within_its_grid_budget_under_many_distinct_resolutions() {
-        let dev = Device::Cpu;
-        let table = Tensor::arange(0f32, (7 * 2) as f32, &dev)
-            .unwrap()
-            .reshape((7, 2))
-            .unwrap();
-        let attn = SamAttention {
-            qkv_w: Tensor::zeros((6, 2), DType::F32, &dev).unwrap(),
-            qkv_b: Tensor::zeros(6, DType::F32, &dev).unwrap(),
-            proj_w: Tensor::zeros((2, 2), DType::F32, &dev).unwrap(),
-            proj_b: Tensor::zeros(2, DType::F32, &dev).unwrap(),
-            rel_pos_h: Some(table.clone()),
-            rel_pos_w: Some(table),
-            num_heads: 1,
-            rel_cache: Mutex::new(HashMap::new()),
-        };
-        for g in 2..=24usize {
-            assert!(attn.rel_tables(g, g).unwrap().is_some());
-        }
-        let len = attn.rel_cache.lock().unwrap().len();
-        assert!(
-            len <= SAM_REL_CACHE_MAX_DISTINCT_GRIDS_PER_LAYER_8_CLEAR_ON_OVERFLOW_IS_SAFE_BECAUSE_SAM_RUNS_EAGER_AND_INFLIGHT_CLONES_KEEP_TENSORS_ALIVE,
-            "a stream of distinct attention grids must not grow the per-layer rel cache past \
-             its budget: len={len}"
-        );
-        assert!(attn.rel_tables(24, 24).unwrap().is_some());
-    }
-
-    #[test]
-    fn pos_cache_stays_within_its_grid_budget_under_many_distinct_resolutions() {
+    fn rel_and_pos_caches_stay_within_their_grid_budgets_under_many_distinct_resolutions() {
         let dev = Device::Cpu;
         let cfg = SamConfig {
             embed_dim: 2,
@@ -1092,18 +1057,30 @@ mod tests {
              len={len}"
         );
         assert_eq!(enc.abs_pos(10).unwrap().dims(), &[1, 10, 10, 2]);
-    }
 
-    #[test]
-    fn layer_norm_normalizes_last_dim() {
-        let dev = Device::Cpu;
-        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 4), &dev).unwrap();
-        let w = Tensor::ones(4, DType::F32, &dev).unwrap();
-        let b = Tensor::zeros(4, DType::F32, &dev).unwrap();
-        let y = layer_norm(&x, &w, &b, 1e-6).unwrap();
-        let v: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
-        let mean: f32 = v.iter().sum::<f32>() / 4.0;
-        assert!(mean.abs() < 1e-5);
-        assert!((v[3] - 1.3416).abs() < 1e-3);
+        let table = Tensor::arange(0f32, (7 * 2) as f32, &dev)
+            .unwrap()
+            .reshape((7, 2))
+            .unwrap();
+        let attn = SamAttention {
+            qkv_w: Tensor::zeros((6, 2), DType::F32, &dev).unwrap(),
+            qkv_b: Tensor::zeros(6, DType::F32, &dev).unwrap(),
+            proj_w: Tensor::zeros((2, 2), DType::F32, &dev).unwrap(),
+            proj_b: Tensor::zeros(2, DType::F32, &dev).unwrap(),
+            rel_pos_h: Some(table.clone()),
+            rel_pos_w: Some(table),
+            num_heads: 1,
+            rel_cache: Mutex::new(HashMap::new()),
+        };
+        for g in 2..=24usize {
+            assert!(attn.rel_tables(g, g).unwrap().is_some());
+        }
+        let len = attn.rel_cache.lock().unwrap().len();
+        assert!(
+            len <= SAM_REL_CACHE_MAX_DISTINCT_GRIDS_PER_LAYER_8_CLEAR_ON_OVERFLOW_IS_SAFE_BECAUSE_SAM_RUNS_EAGER_AND_INFLIGHT_CLONES_KEEP_TENSORS_ALIVE,
+            "a stream of distinct attention grids must not grow the per-layer rel cache past \
+             its budget: len={len}"
+        );
+        assert!(attn.rel_tables(24, 24).unwrap().is_some());
     }
 }

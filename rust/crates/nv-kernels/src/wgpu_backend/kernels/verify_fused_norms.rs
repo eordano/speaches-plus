@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::{
     pack_u16_odd_tail_zeroed_min_one_word as pack_u16, pack_u8_min_one_word as pack_u8,
@@ -384,25 +382,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn params_keep_uniform_layout_multiples() {
-        assert_eq!(std::mem::size_of::<VfParams>() % 16, 0);
-        assert_eq!(std::mem::size_of::<VfrParams>(), 16);
-        assert_eq!(std::mem::size_of::<VfsParams>() % 16, 0);
-    }
-
-    #[test]
-    fn byte_word_packing_round_trips() {
-        let src: Vec<u8> = (0u16..37)
-            .map(|i| (i.wrapping_mul(97) & 0xff) as u8)
-            .collect();
-        let words = pack_u8(&src);
-        let mut back = vec![0u8; src.len()];
-        unpack_u8(&words, &mut back);
-        assert_eq!(back, src);
-        let src16: Vec<u16> = (0u16..21).map(|i| i.wrapping_mul(1031)).collect();
-        let w16 = pack_u16(&src16);
-        let mut back16 = vec![0u16; src16.len()];
-        unpack_u16(&w16, &mut back16);
-        assert_eq!(back16, src16);
+    fn params_keep_uniform_layout_and_packing_round_trips() {
+        {
+            assert_eq!(std::mem::size_of::<VfParams>() % 16, 0);
+            assert_eq!(std::mem::size_of::<VfrParams>(), 16);
+            assert_eq!(std::mem::size_of::<VfsParams>() % 16, 0);
+        }
+        {
+            let src: Vec<u8> = (0u16..37)
+                .map(|i| (i.wrapping_mul(97) & 0xff) as u8)
+                .collect();
+            let words = pack_u8(&src);
+            let mut back = vec![0u8; src.len()];
+            unpack_u8(&words, &mut back);
+            assert_eq!(back, src);
+            let src16: Vec<u16> = (0u16..21).map(|i| i.wrapping_mul(1031)).collect();
+            let w16 = pack_u16(&src16);
+            let mut back16 = vec![0u16; src16.len()];
+            unpack_u16(&w16, &mut back16);
+            assert_eq!(back16, src16);
+        }
     }
 }

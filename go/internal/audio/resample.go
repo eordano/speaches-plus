@@ -1,15 +1,5 @@
 package audio
 
-func DownmixStereoToMonoF32(interleavedStereo StereoS16) MonoF32 {
-	out := make(MonoF32, len(interleavedStereo)/2)
-	for i := 0; i < len(out); i++ {
-		l := float32(interleavedStereo[2*i])
-		r := float32(interleavedStereo[2*i+1])
-		out[i] = ((l + r) * 0.5) / 32768.0
-	}
-	return out
-}
-
 func MonoS16ToF32(samples MonoS16) MonoF32 {
 	out := make(MonoF32, len(samples))
 	for i, s := range samples {

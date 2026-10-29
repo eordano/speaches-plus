@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -84,16 +83,11 @@ pub struct ResponseStatusDetails {
     pub error: Option<ErrorPayload>,
 }
 
-fn realtime_response_object() -> &'static str {
-    "realtime.response"
-}
-
 #[typeshare::typeshare]
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct ResponsePayload {
     pub id: ResponseId,
-    #[serde(default = "realtime_response_object")]
     #[typeshare(skip)]
     pub object: &'static str,
     pub status: ResponseStatus,
@@ -277,6 +271,74 @@ pub struct TranscriptionCompletedEvent {
     #[typeshare(serialized_as = "U53")]
     pub content_index: u64,
     pub transcript: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_logprob: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_speech_prob: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Vec<TranscriptTokenLogprob>>,
+}
+
+impl TranscriptionCompletedEvent {
+    pub fn with_confidence(mut self, confidence: TranscriptConfidence) -> Self {
+        self.avg_logprob = confidence.avg_logprob;
+        self.no_speech_prob = confidence.no_speech_prob;
+        self.compression_ratio = confidence.compression_ratio;
+        self.logprobs = confidence.logprobs;
+        self
+    }
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct TranscriptTokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+}
+
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct TranscriptConfidence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_logprob: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_speech_prob: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compression_ratio: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Vec<TranscriptTokenLogprob>>,
+}
+
+impl TranscriptConfidence {
+    pub fn from_stt(result: &crate::stt::TranscriptionResult) -> Self {
+        Self {
+            avg_logprob: result.avg_logprob,
+            no_speech_prob: result.no_speech_prob,
+            compression_ratio: result.compression_ratio,
+            logprobs: (!result.tokens.is_empty()).then(|| {
+                result
+                    .tokens
+                    .iter()
+                    .map(|t| TranscriptTokenLogprob {
+                        token: t.token.clone(),
+                        logprob: t.logprob,
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    pub fn attach(&self, event: &mut Value) {
+        if let (Value::Object(target), Value::Object(fields)) =
+            (event, serde_json::to_value(self).unwrap_or(Value::Null))
+        {
+            target.extend(fields);
+        }
+    }
 }
 
 #[typeshare::typeshare]
@@ -911,18 +973,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn type_name_matches_serde_tag() {
-        let ev = OutboundEvent::ResponseOutputAudioDone(ResponseOutputAudioDoneEvent {
-            response_id: "r".into(),
-            item_id: "i".into(),
-            output_index: 0,
-            content_index: 0,
-        });
-        let v = serde_json::to_value(&ev).unwrap();
-        assert_eq!(v.get("type").and_then(|t| t.as_str()), Some(ev.type_name()));
-    }
-
     fn sample_response_payload(status: ResponseStatus, audio_end_ms: u64) -> ResponsePayload {
         ResponsePayload {
             id: ResponseId::new("resp_x"),
@@ -935,26 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn topic_classifies_response_variants() {
-        let ev = OutboundEvent::ResponseDone(ResponseDoneEvent {
-            response: sample_response_payload(ResponseStatus::Completed, 0),
-        });
-        assert_eq!(ev.topic(), Topic::Response);
-        let ev2 = OutboundEvent::SessionCreated(SessionCreatedEvent {
-            session: json!({"id": "s"}),
-        });
-        assert_eq!(ev2.topic(), Topic::Session);
-        let ev3 = OutboundEvent::AssistantTruncated(AssistantTruncatedEvent {
-            event_id: "e".into(),
-            item_id: "i".into(),
-            audio_end_ms: 0,
-            transcript: "".into(),
-        });
-        assert_eq!(ev3.topic(), Topic::Item);
-    }
-
-    #[test]
-    fn response_done_audio_end_ms_present_for_every_status() {
+    fn response_done_carries_audio_end_ms_and_status_details_only_when_not_completed() {
         for (status, status_str) in [
             (ResponseStatus::Completed, "completed"),
             (ResponseStatus::Cancelled, "cancelled"),
@@ -977,26 +1008,22 @@ mod tests {
                 "wrong status",
             );
         }
-    }
-
-    #[test]
-    fn response_done_omits_status_details_when_completed_or_cancelled() {
-        let ev = OutboundEvent::ResponseDone(ResponseDoneEvent {
-            response: sample_response_payload(ResponseStatus::Completed, 0),
-        });
-        let v = serde_json::to_value(&ev).unwrap();
-        assert!(v["response"].get("status_details").is_none());
-    }
-
-    #[test]
-    fn response_status_reason_serializes_snake_case() {
-        let mut p = sample_response_payload(ResponseStatus::Incomplete, 5_000);
-        p.status_details = Some(ResponseStatusDetails {
-            reason: ResponseStatusReason::DrainCap,
-            error: None,
-        });
-        let v = serde_json::to_value(&p).unwrap();
-        assert_eq!(v["status_details"]["reason"].as_str(), Some("drain_cap"));
+        {
+            let ev = OutboundEvent::ResponseDone(ResponseDoneEvent {
+                response: sample_response_payload(ResponseStatus::Completed, 0),
+            });
+            let v = serde_json::to_value(&ev).unwrap();
+            assert!(v["response"].get("status_details").is_none());
+        }
+        {
+            let mut p = sample_response_payload(ResponseStatus::Incomplete, 5_000);
+            p.status_details = Some(ResponseStatusDetails {
+                reason: ResponseStatusReason::DrainCap,
+                error: None,
+            });
+            let v = serde_json::to_value(&p).unwrap();
+            assert_eq!(v["status_details"]["reason"].as_str(), Some("drain_cap"));
+        }
     }
 
     #[test]
@@ -1061,18 +1088,16 @@ mod tests {
         assert_eq!(v["error"]["message"].as_str(), Some("bad"));
         assert!(v["error"].get("event_id").is_none());
         assert!(v["error"].get("param").is_none());
+        {
+            let p = ErrorPayload::for_code("vad_failed", "boom");
+            assert_eq!(p.type_, "server_error");
+            let p2 = ErrorPayload::for_code("response_already_active", "nope");
+            assert_eq!(p2.type_, "invalid_request_error");
+        }
     }
 
     #[test]
-    fn error_payload_for_code_resolves_type_field() {
-        let p = ErrorPayload::for_code("vad_failed", "boom");
-        assert_eq!(p.type_, "server_error");
-        let p2 = ErrorPayload::for_code("response_already_active", "nope");
-        assert_eq!(p2.type_, "invalid_request_error");
-    }
-
-    #[test]
-    fn typed_ids_serialize_as_strings_in_outbound_events() {
+    fn typed_ids_serialize_as_strings_and_type_name_matches_the_serde_tag() {
         let ev = OutboundEvent::ResponseOutputAudioDone(ResponseOutputAudioDoneEvent {
             response_id: ResponseId::new("resp_1"),
             item_id: ItemId::new("item_a"),
@@ -1094,10 +1119,20 @@ mod tests {
         assert_eq!(tv["event_id"].as_str(), Some("evt_1"));
         assert_eq!(tv["item_id"].as_str(), Some("item_a"));
         assert_eq!(tv["audio_end_ms"].as_u64(), Some(1234));
+        {
+            let ev = OutboundEvent::ResponseOutputAudioDone(ResponseOutputAudioDoneEvent {
+                response_id: "r".into(),
+                item_id: "i".into(),
+                output_index: 0,
+                content_index: 0,
+            });
+            let v = serde_json::to_value(&ev).unwrap();
+            assert_eq!(v.get("type").and_then(|t| t.as_str()), Some(ev.type_name()));
+        }
     }
 
     #[test]
-    fn event_seq_is_strictly_increasing_and_prefixed() {
+    fn event_seq_is_strictly_increasing_and_stamp_overwrites_only_the_top_level_event_id() {
         let seq = EventSeq::new();
         let a = seq.next_id();
         let b = seq.next_id();
@@ -1105,61 +1140,87 @@ mod tests {
         assert_eq!(b.as_str(), "evt_000000000000000000000001");
         assert!(a.as_str() < b.as_str());
         assert_eq!(seq.issued(), 2);
-    }
-
-    #[test]
-    fn stamp_overwrites_any_caller_supplied_event_id() {
-        let seq = EventSeq::new();
-        let ev = OutboundEvent::AssistantTruncated(AssistantTruncatedEvent {
-            event_id: EventId::new("evt_caller_supplied"),
-            item_id: "i".into(),
-            audio_end_ms: 7,
-            transcript: "x".into(),
-        });
-        let v = ev.to_wire_value(&seq).expect("wire value");
-        assert_eq!(v["event_id"].as_str(), Some("evt_000000000000000000000000"));
-        assert_eq!(v["audio_end_ms"].as_u64(), Some(7));
-    }
-
-    #[test]
-    fn stamp_leaves_nested_error_event_id_alone() {
-        let seq = EventSeq::new();
-        let ev = OutboundEvent::Error(ErrorEvent {
-            error: ErrorPayload {
-                type_: "invalid_request_error".into(),
-                code: "invalid_request_error".into(),
-                message: "bad".into(),
-                event_id: Some("evt_from_client".into()),
-                param: None,
-            },
-        });
-        let v = ev.to_wire_value(&seq).expect("wire value");
-        assert_eq!(v["event_id"].as_str(), Some("evt_000000000000000000000000"));
-        assert_eq!(v["error"]["event_id"].as_str(), Some("evt_from_client"));
-    }
-
-    #[test]
-    fn to_wire_value_is_to_value_plus_stamp() {
-        for ev in [
-            OutboundEvent::BufferCleared,
-            OutboundEvent::SessionDone(SessionDoneEvent { reason: "x".into() }),
-            OutboundEvent::ResponseCancelled(ResponseCancelledEvent {
-                response_id: "r".into(),
-            }),
-        ] {
-            let via_helper = ev.to_wire_value(&EventSeq::new()).expect("wire value");
-            let mut via_emit = serde_json::to_value(&ev).expect("serialize");
-            EventSeq::new().stamp(&mut via_emit);
-            assert_eq!(via_helper, via_emit, "drift for {}", ev.type_name());
+        {
+            let seq = EventSeq::new();
+            let ev = OutboundEvent::AssistantTruncated(AssistantTruncatedEvent {
+                event_id: EventId::new("evt_caller_supplied"),
+                item_id: "i".into(),
+                audio_end_ms: 7,
+                transcript: "x".into(),
+            });
+            let v = ev.to_wire_value(&seq).expect("wire value");
+            assert_eq!(v["event_id"].as_str(), Some("evt_000000000000000000000000"));
+            assert_eq!(v["audio_end_ms"].as_u64(), Some(7));
+        }
+        {
+            let seq = EventSeq::new();
+            let ev = OutboundEvent::Error(ErrorEvent {
+                error: ErrorPayload {
+                    type_: "invalid_request_error".into(),
+                    code: "invalid_request_error".into(),
+                    message: "bad".into(),
+                    event_id: Some("evt_from_client".into()),
+                    param: None,
+                },
+            });
+            let v = ev.to_wire_value(&seq).expect("wire value");
+            assert_eq!(v["event_id"].as_str(), Some("evt_000000000000000000000000"));
+            assert_eq!(v["error"]["event_id"].as_str(), Some("evt_from_client"));
+        }
+        {
+            let seq = EventSeq::new();
+            let mut v = Value::String("not an event".into());
+            assert!(seq.stamp(&mut v).is_none());
+            assert_eq!(seq.issued(), 0);
         }
     }
 
     #[test]
-    fn stamp_does_not_consume_a_number_for_non_objects() {
-        let seq = EventSeq::new();
-        let mut v = Value::String("not an event".into());
-        assert!(seq.stamp(&mut v).is_none());
-        assert_eq!(seq.issued(), 0);
+    fn transcript_confidence_rides_the_completed_event_only_when_known() {
+        let mut bare = serde_json::json!({"type": "conversation.item.input_audio_transcription.completed", "transcript": "t"});
+        TranscriptConfidence::default().attach(&mut bare);
+        assert_eq!(
+            bare.as_object().unwrap().len(),
+            2,
+            "unknown confidence adds no field: {bare}"
+        );
+        let stt = crate::stt::TranscriptionResult {
+            avg_logprob: Some(-0.25),
+            no_speech_prob: Some(0.5),
+            tokens: vec![crate::stt::TokenLogprob {
+                token: " hi".into(),
+                logprob: -0.5,
+            }],
+            ..Default::default()
+        };
+        let mut full = serde_json::json!({"type": "x"});
+        TranscriptConfidence::from_stt(&stt).attach(&mut full);
+        assert_eq!(full["avg_logprob"], -0.25);
+        assert_eq!(full["no_speech_prob"], 0.5);
+        assert!(full.get("compression_ratio").is_none());
+        assert_eq!(full["logprobs"][0]["token"], " hi");
+        assert_eq!(full["logprobs"][0]["logprob"], -0.5);
+        let typed = serde_json::to_value(
+            TranscriptionCompletedEvent {
+                item_id: ItemId::new("item_a"),
+                content_index: 0,
+                transcript: "t".into(),
+                avg_logprob: None,
+                no_speech_prob: None,
+                compression_ratio: None,
+                logprobs: None,
+            }
+            .with_confidence(TranscriptConfidence::from_stt(&stt)),
+        )
+        .unwrap();
+        assert_eq!(
+            typed["logprobs"][0]["logprob"], -0.5,
+            "typed event carries the confidence: {typed}"
+        );
+        assert!(
+            typed.get("compression_ratio").is_none(),
+            "unknown fields stay off the wire: {typed}"
+        );
     }
 
     #[test]

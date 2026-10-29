@@ -1,11 +1,22 @@
-use anyhow::{Context, Result};
+use crate::{dispatch_pass, submit_passes};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use bytemuck::{bytes_of, cast_slice};
+use half::bf16;
+use nv_config::env_arm_opt_in_eq_some_1_reread_every_call;
+use nv_weights::WeightLoader;
+use pollster::block_on;
+use std::env;
+use std::sync::Arc;
+use wgpu::{BindGroup, Buffer, BufferUsages, ComputePipeline, ErrorFilter};
 
 use nv_kernels::wgpu_backend::dispatch;
 use nv_kernels::wgpu_backend::kernels as wk;
 use nv_kernels::wgpu_backend::{compose, WgpuContext};
 
+use crate::pod;
 use crate::qwen3_5_dense_wgpu::{assert_w8_group_divides_k, rope_tables};
 use crate::qwen3_5_moe::{LayerType, Qwen3MoeConfig};
+use crate::wgpu_ledger::env_not_off;
 
 pub use crate::nvfp4_host::NVFP4_BLOCK;
 const MAX_HEAD_DIM: usize = 256;
@@ -18,15 +29,15 @@ fn flash_splits() -> u32 {
 
 const STAGING_FLUSH_BYTES: u64 = 256 << 20;
 
-const GEMV_BF16_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_gemv_bf16.wgsl");
+const GEMV_BF16_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/q3m_gemv_bf16.wgsl");
 
 const GEMV_NVFP4_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_gemv_nvfp4.wgsl");
 
-const GEMV_NVFP4_V2_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_gemv_nvfp4_v2.wgsl");
+const GEMV_NVFP4_V2_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/q3m_gemv_nvfp4_v2.wgsl");
 
-const QUANT_ROWS_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_quant_rows.wgsl");
+const QUANT_ROWS_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/q3m_quant_rows.wgsl");
 
-const DELTA_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_delta.wgsl");
+const DELTA_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/q3m_delta.wgsl");
 
 const ATTN_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_attn.wgsl");
 
@@ -39,244 +50,199 @@ const PF_DELTA_CHUNK_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_pf_del
 
 const PF_ATTN_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_pf_attn.wgsl");
 
-const PF_KVQ_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_pf_kvq.wgsl");
+const PF_KVQ_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/q3m_pf_kvq.wgsl");
 
 const PF_MOE_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_pf_moe.wgsl");
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvBf16Params {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    out_f32: u32,
-    w_row_words: u32,
-    x_off_words: u32,
-    y_off_words: u32,
-    pad0: u32,
-    alpha: f32,
-    pad1: u32,
-    pad2: u32,
-    pad3: u32,
-}
+pod! {
+    struct GemvBf16Params {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        out_f32: u32,
+        w_row_words: u32,
+        x_off_words: u32,
+        y_off_words: u32,
+        pad0: u32,
+        alpha: f32,
+        pad1: u32,
+        pad2: u32,
+        pad3: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GemvNvfp4Params {
-    pub alpha: f32,
-    pub n_rows: u32,
-    pub k_blocks: u32,
-    pub k_tiles: u32,
-    pub groups_x: u32,
-    pub w_e_stride_vec2: u32,
-    pub sf_e_stride_bytes: u32,
-    pub x_slot_stride_vec2: u32,
-    pub xsf_slot_stride_bytes: u32,
-    pub y_slot_stride_words: u32,
-    pub per_expert_alpha: u32,
-    pub m_slots_sharing_expert_zero: u32,
-}
+    pub struct GemvNvfp4Params {
+        pub alpha: f32,
+        pub n_rows: u32,
+        pub k_blocks: u32,
+        pub k_tiles: u32,
+        pub groups_x: u32,
+        pub w_e_stride_vec2: u32,
+        pub sf_e_stride_bytes: u32,
+        pub x_slot_stride_vec2: u32,
+        pub xsf_slot_stride_bytes: u32,
+        pub y_slot_stride_words: u32,
+        pub per_expert_alpha: u32,
+        pub m_slots_sharing_expert_zero: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct QuantRowsParams {
-    pub k_blocks: u32,
-    pub n_slots: u32,
-    pub use_sel: u32,
-    pub x_slot_stride_elems: u32,
-}
+    pub struct QuantRowsParams {
+        pub k_blocks: u32,
+        pub n_slots: u32,
+        pub use_sel: u32,
+        pub x_slot_stride_elems: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct SiluPairParams {
-    pub u_off_elems: u32,
-    pub pad0: u32,
-    pub pad1: u32,
-    pub pad2: u32,
-}
+    pub struct SiluPairParams {
+        pub u_off_elems: u32,
+        pub pad0: u32,
+        pub pad1: u32,
+        pub pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RmsParams {
-    hidden: u32,
-    batch: u32,
-    eps: f32,
-    words_per_row: u32,
-}
+    struct RmsParams {
+        hidden: u32,
+        batch: u32,
+        eps: f32,
+        words_per_row: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ResScaleParams {
-    n: u32,
-    n_words: u32,
-    scale: f32,
-    cap: f32,
-    inv_cap: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct ResScaleParams {
+        n: u32,
+        n_words: u32,
+        scale: f32,
+        cap: f32,
+        inv_cap: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ConvParams {
-    conv_dim: u32,
-    kernel: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct ConvParams {
+        conv_dim: u32,
+        kernel: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct DeltaQkvParams {
-    n_v: u32,
-    d_k: u32,
-    d_v: u32,
-    key_dim: u32,
-    v_per_k: u32,
-    ab_off: u32,
-    pad1: u32,
-    scale: f32,
-}
+    struct DeltaQkvParams {
+        n_v: u32,
+        d_k: u32,
+        d_v: u32,
+        key_dim: u32,
+        v_per_k: u32,
+        ab_off: u32,
+        pad1: u32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GatingParams {
-    n_v: u32,
-    ab_off: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct RecurrentParams {
+        heads: u32,
+        d_k: u32,
+        d_v: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RecurrentParams {
-    heads: u32,
-    d_k: u32,
-    d_v: u32,
-    pad0: u32,
-}
+    struct DeltaOutParams {
+        n_v: u32,
+        d_v: u32,
+        z_off: u32,
+        eps: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct DeltaOutParams {
-    n_v: u32,
-    d_v: u32,
-    z_off: u32,
-    eps: f32,
-}
+    struct NormRopeParams {
+        n_rows: u32,
+        head_dim: u32,
+        src_stride: u32,
+        rot_half: u32,
+        src_off: u32,
+        w_off: u32,
+        n_q: u32,
+        k_src_off: u32,
+        k_src_stride: u32,
+        k_w_off: u32,
+        sin_off: u32,
+        eps: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct NormRopeParams {
-    n_rows: u32,
-    head_dim: u32,
-    src_stride: u32,
-    rot_half: u32,
-    src_off: u32,
-    w_off: u32,
-    n_q: u32,
-    k_src_off: u32,
-    k_src_stride: u32,
-    k_w_off: u32,
-    sin_off: u32,
-    eps: f32,
-}
+    struct KvFp8Params {
+        n_tokens: u32,
+        n_kv: u32,
+        head_dim: u32,
+        ring: u32,
+        pairs: u32,
+        start: u32,
+        slots: u32,
+        reserved: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct KvFp8Params {
-    n_tokens: u32,
-    n_kv: u32,
-    head_dim: u32,
-    ring: u32,
-    pairs: u32,
-    start: u32,
-    slots: u32,
-    reserved: u32,
-}
+    struct FdParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        total: u32,
+        start: u32,
+        splits: u32,
+        ring: u32,
+        out_bf16: u32,
+        scaling: f32,
+        pad0: u32,
+        fused: u32,
+        pad2: u32,
+        m_rows: u32,
+        window: u32,
+        pad3: u32,
+        pad4: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct FdParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    total: u32,
-    start: u32,
-    splits: u32,
-    ring: u32,
-    out_bf16: u32,
-    scaling: f32,
-    pad0: u32,
-    fused: u32,
-    pad2: u32,
-    m_rows: u32,
-    window: u32,
-    pad3: u32,
-    pad4: u32,
-}
+    struct AttnGateParams {
+        n_words: u32,
+        head_dim: u32,
+        src_stride: u32,
+        gate_off: u32,
+        has_gate: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnGateParams {
-    n_words: u32,
-    head_dim: u32,
-    src_stride: u32,
-    gate_off: u32,
-    has_gate: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct RouterParams {
+        n_experts: u32,
+        k: u32,
+        shared_slot: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RouterParams {
-    n_experts: u32,
-    k: u32,
-    shared_slot: u32,
-    pad1: u32,
-}
+    struct SiluMulParams {
+        n_words: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct SiluMulParams {
-    n_words: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct CombineParams {
+        hidden_words: u32,
+        k: u32,
+        slot_stride_words: u32,
+        shared_off_words: u32,
+        slogit_off: u32,
+        pad1: u32,
+        pad2: u32,
+        pad3: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct CombineParams {
-    hidden_words: u32,
-    k: u32,
-    slot_stride_words: u32,
-    shared_off_words: u32,
-    slogit_off: u32,
-    pad1: u32,
-    pad2: u32,
-    pad3: u32,
-}
+    struct GatherParams {
+        row_off: u32,
+        n_rows: u32,
+        hidden_words: u32,
+        vocab: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GatherParams {
-    row_off: u32,
-    n_rows: u32,
-    hidden_words: u32,
-    vocab: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ArgmaxParams {
-    n: u32,
-    groups: u32,
-    pad0: u32,
-    pad1: u32,
+    struct ArgmaxParams {
+        n: u32,
+        groups: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 }
 
 #[derive(Clone)]
@@ -343,18 +309,10 @@ pub struct HostWeights {
 
 pub enum WeightSource<'a> {
     Host(&'a HostWeights),
-    Loader(&'a nv_weights::WeightLoader),
+    Loader(&'a WeightLoader),
 }
 
-fn bf16_bits(x: f32) -> u16 {
-    half::bf16::from_f32(x).to_bits()
-}
-
-fn bf16_val(b: u16) -> f32 {
-    f32::from_bits((b as u32) << 16)
-}
-
-use crate::gemma4_wgpu_shared::pack_pairs;
+use crate::gemma4_wgpu_shared::{bf16_bits, bf16_val, pack_pairs};
 pub use crate::wgpu_ledger::bytes_to_words;
 
 pub use crate::nvfp4_host::{
@@ -365,8 +323,8 @@ pub use crate::nvfp4_host::{quantize_nvfp4_host, stack_nvfp4_host};
 
 #[derive(Clone)]
 struct Pass {
-    pipeline: std::sync::Arc<wgpu::ComputePipeline>,
-    bind: wgpu::BindGroup,
+    pipeline: Arc<ComputePipeline>,
+    bind: BindGroup,
     grid: (u32, u32, u32),
     label: String,
 
@@ -378,11 +336,11 @@ pub const VERIFY_CHAIN_FORWARDS_THE_WHOLE_BAKED_M_ROW_CHUNK_AND_COMMITS_IN_PLACE
 
 struct Verify {
     rows: usize,
-    res2_rows: wgpu::Buffer,
+    res2_rows: Buffer,
     resadd: Pass,
-    tok: wgpu::Buffer,
-    row_logits: Option<wgpu::Buffer>,
-    rollback: Vec<wgpu::Buffer>,
+    tok: Buffer,
+    row_logits: Option<Buffer>,
+    rollback: Vec<Buffer>,
     validated: bool,
     pending: Option<Vec<u32>>,
 }
@@ -410,8 +368,8 @@ struct Builder {
     quant_lane: (usize, usize),
 
     w8_proj: (usize, u64, u64),
-    rope_cs_buffers_one_per_attn_layer_shared_by_decode_and_pf_passes: Vec<wgpu::Buffer>,
-    attn_probe_qf32_and_out_for_test: Vec<(wgpu::Buffer, wgpu::Buffer)>,
+    rope_cs_buffers_one_per_attn_layer_shared_by_decode_and_pf_passes: Vec<Buffer>,
+    attn_probe_qf32_and_out_for_test: Vec<(Buffer, Buffer)>,
 }
 
 impl std::ops::Deref for Builder {
@@ -433,11 +391,11 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<Pass> {
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
         Ok(Pass {
             pipeline,
@@ -454,7 +412,7 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
         let pass = self.make(label, source, entry, binds, grid)?;
@@ -467,23 +425,12 @@ impl Builder {
         Ok(())
     }
 
-    fn push_pf_off(
-        &mut self,
-        label: &str,
-        source: &str,
-        entry: &str,
-        binds: &[(u32, &wgpu::Buffer, u64)],
-        grid: (u32, u32, u32),
-    ) -> Result<()> {
-        self.push_pf_off_counted(label, source, entry, binds, grid, false)
-    }
-
     fn push_pf_off_m_row(
         &mut self,
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer, u64)],
+        binds: &[(u32, &Buffer, u64)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
         self.push_pf_off_counted(label, source, entry, binds, grid, true)
@@ -494,19 +441,19 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer, u64)],
+        binds: &[(u32, &Buffer, u64)],
         grid: (u32, u32, u32),
         covers_many_tokens_so_counts_as_m_row: bool,
     ) -> Result<()> {
         for (slot, _, off) in binds {
-            anyhow::ensure!(
+            ensure!(
                 off.is_multiple_of(PF_MROW_BIND_OFFSET_ALIGN_BYTES),
                 "{label}::{entry} binding {slot}: offset {off} misses the {PF_MROW_BIND_OFFSET_ALIGN_BYTES}B \
                  offset alignment WebGPU guarantees for storage and uniform bindings"
             );
         }
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group_offsets(self.ctx, &pipeline, binds);
         if covers_many_tokens_so_counts_as_m_row {
             self.pf_mrow_pass_mix_m_row_then_per_token_copies.0 += 1;
@@ -529,7 +476,7 @@ pub fn nvfp4_gemv_source() -> String {
     format!("{}\n{}", wk::gemv_nvfp4::gemv_source(), GEMV_NVFP4_WGSL)
 }
 
-const Q8E_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_q8e.wgsl");
+const Q8E_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/q3m_q8e.wgsl");
 
 pub fn moe_source() -> String {
     let mut s = MOE_WGSL.to_string();
@@ -595,22 +542,11 @@ pub const U8L32_DEFAULT_BEATS_U16_ON_THE_ISOLATED_DISPATCH_LADDER_AT_48_HEADS_DK
     "on the isolated-dispatch ladder over 48 layer-state buffers, q3w_delta_recurrent_u8l32 \
      (wg32, lane split, grid (48,4,1)) outruns the old default q3w_delta_recurrent_u16 \
      (wg128, grid (48,1,1)); every arm is bit-identical on all five parity corpora; current \
-     numbers: perf/runs.jsonl. NV_Q3_WGPU_DELTA_UNROLL=16 restores the old default.";
+     numbers: perf/runs.jsonl.";
 
-pub fn delta_recurrent_kernel() -> (&'static str, u32) {
-    match std::env::var("NV_Q3_WGPU_DELTA_UNROLL").ok().as_deref() {
-        Some("0") | Some("off") | Some("false") => ("q3w_delta_recurrent", 0),
-        Some("l32") => ("q3w_delta_recurrent_l32", 32),
-        Some("4") => ("q3w_delta_recurrent_u4", 0),
-        Some("4l32") => ("q3w_delta_recurrent_u4l32", 32),
-        Some("8") => ("q3w_delta_recurrent_u8", 128),
-        Some("16") => ("q3w_delta_recurrent_u16", 128),
-        Some("16l32") => ("q3w_delta_recurrent_u16l32", 32),
-        Some("32") => ("q3w_delta_recurrent_u32", 128),
-        Some("32l32") => ("q3w_delta_recurrent_u32l32", 32),
-        _ => ("q3w_delta_recurrent_u8l32", 32),
-    }
-}
+pub const DELTA_RECURRENT_ENTRY: &str = "q3w_delta_recurrent_u8l32";
+
+pub const DELTA_RECURRENT_LANES_PER_WORKGROUP: u32 = 32;
 
 pub fn nvfp4_quant_source() -> String {
     let mut s = format!("{}\n{}", wk::gemv_nvfp4::quantize_source(), QUANT_ROWS_WGSL);
@@ -679,24 +615,13 @@ pub fn pf_moe_batched_source() -> String {
     compose(&format!("{MOE_WGSL}\n{PF_MOE_WGSL}"))
 }
 
-const PF_FLASH_SG_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_pf_flash.wgsl");
-
-pub fn pf_flash_sg_source() -> String {
-    compose(&format!("{}\n{}", wk::flash_decode::WGSL, PF_FLASH_SG_WGSL))
-}
-
 pub const FLASH_SD_DEFAULT_ON_SHIFT_DECODE_WINS_AT_DEPTH_WITH_QUALITY_UNCHANGED: &str =
     "the exact e4m3_decode spends ~12 ops per KV element (nan guard, subnormal select, sign \
      select) while e4m3_shift_decode_scale_must_carry_2pow120 spends 2 plus a bitcast and \
      folds its 2^120 carry into the per-position k/v scales the kernels already multiply; \
      at deep KV the shift twin wins decode ms/tok with quality unchanged (the \
      e4m3-subnormal flush is below teacher-forced ppl noise); current numbers: \
-     perf/runs.jsonl. NV_Q3M_FLASH_SD=0 restores the exact-decode entries";
-
-pub fn flash_sd_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !off("NV_Q3M_FLASH_SD"))
-}
+     perf/runs.jsonl.";
 
 const PF_SD_K_SCALE_ANCHOR: &str = "ks = fd_k_scales[sp * nkv + kvh];";
 const PF_SD_V_SCALE_ANCHOR: &str = "vs = fd_v_scales[sp * nkv + kvh];";
@@ -749,19 +674,8 @@ fn pf_sd_twin(body: &str, entries: &[&str]) -> String {
     sd
 }
 
-pub fn pf_flash_sg_source_sd() -> String {
-    assert!(
-        PF_FLASH_SG_WGSL.contains("fd_k_fp8(") && PF_FLASH_SG_WGSL.contains("fd_v_fp8("),
-        "q3m_pf_flash.wgsl no longer decodes fp8 KV through the exact fd helpers; an _sd twin \
-         would change nothing while claiming the shift-decode speedup"
-    );
-    let sd = pf_sd_twin(PF_FLASH_SG_WGSL, &["q3w_pf_flash1_fp8kv_mk_sg"])
-        .replace("fd_k_fp8(", "fd_k_fp8_sd(")
-        .replace("fd_v_fp8(", "fd_v_fp8_sd(");
-    compose(&format!("{}\n{}", wk::flash_decode::WGSL, sd))
-}
-
-const PF_FLASH_TILED_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_pf_flash_tiled.wgsl");
+const PF_FLASH_TILED_WGSL: &str =
+    nv_kernels::wgsl!("../../nv-kernels/wgsl/q3m_pf_flash_tiled.wgsl");
 
 const PF_FLASH_TILED_SG_SECTION_STARTS_AT: &str =
     "fn fdt_warp_sum_butterfly_same_tree_as_pfl_warp_sum";
@@ -812,22 +726,6 @@ pub fn pf_flash_tiled_source_sd(subgroup: bool) -> String {
     compose(&format!("{}\n{}", wk::flash_decode::WGSL, sd))
 }
 
-pub fn pf_flash_tiled_default_on_since_slotml_solo_nll_plus_p006_nats_under_p01_bound_and_557_vs_431_tok_s_user_signed_off(
-) -> bool {
-    !matches!(
-        std::env::var("NV_Q3_WGPU_PF_FLASH_TILED").ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
-pub fn pf_flash_tiled_slotml_is_the_default_arm_env_value_1_selects_the_older_tiling_with_larger_nll_penalty(
-) -> bool {
-    !matches!(
-        std::env::var("NV_Q3_WGPU_PF_FLASH_TILED").ok().as_deref(),
-        Some("1")
-    )
-}
-
 pub const PF_TILED_FLASH_ROWS_ONE_KV_STREAM_SERVES_32_ROWS_AT_4_PER_WARP: usize = 32;
 
 const PF_FD_ONE_TRAILING_SLOT_VIEWS_THE_WHOLE_CHUNK_FOR_TILED_FLASH: usize = 1;
@@ -841,10 +739,6 @@ pub fn pf_moe_grouped_source(cfg: wk::gemv_nvfp4_v2::V2Config) -> String {
         GEMV_NVFP4_V2_WGSL,
         PF_MOE_GROUPED_WGSL
     ))
-}
-
-pub fn pf_moe_grouped_default_on_reuses_expert_weight_loads_across_sorted_slots() -> bool {
-    !off("NV_Q3_WGPU_PF_MOE_GROUPED")
 }
 
 pub const PF_COOP_NOT_WIRED_HERE_MOE_EXPERTS_STAY_GROUPED_AND_DENSE_ARM_GEMMS_ARE_32PCT: &str =
@@ -902,19 +796,18 @@ impl Sources {
 }
 
 struct Bf16Gpu {
-    w: wgpu::Buffer,
+    w: Buffer,
     n: usize,
     k: usize,
-    entry: &'static str,
 }
 
 use crate::nvfp4_host::{upload_nvfp4, Nvfp4Gpu};
 
 struct ExpertGpu {
-    w: wgpu::Buffer,
-    scales: wgpu::Buffer,
-    alphas: wgpu::Buffer,
-    globals: wgpu::Buffer,
+    w: Buffer,
+    scales: Buffer,
+    alphas: Buffer,
+    globals: Buffer,
     n: usize,
     k: usize,
 }
@@ -930,16 +823,16 @@ pub struct Qwen3MoeWgpu {
     head_start: usize,
     final_start: usize,
     verify: Option<Verify>,
-    _buffers: Vec<wgpu::Buffer>,
-    tok_buf: wgpu::Buffer,
-    pos_buf: wgpu::Buffer,
-    fd_buf: wgpu::Buffer,
+    _buffers: Vec<Buffer>,
+    tok_buf: Buffer,
+    pos_buf: Buffer,
+    fd_buf: Buffer,
     fd_base: FdParams,
-    res2: wgpu::Buffer,
-    token_out: wgpu::Buffer,
-    logits: wgpu::Buffer,
-    state_buffers: Vec<(wgpu::Buffer, u64)>,
-    recurrent_states: Vec<(wgpu::Buffer, u64)>,
+    res2: Buffer,
+    token_out: Buffer,
+    logits: Buffer,
+    state_buffers: Vec<(Buffer, u64)>,
+    recurrent_states: Vec<(Buffer, u64)>,
     vocab: usize,
     vram: VramReport,
     nvfp4_v2: (usize, usize),
@@ -955,20 +848,20 @@ pub struct Qwen3MoeWgpu {
     gemv_unrolled: (usize, usize),
     quant_lane: (usize, usize),
     w8_proj: (usize, u64, u64),
-    chain_ring: Option<wgpu::Buffer>,
-    pf_list: Option<wgpu::Buffer>,
+    chain_ring: Option<Buffer>,
+    pf_list: Option<Buffer>,
     pf_m: usize,
     pf_validated: bool,
     pfm: Option<PfMrowExec>,
     pfm_passes: Vec<Pass>,
     pfm_mix: (usize, usize),
     pfm_validated: bool,
-    res: wgpu::Buffer,
+    res: Buffer,
     embed_gather_end: usize,
     pfm_gather_end: usize,
     splice_validated: bool,
-    rope_cs_buffers: Vec<wgpu::Buffer>,
-    attn_probes: Vec<(wgpu::Buffer, wgpu::Buffer)>,
+    rope_cs_buffers: Vec<Buffer>,
+    attn_probes: Vec<(Buffer, Buffer)>,
     mrope_rows_installed: bool,
 
     base_passes: usize,
@@ -979,14 +872,11 @@ pub use crate::embed_row_splice::EmbedRowSplice as EmbedRowsSplice;
 pub const PREFILL_M_MAX: usize = 64;
 
 pub fn prefill_m() -> usize {
-    match std::env::var("NV_QWEN35MOE_WGPU_PREFILL_M")
-        .or_else(|_| std::env::var("NV_WGPU_PREFILL_M"))
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-    {
+    let rows = |k| env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    match rows("NV_QWEN35MOE_WGPU_PREFILL_M") {
         Some(0) => 0,
         Some(m) => m.clamp(2, PREFILL_M_MAX),
-        None => PREFILL_M_MAX,
+        None => rows("NV_WGPU_PREFILL_M").map_or(PREFILL_M_MAX, |m| m.clamp(2, PREFILL_M_MAX)),
     }
 }
 
@@ -1002,13 +892,6 @@ pub const PF_MROW_BIND_OFFSET_ALIGN_BYTES: u64 = 256;
 
 pub const PF_MROW_POS_STRIDE_WORDS: usize = 64;
 
-pub fn pf_mrow_default_on_since_real_weights_first_token_parity_and_1_84x_at_8k() -> bool {
-    !matches!(
-        std::env::var("NV_Q3_WGPU_PF_MROW").ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
 pub fn pf_mrow_scratch_bytes_upper_bound_for_mem_fit(cfg: &Qwen3MoeConfig) -> usize {
     let m = PF_MROW_M_MAX_VIA_16_ROW_GEMM_TILES_AT_256B_ALIGNED_OFFSETS;
     let hidden = cfg.hidden_size;
@@ -1016,13 +899,8 @@ pub fn pf_mrow_scratch_bytes_upper_bound_for_mem_fit(cfg: &Qwen3MoeConfig) -> us
     let n_all = cfg.linear_num_key_heads * cfg.linear_key_head_dim * 2
         + cfg.linear_num_value_heads * cfg.linear_value_head_dim;
     let delta = m * (n_all * 2 + n_all * 4 + cfg.linear_conv_kernel_dim * n_all * 4);
-    let scratch_rows = if pf_flash_tiled_default_on_since_slotml_solo_nll_plus_p006_nats_under_p01_bound_and_557_vs_431_tok_s_user_signed_off() {
-        m
-    } else {
-        PF_MK_FLASH_ROWS_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS
-    };
     let attn = 2 * m * cfg.num_attention_heads * cfg.head_dim * 4
-        + cfg.num_attention_heads * scratch_rows * flash_splits() as usize * (cfg.head_dim + 2) * 4;
+        + cfg.num_attention_heads * m * flash_splits() as usize * (cfg.head_dim + 2) * 4;
     (moe + delta + attn) * 3 / 2
 }
 
@@ -1040,26 +918,24 @@ fn pf_stride_bytes_f32(raw_elems: usize) -> u64 {
 
 const PF_GLUE_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_pf_glue.wgsl");
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfCopyParams {
-    rows: u32,
-    row_words: u32,
-    src_stride_words: u32,
-    slots: u32,
-}
+pod! {
+    struct PfCopyParams {
+        rows: u32,
+        row_words: u32,
+        src_stride_words: u32,
+        slots: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfGemmParams {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    w_row_words: u32,
-    x_stride_words: u32,
-    y_stride_words: u32,
-    out_f32: u32,
-    pad0: u32,
+    struct PfGemmParams {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        w_row_words: u32,
+        x_stride_words: u32,
+        y_stride_words: u32,
+        out_f32: u32,
+        pad0: u32,
+    }
 }
 
 fn pf_gemm_bf16_mrow_entry(m: usize) -> String {
@@ -1075,31 +951,51 @@ fn pf_gemm_bf16_mrow_source(m: usize) -> String {
     );
     let mut b = String::new();
     b.push_str(
-        "struct Q3pgParams {\n    n_rows: u32,\n    k_words: u32,\n    groups_x: u32,\n    w_row_words: u32,\n    x_stride_words: u32,\n    y_stride_words: u32,\n    out_f32: u32,\n    pad0: u32,\n};\n\n",
+        "struct Q3pgParams {
+    n_rows: u32,
+    k_words: u32,
+    groups_x: u32,
+    w_row_words: u32,
+    x_stride_words: u32,
+    y_stride_words: u32,
+    out_f32: u32,
+    pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> gm_w: array<u32>;
+@group(0) @binding(1) var<storage, read> gm_x: array<u32>;
+@group(0) @binding(2) var<uniform> gm_p: Q3pgParams;
+@group(0) @binding(3) var<storage, read_write> gm_y: array<u32>;
+
+",
     );
-    b.push_str("@group(0) @binding(0) var<storage, read> gm_w: array<u32>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> gm_x: array<u32>;\n");
-    b.push_str("@group(0) @binding(2) var<uniform> gm_p: Q3pgParams;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> gm_y: array<u32>;\n\n");
     writeln!(b, "var<workgroup> gm_red: array<f32, {}>;\n", 256 * m).unwrap();
     writeln!(b, "@compute @workgroup_size(256)").unwrap();
     writeln!(b, "fn {}(", pf_gemm_bf16_mrow_entry(m)).unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>\n) {\n");
-    b.push_str("    let tid = lid.x;\n");
-    b.push_str("    let half = tid >> 7u;\n");
-    b.push_str("    let lane = tid & 127u;\n");
-    b.push_str("    let pair = wid.x + wid.y * gm_p.groups_x;\n");
-    b.push_str("    let row = pair * 2u + half;\n");
-    b.push_str("    let live = row < gm_p.n_rows;\n");
-    b.push_str("    let wbase = select(0u, row * gm_p.w_row_words, live);\n");
-    b.push_str("    let kw = select(0u, gm_p.k_words, live);\n");
+    b.push_str(
+        "    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let tid = lid.x;
+    let half = tid >> 7u;
+    let lane = tid & 127u;
+    let pair = wid.x + wid.y * gm_p.groups_x;
+    let row = pair * 2u + half;
+    let live = row < gm_p.n_rows;
+    let wbase = select(0u, row * gm_p.w_row_words, live);
+    let kw = select(0u, gm_p.k_words, live);
+",
+    );
     for mi in 0..m {
         writeln!(b, "    var acc{mi} = 0.0;").unwrap();
     }
-    b.push_str("    for (var i = lane; i < kw; i = i + 128u) {\n");
-    b.push_str("        let ww = gm_w[wbase + i];\n");
-    b.push_str("        let wlo = bf16_lo(ww);\n");
-    b.push_str("        let whi = bf16_hi(ww);\n");
+    b.push_str(
+        "    for (var i = lane; i < kw; i = i + 128u) {
+        let ww = gm_w[wbase + i];
+        let wlo = bf16_lo(ww);
+        let whi = bf16_hi(ww);
+",
+    );
     for mi in 0..m {
         writeln!(
             b,
@@ -1113,9 +1009,12 @@ fn pf_gemm_bf16_mrow_source(m: usize) -> String {
     for mi in 0..m {
         writeln!(b, "    gm_red[{mi}u * 256u + tid] = acc{mi};").unwrap();
     }
-    b.push_str("    workgroupBarrier();\n");
-    b.push_str("    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {\n");
-    b.push_str("        if (lane < stride) {\n");
+    b.push_str(
+        "    workgroupBarrier();
+    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
+        if (lane < stride) {
+",
+    );
     for mi in 0..m {
         writeln!(
             b,
@@ -1126,46 +1025,42 @@ fn pf_gemm_bf16_mrow_source(m: usize) -> String {
     }
     b.push_str("        }\n        workgroupBarrier();\n    }\n");
     writeln!(b, "    if (tid < {m}u) {{").unwrap();
-    b.push_str("        let mi = tid;\n");
-    b.push_str("        let base = pair * 2u;\n");
-    b.push_str("        let lo = gm_red[mi * 256u];\n");
-    b.push_str("        var hi = 0.0;\n");
-    b.push_str("        if (base + 1u < gm_p.n_rows) {\n");
-    b.push_str("            hi = gm_red[mi * 256u + 128u];\n");
-    b.push_str("        }\n");
-    b.push_str("        if (base < gm_p.n_rows) {\n");
-    b.push_str("            if (gm_p.out_f32 == 1u) {\n");
-    b.push_str("                gm_y[mi * gm_p.y_stride_words + base] = bitcast<u32>(lo);\n");
-    b.push_str("                if (base + 1u < gm_p.n_rows) {\n");
     b.push_str(
-        "                    gm_y[mi * gm_p.y_stride_words + base + 1u] = bitcast<u32>(hi);\n",
+        "        let mi = tid;
+        let base = pair * 2u;
+        let lo = gm_red[mi * 256u];
+        var hi = 0.0;
+        if (base + 1u < gm_p.n_rows) {
+            hi = gm_red[mi * 256u + 128u];
+        }
+        if (base < gm_p.n_rows) {
+            if (gm_p.out_f32 == 1u) {
+                gm_y[mi * gm_p.y_stride_words + base] = bitcast<u32>(lo);
+                if (base + 1u < gm_p.n_rows) {
+                    gm_y[mi * gm_p.y_stride_words + base + 1u] = bitcast<u32>(hi);
+                }
+            } else {
+                gm_y[mi * gm_p.y_stride_words + (base >> 1u)] = bf16_pack(lo, hi);
+            }
+        }
+    }
+}
+",
     );
-    b.push_str("                }\n");
-    b.push_str("            } else {\n");
-    b.push_str(
-        "                gm_y[mi * gm_p.y_stride_words + (base >> 1u)] = bf16_pack(lo, hi);\n",
-    );
-    b.push_str("            }\n");
-    b.push_str("        }\n");
-    b.push_str("    }\n}\n");
     compose(&b)
 }
 
-pub fn pf_token_parallel_default_on_escape_to_per_token_copies() -> bool {
-    !off("NV_Q3_WGPU_PF_TOKENPAR")
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfDeltaChunkParams {
-    tokens: u32,
-    in_stride_elems: u32,
-    mixed_stride_elems: u32,
-    qk_stride_elems: u32,
-    v_stride_elems: u32,
-    gb_stride_elems: u32,
-    core_stride_elems: u32,
-    gated_stride_elems: u32,
+pod! {
+    struct PfDeltaChunkParams {
+        tokens: u32,
+        in_stride_elems: u32,
+        mixed_stride_elems: u32,
+        qk_stride_elems: u32,
+        v_stride_elems: u32,
+        gb_stride_elems: u32,
+        core_stride_elems: u32,
+        gated_stride_elems: u32,
+    }
 }
 
 fn pf_delta_chunk_source(d_k: usize) -> String {
@@ -1183,57 +1078,49 @@ fn pf_delta_chunk_source(d_k: usize) -> String {
 
 pub const PF_MK_FLASH_ROWS_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS: usize = 8;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfAttnRopeParams {
-    tokens: u32,
-    q_src_stride_elems: u32,
-    k_src_stride_elems: u32,
-    q_out_stride_elems: u32,
-    k_out_stride_elems: u32,
-    qf_out_stride_elems: u32,
-    pos_stride_words: u32,
-    pad0: u32,
-}
+pod! {
+    struct PfAttnRopeParams {
+        tokens: u32,
+        q_src_stride_elems: u32,
+        k_src_stride_elems: u32,
+        q_out_stride_elems: u32,
+        k_out_stride_elems: u32,
+        qf_out_stride_elems: u32,
+        pos_stride_words: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfAttnGateParams {
-    attn_stride_elems: u32,
-    qraw_stride_elems: u32,
-    out_stride_words: u32,
-    pad0: u32,
-}
+    struct PfAttnGateParams {
+        attn_stride_elems: u32,
+        qraw_stride_elems: u32,
+        out_stride_words: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfKvqParams {
-    tokens: u32,
-    x_stride_elems: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct PfKvqParams {
+        tokens: u32,
+        x_stride_elems: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfTopkParams {
-    tokens: u32,
-    rl_stride_words: u32,
-    sel_stride_words: u32,
-    pad0: u32,
-}
+    struct PfTopkParams {
+        tokens: u32,
+        rl_stride_words: u32,
+        sel_stride_words: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfCombineParams {
-    tokens: u32,
-    y_stride_words: u32,
-    wts_stride_words: u32,
-    slogit_stride_words: u32,
-    out_stride_words: u32,
-    sel_slots_per_token: u32,
-    pad1: u32,
-    pad2: u32,
+    struct PfCombineParams {
+        tokens: u32,
+        y_stride_words: u32,
+        wts_stride_words: u32,
+        slogit_stride_words: u32,
+        out_stride_words: u32,
+        sel_slots_per_token: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 }
 
 #[doc(hidden)]
@@ -1250,7 +1137,6 @@ pub fn pf_mrow_audit_sources() -> Vec<(&'static str, String)> {
         ("q3m:pf_attn", pf_attn_source()),
         ("q3m:pf_kvq", pf_kvq_source()),
         ("q3m:pf_moe", pf_moe_batched_source()),
-        ("q3m:pf_flash_sg", pf_flash_sg_source()),
         ("q3m:pf_flash_tiled_sg", pf_flash_tiled_source(true)),
         ("q3m:pf_flash_tiled_wg", pf_flash_tiled_source(false)),
         (
@@ -1264,36 +1150,33 @@ pub fn pf_mrow_audit_sources() -> Vec<(&'static str, String)> {
     ]
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfGroupedParams {
-    zn: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+pod! {
+    struct PfGroupedParams {
+        zn: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
+
+    struct PfSortParams {
+        tokens: u32,
+        slots_per_token: u32,
+        ids_stride_words: u32,
+        bins_cover_n_experts_plus_the_shared_slot: u32,
+    }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfSortParams {
-    tokens: u32,
-    slots_per_token: u32,
-    ids_stride_words: u32,
-    bins_cover_n_experts_plus_the_shared_slot: u32,
-}
-
-#[allow(clippy::too_many_arguments)]
 fn pf_push_gemv_nvfp4_grouped(
     b: &mut Builder,
     label: &str,
-    w: &wgpu::Buffer,
-    ws: &wgpu::Buffer,
-    x: &wgpu::Buffer,
-    xs: &wgpu::Buffer,
-    y: &wgpu::Buffer,
-    sel_sorted: &wgpu::Buffer,
-    perm: &wgpu::Buffer,
-    alphas: &wgpu::Buffer,
+    w: &Buffer,
+    ws: &Buffer,
+    x: &Buffer,
+    xs: &Buffer,
+    y: &Buffer,
+    sel_sorted: &Buffer,
+    perm: &Buffer,
+    alphas: &Buffer,
     n: usize,
     k: usize,
     zslots: usize,
@@ -1366,79 +1249,79 @@ fn pf_push_gemv_nvfp4_grouped(
 
 struct PfDeltaBufs {
     in_stride_words: usize,
-    in_all: wgpu::Buffer,
+    in_all: Buffer,
     mixed_stride_bytes: u64,
-    mixed: wgpu::Buffer,
+    mixed: Buffer,
     qk_stride_bytes: u64,
-    qg: wgpu::Buffer,
-    kg: wgpu::Buffer,
+    qg: Buffer,
+    kg: Buffer,
     v_stride_bytes: u64,
-    vg: wgpu::Buffer,
+    vg: Buffer,
     gb_stride_bytes: u64,
-    gexp: wgpu::Buffer,
-    beta: wgpu::Buffer,
+    gexp: Buffer,
+    beta: Buffer,
     core_stride_bytes: u64,
-    core: wgpu::Buffer,
+    core: Buffer,
     gated_stride_words: usize,
-    gated: wgpu::Buffer,
+    gated: Buffer,
 }
 
 struct PfAttnBufs {
     fused_kv: bool,
-    mk_scratch: Option<wgpu::Buffer>,
-    xq: wgpu::Buffer,
-    xs: wgpu::Buffer,
+    mk_scratch: Buffer,
+    xq: Buffer,
+    xs: Buffer,
     q_raw_stride_words: usize,
-    q_raw: wgpu::Buffer,
+    q_raw: Buffer,
     vk_raw_stride_words: usize,
-    vk_raw: wgpu::Buffer,
+    vk_raw: Buffer,
     k_raw_stride_words: usize,
-    k_raw: wgpu::Buffer,
+    k_raw: Buffer,
     q_stride_bytes: u64,
-    q: wgpu::Buffer,
+    q: Buffer,
     k_stride_bytes: u64,
-    k: wgpu::Buffer,
+    k: Buffer,
     qf32_stride_bytes: u64,
-    q_f32: wgpu::Buffer,
+    q_f32: Buffer,
     attn_stride_bytes: u64,
-    attn: wgpu::Buffer,
+    attn: Buffer,
     gated_stride_words: usize,
-    gated: wgpu::Buffer,
-    oq: wgpu::Buffer,
-    os: wgpu::Buffer,
+    gated: Buffer,
+    oq: Buffer,
+    os: Buffer,
 }
 
 struct PfMoeBufs {
     rl_stride_bytes: u64,
-    rlogits: wgpu::Buffer,
-    ids: wgpu::Buffer,
-    wts: wgpu::Buffer,
-    sel_sorted: wgpu::Buffer,
-    perm: wgpu::Buffer,
-    sel_flat: wgpu::Buffer,
-    x_rep: wgpu::Buffer,
-    xq: wgpu::Buffer,
-    xs: wgpu::Buffer,
-    y_gate: wgpu::Buffer,
-    y_up: wgpu::Buffer,
-    aq: wgpu::Buffer,
-    as_: wgpu::Buffer,
-    y_down: wgpu::Buffer,
+    rlogits: Buffer,
+    ids: Buffer,
+    wts: Buffer,
+    sel_sorted: Buffer,
+    perm: Buffer,
+    sel_flat: Buffer,
+    x_rep: Buffer,
+    xq: Buffer,
+    xs: Buffer,
+    y_gate: Buffer,
+    y_up: Buffer,
+    aq: Buffer,
+    as_: Buffer,
+    y_down: Buffer,
 }
 
 struct PfMrowBufs {
     m: usize,
     ok: bool,
     off_reason: Option<String>,
-    sel_zeros_m: wgpu::Buffer,
-    tok: wgpu::Buffer,
-    pos_strided_one_i32_per_256b_slot: wgpu::Buffer,
-    fd_strided_one_fdparams_per_256b_slot: wgpu::Buffer,
-    res: wgpu::Buffer,
-    normed: wgpu::Buffer,
-    mix: wgpu::Buffer,
-    normed_post: wgpu::Buffer,
-    moe_out: wgpu::Buffer,
+    sel_zeros_m: Buffer,
+    tok: Buffer,
+    pos_strided_one_i32_per_256b_slot: Buffer,
+    fd_strided_one_fdparams_per_256b_slot: Buffer,
+    res: Buffer,
+    normed: Buffer,
+    mix: Buffer,
+    normed_post: Buffer,
+    moe_out: Buffer,
     gemm_tile_rows: usize,
     gemm_src: String,
     gemm_entry: String,
@@ -1450,23 +1333,14 @@ struct PfMrowBufs {
 
 struct PfMrowExec {
     m: usize,
-    tok: wgpu::Buffer,
-    pos: wgpu::Buffer,
-    fd: wgpu::Buffer,
-    res: wgpu::Buffer,
+    tok: Buffer,
+    pos: Buffer,
+    fd: Buffer,
+    res: Buffer,
 }
 
 pub fn vram_report_enabled() -> bool {
     crate::wgpu_ledger::vram_report_var_enabled("NV_QWEN36_WGPU_VRAM")
-}
-
-pub fn staging_flush_enabled() -> bool {
-    !matches!(
-        std::env::var("NV_QWEN36_WGPU_STAGING_FLUSH")
-            .ok()
-            .as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
 }
 
 impl Qwen3MoeWgpu {
@@ -1501,37 +1375,26 @@ impl Qwen3MoeWgpu {
     pub fn probe_at(&mut self, token: u32, pos: usize) {
         self.ctx
             .queue
-            .write_buffer(&self.tok_buf, 0, bytemuck::bytes_of(&(token as i32)));
+            .write_buffer(&self.tok_buf, 0, bytes_of(&(token as i32)));
         self.ctx
             .queue
-            .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(pos as i32)));
+            .write_buffer(&self.pos_buf, 0, bytes_of(&(pos as i32)));
         let mut fd = self.fd_base;
         fd.total = (pos + 1) as u32;
-        self.ctx
-            .queue
-            .write_buffer(&self.fd_buf, 0, bytemuck::bytes_of(&fd));
+        self.ctx.queue.write_buffer(&self.fd_buf, 0, bytes_of(&fd));
     }
 
     pub fn probe_prefix(&self, n: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             n <= self.passes.len(),
             "prefix {n} beyond {} passes",
             self.passes.len()
         );
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            for p in &self.passes[..n] {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-            }
-        }
-        self.ctx.queue.submit([enc.finish()]);
+        submit_passes!(self.ctx, &self.passes[..n]);
         self.ctx
             .device
             .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| anyhow::anyhow!("probe_prefix drain: {e}"))?;
+            .map_err(|e| anyhow!("probe_prefix drain: {e}"))?;
         Ok(())
     }
 
@@ -1554,7 +1417,7 @@ impl Qwen3MoeWgpu {
     }
 
     pub fn probe_prefix_tail(&self, n: usize, tail: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             n <= self.passes.len() && tail < self.passes.len(),
             "prefix {n} / tail {tail} beyond {} passes",
             self.passes.len()
@@ -1572,12 +1435,12 @@ impl Qwen3MoeWgpu {
         self.ctx
             .device
             .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| anyhow::anyhow!("probe_prefix_tail drain: {e}"))?;
+            .map_err(|e| anyhow!("probe_prefix_tail drain: {e}"))?;
         Ok(())
     }
 
     pub fn probe_encode(&self, n: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             n <= self.passes.len(),
             "prefix {n} beyond {} passes",
             self.passes.len()
@@ -1586,9 +1449,7 @@ impl Qwen3MoeWgpu {
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             for p in &self.passes[..n] {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                dispatch_pass!(pass, p);
             }
         }
         drop(enc.finish());
@@ -1630,12 +1491,12 @@ impl Qwen3MoeWgpu {
         section: [usize; 3],
     ) -> Result<()> {
         let rh = self.rope_rot_half();
-        anyhow::ensure!(
+        ensure!(
             section.iter().sum::<usize>() == rh,
             "mrope section {section:?} must tile the {rh} rotary half-frequencies of this graph"
         );
         let n = pos.len();
-        anyhow::ensure!(
+        ensure!(
             n > 0 && n <= self.max_seq,
             "mrope prompt of {n} tokens does not fit max_seq {}",
             self.max_seq
@@ -1651,7 +1512,7 @@ impl Qwen3MoeWgpu {
                     2 => pos.w[i],
                     _ => pos.t[i],
                 } as usize;
-                anyhow::ensure!(
+                ensure!(
                     p < self.max_seq,
                     "mrope axis-{axis} position {p} at token {i} exceeds the {}-row rope table",
                     self.max_seq
@@ -1663,7 +1524,7 @@ impl Qwen3MoeWgpu {
         let delta = pos.delta_added_to_token_index_for_every_position_after_this_prefill;
         for i in n..self.max_seq {
             let p = i as i64 + delta;
-            anyhow::ensure!(
+            ensure!(
                 (0..self.max_seq as i64).contains(&p),
                 "mrope continuation row {i} shifts to {p}, outside the {}-row rope table",
                 self.max_seq
@@ -1674,9 +1535,7 @@ impl Qwen3MoeWgpu {
                 .copy_from_slice(&std_sin[p * rh..(p + 1) * rh]);
         }
         for csb in &self.rope_cs_buffers {
-            self.ctx
-                .queue
-                .write_buffer(csb, 0, bytemuck::cast_slice(&cs));
+            self.ctx.queue.write_buffer(csb, 0, cast_slice(&cs));
         }
         self.mrope_rows_installed = true;
         Ok(())
@@ -1690,9 +1549,7 @@ impl Qwen3MoeWgpu {
         let mut cs = std_cos;
         cs.extend_from_slice(&std_sin);
         for csb in &self.rope_cs_buffers {
-            self.ctx
-                .queue
-                .write_buffer(csb, 0, bytemuck::cast_slice(&cs));
+            self.ctx.queue.write_buffer(csb, 0, cast_slice(&cs));
         }
         self.mrope_rows_installed = false;
     }
@@ -1712,40 +1569,39 @@ impl Qwen3MoeWgpu {
         let (qf, at) = self
             .attn_probes
             .get(attn_layer)
-            .ok_or_else(|| anyhow::anyhow!("no attention layer {attn_layer} probe"))?;
+            .ok_or_else(|| anyhow!("no attention layer {attn_layer} probe"))?;
         let n = self.config.num_attention_heads * self.config.head_dim;
         Ok((
-            dispatch::read_back::<f32>(self.ctx, qf, n).map_err(|e| anyhow::anyhow!("{e}"))?,
-            dispatch::read_back::<f32>(self.ctx, at, n).map_err(|e| anyhow::anyhow!("{e}"))?,
+            dispatch::read_back::<f32>(self.ctx, qf, n).map_err(|e| anyhow!("{e}"))?,
+            dispatch::read_back::<f32>(self.ctx, at, n).map_err(|e| anyhow!("{e}"))?,
         ))
     }
 
     pub fn write_rope_cs_rows_for_test(&self, cs: &[f32]) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             cs.len() == 2 * self.max_seq * self.rope_rot_half(),
             "cs must be the full cos||sin table"
         );
         for csb in &self.rope_cs_buffers {
-            self.ctx
-                .queue
-                .write_buffer(csb, 0, bytemuck::cast_slice(cs));
+            self.ctx.queue.write_buffer(csb, 0, cast_slice(cs));
         }
         Ok(())
     }
 
     pub fn read_rope_cs_rows_for_test(&self, attn_layer: usize) -> Result<Vec<f32>> {
-        let csb = self.rope_cs_buffers.get(attn_layer).ok_or_else(|| {
-            anyhow::anyhow!("no attention layer {attn_layer} with a rope cs buffer")
-        })?;
+        let csb = self
+            .rope_cs_buffers
+            .get(attn_layer)
+            .ok_or_else(|| anyhow!("no attention layer {attn_layer} with a rope cs buffer"))?;
         dispatch::read_back::<f32>(self.ctx, csb, 2 * self.max_seq * self.rope_rot_half())
-            .map_err(|e| anyhow::anyhow!("{e}"))
+            .map_err(|e| anyhow!("{e}"))
     }
 
     pub fn fill_state_buffers_with_finite_synthetic_bytes_and_set_pos_for_depth_timing_decode_reads_kv_size_not_values(
         &mut self,
         pos: usize,
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             pos <= self.max_seq,
             "synthetic fill pos {pos} past max_seq {}; window start and gdn state selection are pure functions of pos, so pos alone is the cache-depth state",
             self.max_seq
@@ -1772,68 +1628,68 @@ impl Qwen3MoeWgpu {
 
     pub fn from_loader(
         config: Qwen3MoeConfig,
-        weights: &nv_weights::WeightLoader,
+        weights: &WeightLoader,
         max_seq: usize,
     ) -> Result<Self> {
         Self::build(config, WeightSource::Loader(weights), max_seq)
     }
 
     fn build(config: Qwen3MoeConfig, src: WeightSource<'_>, max_seq: usize) -> Result<Self> {
-        let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
         let s = Sources::new();
         let cfg = &config;
 
-        anyhow::ensure!(max_seq > 0, "max_seq must be positive");
-        anyhow::ensure!(
+        ensure!(max_seq > 0, "max_seq must be positive");
+        ensure!(
             cfg.hidden_size.is_multiple_of(2 * NVFP4_BLOCK),
             "hidden_size {} must be a multiple of {}",
             cfg.hidden_size,
             2 * NVFP4_BLOCK
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.moe_intermediate_size.is_multiple_of(4 * NVFP4_BLOCK),
             "moe_intermediate_size {} must be a multiple of {}",
             cfg.moe_intermediate_size,
             4 * NVFP4_BLOCK
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.shared_expert_intermediate_size
                 .is_multiple_of(4 * NVFP4_BLOCK),
             "shared_expert_intermediate_size must be a multiple of {}",
             4 * NVFP4_BLOCK
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.num_experts <= 256,
             "router top-k kernel caps num_experts at 256, got {}",
             cfg.num_experts
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.num_experts_per_tok <= MAX_TOPK,
             "num_experts_per_tok {} exceeds {MAX_TOPK}",
             cfg.num_experts_per_tok
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.head_dim <= MAX_HEAD_DIM && cfg.head_dim.is_multiple_of(4),
             "head_dim {} must be a multiple of 4 (fp8 KV word packing) and <= {MAX_HEAD_DIM}",
             cfg.head_dim
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.linear_key_head_dim <= MAX_LIN_HEAD_DIM
                 && cfg.linear_value_head_dim <= MAX_LIN_HEAD_DIM
                 && cfg.linear_value_head_dim.is_multiple_of(2),
             "linear head dims must be even and <= {MAX_LIN_HEAD_DIM}"
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.linear_num_value_heads
                 .is_multiple_of(cfg.linear_num_key_heads),
             "linear value heads must be a multiple of key heads"
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.num_attention_heads
                 .is_multiple_of(cfg.num_key_value_heads),
             "attention heads must be a multiple of kv heads"
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.layer_types.len() == cfg.num_hidden_layers,
             "layer_types has {} entries for {} layers",
             cfg.layer_types.len(),
@@ -1849,7 +1705,6 @@ impl Qwen3MoeWgpu {
             core: crate::wgpu_ledger::VramLedger::new(
                 ctx,
                 "q3w-",
-                staging_flush_enabled,
                 STAGING_FLUSH_BYTES,
             ),
             passes: Vec::new(),
@@ -1895,20 +1750,16 @@ impl Qwen3MoeWgpu {
         let mixed_out = b.zeros("q3w-mix", (hidden_words * 4) as u64);
         let moe_out = b.zeros("q3w-moeout", (hidden_words * 4) as u64);
 
-        let pf_mrow_m =
-            if pf_mrow_default_on_since_real_weights_first_token_parity_and_1_84x_at_8k() {
-                let mut m =
-                    prefill_m().min(PF_MROW_M_MAX_VIA_16_ROW_GEMM_TILES_AT_256B_ALIGNED_OFFSETS);
-                if m > PF_MROW_GEMM_M_MAX && m % PF_MROW_GEMM_M_MAX == 1 {
-                    m -= 1;
-                }
-                m
-            } else {
-                0
-            };
+        let pf_mrow_m = {
+            let mut m = prefill_m().min(PF_MROW_M_MAX_VIA_16_ROW_GEMM_TILES_AT_256B_ALIGNED_OFFSETS);
+            if m > PF_MROW_GEMM_M_MAX && m % PF_MROW_GEMM_M_MAX == 1 {
+                m -= 1;
+            }
+            m
+        };
         let mut pf_mrow: Option<PfMrowBufs> = if pf_mrow_m >= 2 {
             let m = pf_mrow_m;
-            anyhow::ensure!(
+            ensure!(
                 hidden.is_multiple_of(128),
                 "the M-row list offset-binds hidden-row slices at token strides, so hidden \
                  must keep hidden*2 bytes a multiple of {PF_MROW_BIND_OFFSET_ALIGN_BYTES}"
@@ -1922,7 +1773,7 @@ impl Qwen3MoeWgpu {
                     + PF_FD_ONE_TRAILING_SLOT_VIEWS_THE_WHOLE_CHUNK_FOR_TILED_FLASH)
                     as u64
                     * PF_MROW_BIND_OFFSET_ALIGN_BYTES,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             Some(PfMrowBufs {
@@ -1961,7 +1812,7 @@ impl Qwen3MoeWgpu {
         };
 
         let embed = src.embed(cfg)?;
-        anyhow::ensure!(
+        ensure!(
             embed.len() == vocab * hidden,
             "embed has {} values, want {}",
             embed.len(),
@@ -2018,8 +1869,8 @@ impl Qwen3MoeWgpu {
         let embed_gather_end = b.passes.len();
         let pfm_gather_end = b.pf_passes.len();
 
-        let mut state_buffers: Vec<(wgpu::Buffer, u64)> = Vec::new();
-        let mut recurrent_states: Vec<(wgpu::Buffer, u64)> = Vec::new();
+        let mut state_buffers: Vec<(Buffer, u64)> = Vec::new();
+        let mut recurrent_states: Vec<(Buffer, u64)> = Vec::new();
 
         for li in 0..cfg.num_hidden_layers {
             let layer = src.layer(cfg, li)?;
@@ -2287,7 +2138,7 @@ impl Qwen3MoeWgpu {
         let head_start = b.passes.len();
         let logits = b.zeros("q3w-logits", (vocab * 4) as u64);
         let lm = src.lm_head(cfg)?;
-        anyhow::ensure!(
+        ensure!(
             lm.len() == vocab * hidden,
             "lm_head has {} values, want {}",
             lm.len(),
@@ -2413,13 +2264,10 @@ impl Qwen3MoeWgpu {
             router_topk_entry().1,
             delta_u4.0,
             delta_u4.1,
-            delta_recurrent_kernel().0,
+            DELTA_RECURRENT_ENTRY,
             quant_lane.0,
             quant_lane.1,
-            match quant_lane_mode() {
-                Some(wg) => format!("wg{wg}"),
-                None => "off".to_string(),
-            }
+            format!("wg{}", quant_lane_mode())
         );
         eprintln!(
             "[q3w-wgpu] fusions: delta in_proj {}/{} stacked, gating {}/{} on the \
@@ -2611,9 +2459,9 @@ impl Qwen3MoeWgpu {
     }
 
     pub fn decode_chain(&mut self, token: u32, k: usize) -> Result<Vec<u32>> {
-        anyhow::ensure!(k >= 1, "decode_chain needs k >= 1");
-        anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
-        anyhow::ensure!(
+        ensure!(k >= 1, "decode_chain needs k >= 1");
+        ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+        ensure!(
             self.pos + k <= self.max_seq,
             "kv cache holds {} more steps, asked for {k}",
             self.max_seq - self.pos
@@ -2641,34 +2489,26 @@ impl Qwen3MoeWgpu {
 
         self.ctx
             .queue
-            .write_buffer(&self.tok_buf, 0, bytemuck::bytes_of(&(token as i32)));
+            .write_buffer(&self.tok_buf, 0, bytes_of(&(token as i32)));
         for i in 0..k {
             let pos = self.pos + i;
             self.ctx
                 .queue
-                .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(pos as i32)));
+                .write_buffer(&self.pos_buf, 0, bytes_of(&(pos as i32)));
             let mut fd = self.fd_base;
             fd.total = (pos + 1) as u32;
-            self.ctx
-                .queue
-                .write_buffer(&self.fd_buf, 0, bytemuck::bytes_of(&fd));
+            self.ctx.queue.write_buffer(&self.fd_buf, 0, bytes_of(&fd));
 
             let scope = if self.validated {
                 None
             } else {
-                Some(
-                    self.ctx
-                        .device
-                        .push_error_scope(wgpu::ErrorFilter::Validation),
-                )
+                Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
             };
             let mut enc = self.ctx.device.create_command_encoder(&Default::default());
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for p in &self.passes {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                    dispatch_pass!(pass, p);
                 }
             }
             enc.copy_buffer_to_buffer(&self.token_out, 0, &ring, (i * 4) as u64, 4);
@@ -2677,20 +2517,20 @@ impl Qwen3MoeWgpu {
             }
             self.ctx.queue.submit([enc.finish()]);
             if let Some(scope) = scope {
-                if let Some(e) = pollster::block_on(scope.pop()) {
-                    anyhow::bail!("qwen3_5_moe_wgpu decode chain validation: {e}");
+                if let Some(e) = block_on(scope.pop()) {
+                    bail!("qwen3_5_moe_wgpu decode chain validation: {e}");
                 }
                 self.validated = true;
                 self.prefix_validated = true;
             }
         }
         self.pos += k;
-        dispatch::read_back(self.ctx, &ring, k).map_err(|e| anyhow::anyhow!("{e}"))
+        dispatch::read_back(self.ctx, &ring, k).map_err(|e| anyhow!("{e}"))
     }
 
     fn step_inner(&mut self, token: u32, full: bool) -> Result<()> {
-        anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
-        anyhow::ensure!(
+        ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+        ensure!(
             self.pos < self.max_seq,
             "kv cache full at {} (max_seq {})",
             self.pos,
@@ -2698,15 +2538,13 @@ impl Qwen3MoeWgpu {
         );
         self.ctx
             .queue
-            .write_buffer(&self.tok_buf, 0, bytemuck::bytes_of(&(token as i32)));
+            .write_buffer(&self.tok_buf, 0, bytes_of(&(token as i32)));
         self.ctx
             .queue
-            .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(self.pos as i32)));
+            .write_buffer(&self.pos_buf, 0, bytes_of(&(self.pos as i32)));
         let mut fd = self.fd_base;
         fd.total = (self.pos + 1) as u32;
-        self.ctx
-            .queue
-            .write_buffer(&self.fd_buf, 0, bytemuck::bytes_of(&fd));
+        self.ctx.queue.write_buffer(&self.fd_buf, 0, bytes_of(&fd));
 
         let need_scope = if full {
             !self.validated
@@ -2714,11 +2552,7 @@ impl Qwen3MoeWgpu {
             !self.validated && !self.prefix_validated
         };
         let scope = if need_scope {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         } else {
             None
         };
@@ -2728,28 +2562,19 @@ impl Qwen3MoeWgpu {
             &self.passes[..self.head_start]
         };
         if dispatch::profile::enabled() && self.ctx.caps.timestamp_query {
-            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = passes
+            let raw: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = passes
                 .iter()
                 .map(|p| (p.pipeline.as_ref(), &p.bind, p.grid))
                 .collect();
             let labels: Vec<String> = passes.iter().map(|p| p.label.clone()).collect();
             dispatch::submit_profiled_slices(self.ctx, &raw, &labels)
-                .map_err(|e| anyhow::anyhow!("profiled submit: {e}"))?;
+                .map_err(|e| anyhow!("profiled submit: {e}"))?;
         } else {
-            let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                for p in passes {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-                }
-            }
-            self.ctx.queue.submit([enc.finish()]);
+            submit_passes!(self.ctx, passes);
         }
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("qwen3_5_moe_wgpu decode step validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("qwen3_5_moe_wgpu decode step validation: {e}");
             }
             if full {
                 self.validated = true;
@@ -2763,7 +2588,7 @@ impl Qwen3MoeWgpu {
     crate::wgpu_step_readback_api!();
 
     pub fn last_decode_logits(&self) -> Result<Vec<f32>> {
-        dispatch::read_back(self.ctx, &self.logits, self.vocab).map_err(|e| anyhow::anyhow!("{e}"))
+        dispatch::read_back(self.ctx, &self.logits, self.vocab).map_err(|e| anyhow!("{e}"))
     }
 
     pub fn prefill_chunk_len(&self) -> usize {
@@ -2789,16 +2614,12 @@ impl Qwen3MoeWgpu {
     fn pfm_write_host_inputs(&self, e: &PfMrowExec, chunk: &[u32]) {
         let m = e.m;
         let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
-        self.ctx
-            .queue
-            .write_buffer(&e.tok, 0, bytemuck::cast_slice(&ids));
+        self.ctx.queue.write_buffer(&e.tok, 0, cast_slice(&ids));
         let mut posw = vec![0u32; m * PF_MROW_POS_STRIDE_WORDS];
         for (t, w) in posw.chunks_exact_mut(PF_MROW_POS_STRIDE_WORDS).enumerate() {
             w[0] = (self.pos + t) as i32 as u32;
         }
-        self.ctx
-            .queue
-            .write_buffer(&e.pos, 0, bytemuck::cast_slice(&posw));
+        self.ctx.queue.write_buffer(&e.pos, 0, cast_slice(&posw));
         let stride = PF_MROW_BIND_OFFSET_ALIGN_BYTES as usize;
         let rows = PF_MK_FLASH_ROWS_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS;
         let groups = m.div_ceil(rows);
@@ -2821,7 +2642,7 @@ impl Qwen3MoeWgpu {
                 fd.total = (self.pos + g * rows + mr_g) as u32;
                 fd.m_rows = mr_g as u32;
             }
-            slot[..std::mem::size_of::<FdParams>()].copy_from_slice(bytemuck::bytes_of(&fd));
+            slot[..std::mem::size_of::<FdParams>()].copy_from_slice(bytes_of(&fd));
         }
         self.ctx.queue.write_buffer(&e.fd, 0, &fdb);
     }
@@ -2829,55 +2650,42 @@ impl Qwen3MoeWgpu {
     fn prefill_chunk_m_row_projections(&mut self, chunk: &[u32]) -> Result<()> {
         let e = self.pfm.as_ref().expect("M-row chunk without the pf list");
         let m = e.m;
-        anyhow::ensure!(
+        ensure!(
             chunk.len() == m,
             "the M-row list is baked for chunks of exactly {m} tokens, got {}; the caller \
              routes shorter tails through the per-token replay",
             chunk.len()
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + m <= self.max_seq,
             "kv cache full at {} + {m} (max_seq {})",
             self.pos,
             self.max_seq
         );
         for &t in chunk {
-            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+            ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
         self.pfm_write_host_inputs(e, chunk);
         let scope = if self.pfm_validated {
             None
         } else {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         if dispatch::profile::enabled() && self.ctx.caps.timestamp_query {
-            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = self
+            let raw: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = self
                 .pfm_passes
                 .iter()
                 .map(|p| (p.pipeline.as_ref(), &p.bind, p.grid))
                 .collect();
             let labels: Vec<String> = self.pfm_passes.iter().map(|p| p.label.clone()).collect();
             dispatch::submit_profiled_slices(self.ctx, &raw, &labels)
-                .map_err(|e| anyhow::anyhow!("profiled M-row chunk submit: {e}"))?;
+                .map_err(|e| anyhow!("profiled M-row chunk submit: {e}"))?;
         } else {
-            let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                for p in &self.pfm_passes {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-                }
-            }
-            self.ctx.queue.submit([enc.finish()]);
+            submit_passes!(self.ctx, &self.pfm_passes);
         }
         if let Some(scope) = scope {
-            if let Some(err) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("qwen3_5_moe_wgpu M-row prefill chunk validation: {err}");
+            if let Some(err) = block_on(scope.pop()) {
+                bail!("qwen3_5_moe_wgpu M-row prefill chunk validation: {err}");
             }
             self.pfm_validated = true;
         }
@@ -2887,44 +2695,40 @@ impl Qwen3MoeWgpu {
 
     fn prefill_chunk_one_submission_of_per_token_passes(&mut self, chunk: &[u32]) -> Result<()> {
         let n = chunk.len();
-        anyhow::ensure!(
+        ensure!(
             (2..=self.pf_m).contains(&n),
             "prefill chunk is {n} tokens, want 2..={}; a 1-token chunk is the per-token path \
              wearing the chunked path's name",
             self.pf_m
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + n <= self.max_seq,
             "kv cache full at {} + {n} (max_seq {})",
             self.pos,
             self.max_seq
         );
         for &t in chunk {
-            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+            ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
         let fd_sz = std::mem::size_of::<FdParams>();
         let mut host: Vec<u8> = Vec::with_capacity(n * (8 + fd_sz));
         for &t in chunk {
-            host.extend_from_slice(bytemuck::bytes_of(&(t as i32)));
+            host.extend_from_slice(bytes_of(&(t as i32)));
         }
         for i in 0..n {
-            host.extend_from_slice(bytemuck::bytes_of(&((self.pos + i) as i32)));
+            host.extend_from_slice(bytes_of(&((self.pos + i) as i32)));
         }
         for i in 0..n {
             let mut fd = self.fd_base;
             fd.total = (self.pos + i + 1) as u32;
-            host.extend_from_slice(bytemuck::bytes_of(&fd));
+            host.extend_from_slice(bytes_of(&fd));
         }
         let list = self.pf_list.clone().expect("prefill chunk without pf list");
         self.ctx.queue.write_buffer(&list, 0, &host);
         let scope = if self.pf_validated {
             None
         } else {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
         for i in 0..n {
@@ -2939,16 +2743,14 @@ impl Qwen3MoeWgpu {
             );
             let mut pass = enc.begin_compute_pass(&Default::default());
             for p in &self.passes[..self.head_start] {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                dispatch_pass!(pass, p);
             }
             drop(pass);
         }
         self.ctx.queue.submit([enc.finish()]);
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("qwen3_5_moe_wgpu prefill chunk validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("qwen3_5_moe_wgpu prefill chunk validation: {e}");
             }
             self.pf_validated = true;
             self.prefix_validated = true;
@@ -2987,7 +2789,7 @@ impl Qwen3MoeWgpu {
     }
 
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<u32> {
-        anyhow::ensure!(!tokens.is_empty(), "prefill needs at least one token");
+        ensure!(!tokens.is_empty(), "prefill needs at least one token");
         let (last, rest) = tokens.split_last().expect("non-empty");
         let done = self.prefill_tokens(rest)?;
         for t in &rest[done..] {
@@ -3014,21 +2816,21 @@ impl Qwen3MoeWgpu {
         want_logits: bool,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
         let rows = self.verify_max_rows();
-        anyhow::ensure!(
+        ensure!(
             rows >= 2,
-            "verify_chain needs the M-row prefill list; it is off (NV_Q3_WGPU_PF_MROW=0 or a \
+            "verify_chain needs the M-row prefill list; it is off (NV_WGPU_PREFILL_M below 2 or a \
              build-time bail printed at load)"
         );
         let live = batch.len();
-        anyhow::ensure!(
+        ensure!(
             (1..=rows).contains(&live),
             "verify_chain batch {live} out of 1..={rows}"
         );
-        anyhow::ensure!(
+        ensure!(
             self.verify.as_ref().is_some_and(|v| v.pending.is_none()),
             "verify_chain twice without advance(): {VERIFY_CHAIN_FORWARDS_THE_WHOLE_BAKED_M_ROW_CHUNK_AND_COMMITS_IN_PLACE_ONLY_AT_FULL_WIDTH}"
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + rows <= self.max_seq,
             "verify_chain forwards the whole {rows}-row chunk, so it needs {rows} free kv rows \
              at {} (max_seq {})",
@@ -3036,13 +2838,13 @@ impl Qwen3MoeWgpu {
             self.max_seq
         );
         for &t in batch {
-            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+            ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
         let hidden_words = self.config.hidden_size / 2;
         let row_bytes = (hidden_words * 4) as u64;
         let vocab_bytes = (self.vocab * 4) as u64;
         if self.verify.as_ref().is_some_and(|v| v.rollback.is_empty()) {
-            let rollback: Vec<wgpu::Buffer> = self
+            let rollback: Vec<Buffer> = self
                 .recurrent_states
                 .iter()
                 .map(|(_, bytes)| dispatch::storage_zeroed(self.ctx, "q3w-vf-rollback", *bytes))
@@ -3061,11 +2863,8 @@ impl Qwen3MoeWgpu {
         self.pfm_write_host_inputs(e, &padded);
 
         let v = self.verify.as_ref().expect("verify list");
-        let scope = (!v.validated).then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
+        let scope =
+            (!v.validated).then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
         for ((src, bytes), dst) in self.recurrent_states.iter().zip(&v.rollback) {
             enc.copy_buffer_to_buffer(src, 0, dst, 0, *bytes);
@@ -3073,9 +2872,7 @@ impl Qwen3MoeWgpu {
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             for p in self.pfm_passes.iter().chain(std::iter::once(&v.resadd)) {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                dispatch_pass!(pass, p);
             }
         }
         for r in 0..live {
@@ -3083,9 +2880,7 @@ impl Qwen3MoeWgpu {
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for p in &self.passes[self.final_start..] {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                    dispatch_pass!(pass, p);
                 }
             }
             enc.copy_buffer_to_buffer(&self.token_out, 0, &v.tok, r as u64 * 4, 4);
@@ -3096,15 +2891,16 @@ impl Qwen3MoeWgpu {
         }
         self.ctx.queue.submit([enc.finish()]);
         if let Some(scope) = scope {
-            if let Some(err) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("qwen3_5_moe_wgpu verify chain validation: {err}");
+            if let Some(err) = block_on(scope.pop()) {
+                bail!("qwen3_5_moe_wgpu verify chain validation: {err}");
             }
         }
         let toks: Vec<u32> =
-            dispatch::read_back(self.ctx, &v.tok, live).map_err(|e| anyhow::anyhow!("{e}"))?;
+            dispatch::read_back(self.ctx, &v.tok, live).map_err(|e| anyhow!("{e}"))?;
         let logits = match v.row_logits.as_ref().filter(|_| want_logits) {
-            Some(rl) => dispatch::read_back(self.ctx, rl, live * self.vocab)
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            Some(rl) => {
+                dispatch::read_back(self.ctx, rl, live * self.vocab).map_err(|e| anyhow!("{e}"))?
+            }
             None => Vec::new(),
         };
         let vm = self.verify.as_mut().expect("verify list");
@@ -3118,8 +2914,8 @@ impl Qwen3MoeWgpu {
             .verify
             .as_ref()
             .and_then(|v| v.pending.as_ref().map(|b| b.len()))
-            .ok_or_else(|| anyhow::anyhow!("advance() without a pending verify_chain"))?;
-        anyhow::ensure!(
+            .ok_or_else(|| anyhow!("advance() without a pending verify_chain"))?;
+        ensure!(
             n <= rows,
             "advance {n} beyond the {rows} rows verify_chain read back"
         );
@@ -3151,46 +2947,35 @@ impl Qwen3MoeWgpu {
 
     fn prefill_step_embed_row(&mut self, row_words: &[u32]) -> Result<()> {
         let hidden_words = self.config.hidden_size / 2;
-        anyhow::ensure!(
+        ensure!(
             self.pos < self.max_seq,
             "kv cache full at {} (max_seq {})",
             self.pos,
             self.max_seq
         );
-        anyhow::ensure!(
+        ensure!(
             row_words.len() == hidden_words,
             "spliced embed row has {} words, want {hidden_words}",
             row_words.len()
         );
         self.ctx
             .queue
-            .write_buffer(&self.res, 0, bytemuck::cast_slice(row_words));
+            .write_buffer(&self.res, 0, cast_slice(row_words));
         self.ctx
             .queue
-            .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(self.pos as i32)));
+            .write_buffer(&self.pos_buf, 0, bytes_of(&(self.pos as i32)));
         let mut fd = self.fd_base;
         fd.total = (self.pos + 1) as u32;
-        self.ctx
-            .queue
-            .write_buffer(&self.fd_buf, 0, bytemuck::bytes_of(&fd));
-        let scope = (!self.splice_validated).then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            for p in &self.passes[self.embed_gather_end..self.head_start] {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-            }
-        }
-        self.ctx.queue.submit([enc.finish()]);
+        self.ctx.queue.write_buffer(&self.fd_buf, 0, bytes_of(&fd));
+        let scope = (!self.splice_validated)
+            .then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
+        submit_passes!(
+            self.ctx,
+            &self.passes[self.embed_gather_end..self.head_start]
+        );
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("qwen3_5_moe_wgpu splice prefill step validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("qwen3_5_moe_wgpu splice prefill step validation: {e}");
             }
             self.splice_validated = true;
         }
@@ -3209,38 +2994,26 @@ impl Qwen3MoeWgpu {
             .expect("M-row spliced chunk without the pf list");
         let m = e.m;
         let hidden_words = self.config.hidden_size / 2;
-        anyhow::ensure!(
+        ensure!(
             chunk.len() == m,
             "the M-row list is baked for chunks of exactly {m} tokens, got {}",
             chunk.len()
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + m <= self.max_seq,
             "kv cache full at {} + {m} (max_seq {})",
             self.pos,
             self.max_seq
         );
         for &t in chunk {
-            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+            ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
         self.pfm_write_host_inputs(e, chunk);
-        let scope = (!self.splice_validated).then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            for p in &self.pfm_passes[..self.pfm_gather_end] {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-            }
-        }
-        self.ctx.queue.submit([enc.finish()]);
+        let scope = (!self.splice_validated)
+            .then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
+        submit_passes!(self.ctx, &self.pfm_passes[..self.pfm_gather_end]);
         for (row_start, words) in rows {
-            anyhow::ensure!(
+            ensure!(
                 words.len() % hidden_words == 0 && row_start + words.len() / hidden_words <= m,
                 "spliced segment at chunk row {row_start} ({} words) overflows the {m}-row chunk",
                 words.len()
@@ -3248,22 +3021,13 @@ impl Qwen3MoeWgpu {
             self.ctx.queue.write_buffer(
                 &e.res,
                 (row_start * hidden_words * 4) as u64,
-                bytemuck::cast_slice(words),
+                cast_slice(words),
             );
         }
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            for p in &self.pfm_passes[self.pfm_gather_end..] {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-            }
-        }
-        self.ctx.queue.submit([enc.finish()]);
+        submit_passes!(self.ctx, &self.pfm_passes[self.pfm_gather_end..]);
         if let Some(scope) = scope {
-            if let Some(err) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("qwen3_5_moe_wgpu M-row spliced chunk validation: {err}");
+            if let Some(err) = block_on(scope.pop()) {
+                bail!("qwen3_5_moe_wgpu M-row spliced chunk validation: {err}");
             }
             self.splice_validated = true;
         }
@@ -3287,19 +3051,19 @@ impl Qwen3MoeWgpu {
         let hidden_words = hidden / 2;
         let mut cursor = 0usize;
         for (k, sp) in splices.iter().enumerate() {
-            anyhow::ensure!(
+            ensure!(
                 !sp.rows_bf16.is_empty() && sp.rows_bf16.len() % hidden == 0,
                 "splice {k} rows_bf16 length {} is not a positive multiple of hidden_size {hidden}",
                 sp.rows_bf16.len()
             );
             let n_rows = sp.rows_bf16.len() / hidden;
-            anyhow::ensure!(
+            ensure!(
                 sp.position >= cursor,
                 "splices must be strictly sorted and non-overlapping; splice {k} starts at {} but \
                  the previous splice ends at {cursor}",
                 sp.position
             );
-            anyhow::ensure!(
+            ensure!(
                 sp.position + n_rows <= tokens.len(),
                 "splice {k} covers tokens [{}, {}) but only {} tokens are being prefilled; the \
                  final prompt token must stay plain because decode_step replays the embed gathers",
@@ -3373,7 +3137,7 @@ impl Qwen3MoeWgpu {
         if splices.is_empty() {
             return self.prefill(tokens);
         }
-        anyhow::ensure!(!tokens.is_empty(), "prefill needs at least one token");
+        ensure!(!tokens.is_empty(), "prefill needs at least one token");
         let (last, rest) = tokens.split_last().expect("non-empty");
         self.prefill_tokens_with_image_rows(rest, splices)?;
         self.decode_step(*last)
@@ -3389,14 +3153,13 @@ fn row_chunk(ctx: &WgpuContext, hidden: usize) -> usize {
     ((limit / per_row) as usize).max(2) & !1usize
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_bf16(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Bf16Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     out_f32: bool,
     y_off_words: usize,
 ) -> Result<()> {
@@ -3419,29 +3182,28 @@ fn push_gemv_bf16(
     b.push(
         label,
         &s.gemv_bf16,
-        w.entry,
+        "q3w_gemv_bf16_u8",
         &[(0, &w.w), (1, x), (2, &p), (3, y)],
         grid,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_quant_rows(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
-    packed: &wgpu::Buffer,
-    scales: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
-    globals: &wgpu::Buffer,
+    x: &Buffer,
+    packed: &Buffer,
+    scales: &Buffer,
+    sel: &Buffer,
+    globals: &Buffer,
     k: usize,
     slots: usize,
     use_sel: bool,
     x_slot_stride_elems: usize,
 ) -> Result<()> {
     let k_blocks = k / NVFP4_BLOCK;
-    anyhow::ensure!(
+    ensure!(
         k_blocks.is_multiple_of(4),
         "quant rows needs k/{NVFP4_BLOCK} divisible by 4, got {k_blocks}"
     );
@@ -3477,39 +3239,33 @@ fn push_quant_rows(
     )
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct Q8eParams {
-    n_rows: u32,
-    k_elems: u32,
-    groups_x: u32,
-    x_slot_stride_elems: u32,
-    w_e_stride_words: u32,
-    y_slot_stride_words: u32,
-    use_sel: u32,
-    groups_per_row: u32,
-    group_shift: u32,
-    y_off_words: u32,
-    pad1: u32,
-    pad2: u32,
+pod! {
+    #[derive(Debug)]
+    struct Q8eParams {
+        n_rows: u32,
+        k_elems: u32,
+        groups_x: u32,
+        x_slot_stride_elems: u32,
+        w_e_stride_words: u32,
+        y_slot_stride_words: u32,
+        use_sel: u32,
+        groups_per_row: u32,
+        group_shift: u32,
+        y_off_words: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 }
 
-fn fuse_silu_quant_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_Q3_WGPU_FUSE_SILU_QUANT",
-    )
-}
-
-pub fn quant_lane_mode() -> Option<usize> {
-    match std::env::var("NV_Q3_WGPU_QUANT_LANE").ok().as_deref() {
-        Some("0") | Some("off") | Some("false") => None,
-        Some("w256") | Some("256") => Some(256),
-        _ => Some(32),
+pub fn quant_lane_mode() -> usize {
+    match env::var("NV_Q3_WGPU_QUANT_LANE").ok().as_deref() {
+        Some("w256") | Some("256") => 256,
+        _ => 32,
     }
 }
 
 pub(crate) fn quant_lane_entry(ctx: &WgpuContext, base: &str) -> Option<(&'static str, usize)> {
-    let wg = quant_lane_mode()?;
+    let wg = quant_lane_mode();
     if !wk::gemv_nvfp4_v2::subgroup32_ok(ctx) {
         return None;
     }
@@ -3519,52 +3275,16 @@ pub(crate) fn quant_lane_entry(ctx: &WgpuContext, base: &str) -> Option<(&'stati
         .map(|(e, _, w)| (e, w))
 }
 
-fn off(var: &str) -> bool {
-    matches!(
-        std::env::var(var).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
-pub fn delta_in_proj_fused() -> bool {
-    !off("NV_Q3_WGPU_FUSE_DN_INPROJ")
-}
-
-pub fn delta_gate_fused() -> bool {
-    !off("NV_Q3_WGPU_FUSE_DN_GATE")
-}
-
-pub fn attn_qcast_fused() -> bool {
-    !off("NV_Q3_WGPU_FUSE_AT_QCAST")
-}
-
-pub fn attn_kv_fused() -> bool {
-    !off("NV_Q3_WGPU_FUSE_AT_KV")
-}
-
-pub fn attn_qknorm_fused() -> bool {
-    !off("NV_Q3_WGPU_FUSE_AT_QKNORM")
-}
-
-pub fn router_gate_fused() -> bool {
-    !off("NV_Q3_WGPU_FUSE_ROUTER_GATE")
-}
-
-pub fn shared_expert_folded() -> bool {
-    !off("NV_Q3_WGPU_FUSE_SHARED_EXPERT")
-}
-
-#[allow(clippy::too_many_arguments)]
 fn push_silu_mul_quant(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    y_gate: &wgpu::Buffer,
-    y_up: &wgpu::Buffer,
-    packed: &wgpu::Buffer,
-    scales: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
-    globals: &wgpu::Buffer,
+    y_gate: &Buffer,
+    y_up: &Buffer,
+    packed: &Buffer,
+    scales: &Buffer,
+    sel: &Buffer,
+    globals: &Buffer,
     k: usize,
     slots: usize,
     use_sel: bool,
@@ -3572,11 +3292,11 @@ fn push_silu_mul_quant(
     fused_pair: bool,
 ) -> Result<()> {
     let k_blocks = k / NVFP4_BLOCK;
-    anyhow::ensure!(
+    ensure!(
         k_blocks.is_multiple_of(4),
         "silu_mul_quant needs k/{NVFP4_BLOCK} divisible by 4, got {k_blocks}"
     );
-    anyhow::ensure!(
+    ensure!(
         !fused_pair || k.is_multiple_of(2),
         "silu_mul_quant fused pair needs an even row count, got {k}"
     );
@@ -3625,18 +3345,17 @@ fn push_silu_mul_quant(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_nvfp4(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    w: &wgpu::Buffer,
-    ws: &wgpu::Buffer,
-    x: &wgpu::Buffer,
-    xs: &wgpu::Buffer,
-    y: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
-    alphas: &wgpu::Buffer,
+    w: &Buffer,
+    ws: &Buffer,
+    x: &Buffer,
+    xs: &Buffer,
+    y: &Buffer,
+    sel: &Buffer,
+    alphas: &Buffer,
     n: usize,
     k: usize,
     slots: usize,
@@ -3717,16 +3436,8 @@ pub struct Nvfp4V2Route {
     pub vec4: bool,
 }
 
-pub const NVFP4_V2_DEFAULT_ON: bool = true;
-
 pub fn nvfp4_v2_enabled(ctx: &WgpuContext) -> bool {
-    if !wk::gemv_nvfp4_v2::subgroup32_ok(ctx) {
-        return false;
-    }
-    match std::env::var("NV_Q3_WGPU_NVFP4_V2") {
-        Ok(v) => v != "0",
-        Err(_) => NVFP4_V2_DEFAULT_ON,
-    }
+    wk::gemv_nvfp4_v2::subgroup32_ok(ctx)
 }
 
 pub fn nvfp4_v2_boot_line(requested: bool, routed: usize, total: usize) -> Option<String> {
@@ -3790,10 +3501,6 @@ pub const SLOTSHARED_IS_ONLY_CORRECT_WHEN_EVERY_SLOT_SELECTS_EXPERT_ZERO: &str =
      sweeps; it reads q34_sel[0] for every slot, so a caller whose slots select different \
      experts (the MoE stacks) must keep the z-replicated route.";
 
-pub fn nvfp4_slotshared_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_NVFP4_SLOTSHARED")
-}
-
 pub const SLOTSHARED_MAP_ENTRY: &str = "q3w_i8map_x_rows";
 
 pub fn nvfp4_slotshared_sources() -> String {
@@ -3822,7 +3529,7 @@ pub fn nvfp4_v2_route_slotshared(
     k_blocks: usize,
     slots: usize,
 ) -> Option<Nvfp4V2Route> {
-    if !nvfp4_v2_enabled(ctx) || !nvfp4_slotshared_enabled() {
+    if !nvfp4_v2_enabled(ctx) {
         return None;
     }
     if !(2..=NVFP4_SLOTSHARED_MAX_SLOTS_ONE_ACC_REGISTER_PER_SLOT).contains(&slots) {
@@ -3852,8 +3559,7 @@ pub const MROW2_UPGRADE_BEATS_MROW_ON_EVERY_DENSE_SINGLE_SLOT_SHAPE_MEASURED: &s
     "interleaved route A/B (dense_single_slot_route_ab): scalar two-row mrow2 out-streams \
      mrow(128,2) on every dense single-slot projection shape measured, both orientations, \
      bit-identical outputs on every arm; select_slots only returns MRow at slots<=1 so this \
-     upgrade is scoped to exactly the measured regime; current numbers: perf/runs.jsonl. \
-     NV_Q3_WGPU_NVFP4_MROW2=0 restores mrow.";
+     upgrade is scoped to exactly the measured regime; current numbers: perf/runs.jsonl.";
 
 fn mrow2_upgrade(
     kernel: wk::gemv_nvfp4_v2::V2Kernel,
@@ -3863,9 +3569,6 @@ fn mrow2_upgrade(
 ) -> (wk::gemv_nvfp4_v2::V2Kernel, &'static str) {
     let mrow2 = wk::gemv_nvfp4_v2::V2Kernel::MRow2;
     if pk_entry != wk::gemv_nvfp4_v2::MROW_PK_ENTRY
-        || !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            "NV_Q3_WGPU_NVFP4_MROW2",
-        )
         || !mrow2.shape_ok(k)
         || !wk::gemv_nvfp4_v2::pk_capable(mrow2, cfg)
     {
@@ -3874,23 +3577,13 @@ fn mrow2_upgrade(
     (mrow2, wk::gemv_nvfp4_v2::MROW2_PK_ENTRY)
 }
 
-pub fn gemv_bf16_load() -> &'static str {
-    match std::env::var("NV_Q3_WGPU_GEMV_BF16_LOAD").ok().as_deref() {
-        Some("1") | Some("scalar") | Some("off") => "q3w_gemv_bf16",
-        Some("u4") => "q3w_gemv_bf16_u4",
-        _ => "q3w_gemv_bf16_u8",
-    }
-}
-
 fn upload_bf16(b: &mut Builder, label: &str, l: &HostBf16Lin) -> Bf16Gpu {
-    let entry = gemv_bf16_load();
-    b.gemv_unrolled.0 += usize::from(entry != "q3w_gemv_bf16");
+    b.gemv_unrolled.0 += 1;
     b.gemv_unrolled.1 += 1;
     Bf16Gpu {
         w: b.upload_u32(label, &pack_pairs(&l.w)),
         n: l.n,
         k: l.k,
-        entry,
     }
 }
 
@@ -3939,15 +3632,8 @@ fn upload_nvfp4_rowcat(
     }
 }
 
-pub fn router_par_enabled() -> bool {
-    !matches!(
-        std::env::var("NV_Q3_WGPU_ROUTER_PAR").ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
 pub fn router_topk_entry() -> (&'static str, &'static str) {
-    match std::env::var("NV_Q3_WGPU_ROUTER_TOPK").ok().as_deref() {
+    match env::var("NV_Q3_WGPU_ROUTER_TOPK").ok().as_deref() {
         Some("tree") => ("q3w-moe-topk-tree", "q3w_router_topk_tree"),
         Some("r4") => ("q3w-moe-topk-r4", "q3w_router_topk_r4"),
         Some("r16") => ("q3w-moe-topk-r16", "q3w_router_topk_r16"),
@@ -3960,12 +3646,12 @@ fn w8_group() -> usize {
 }
 
 fn w8_experts_enabled(ctx: &WgpuContext) -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q3_WGPU_W8_EXPERTS")
+    env_arm_opt_in_eq_some_1_reread_every_call("NV_Q3_WGPU_W8_EXPERTS")
         && wk::gemv_nvfp4_v2::subgroup32_ok(ctx)
 }
 
 fn w8_proj_group() -> usize {
-    let g = std::env::var("NV_Q3_WGPU_W8_PROJ_GROUP")
+    let g = env::var("NV_Q3_WGPU_W8_PROJ_GROUP")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(128);
@@ -3982,7 +3668,7 @@ fn w8_delta_proj_enabled(ctx: &WgpuContext) -> (bool, bool) {
     if !wk::gemv_nvfp4_v2::subgroup32_ok(ctx) {
         return (false, false);
     }
-    match std::env::var("NV_Q3_WGPU_W8_DELTA").ok().as_deref() {
+    match env::var("NV_Q3_WGPU_W8_DELTA").ok().as_deref() {
         Some("1") | Some("all") => (true, true),
         Some("out") => (false, true),
         Some("in") => (true, false),
@@ -3991,13 +3677,12 @@ fn w8_delta_proj_enabled(ctx: &WgpuContext) -> (bool, bool) {
 }
 
 fn w8_lmhead_enabled(ctx: &WgpuContext) -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q3_WGPU_W8_LMHEAD")
-        && wk::gemv_nvfp4_v2::subgroup32_ok(ctx)
+    wk::gemv_nvfp4_v2::subgroup32_ok(ctx)
 }
 
 struct ExpertI8Gpu {
-    w: wgpu::Buffer,
-    s: wgpu::Buffer,
+    w: Buffer,
+    s: Buffer,
     n: usize,
     k: usize,
     group: usize,
@@ -4072,20 +3757,19 @@ fn upload_nvfp4_i8(b: &mut Builder, label: &str, l: &HostNvfp4Lin) -> ExpertI8Gp
     upload_experts_i8(b, label, &st)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_i8_experts(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     ex: &ExpertI8Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
+    sel: &Buffer,
     slots: usize,
     use_sel: bool,
     x_per_slot: bool,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         ex.k.is_multiple_of(4),
         "i8 experts need k % 4 == 0, got {}",
         ex.k
@@ -4131,13 +3815,13 @@ fn push_gemv_i8_f32(
     s: &Sources,
     label: &str,
     ex: &ExpertI8Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     y_off_words: usize,
 ) -> Result<()> {
-    anyhow::ensure!(ex.group > 0, "the f32 int8 GEMV is group-scaled only");
+    ensure!(ex.group > 0, "the f32 int8 GEMV is group-scaled only");
     let groups = ex.n.div_ceil(8) as u32;
-    anyhow::ensure!(
+    ensure!(
         groups <= b.ctx.caps.max_compute_workgroups_per_dimension,
         "lm_head int8 chunk needs {groups} workgroups, over the {} per-dimension \
          limit; lower the row chunk",
@@ -4169,13 +3853,6 @@ fn push_gemv_i8_f32(
     )
 }
 
-fn gate_up_fused() -> bool {
-    !matches!(
-        std::env::var("NV_Q3_WGPU_FUSE_GATEUP").ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
 fn upload_experts_gate_up(
     b: &mut Builder,
     label: &str,
@@ -4183,7 +3860,7 @@ fn upload_experts_gate_up(
     u: &HostExpertStack,
     sh: Option<(&HostNvfp4Lin, &HostNvfp4Lin)>,
 ) -> Result<ExpertGpu> {
-    anyhow::ensure!(
+    ensure!(
         g.e == u.e && g.n == u.n && g.k == u.k,
         "{label}: gate {}x{}x{} vs up {}x{}x{}",
         g.e,
@@ -4193,20 +3870,20 @@ fn upload_experts_gate_up(
         u.n,
         u.k
     );
-    anyhow::ensure!(
+    ensure!(
         g.n.is_multiple_of(128),
         "{label}: n={} is not a multiple of the 128-row scale-swizzle tile, so the \
          concatenated scales would not be the swizzle of the concatenated rows",
         g.n
     );
-    anyhow::ensure!(
+    ensure!(
         g.alphas == u.alphas && g.input_globals == u.input_globals,
         "{label}: gate and up disagree on weight_global_scale or input_global_scale, \
          so one GEMV cannot carry both"
     );
     let ws = g.packed.len() / g.e;
     let ss = g.scales_swizzled.len() / g.e;
-    anyhow::ensure!(
+    ensure!(
         g.packed.len().is_multiple_of(g.e)
             && u.packed.len() == g.packed.len()
             && g.scales_swizzled.len().is_multiple_of(g.e)
@@ -4228,7 +3905,7 @@ fn upload_experts_gate_up(
     let mut alphas = g.alphas.clone();
     let mut globals = g.input_globals.clone();
     if let Some((sg, su)) = sh {
-        anyhow::ensure!(
+        ensure!(
             sg.n == g.n && su.n == g.n && sg.k == g.k && su.k == g.k,
             "{label}: shared pair is {}x{}/{}x{}, stack is {}x{}",
             sg.n,
@@ -4238,14 +3915,14 @@ fn upload_experts_gate_up(
             g.n,
             g.k
         );
-        anyhow::ensure!(
+        ensure!(
             sg.packed.len() == ws
                 && su.packed.len() == ws
                 && sg.scales_swizzled.len() == ss
                 && su.scales_swizzled.len() == ss,
             "{label}: shared pair does not occupy exactly one expert stride"
         );
-        anyhow::ensure!(
+        ensure!(
             sg.alpha == su.alpha && sg.input_global == su.input_global,
             "{label}: shared gate and up disagree on their global scales"
         );
@@ -4288,7 +3965,7 @@ fn upload_experts_with(
     };
     let w_stride = st.packed.len() / st.e;
     let sf_stride = st.scales_swizzled.len() / st.e;
-    anyhow::ensure!(
+    ensure!(
         sh.n == st.n && sh.k == st.k,
         "{label}: shared expert is {}x{}, stack is {}x{}",
         sh.n,
@@ -4296,17 +3973,17 @@ fn upload_experts_with(
         st.n,
         st.k
     );
-    anyhow::ensure!(
+    ensure!(
         st.packed.len().is_multiple_of(st.e) && sh.packed.len() == w_stride,
         "{label}: shared packed {} bytes, per-expert stride {w_stride}",
         sh.packed.len()
     );
-    anyhow::ensure!(
+    ensure!(
         st.scales_swizzled.len().is_multiple_of(st.e) && sh.scales_swizzled.len() == sf_stride,
         "{label}: shared scales {} bytes, per-expert stride {sf_stride}",
         sh.scales_swizzled.len()
     );
-    anyhow::ensure!(
+    ensure!(
         w_stride.is_multiple_of(8) && sf_stride.is_multiple_of(8),
         "{label}: strides {w_stride}/{sf_stride} must be whole u32 pairs for the \
          word-packed upload to concatenate exactly"
@@ -4336,7 +4013,7 @@ fn upload_experts_with(
 enum ProjGpu {
     Bf16(Bf16Gpu),
 
-    I8(ExpertI8Gpu, wgpu::Buffer),
+    I8(ExpertI8Gpu, Buffer),
 }
 
 fn upload_proj(b: &mut Builder, label: &str, l: &HostBf16Lin, w8: Option<usize>) -> ProjGpu {
@@ -4354,8 +4031,8 @@ fn push_proj(
     s: &Sources,
     label: &str,
     p: &ProjGpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
 ) -> Result<()> {
     match p {
         ProjGpu::Bf16(w) => push_gemv_bf16(b, s, label, w, x, y, false, 0),
@@ -4363,15 +4040,14 @@ fn push_proj(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_push_gemm_bf16_m(
     b: &mut Builder,
     pf: &PfMrowBufs,
     label: &str,
     w: &Bf16Gpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_stride_words: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
     out_f32: bool,
 ) -> Result<()> {
@@ -4398,12 +4074,12 @@ fn pf_push_gemm_bf16_m(
             (&pf.gemm_src, &pf.gemm_entry)
         } else {
             let (tr, ts, te) = pf.gemm_tail.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
+                anyhow!(
                     "{label}: the {rows}-row GEMM tail has no generated kernel; \
                      pf_mrow_m and gemm_tail disagree"
                 )
             })?;
-            anyhow::ensure!(
+            ensure!(
                 *tr == rows,
                 "{label}: tail kernel is {tr} rows, want {rows}"
             );
@@ -4433,20 +4109,19 @@ fn pf_push_gemm_bf16_m(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_push_gemv_i8_slots(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     ex: &ExpertI8Gpu,
-    sel_zeros: &wgpu::Buffer,
-    x: &wgpu::Buffer,
+    sel_zeros: &Buffer,
+    x: &Buffer,
     x_slot_stride_elems: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_slot_stride_words: usize,
     slots: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         ex.k.is_multiple_of(4),
         "i8 experts need k % 4 == 0, got {}",
         ex.k
@@ -4494,16 +4169,15 @@ fn pf_push_gemv_i8_slots(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_push_proj_m(
     b: &mut Builder,
     s: &Sources,
     pf: &PfMrowBufs,
     label: &str,
     p: &ProjGpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_stride_words: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
 ) -> Result<()> {
     match p {
@@ -4528,15 +4202,14 @@ fn pf_push_proj_m(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_delta(
     b: &mut Builder,
     s: &Sources,
     cfg: &Qwen3MoeConfig,
     d: &HostDeltaNet,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
-    states: &mut Vec<(wgpu::Buffer, u64)>,
+    x: &Buffer,
+    out: &Buffer,
+    states: &mut Vec<(Buffer, u64)>,
     pf: &mut Option<PfMrowBufs>,
 ) -> Result<()> {
     let n_k = cfg.linear_num_key_heads;
@@ -4554,8 +4227,7 @@ fn build_delta(
 
     let w_out = upload_proj(b, "q3w-dn-out", &d.out_proj, w8_out);
 
-    let fuse_in_proj = delta_in_proj_fused()
-        && d.in_proj_qkv.k == d.in_proj_z.k
+    let fuse_in_proj = d.in_proj_qkv.k == d.in_proj_z.k
         && d.in_proj_qkv.k == d.in_proj_ab.k
         && conv_dim.is_multiple_of(2)
         && value_dim.is_multiple_of(2);
@@ -4644,58 +4316,25 @@ fn build_delta(
     let gexp = b.zeros("q3w-dn-g", (n_v * 4) as u64);
     let beta = b.zeros("q3w-dn-beta", (n_v * 4) as u64);
 
-    if delta_gate_fused() {
-        b.push(
-            "q3w-dn-split",
-            &s.delta,
-            "q3w_delta_qkv_gated",
-            &[
-                (10, &mixed),
-                (11, &qg),
-                (12, &kg),
-                (13, &vg),
-                (14, &dqp),
-                (20, &ab),
-                (21, &alogdt),
-                (23, &gexp),
-                (24, &beta),
-            ],
-            (n_v as u32, 1, 1),
-        )?;
-        b.dn_gate.0 += 1;
-        b.dn_gate.1 += 1;
-    } else {
-        b.push(
-            "q3w-dn-split",
-            &s.delta,
-            "q3w_delta_qkv",
-            &[(10, &mixed), (11, &qg), (12, &kg), (13, &vg), (14, &dqp)],
-            (n_v as u32, 1, 1),
-        )?;
-        let gp = b.uni(
-            "q3w-dn-gate-p",
-            GatingParams {
-                n_v: n_v as u32,
-                ab_off: ab_off as u32,
-                ..Default::default()
-            },
-        );
-        let grid = b.grid1(n_v as u64, 64);
-        b.push(
-            "q3w-dn-gating",
-            &s.delta,
-            "q3w_delta_gating",
-            &[
-                (20, &ab),
-                (21, &alogdt),
-                (23, &gexp),
-                (24, &beta),
-                (25, &gp),
-            ],
-            grid,
-        )?;
-        b.dn_gate.1 += 1;
-    }
+    b.push(
+        "q3w-dn-split",
+        &s.delta,
+        "q3w_delta_qkv_gated",
+        &[
+            (10, &mixed),
+            (11, &qg),
+            (12, &kg),
+            (13, &vg),
+            (14, &dqp),
+            (20, &ab),
+            (21, &alogdt),
+            (23, &gexp),
+            (24, &beta),
+        ],
+        (n_v as u32, 1, 1),
+    )?;
+    b.dn_gate.0 += 1;
+    b.dn_gate.1 += 1;
 
     let state_bytes = (n_v * d_k * d_v * 4) as u64;
     let state = b.zeros("q3w-dn-state", state_bytes);
@@ -4710,22 +4349,13 @@ fn build_delta(
             pad0: 0,
         },
     );
-    let (rec_entry, rec_lanes) = delta_recurrent_kernel();
-    anyhow::ensure!(
-        rec_lanes > 0 || d_v <= 128,
-        "{rec_entry} covers one lane per invocation of a 128-wide workgroup, got d_v {d_v}"
-    );
-    let rec_grid_y = if rec_lanes > 0 {
-        (d_v as u32).div_ceil(rec_lanes)
-    } else {
-        1
-    };
-    b.delta_u4.0 += usize::from(rec_entry != "q3w_delta_recurrent");
+    let rec_grid_y = (d_v as u32).div_ceil(DELTA_RECURRENT_LANES_PER_WORKGROUP);
+    b.delta_u4.0 += 1;
     b.delta_u4.1 += 1;
     b.push(
         "q3w-dn-recurrent",
         &s.delta,
-        rec_entry,
+        DELTA_RECURRENT_ENTRY,
         &[
             (30, &qg),
             (31, &kg),
@@ -4772,16 +4402,11 @@ fn build_delta(
     b.to_prefill = true;
     let r = (|b: &mut Builder| -> Result<()> {
         let w_in_all = w_in_all.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow!(
                 "M-row prefill covers only the fused delta in_proj arm; \
-                 NV_Q3_WGPU_FUSE_DN_INPROJ=0 leaves prefill on the per-token replay"
+                 this in_proj geometry leaves prefill on the per-token replay"
             )
         })?;
-        anyhow::ensure!(
-            delta_gate_fused(),
-            "M-row prefill covers only the fused delta gating arm; \
-             NV_Q3_WGPU_FUSE_DN_GATE=0 leaves prefill on the per-token replay"
-        );
         let m = p.m;
         let hidden_words = cfg.hidden_size / 2;
         let n_all = conv_dim + value_dim + 2 * n_v;
@@ -4813,7 +4438,7 @@ fn build_delta(
             });
         }
         let dl = p.delta.as_ref().expect("created above");
-        anyhow::ensure!(
+        ensure!(
             dl.in_stride_words == pf_stride_elems_bf16(n_all) / 2,
             "pf delta scratch was sized for a different layer shape"
         );
@@ -4829,164 +4454,88 @@ fn build_delta(
             dl.in_stride_words,
         )?;
         let conv_grid = b.grid1(conv_dim as u64, 64);
-        if pf_token_parallel_default_on_escape_to_per_token_copies() {
-            anyhow::ensure!(
-                ks <= 8,
-                "q3w_pf_delta_conv_chunk keeps the rolling window in a fixed 8-slot \
-                 register array, got kernel {ks}"
-            );
-            let src = pf_delta_chunk_source(d_k);
-            let pdp = b.uni(
-                "q3w-pf-dn-chunk-p",
-                PfDeltaChunkParams {
-                    tokens: m as u32,
-                    in_stride_elems: (dl.in_stride_words * 2) as u32,
-                    mixed_stride_elems: (dl.mixed_stride_bytes / 4) as u32,
-                    qk_stride_elems: (dl.qk_stride_bytes / 4) as u32,
-                    v_stride_elems: (dl.v_stride_bytes / 4) as u32,
-                    gb_stride_elems: (dl.gb_stride_bytes / 4) as u32,
-                    core_stride_elems: (dl.core_stride_bytes / 4) as u32,
-                    gated_stride_elems: (dl.gated_stride_words * 2) as u32,
-                },
-            );
-            b.push(
-                "q3w-pf-dn-conv-chunk",
-                &src,
-                "q3w_pf_delta_conv_chunk",
-                &[
-                    (0, &dl.in_all),
-                    (1, &conv_w),
-                    (2, &conv_state),
-                    (3, &dl.mixed),
-                    (4, &cp),
-                    (50, &pdp),
-                ],
-                conv_grid,
-            )?;
-            b.push(
-                "q3w-pf-dn-split-m",
-                &src,
-                "q3w_pf_delta_split_gated_m",
-                &[
-                    (10, &dl.mixed),
-                    (11, &dl.qg),
-                    (12, &dl.kg),
-                    (13, &dl.vg),
-                    (14, &dqp),
-                    (20, &dl.in_all),
-                    (21, &alogdt),
-                    (23, &dl.gexp),
-                    (24, &dl.beta),
-                    (50, &pdp),
-                ],
-                (n_v as u32, m as u32, 1),
-            )?;
-            b.push(
-                "q3w-pf-dn-recurrent-chunk",
-                &src,
-                "q3w_pf_delta_recurrent_chunk",
-                &[
-                    (30, &dl.qg),
-                    (31, &dl.kg),
-                    (32, &dl.vg),
-                    (33, &dl.gexp),
-                    (34, &dl.beta),
-                    (35, &dl.core),
-                    (36, &state),
-                    (37, &rp),
-                    (50, &pdp),
-                ],
-                (n_v as u32, (d_v as u32).div_ceil(32), 1),
-            )?;
-            b.push(
-                "q3w-pf-dn-out-m",
-                &src,
-                "q3w_pf_delta_out_m",
-                &[
-                    (40, &dl.core),
-                    (41, &norm_w),
-                    (42, &dl.in_all),
-                    (43, &dl.gated),
-                    (44, &dop),
-                    (50, &pdp),
-                ],
-                (n_v as u32, m as u32, 1),
-            )?;
-            return pf_push_proj_m(
-                b,
-                s,
-                p,
-                "q3w-pf-dn-oproj",
-                &w_out,
-                &dl.gated,
-                dl.gated_stride_words,
-                &p.mix,
-                hidden_words,
-            );
-        }
-        let in_stride_bytes = (dl.in_stride_words * 4) as u64;
-        let gated_stride_bytes = (dl.gated_stride_words * 4) as u64;
-        for t in 0..m as u64 {
-            b.push_pf_off(
-                "q3w-pf-dn-conv",
-                &s.delta,
-                "q3w_delta_conv",
-                &[
-                    (0, &dl.in_all, t * in_stride_bytes),
-                    (1, &conv_w, 0),
-                    (2, &conv_state, 0),
-                    (3, &dl.mixed, t * dl.mixed_stride_bytes),
-                    (4, &cp, 0),
-                ],
-                conv_grid,
-            )?;
-            b.push_pf_off(
-                "q3w-pf-dn-split",
-                &s.delta,
-                "q3w_delta_qkv_gated",
-                &[
-                    (10, &dl.mixed, t * dl.mixed_stride_bytes),
-                    (11, &dl.qg, t * dl.qk_stride_bytes),
-                    (12, &dl.kg, t * dl.qk_stride_bytes),
-                    (13, &dl.vg, t * dl.v_stride_bytes),
-                    (14, &dqp, 0),
-                    (20, &dl.in_all, t * in_stride_bytes),
-                    (21, &alogdt, 0),
-                    (23, &dl.gexp, t * dl.gb_stride_bytes),
-                    (24, &dl.beta, t * dl.gb_stride_bytes),
-                ],
-                (n_v as u32, 1, 1),
-            )?;
-            b.push_pf_off(
-                "q3w-pf-dn-recurrent",
-                &s.delta,
-                rec_entry,
-                &[
-                    (30, &dl.qg, t * dl.qk_stride_bytes),
-                    (31, &dl.kg, t * dl.qk_stride_bytes),
-                    (32, &dl.vg, t * dl.v_stride_bytes),
-                    (33, &dl.gexp, t * dl.gb_stride_bytes),
-                    (34, &dl.beta, t * dl.gb_stride_bytes),
-                    (35, &dl.core, t * dl.core_stride_bytes),
-                    (36, &state, 0),
-                    (37, &rp, 0),
-                ],
-                (n_v as u32, rec_grid_y, 1),
-            )?;
-            b.push_pf_off(
-                "q3w-pf-dn-out",
-                &s.delta,
-                "q3w_delta_out",
-                &[
-                    (40, &dl.core, t * dl.core_stride_bytes),
-                    (41, &norm_w, 0),
-                    (42, &dl.in_all, t * in_stride_bytes),
-                    (43, &dl.gated, t * gated_stride_bytes),
-                    (44, &dop, 0),
-                ],
-                (n_v as u32, 1, 1),
-            )?;
-        }
+        ensure!(
+            ks <= 8,
+            "q3w_pf_delta_conv_chunk keeps the rolling window in a fixed 8-slot \
+             register array, got kernel {ks}"
+        );
+        let src = pf_delta_chunk_source(d_k);
+        let pdp = b.uni(
+            "q3w-pf-dn-chunk-p",
+            PfDeltaChunkParams {
+                tokens: m as u32,
+                in_stride_elems: (dl.in_stride_words * 2) as u32,
+                mixed_stride_elems: (dl.mixed_stride_bytes / 4) as u32,
+                qk_stride_elems: (dl.qk_stride_bytes / 4) as u32,
+                v_stride_elems: (dl.v_stride_bytes / 4) as u32,
+                gb_stride_elems: (dl.gb_stride_bytes / 4) as u32,
+                core_stride_elems: (dl.core_stride_bytes / 4) as u32,
+                gated_stride_elems: (dl.gated_stride_words * 2) as u32,
+            },
+        );
+        b.push(
+            "q3w-pf-dn-conv-chunk",
+            &src,
+            "q3w_pf_delta_conv_chunk",
+            &[
+                (0, &dl.in_all),
+                (1, &conv_w),
+                (2, &conv_state),
+                (3, &dl.mixed),
+                (4, &cp),
+                (50, &pdp),
+            ],
+            conv_grid,
+        )?;
+        b.push(
+            "q3w-pf-dn-split-m",
+            &src,
+            "q3w_pf_delta_split_gated_m",
+            &[
+                (10, &dl.mixed),
+                (11, &dl.qg),
+                (12, &dl.kg),
+                (13, &dl.vg),
+                (14, &dqp),
+                (20, &dl.in_all),
+                (21, &alogdt),
+                (23, &dl.gexp),
+                (24, &dl.beta),
+                (50, &pdp),
+            ],
+            (n_v as u32, m as u32, 1),
+        )?;
+        b.push(
+            "q3w-pf-dn-recurrent-chunk",
+            &src,
+            "q3w_pf_delta_recurrent_chunk",
+            &[
+                (30, &dl.qg),
+                (31, &dl.kg),
+                (32, &dl.vg),
+                (33, &dl.gexp),
+                (34, &dl.beta),
+                (35, &dl.core),
+                (36, &state),
+                (37, &rp),
+                (50, &pdp),
+            ],
+            (n_v as u32, (d_v as u32).div_ceil(32), 1),
+        )?;
+        b.push(
+            "q3w-pf-dn-out-m",
+            &src,
+            "q3w_pf_delta_out_m",
+            &[
+                (40, &dl.core),
+                (41, &norm_w),
+                (42, &dl.in_all),
+                (43, &dl.gated),
+                (44, &dop),
+                (50, &pdp),
+            ],
+            (n_v as u32, m as u32, 1),
+        )?;
         pf_push_proj_m(
             b,
             s,
@@ -5012,18 +4561,17 @@ enum PfKvProj {
     Split(Nvfp4Gpu, Nvfp4Gpu),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_attn(
     b: &mut Builder,
     s: &Sources,
     cfg: &Qwen3MoeConfig,
     a: &HostAttention,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
-    pos_buf: &wgpu::Buffer,
-    fd_buf: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
+    pos_buf: &Buffer,
+    fd_buf: &Buffer,
     max_seq: usize,
-    states: &mut Vec<(wgpu::Buffer, u64)>,
+    states: &mut Vec<(Buffer, u64)>,
     pf: &mut Option<PfMrowBufs>,
 ) -> Result<()> {
     let hidden = cfg.hidden_size;
@@ -5031,11 +4579,11 @@ fn build_attn(
     let n_h = cfg.num_attention_heads;
     let n_kv = cfg.num_key_value_heads;
     let rot = cfg.rotary_dim();
-    anyhow::ensure!(
+    ensure!(
         rot.is_multiple_of(2) && rot <= hd,
         "rotary_dim {rot} invalid"
     );
-    anyhow::ensure!(
+    ensure!(
         hd.is_multiple_of(2) && a.q_norm.len() == hd && a.k_norm.len() == hd,
         "q/k norm weights are {}/{} long, want head_dim {hd} (even)",
         a.q_norm.len(),
@@ -5067,7 +4615,7 @@ fn build_attn(
         0,
     )?;
 
-    anyhow::ensure!(
+    ensure!(
         (a.q.input_global - a.k.input_global).abs() <= 1e-6
             && (a.q.input_global - a.v.input_global).abs() <= 1e-6,
         "q/k/v input_global_scale differ: {} {} {}",
@@ -5096,7 +4644,7 @@ fn build_attn(
         wq.alpha,
     )?;
 
-    let fuse_kv = attn_kv_fused() && nvfp4_rowcat_ok(b.ctx, &a.v, &a.k);
+    let fuse_kv = nvfp4_rowcat_ok(b.ctx, &a.v, &a.k);
     b.at_kv.1 += 1;
     let (v_raw, k_raw, k_src_off, kv_proj) = if fuse_kv {
         let vk = upload_nvfp4_rowcat(b, "q3w-at-vk", &a.v, &a.k);
@@ -5179,119 +4727,41 @@ fn build_attn(
     let k = b.zeros("q3w-at-k", (n_kv * hd * 2) as u64);
     let src_stride_q = if cfg.attn_output_gate { 2 * hd } else { hd };
     let q_f32 = b.zeros("q3w-at-qf32", (n_h * hd * 4) as u64);
-    let fuse_qcast = attn_qcast_fused();
-    let fuse_qknorm = fuse_qcast && attn_qknorm_fused();
-    if fuse_qknorm {
-        let np = b.uni(
-            "q3w-at-qknorm-p",
-            NormRopeParams {
-                n_rows: (n_h + n_kv) as u32,
-                head_dim: hd as u32,
-                src_stride: src_stride_q as u32,
-                rot_half: (rot / 2) as u32,
-                n_q: n_h as u32,
-                k_src_off: k_src_off as u32,
-                k_src_stride: hd as u32,
-                k_w_off: hd as u32,
-                sin_off: sin_off as u32,
-                eps: cfg.rms_norm_eps as f32,
-                ..Default::default()
-            },
-        );
-        b.push(
-            "q3w-at-qknorm",
-            &s.attn,
-            "q3w_attn_norm_rope_qk",
-            &[
-                (0, &q_raw),
-                (1, &qkn),
-                (2, &csb),
-                (3, pos_buf),
-                (4, &k_raw),
-                (5, &q),
-                (6, &np),
-                (7, &q_f32),
-                (8, &k),
-            ],
-            ((n_h + n_kv) as u32, 1, 1),
-        )?;
-        b.at_qknorm.0 += 1;
-        b.at_qcast.0 += 1;
-    } else {
-        let qp = b.uni(
-            "q3w-at-qnorm-p",
-            NormRopeParams {
-                n_rows: n_h as u32,
-                head_dim: hd as u32,
-                src_stride: src_stride_q as u32,
-                rot_half: (rot / 2) as u32,
-                sin_off: sin_off as u32,
-                eps: cfg.rms_norm_eps as f32,
-                ..Default::default()
-            },
-        );
-        if fuse_qcast {
-            b.push(
-                "q3w-at-qnorm",
-                &s.attn,
-                "q3w_attn_norm_rope_f32",
-                &[
-                    (0, &q_raw),
-                    (1, &qkn),
-                    (2, &csb),
-                    (3, pos_buf),
-                    (5, &q),
-                    (6, &qp),
-                    (7, &q_f32),
-                ],
-                (n_h as u32, 1, 1),
-            )?;
-            b.at_qcast.0 += 1;
-        } else {
-            b.push(
-                "q3w-at-qnorm",
-                &s.attn,
-                "q3w_attn_norm_rope",
-                &[
-                    (0, &q_raw),
-                    (1, &qkn),
-                    (2, &csb),
-                    (3, pos_buf),
-                    (5, &q),
-                    (6, &qp),
-                ],
-                (n_h as u32, 1, 1),
-            )?;
-        }
-        let kp = b.uni(
-            "q3w-at-knorm-p",
-            NormRopeParams {
-                n_rows: n_kv as u32,
-                head_dim: hd as u32,
-                src_stride: hd as u32,
-                rot_half: (rot / 2) as u32,
-                src_off: k_src_off as u32,
-                w_off: hd as u32,
-                sin_off: sin_off as u32,
-                eps: cfg.rms_norm_eps as f32,
-                ..Default::default()
-            },
-        );
-        b.push(
-            "q3w-at-knorm",
-            &s.attn,
-            "q3w_attn_norm_rope",
-            &[
-                (0, &k_raw),
-                (1, &qkn),
-                (2, &csb),
-                (3, pos_buf),
-                (5, &k),
-                (6, &kp),
-            ],
-            (n_kv as u32, 1, 1),
-        )?;
-    }
+    let np = b.uni(
+        "q3w-at-qknorm-p",
+        NormRopeParams {
+            n_rows: (n_h + n_kv) as u32,
+            head_dim: hd as u32,
+            src_stride: src_stride_q as u32,
+            rot_half: (rot / 2) as u32,
+            n_q: n_h as u32,
+            k_src_off: k_src_off as u32,
+            k_src_stride: hd as u32,
+            k_w_off: hd as u32,
+            sin_off: sin_off as u32,
+            eps: cfg.rms_norm_eps as f32,
+            ..Default::default()
+        },
+    );
+    b.push(
+        "q3w-at-qknorm",
+        &s.attn,
+        "q3w_attn_norm_rope_qk",
+        &[
+            (0, &q_raw),
+            (1, &qkn),
+            (2, &csb),
+            (3, pos_buf),
+            (4, &k_raw),
+            (5, &q),
+            (6, &np),
+            (7, &q_f32),
+            (8, &k),
+        ],
+        ((n_h + n_kv) as u32, 1, 1),
+    )?;
+    b.at_qknorm.0 += 1;
+    b.at_qcast.0 += 1;
     b.at_qcast.1 += 1;
     b.at_qknorm.1 += 1;
 
@@ -5331,26 +4801,6 @@ fn build_attn(
         (n_kv as u32, 1, 1),
     )?;
 
-    if !fuse_qcast {
-        let cast_p = b.uni(
-            "q3w-at-cast-p",
-            ResScaleParams {
-                n: (n_h * hd) as u32,
-                n_words: (n_h * hd / 2) as u32,
-                scale: 1.0,
-                ..Default::default()
-            },
-        );
-        let grid = b.grid1((n_h * hd / 2) as u64, 256);
-        b.push(
-            "q3w-at-qcast",
-            &s.resscale,
-            "cast_bf16_to_f32",
-            &[(0, &q), (3, &cast_p), (4, &q_f32)],
-            grid,
-        )?;
-    }
-
     let scratch = b.zeros(
         "q3w-at-scratch",
         (n_h * flash_splits() as usize * (hd + 2) * 4) as u64,
@@ -5361,11 +4811,7 @@ fn build_attn(
     b.push(
         "q3w-at-flash1",
         &s.flash,
-        if flash_sd_enabled() {
-            wk::flash_decode::ENTRY_STAGE1_FP8_SD
-        } else {
-            wk::flash_decode::ENTRY_STAGE1_FP8
-        },
+        wk::flash_decode::ENTRY_STAGE1_FP8_SD,
         &[
             (0, &q_f32),
             (4, fd_buf),
@@ -5448,12 +4894,6 @@ fn build_attn(
     };
     b.to_prefill = true;
     let r = (|b: &mut Builder| -> Result<()> {
-        anyhow::ensure!(
-            fuse_qknorm,
-            "M-row prefill covers only the fused q/k norm+rope arm; \
-             NV_Q3_WGPU_FUSE_AT_QKNORM=0 or NV_Q3_WGPU_FUSE_AT_QCAST=0 leaves prefill \
-             on the per-token replay"
-        );
         let m = p.m;
         let hidden_words = hidden / 2;
         if p.attn.is_none() {
@@ -5470,18 +4910,10 @@ fn build_attn(
                 let st = pf_stride_elems_bf16(k_rows) / 2;
                 (st, b.zeros("q3w-pf-at-kraw", (m * st * 4) as u64))
             };
-            let mk_scratch = pf_token_parallel_default_on_escape_to_per_token_copies().then(|| {
-                let scratch_rows =
-                    if pf_flash_tiled_default_on_since_slotml_solo_nll_plus_p006_nats_under_p01_bound_and_557_vs_431_tok_s_user_signed_off() {
-                        m
-                    } else {
-                        PF_MK_FLASH_ROWS_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS
-                    };
-                b.zeros(
-                    "q3w-pf-at-mkscratch",
-                    (n_h * scratch_rows * flash_splits() as usize * (hd + 2) * 4) as u64,
-                )
-            });
+            let mk_scratch = b.zeros(
+                "q3w-pf-at-mkscratch",
+                (n_h * m * flash_splits() as usize * (hd + 2) * 4) as u64,
+            );
             p.attn = Some(PfAttnBufs {
                 fused_kv: fuse_kv,
                 mk_scratch,
@@ -5517,7 +4949,7 @@ fn build_attn(
             });
         }
         let at = p.attn.as_ref().expect("created above");
-        anyhow::ensure!(
+        ensure!(
             at.fused_kv == fuse_kv,
             "kv fusion arm changed between attention layers; the shared M-row scratch \
              assumes one arm for every layer"
@@ -5632,323 +5064,157 @@ fn build_attn(
             },
         );
         let glob_o_m = b.upload_f32("q3w-pf-at-gout", &vec![wo.input_global; m]);
-        let qraw_bytes = (at.q_raw_stride_words * 4) as u64;
-        let vkraw_bytes = (at.vk_raw_stride_words * 4) as u64;
-        let kraw_bytes = (at.k_raw_stride_words * 4) as u64;
-        let gated_bytes = (at.gated_stride_words * 4) as u64;
-        let gate_grid = b.grid1((n_h * hd / 2) as u64, 64);
-        if pf_token_parallel_default_on_escape_to_per_token_copies() {
-            anyhow::ensure!(
-                at.qf32_stride_bytes == (n_h * hd * 4) as u64
-                    && at.attn_stride_bytes == (n_h * hd * 4) as u64,
-                "the MK flash kernels index q and out as tightly packed [token][head][dim] \
-                 rows, so the pf q_f32/attn strides must equal n_h*hd*4 exactly; \
-                 got {} and {} for {}",
-                at.qf32_stride_bytes,
-                at.attn_stride_bytes,
-                n_h * hd * 4
-            );
-            let mk_scratch = at.mk_scratch.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "token-parallel attn needs the mk scratch allocated by the first \
-                     attention layer under the same env; the env changed between layers"
-                )
-            })?;
-            let parp = b.uni(
-                "q3w-pf-at-rope-p",
-                PfAttnRopeParams {
-                    tokens: m as u32,
-                    q_src_stride_elems: (at.q_raw_stride_words * 2) as u32,
-                    k_src_stride_elems: (at.k_raw_stride_words * 2) as u32,
-                    q_out_stride_elems: (at.q_stride_bytes / 2) as u32,
-                    k_out_stride_elems: (at.k_stride_bytes / 2) as u32,
-                    qf_out_stride_elems: (at.qf32_stride_bytes / 4) as u32,
-                    pos_stride_words: PF_MROW_POS_STRIDE_WORDS as u32,
-                    pad0: 0,
-                },
-            );
-            b.push(
-                "q3w-pf-at-qknorm-m",
-                &s.pf_attn,
-                "q3w_pf_attn_norm_rope_qk_m",
-                &[
-                    (0, &at.q_raw),
-                    (1, &qkn),
-                    (2, &csb),
-                    (3, &p.pos_strided_one_i32_per_256b_slot),
-                    (4, &at.k_raw),
-                    (5, &at.q),
-                    (6, &np),
-                    (7, &at.q_f32),
-                    (8, &at.k),
-                    (9, &parp),
-                ],
-                ((n_h + n_kv) as u32, m as u32, 1),
-            )?;
-            let pkv_k = b.uni(
-                "q3w-pf-at-kvq-k-p",
-                PfKvqParams {
-                    tokens: m as u32,
-                    x_stride_elems: (at.k_stride_bytes / 2) as u32,
-                    ..Default::default()
-                },
-            );
-            b.push(
-                "q3w-pf-at-kvq-k-m",
-                &s.pf_kvq,
-                "q3w_pf_quantize_kv_fp8_m",
-                &[
-                    (0, &at.k),
-                    (1, &kc),
-                    (2, &ksc),
-                    (3, &p.pos_strided_one_i32_per_256b_slot),
-                    (4, &kvq_p),
-                    (9, &pkv_k),
-                ],
-                (n_kv as u32, m as u32, 1),
-            )?;
-            let pkv_v = b.uni(
-                "q3w-pf-at-kvq-v-p",
-                PfKvqParams {
-                    tokens: m as u32,
-                    x_stride_elems: (at.vk_raw_stride_words * 2) as u32,
-                    ..Default::default()
-                },
-            );
-            b.push(
-                "q3w-pf-at-kvq-v-m",
-                &s.pf_kvq,
-                "q3w_pf_quantize_kv_fp8_m",
-                &[
-                    (0, &at.vk_raw),
-                    (1, &vc),
-                    (2, &vsc),
-                    (3, &p.pos_strided_one_i32_per_256b_slot),
-                    (4, &kvq_p),
-                    (9, &pkv_v),
-                ],
-                (n_kv as u32, m as u32, 1),
-            )?;
-            let rows = PF_MK_FLASH_ROWS_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS;
-            if pf_flash_tiled_default_on_since_slotml_solo_nll_plus_p006_nats_under_p01_bound_and_557_vs_431_tok_s_user_signed_off() {
-                anyhow::ensure!(
-                    PF_FLASH_TILED_WGSL.contains("const FDT_ROWS: u32 = 32u"),
-                    "the tiled flash tile height is baked as 32 on both sides; \
-                     PF_TILED_FLASH_ROWS_ONE_KV_STREAM_SERVES_32_ROWS_AT_4_PER_WARP and the \
-                     kernel's FDT_ROWS must move together"
-                );
-                let subgroup = wk::gemv_nvfp4_v2::subgroup32_ok(b.ctx);
-                let sd = flash_sd_enabled();
-                let tiled_src = if sd {
-                    pf_flash_tiled_source_sd(subgroup)
-                } else {
-                    pf_flash_tiled_source(subgroup)
-                };
-                let slotml =
-                    pf_flash_tiled_slotml_is_the_default_arm_env_value_1_selects_the_older_tiling_with_larger_nll_penalty();
-                let stock_entry = match (slotml, subgroup) {
-                    (false, true) => "q3w_pf_flash1_fp8kv_tiled_sg",
-                    (false, false) => "q3w_pf_flash1_fp8kv_tiled_wg",
-                    (true, true) => "q3w_pf_flash1_fp8kv_tiled_slotml_sg",
-                    (true, false) => "q3w_pf_flash1_fp8kv_tiled_slotml_wg",
-                };
-                let tiled_entry = if sd {
-                    format!("{stock_entry}_sd")
-                } else {
-                    stock_entry.to_string()
-                };
-                let tiles = m.div_ceil(PF_TILED_FLASH_ROWS_ONE_KV_STREAM_SERVES_32_ROWS_AT_4_PER_WARP);
-                let fdb = ((m + m.div_ceil(rows)) as u64) * PF_MROW_BIND_OFFSET_ALIGN_BYTES;
-                b.push_pf_off_m_row(
-                    "q3w-pf-at-flash1-tiled",
-                    &tiled_src,
-                    &tiled_entry,
-                    &[
-                        (0, &at.q_f32, 0),
-                        (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
-                        (5, &kc, 0),
-                        (6, &vc, 0),
-                        (7, mk_scratch, 0),
-                        (8, &ksc, 0),
-                        (9, &vsc, 0),
-                    ],
-                    (n_h as u32, flash_splits(), tiles as u32),
-                )?;
-                b.push_pf_off_m_row(
-                    "q3w-pf-at-flash2-mk",
-                    &s.flash,
-                    wk::flash_decode::ENTRY_STAGE2_MK,
-                    &[
-                        (3, &at.attn, 0),
-                        (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
-                        (7, mk_scratch, 0),
-                    ],
-                    (n_h as u32, m as u32, 1),
-                )?;
-            } else {
-            let flash1_owned = match (wk::gemv_nvfp4_v2::subgroup32_ok(b.ctx), flash_sd_enabled()) {
-                (true, true) => Some((pf_flash_sg_source_sd(), "q3w_pf_flash1_fp8kv_mk_sg_sd")),
-                (true, false) => Some((pf_flash_sg_source(), "q3w_pf_flash1_fp8kv_mk_sg")),
-                (false, true) => Some((
-                    compose(&format!(
-                        "{}\n{}",
-                        wk::flash_decode::WGSL,
-                        wk::flash_decode::mk_stage1_source_sd()
-                    )),
-                    wk::flash_decode::ENTRY_STAGE1_FP8_MK_SD,
-                )),
-                (false, false) => None,
-            };
-            let (flash1_src, flash1_entry): (&str, &str) = match &flash1_owned {
-                Some((src, entry)) => (src, entry),
-                None => (&s.flash, wk::flash_decode::ENTRY_STAGE1_FP8_MK),
-            };
-            for g in 0..m.div_ceil(rows) {
-                let mr_g = rows.min(m - g * rows);
-                let qb = (g * rows) as u64 * at.qf32_stride_bytes;
-                let ob = (g * rows) as u64 * at.attn_stride_bytes;
-                let fdb = ((m + g) as u64) * PF_MROW_BIND_OFFSET_ALIGN_BYTES;
-                b.push_pf_off_m_row(
-                    "q3w-pf-at-flash1-mk",
-                    flash1_src,
-                    flash1_entry,
-                    &[
-                        (0, &at.q_f32, qb),
-                        (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
-                        (5, &kc, 0),
-                        (6, &vc, 0),
-                        (7, mk_scratch, 0),
-                        (8, &ksc, 0),
-                        (9, &vsc, 0),
-                    ],
-                    (n_h as u32, flash_splits(), 1),
-                )?;
-                b.push_pf_off_m_row(
-                    "q3w-pf-at-flash2-mk",
-                    &s.flash,
-                    wk::flash_decode::ENTRY_STAGE2_MK,
-                    &[
-                        (3, &at.attn, ob),
-                        (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
-                        (7, mk_scratch, 0),
-                    ],
-                    (n_h as u32, mr_g as u32, 1),
-                )?;
-            }
-            }
-            let pagp = b.uni(
-                "q3w-pf-at-gate-p",
-                PfAttnGateParams {
-                    attn_stride_elems: (at.attn_stride_bytes / 4) as u32,
-                    qraw_stride_elems: (at.q_raw_stride_words * 2) as u32,
-                    out_stride_words: at.gated_stride_words as u32,
-                    pad0: 0,
-                },
-            );
-            b.push(
-                "q3w-pf-at-gate-m",
-                &s.pf_attn,
-                "q3w_pf_attn_gate_m",
-                &[
-                    (30, &at.attn),
-                    (31, &at.q_raw),
-                    (32, &at.gated),
-                    (33, &agp),
-                    (34, &pagp),
-                ],
-                (((n_h * hd / 2) as u32).div_ceil(64), m as u32, 1),
-            )?;
+        ensure!(
+            at.qf32_stride_bytes == (n_h * hd * 4) as u64
+                && at.attn_stride_bytes == (n_h * hd * 4) as u64,
+            "the MK flash kernels index q and out as tightly packed [token][head][dim] \
+             rows, so the pf q_f32/attn strides must equal n_h*hd*4 exactly; \
+             got {} and {} for {}",
+            at.qf32_stride_bytes,
+            at.attn_stride_bytes,
+            n_h * hd * 4
+        );
+        let mk_scratch = &at.mk_scratch;
+        let parp = b.uni(
+            "q3w-pf-at-rope-p",
+            PfAttnRopeParams {
+                tokens: m as u32,
+                q_src_stride_elems: (at.q_raw_stride_words * 2) as u32,
+                k_src_stride_elems: (at.k_raw_stride_words * 2) as u32,
+                q_out_stride_elems: (at.q_stride_bytes / 2) as u32,
+                k_out_stride_elems: (at.k_stride_bytes / 2) as u32,
+                qf_out_stride_elems: (at.qf32_stride_bytes / 4) as u32,
+                pos_stride_words: PF_MROW_POS_STRIDE_WORDS as u32,
+                pad0: 0,
+            },
+        );
+        b.push(
+            "q3w-pf-at-qknorm-m",
+            &s.pf_attn,
+            "q3w_pf_attn_norm_rope_qk_m",
+            &[
+                (0, &at.q_raw),
+                (1, &qkn),
+                (2, &csb),
+                (3, &p.pos_strided_one_i32_per_256b_slot),
+                (4, &at.k_raw),
+                (5, &at.q),
+                (6, &np),
+                (7, &at.q_f32),
+                (8, &at.k),
+                (9, &parp),
+            ],
+            ((n_h + n_kv) as u32, m as u32, 1),
+        )?;
+        let pkv_k = b.uni(
+            "q3w-pf-at-kvq-k-p",
+            PfKvqParams {
+                tokens: m as u32,
+                x_stride_elems: (at.k_stride_bytes / 2) as u32,
+                ..Default::default()
+            },
+        );
+        b.push(
+            "q3w-pf-at-kvq-k-m",
+            &s.pf_kvq,
+            "q3w_pf_quantize_kv_fp8_m",
+            &[
+                (0, &at.k),
+                (1, &kc),
+                (2, &ksc),
+                (3, &p.pos_strided_one_i32_per_256b_slot),
+                (4, &kvq_p),
+                (9, &pkv_k),
+            ],
+            (n_kv as u32, m as u32, 1),
+        )?;
+        let pkv_v = b.uni(
+            "q3w-pf-at-kvq-v-p",
+            PfKvqParams {
+                tokens: m as u32,
+                x_stride_elems: (at.vk_raw_stride_words * 2) as u32,
+                ..Default::default()
+            },
+        );
+        b.push(
+            "q3w-pf-at-kvq-v-m",
+            &s.pf_kvq,
+            "q3w_pf_quantize_kv_fp8_m",
+            &[
+                (0, &at.vk_raw),
+                (1, &vc),
+                (2, &vsc),
+                (3, &p.pos_strided_one_i32_per_256b_slot),
+                (4, &kvq_p),
+                (9, &pkv_v),
+            ],
+            (n_kv as u32, m as u32, 1),
+        )?;
+        let rows = PF_MK_FLASH_ROWS_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS;
+        ensure!(
+            PF_FLASH_TILED_WGSL.contains("const FDT_ROWS: u32 = 32u"),
+            "the tiled flash tile height is baked as 32 on both sides; \
+             PF_TILED_FLASH_ROWS_ONE_KV_STREAM_SERVES_32_ROWS_AT_4_PER_WARP and the \
+             kernel's FDT_ROWS must move together"
+        );
+        let subgroup = wk::gemv_nvfp4_v2::subgroup32_ok(b.ctx);
+        let tiled_src = pf_flash_tiled_source_sd(subgroup);
+        let tiled_entry = if subgroup {
+            "q3w_pf_flash1_fp8kv_tiled_slotml_sg_sd"
         } else {
-            for t in 0..m as u64 {
-                let posb = t * (PF_MROW_POS_STRIDE_WORDS as u64 * 4);
-                let fdb = t * PF_MROW_BIND_OFFSET_ALIGN_BYTES;
-                b.push_pf_off(
-                    "q3w-pf-at-qknorm",
-                    &s.attn,
-                    "q3w_attn_norm_rope_qk",
-                    &[
-                        (0, &at.q_raw, t * qraw_bytes),
-                        (1, &qkn, 0),
-                        (2, &csb, 0),
-                        (3, &p.pos_strided_one_i32_per_256b_slot, posb),
-                        (4, &at.k_raw, t * kraw_bytes),
-                        (5, &at.q, t * at.q_stride_bytes),
-                        (6, &np, 0),
-                        (7, &at.q_f32, t * at.qf32_stride_bytes),
-                        (8, &at.k, t * at.k_stride_bytes),
-                    ],
-                    ((n_h + n_kv) as u32, 1, 1),
-                )?;
-                b.push_pf_off(
-                    "q3w-pf-at-kvq-k",
-                    &s.kvq,
-                    wk::kv_fp8::QUANTIZE_ENTRY,
-                    &[
-                        (0, &at.k, t * at.k_stride_bytes),
-                        (1, &kc, 0),
-                        (2, &ksc, 0),
-                        (3, &p.pos_strided_one_i32_per_256b_slot, posb),
-                        (4, &kvq_p, 0),
-                    ],
-                    (n_kv as u32, 1, 1),
-                )?;
-                b.push_pf_off(
-                    "q3w-pf-at-kvq-v",
-                    &s.kvq,
-                    wk::kv_fp8::QUANTIZE_ENTRY,
-                    &[
-                        (0, &at.vk_raw, t * vkraw_bytes),
-                        (1, &vc, 0),
-                        (2, &vsc, 0),
-                        (3, &p.pos_strided_one_i32_per_256b_slot, posb),
-                        (4, &kvq_p, 0),
-                    ],
-                    (n_kv as u32, 1, 1),
-                )?;
-                b.push_pf_off(
-                    "q3w-pf-at-flash1",
-                    &s.flash,
-                    if flash_sd_enabled() {
-                        wk::flash_decode::ENTRY_STAGE1_FP8_SD
-                    } else {
-                        wk::flash_decode::ENTRY_STAGE1_FP8
-                    },
-                    &[
-                        (0, &at.q_f32, t * at.qf32_stride_bytes),
-                        (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
-                        (5, &kc, 0),
-                        (6, &vc, 0),
-                        (7, &scratch, 0),
-                        (8, &ksc, 0),
-                        (9, &vsc, 0),
-                    ],
-                    (n_h as u32, flash_splits(), 1),
-                )?;
-                b.push_pf_off(
-                    "q3w-pf-at-flash2",
-                    &s.flash,
-                    wk::flash_decode::ENTRY_STAGE2,
-                    &[
-                        (3, &at.attn, t * at.attn_stride_bytes),
-                        (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
-                        (7, &scratch, 0),
-                    ],
-                    (n_h as u32, 1, 1),
-                )?;
-                b.push_pf_off(
-                    "q3w-pf-at-gate",
-                    &s.attn,
-                    "q3w_attn_gate",
-                    &[
-                        (30, &at.attn, t * at.attn_stride_bytes),
-                        (31, &at.q_raw, t * qraw_bytes),
-                        (32, &at.gated, t * gated_bytes),
-                        (33, &agp, 0),
-                    ],
-                    gate_grid,
-                )?;
-            }
-        }
+            "q3w_pf_flash1_fp8kv_tiled_slotml_wg_sd"
+        };
+        let tiles = m.div_ceil(PF_TILED_FLASH_ROWS_ONE_KV_STREAM_SERVES_32_ROWS_AT_4_PER_WARP);
+        let fdb = ((m + m.div_ceil(rows)) as u64) * PF_MROW_BIND_OFFSET_ALIGN_BYTES;
+        b.push_pf_off_m_row(
+            "q3w-pf-at-flash1-tiled",
+            &tiled_src,
+            tiled_entry,
+            &[
+                (0, &at.q_f32, 0),
+                (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
+                (5, &kc, 0),
+                (6, &vc, 0),
+                (7, mk_scratch, 0),
+                (8, &ksc, 0),
+                (9, &vsc, 0),
+            ],
+            (n_h as u32, flash_splits(), tiles as u32),
+        )?;
+        b.push_pf_off_m_row(
+            "q3w-pf-at-flash2-mk",
+            &s.flash,
+            wk::flash_decode::ENTRY_STAGE2_MK,
+            &[
+                (3, &at.attn, 0),
+                (4, &p.fd_strided_one_fdparams_per_256b_slot, fdb),
+                (7, mk_scratch, 0),
+            ],
+            (n_h as u32, m as u32, 1),
+        )?;
+        let pagp = b.uni(
+            "q3w-pf-at-gate-p",
+            PfAttnGateParams {
+                attn_stride_elems: (at.attn_stride_bytes / 4) as u32,
+                qraw_stride_elems: (at.q_raw_stride_words * 2) as u32,
+                out_stride_words: at.gated_stride_words as u32,
+                pad0: 0,
+            },
+        );
+        b.push(
+            "q3w-pf-at-gate-m",
+            &s.pf_attn,
+            "q3w_pf_attn_gate_m",
+            &[
+                (30, &at.attn),
+                (31, &at.q_raw),
+                (32, &at.gated),
+                (33, &agp),
+                (34, &pagp),
+            ],
+            (((n_h * hd / 2) as u32).div_ceil(64), m as u32, 1),
+        )?;
+
         push_quant_rows(
             b,
             s,
@@ -5990,20 +5256,19 @@ fn build_attn(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn emit_moe_w8(
     b: &mut Builder,
     s: &Sources,
     m: &HostMoe,
-    x: &wgpu::Buffer,
-    ids: &wgpu::Buffer,
-    wts: &wgpu::Buffer,
+    x: &Buffer,
+    ids: &Buffer,
+    wts: &Buffer,
     k_top: usize,
     hidden: usize,
     inter: usize,
     sinter: usize,
     hidden_words: usize,
-    out: &wgpu::Buffer,
+    out: &Buffer,
 ) -> Result<()> {
     let eg = upload_experts_i8(b, "q3w-moe8-eg", &m.experts_gate);
     let eu = upload_experts_i8(b, "q3w-moe8-eu", &m.experts_up);
@@ -6138,14 +5403,13 @@ fn emit_moe_w8(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_moe(
     b: &mut Builder,
     s: &Sources,
     cfg: &Qwen3MoeConfig,
     m: &HostMoe,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
     pf: &mut Option<PfMrowBufs>,
 ) -> Result<()> {
     let hidden = cfg.hidden_size;
@@ -6155,18 +5419,17 @@ fn build_moe(
     let e = cfg.num_experts;
     let k_top = cfg.num_experts_per_tok;
 
-    anyhow::ensure!(
+    ensure!(
         m.experts_gate.input_globals == m.experts_up.input_globals,
         "expert gate/up input_global_scale differ; the wgpu path quantizes the token once per slot"
     );
-    anyhow::ensure!(
+    ensure!(
         (m.shared_gate.input_global - m.shared_up.input_global).abs() <= 1e-6,
         "shared expert gate/up input_global_scale differ"
     );
 
     let w8 = w8_experts_enabled(b.ctx);
-    let fold = shared_expert_folded()
-        && !w8
+    let fold = !w8
         && sinter == inter
         && m.shared_gate.n == inter
         && m.shared_up.n == inter
@@ -6178,8 +5441,7 @@ fn build_moe(
     b.shared_fold.1 += 1;
     let slots = k_top + usize::from(fold);
 
-    let gate_fused =
-        router_gate_fused() && m.shared_expert_gate.n == 1 && m.shared_expert_gate.k == m.router.k;
+    let gate_fused = m.shared_expert_gate.n == 1 && m.shared_expert_gate.k == m.router.k;
     let router = if gate_fused {
         let mut w = Vec::with_capacity((m.router.n + 1) * m.router.k);
         w.extend_from_slice(&m.router.w);
@@ -6210,17 +5472,12 @@ fn build_moe(
             ..Default::default()
         },
     );
-    anyhow::ensure!(
+    ensure!(
         e <= 256,
         "router top-k kernels bound n_experts to 256, got {e}"
     );
-    let par = router_par_enabled();
-    let (topk_label, topk_entry) = if par {
-        router_topk_entry()
-    } else {
-        ("q3w-moe-topk", "q3w_router_topk")
-    };
-    b.router_par.0 += usize::from(par);
+    let (topk_label, topk_entry) = router_topk_entry();
+    b.router_par.0 += 1;
     b.router_par.1 += 1;
     b.push(
         topk_label,
@@ -6256,9 +5513,7 @@ fn build_moe(
         nvfp4_v2_route(b.ctx, n, hidden, hb, slots)
             .map(|r| (r.entry, r.rows_per_group, r.vec4, r.source))
     };
-    let fuse_gu = gate_up_fused()
-        && fuse_silu_quant_enabled()
-        && m.experts_gate.n.is_multiple_of(128)
+    let fuse_gu = m.experts_gate.n.is_multiple_of(128)
         && m.experts_gate.alphas == m.experts_up.alphas
         && m.experts_gate.input_globals == m.experts_up.input_globals
         && (!fold
@@ -6389,55 +5644,22 @@ fn build_moe(
 
     let aq = b.zeros("q3w-moe-aq", (slots * inter / 2) as u64);
     let as_ = b.zeros("q3w-moe-as", (slots * ib) as u64);
-    if fuse_silu_quant_enabled() {
-        push_silu_mul_quant(
-            b,
-            s,
-            "q3w-moe-siluq",
-            &y_gate,
-            &y_up,
-            &aq,
-            &as_,
-            &ids,
-            &ed.globals,
-            inter,
-            slots,
-            true,
-            true,
-            fuse_gu,
-        )?;
-    } else {
-        let act = b.zeros("q3w-moe-act", (slots * inter * 2) as u64);
-        let smp = b.uni(
-            "q3w-moe-silu-p",
-            SiluMulParams {
-                n_words: (slots * inter / 2) as u32,
-                ..Default::default()
-            },
-        );
-        let grid = b.grid1((slots * inter / 2) as u64, 64);
-        b.push(
-            "q3w-moe-silu",
-            &s.moe,
-            "q3w_silu_mul",
-            &[(10, &y_gate), (11, &y_up), (12, &act), (13, &smp)],
-            grid,
-        )?;
-        push_quant_rows(
-            b,
-            s,
-            "q3w-moe-aquant",
-            &act,
-            &aq,
-            &as_,
-            &ids,
-            &ed.globals,
-            inter,
-            slots,
-            true,
-            inter,
-        )?;
-    }
+    push_silu_mul_quant(
+        b,
+        s,
+        "q3w-moe-siluq",
+        &y_gate,
+        &y_up,
+        &aq,
+        &as_,
+        &ids,
+        &ed.globals,
+        inter,
+        slots,
+        true,
+        true,
+        fuse_gu,
+    )?;
 
     let y_down = b.zeros("q3w-moe-ydown", (slots * hidden * 2) as u64);
     push_gemv_nvfp4(
@@ -6510,17 +5732,12 @@ fn build_moe(
     };
     b.to_prefill = true;
     let r = (|b: &mut Builder| -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             fold && gate_fused,
             "M-row prefill covers only the folded-shared-expert + fused-router-gate arm; \
              this layer fell back, so prefill stays on the per-token replay"
         );
-        anyhow::ensure!(
-            fuse_silu_quant_enabled(),
-            "M-row prefill covers only the fused silu+quant arm; \
-             NV_Q3_WGPU_FUSE_SILU_QUANT=0 leaves prefill on the per-token replay"
-        );
-        anyhow::ensure!(
+        ensure!(
             slots <= PF_MROW_POS_STRIDE_WORDS,
             "the per-token top-k copies write ids/wts into one {PF_MROW_BIND_OFFSET_ALIGN_BYTES}B \
              slot each, which holds at most {PF_MROW_POS_STRIDE_WORDS} entries; got {slots} slots"
@@ -6568,7 +5785,7 @@ fn build_moe(
             });
         }
         let mo = p.moe.as_ref().expect("created above");
-        anyhow::ensure!(
+        ensure!(
             mo.y_gate.size() == ygu_bytes && mo.rl_stride_bytes == pf_stride_bytes_f32(router.n),
             "the gate/up fusion arm or router width changed between layers; the shared \
              M-row scratch assumes one arm for every layer"
@@ -6584,47 +5801,31 @@ fn build_moe(
             (mo.rl_stride_bytes / 4) as usize,
             true,
         )?;
-        if pf_token_parallel_default_on_escape_to_per_token_copies() {
-            let ptkp = b.uni(
-                "q3w-pf-moe-topk-p",
-                PfTopkParams {
-                    tokens: m_tok as u32,
-                    rl_stride_words: (mo.rl_stride_bytes / 4) as u32,
-                    sel_stride_words: PF_MROW_POS_STRIDE_WORDS as u32,
-                    pad0: 0,
-                },
-            );
-            b.push(
-                "q3w-pf-moe-topk-m",
-                &s.pf_moe,
-                "q3w_pf_router_topk_m",
-                &[
-                    (0, &mo.rlogits),
-                    (1, &mo.ids),
-                    (2, &mo.wts),
-                    (3, &rp),
-                    (4, &ptkp),
-                ],
-                (m_tok as u32, 1, 1),
-            )?;
-        } else {
-            for t in 0..m_tok as u64 {
-                b.push_pf_off(
-                    "q3w-pf-moe-topk",
-                    &s.moe,
-                    topk_entry,
-                    &[
-                        (0, &mo.rlogits, t * mo.rl_stride_bytes),
-                        (1, &mo.ids, t * PF_MROW_BIND_OFFSET_ALIGN_BYTES),
-                        (2, &mo.wts, t * PF_MROW_BIND_OFFSET_ALIGN_BYTES),
-                        (3, &rp, 0),
-                    ],
-                    (1, 1, 1),
-                )?;
-            }
-        }
+        let ptkp = b.uni(
+            "q3w-pf-moe-topk-p",
+            PfTopkParams {
+                tokens: m_tok as u32,
+                rl_stride_words: (mo.rl_stride_bytes / 4) as u32,
+                sel_stride_words: PF_MROW_POS_STRIDE_WORDS as u32,
+                pad0: 0,
+            },
+        );
+        b.push(
+            "q3w-pf-moe-topk-m",
+            &s.pf_moe,
+            "q3w_pf_router_topk_m",
+            &[
+                (0, &mo.rlogits),
+                (1, &mo.ids),
+                (2, &mo.wts),
+                (3, &rp),
+                (4, &ptkp),
+            ],
+            (m_tok as u32, 1, 1),
+        )?;
+
         let rep_groups = ((zslots * hidden_words) as u32).div_ceil(256);
-        anyhow::ensure!(
+        ensure!(
             rep_groups <= b.ctx.caps.max_compute_workgroups_per_dimension,
             "the x-replicate glue pass needs {rep_groups} workgroups in one dimension, \
              over the device limit {}",
@@ -6662,10 +5863,8 @@ fn build_moe(
             &[(0, &p.normed_post), (1, &mo.x_rep), (2, &repp)],
             (rep_groups, 1, 1),
         )?;
-        let sel_slots: &wgpu::Buffer = &mo.sel_flat;
-        let grouped_on = pf_token_parallel_default_on_escape_to_per_token_copies()
-            && pf_moe_grouped_default_on_reuses_expert_weight_loads_across_sorted_slots()
-            && e < 257;
+        let sel_slots: &Buffer = &mo.sel_flat;
+        let grouped_on = e < 257;
         if grouped_on {
             let psp = b.uni(
                 "q3w-pf-moe-sort-p",
@@ -6831,54 +6030,34 @@ fn build_moe(
                 1.0,
             )?;
         }
-        let comb_grid = b.grid1(hidden_words as u64, 64);
         let tok_block_bytes = (slots * hidden * 2) as u64;
-        if pf_token_parallel_default_on_escape_to_per_token_copies() {
-            let pmcp = b.uni(
-                "q3w-pf-moe-comb-m-p",
-                PfCombineParams {
-                    tokens: m_tok as u32,
-                    y_stride_words: (tok_block_bytes / 4) as u32,
-                    wts_stride_words: PF_MROW_POS_STRIDE_WORDS as u32,
-                    slogit_stride_words: (mo.rl_stride_bytes / 4) as u32,
-                    out_stride_words: hidden_words as u32,
-                    sel_slots_per_token: slots as u32,
-                    ..Default::default()
-                },
-            );
-            b.push(
-                "q3w-pf-moe-combine-m",
-                &s.pf_moe,
-                "q3w_pf_moe_combine_m",
-                &[
-                    (20, &mo.y_down),
-                    (21, &mo.wts),
-                    (22, &mo.y_down),
-                    (23, &mo.rlogits),
-                    (24, &p.moe_out),
-                    (25, &mcp),
-                    (26, &pmcp),
-                ],
-                ((hidden_words as u32).div_ceil(64), m_tok as u32, 1),
-            )?;
-            return Ok(());
-        }
-        for t in 0..m_tok as u64 {
-            b.push_pf_off(
-                "q3w-pf-moe-combine",
-                &s.moe,
-                "q3w_moe_combine",
-                &[
-                    (20, &mo.y_down, t * tok_block_bytes),
-                    (21, &mo.wts, t * PF_MROW_BIND_OFFSET_ALIGN_BYTES),
-                    (22, &mo.y_down, t * tok_block_bytes),
-                    (23, &mo.rlogits, t * mo.rl_stride_bytes),
-                    (24, &p.moe_out, t * (hidden * 2) as u64),
-                    (25, &mcp, 0),
-                ],
-                comb_grid,
-            )?;
-        }
+        let pmcp = b.uni(
+            "q3w-pf-moe-comb-m-p",
+            PfCombineParams {
+                tokens: m_tok as u32,
+                y_stride_words: (tok_block_bytes / 4) as u32,
+                wts_stride_words: PF_MROW_POS_STRIDE_WORDS as u32,
+                slogit_stride_words: (mo.rl_stride_bytes / 4) as u32,
+                out_stride_words: hidden_words as u32,
+                sel_slots_per_token: slots as u32,
+                ..Default::default()
+            },
+        );
+        b.push(
+            "q3w-pf-moe-combine-m",
+            &s.pf_moe,
+            "q3w_pf_moe_combine_m",
+            &[
+                (20, &mo.y_down),
+                (21, &mo.wts),
+                (22, &mo.y_down),
+                (23, &mo.rlogits),
+                (24, &p.moe_out),
+                (25, &mcp),
+                (26, &pmcp),
+            ],
+            ((hidden_words as u32).div_ceil(64), m_tok as u32, 1),
+        )?;
         Ok(())
     })(b);
     b.to_prefill = false;
@@ -6893,10 +6072,10 @@ fn emit_shared_expert(
     b: &mut Builder,
     s: &Sources,
     m: &HostMoe,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     hidden: usize,
     sinter: usize,
-) -> Result<wgpu::Buffer> {
+) -> Result<Buffer> {
     let hb = hidden / NVFP4_BLOCK;
     let sel0 = b.upload_u32("q3w-moe-sel0", &[0u32]);
     let adummy = b.upload_f32("q3w-moe-adummy", &[1.0f32]);
@@ -6963,55 +6142,22 @@ fn emit_shared_expert(
     let saq = b.zeros("q3w-moe-saq", (sinter / 2) as u64);
     let sas = b.zeros("q3w-moe-sas", (sib.div_ceil(4) * 4) as u64);
     let sdglob = b.upload_f32("q3w-moe-sdglob", &[sd.input_global]);
-    if fuse_silu_quant_enabled() {
-        push_silu_mul_quant(
-            b,
-            s,
-            "q3w-moe-ssiluq",
-            &sy_g,
-            &sy_u,
-            &saq,
-            &sas,
-            &sel0,
-            &sdglob,
-            sinter,
-            1,
-            false,
-            false,
-            false,
-        )?;
-    } else {
-        let sact = b.zeros("q3w-moe-sact", (sinter * 2) as u64);
-        let ssp = b.uni(
-            "q3w-moe-ssilu-p",
-            SiluMulParams {
-                n_words: (sinter / 2) as u32,
-                ..Default::default()
-            },
-        );
-        let grid = b.grid1((sinter / 2) as u64, 64);
-        b.push(
-            "q3w-moe-ssilu",
-            &s.moe,
-            "q3w_silu_mul",
-            &[(10, &sy_g), (11, &sy_u), (12, &sact), (13, &ssp)],
-            grid,
-        )?;
-        push_quant_rows(
-            b,
-            s,
-            "q3w-moe-saquant",
-            &sact,
-            &saq,
-            &sas,
-            &sel0,
-            &sdglob,
-            sinter,
-            1,
-            false,
-            0,
-        )?;
-    }
+    push_silu_mul_quant(
+        b,
+        s,
+        "q3w-moe-ssiluq",
+        &sy_g,
+        &sy_u,
+        &saq,
+        &sas,
+        &sel0,
+        &sdglob,
+        sinter,
+        1,
+        false,
+        false,
+        false,
+    )?;
     let shared_out = b.zeros("q3w-moe-sout", (hidden * 2) as u64);
     push_gemv_nvfp4(
         b,
@@ -7095,32 +6241,25 @@ impl WeightSource<'_> {
     }
 }
 
-fn load_bf16(w: &nv_weights::WeightLoader, names: &[&str], shape: &[usize]) -> Result<Vec<u16>> {
+fn load_bf16(w: &WeightLoader, names: &[&str], shape: &[usize]) -> Result<Vec<u16>> {
     for n in names {
         if w.has(n) {
             let t = w
                 .get(n, candle_core::DType::BF16)
                 .with_context(|| format!("load {n}"))?;
-            anyhow::ensure!(t.dims() == shape, "{n}: shape {:?} != {shape:?}", t.dims());
-            let v: Vec<half::bf16> = t.flatten_all()?.to_vec1()?;
+            ensure!(t.dims() == shape, "{n}: shape {:?} != {shape:?}", t.dims());
+            let v: Vec<bf16> = t.flatten_all()?.to_vec1()?;
             return Ok(v.into_iter().map(|x| x.to_bits()).collect());
         }
     }
-    anyhow::bail!("none of {names:?} found")
+    bail!("none of {names:?} found")
 }
 
 pub fn norm_plus_one_enabled() -> bool {
-    !matches!(
-        std::env::var("NV_QWEN36_NORM_PLUS_ONE").ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
+    env_not_off("NV_QWEN36_NORM_PLUS_ONE")
 }
 
-fn load_norm_plus_one(
-    w: &nv_weights::WeightLoader,
-    names: &[&str],
-    dim: usize,
-) -> Result<Vec<u16>> {
+fn load_norm_plus_one(w: &WeightLoader, names: &[&str], dim: usize) -> Result<Vec<u16>> {
     let raw = load_bf16(w, names, &[dim])?;
     if !norm_plus_one_enabled() {
         return Ok(raw);
@@ -7131,29 +6270,24 @@ fn load_norm_plus_one(
         .collect())
 }
 
-fn load_f32_vec(w: &nv_weights::WeightLoader, names: &[&str], dim: usize) -> Result<Vec<f32>> {
+pub(crate) fn load_f32_vec(w: &WeightLoader, names: &[&str], dim: usize) -> Result<Vec<f32>> {
     let raw = load_bf16(w, names, &[dim])?;
     Ok(raw.into_iter().map(bf16_val).collect())
 }
 
-pub fn load_nvfp4(
-    w: &nv_weights::WeightLoader,
-    module: &str,
-    n: usize,
-    k: usize,
-) -> Result<HostNvfp4Lin> {
+pub fn load_nvfp4(w: &WeightLoader, module: &str, n: usize, k: usize) -> Result<HostNvfp4Lin> {
     let packed_name = format!("{module}.weight_packed");
     let shape = w
         .shape_of(&packed_name)
-        .ok_or_else(|| anyhow::anyhow!("missing {packed_name}"))?;
-    anyhow::ensure!(
+        .ok_or_else(|| anyhow!("missing {packed_name}"))?;
+    ensure!(
         shape.len() == 2 && shape[0] == n && shape[1] == k / 2,
         "{module}: weight_packed shape {shape:?}, want [{n}, {}]",
         k / 2
     );
     let packed = w.raw_bytes(&packed_name)?.to_vec();
     let scale_raw = w.raw_bytes(&format!("{module}.weight_scale"))?.to_vec();
-    anyhow::ensure!(
+    ensure!(
         scale_raw.len() == n * k / NVFP4_BLOCK,
         "{module}: weight_scale {} bytes, want {}",
         scale_raw.len(),
@@ -7183,13 +6317,13 @@ pub fn load_nvfp4(
     })
 }
 
-fn scalar_f32(w: &nv_weights::WeightLoader, name: &str) -> Result<f32> {
+fn scalar_f32(w: &WeightLoader, name: &str) -> Result<f32> {
     let t = w.get(name, candle_core::DType::F32)?;
     let v: Vec<f32> = t.flatten_all()?.to_vec1()?;
     Ok(*v.first().unwrap_or(&1.0))
 }
 
-fn load_layer(cfg: &Qwen3MoeConfig, w: &nv_weights::WeightLoader, idx: usize) -> Result<HostLayer> {
+fn load_layer(cfg: &Qwen3MoeConfig, w: &WeightLoader, idx: usize) -> Result<HostLayer> {
     let prefix = format!("model.language_model.layers.{idx}");
     let alt = format!("model.layers.{idx}");
     let input_ln = load_norm_plus_one(
@@ -7372,7 +6506,7 @@ fn load_layer(cfg: &Qwen3MoeConfig, w: &nv_weights::WeightLoader, idx: usize) ->
     })
 }
 
-fn rbf(x: f32) -> f32 {
+pub(crate) fn rbf(x: f32) -> f32 {
     bf16_val(bf16_bits(x))
 }
 
@@ -7456,15 +6590,15 @@ fn ref_kv_fp8(rows: &[f32], n_kv: usize, hd: usize) -> Vec<f32> {
     out
 }
 
-fn silu(x: f32) -> f32 {
+pub(crate) fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-fn sigmoid(x: f32) -> f32 {
+pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-fn ref_gemv_bf16(w: &HostBf16Lin, x: &[f32]) -> Vec<f32> {
+pub(crate) fn ref_gemv_bf16(w: &HostBf16Lin, x: &[f32]) -> Vec<f32> {
     let mut y = vec![0f32; w.n];
     for r in 0..w.n {
         let mut acc = 0f32;
@@ -7495,7 +6629,7 @@ pub fn ref_gemv_nvfp4(lin: &HostNvfp4Lin, x_eff: &[f32]) -> Vec<f32> {
     y
 }
 
-fn ref_rmsnorm(x: &[f32], w: &[u16], eps: f32) -> Vec<f32> {
+pub(crate) fn ref_rmsnorm(x: &[f32], w: &[u16], eps: f32) -> Vec<f32> {
     let n = x.len();
     let mut ss = 0f32;
     for v in x {
@@ -7508,14 +6642,30 @@ fn ref_rmsnorm(x: &[f32], w: &[u16], eps: f32) -> Vec<f32> {
 pub struct RefState {
     conv: Vec<Vec<f32>>,
     rec: Vec<Vec<f32>>,
-    kc: Vec<Vec<f32>>,
-    vc: Vec<Vec<f32>>,
-    pos: usize,
+    pub(crate) kc: Vec<Vec<f32>>,
+    pub(crate) vc: Vec<Vec<f32>>,
+    pub(crate) pos: usize,
+}
+
+pub trait RefStateLayers {
+    fn ref_state_layers(&self) -> usize;
+}
+
+impl RefStateLayers for Qwen3MoeConfig {
+    fn ref_state_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
+}
+
+impl RefStateLayers for crate::qwen3_5_moe::Qwen3_5DenseConfig {
+    fn ref_state_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
 }
 
 impl RefState {
-    pub fn new(cfg: &Qwen3MoeConfig) -> Self {
-        let l = cfg.num_hidden_layers;
+    pub fn new(cfg: &impl RefStateLayers) -> Self {
+        let l = cfg.ref_state_layers();
         Self {
             conv: vec![Vec::new(); l],
             rec: vec![Vec::new(); l],
@@ -7567,7 +6717,7 @@ pub fn reference_step(
     Ok(ref_gemv_bf16(&lm, &fx))
 }
 
-fn ref_delta(
+pub(crate) fn ref_delta(
     cfg: &Qwen3MoeConfig,
     d: &HostDeltaNet,
     x: &[f32],

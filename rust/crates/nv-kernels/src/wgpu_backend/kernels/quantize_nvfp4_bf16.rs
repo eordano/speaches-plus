@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::kernels::gemv_nvfp4;
 use crate::wgpu_backend::pack::pack_u16_even_min_one_word as pack_words;

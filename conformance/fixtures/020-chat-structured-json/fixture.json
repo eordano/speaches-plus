@@ -51,7 +51,7 @@
   "comparison_strategy": "structural+jsonschema",
   "ref_outputs": {
     "mode": "placeholder",
-    "notes": "Today `response_format` is not yet honored by NvEngineChat (it falls through to free-form decode). The structural assertion in placeholder mode is: route accepts the request body without rejecting `response_format` as an unknown field (serde permits unknown keys via #[serde(default)] on other fields; this fixture is the regression gate for that). When grammar-constrained decode lands the schema-match assertion turns on."
+    "notes": "`response_format: {\"type\": \"json_object\"}` is enforced at the token level (any JSON object). The `schema` key nested directly under a json_object response_format is not read by OpenAI-compatible servers, this one included, so the schema-match assertion holds only when the model follows the system prompt. 020-chat-guided-schema-keywords is the fixture for schema enforcement via `json_schema`."
   },
   "skip_when_no_model": true
 }

@@ -4,13 +4,13 @@ The multimedia nano-vLLM. One process, one OpenAI-compatible HTTP surface, multi
 
 Bundles five planes:
 
-- **Qwen3-TTS** -- small text-to-speech with three modes (preset voice, voice design, voice cloning).
-- **Qwen3-Omni** -- multimodal chat (any-to-any), transcription, translation. With talker -> speaks back.
-- **Qwen3-ForcedAligner** -- word-level timestamps, drives SRT / VTT subtitles.
-- **Gemma 4** -- alternative chat path (image + audio + video in, text out).
-- **Kokoro TTS** -- 82M ONNX TTS, runs on CPU at real-time, 55 voices across 8 languages.
+- Qwen3-TTS -- small text-to-speech with three modes (preset voice, voice design, voice cloning).
+- Qwen3-Omni -- multimodal chat (any-to-any), transcription, translation. With talker -> speaks back.
+- Qwen3-ForcedAligner -- word-level timestamps, drives SRT / VTT subtitles.
+- Gemma 4 -- alternative chat path (image + audio + video in, text out).
+- Kokoro TTS -- 82M ONNX TTS, runs on CPU at real-time, 55 voices across 8 languages.
 
-Plus an embedded **nano-vllm** engine (CUDA only) for vLLM-class throughput on the autoregressive paths.
+Plus an embedded nano-vllm engine (CUDA only) for vLLM-class throughput on the autoregressive paths.
 
 ## Quick start
 

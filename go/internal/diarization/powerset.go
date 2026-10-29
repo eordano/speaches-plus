@@ -71,9 +71,7 @@ func argmax(row []float32) int {
 func buildMapping(numClasses, maxSetSize int) [][]int {
 	var out [][]int
 	for size := 0; size <= maxSetSize; size++ {
-		for _, combo := range combinations(numClasses, size) {
-			out = append(out, combo)
-		}
+		out = append(out, combinations(numClasses, size)...)
 	}
 	return out
 }

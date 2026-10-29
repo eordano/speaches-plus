@@ -322,39 +322,18 @@ impl DotsW4Weights {
         );
         Ok((words, scales, biases))
     }
-
-    pub fn dense_pretransposed(
-        &self,
-        module: &str,
-        n: usize,
-        k: usize,
-        dtype: DType,
-    ) -> Result<Tensor> {
-        Ok(
-            Tensor::from_vec(self.dense_f32(module, n, k)?, (n, k), &Device::Cpu)?
-                .t()?
-                .contiguous()?
-                .to_dtype(dtype)?
-                .to_device(&self.device)?,
-        )
-    }
 }
 
 pub const DOTS_HEAD_W_DELETES_A_933MB_STRIDED_TRANSPOSE_COPY_PER_HEAD_CHUNK: &str =
     "nv_layers::Linear's Metal fallback materializes weight.t().contiguous() on every forward, \
      so the chunked head CE re-transposed the [151936,1536] fp32 lm_head once per chunk (12x \
-     per step on the n25 basis). NV_DOTS_HEAD_W picks the resident layout: unset/'view' holds \
-     the untransposed [151936,1536] tensor and runs the forward GEMM through a transposed view \
-     (no copy ever, and the backward dx GEMM then sees a contiguous rhs, the faster mlx layout \
-     at the 151936-k shape); 1 holds one resident [1536,151936] pretransposed tensor, feeding \
-     identical bytes to the identical GEMM layout the per-call copy fed, so it is bitwise by \
-     construction; 0 restores the per-call Linear path. All three arms reproduce the canonical \
-     20-step trajectory, the 28 eval CEs and the adapter delta-amax bit-for-bit on the n25 \
-     basis, so the no-copy contiguous-dx arm ships as the default";
+     per step on the n25 basis). The head holds the untransposed [151936,1536] tensor and runs \
+     the forward GEMM through a transposed view (no copy ever, and the backward dx GEMM then \
+     sees a contiguous rhs, the faster mlx layout at the 151936-k shape); it reproduces the \
+     canonical 20-step trajectory, the 28 eval CEs and the adapter delta-amax of the per-call \
+     copy bit-for-bit on the n25 basis";
 
 pub enum DotsHeadWeight {
-    TransposeEveryCall(Linear),
-    Pretransposed(Tensor),
     TransposedView(Tensor),
     #[cfg(feature = "metal")]
     W4Fused(std::sync::Arc<crate::dots_w4head::DotsW4Head>),
@@ -382,30 +361,15 @@ impl DotsHeadWeight {
                 "NV_DOTS_QLORA_W4HEAD=1 needs the metal feature: the fused W4 head is an MSL path"
             );
         }
-        match std::env::var("NV_DOTS_HEAD_W").as_deref() {
-            Ok("0") => Ok(Self::TransposeEveryCall(src.dense_linear(
-                DOTS_LM_HEAD_MODULE,
-                n,
-                k,
-                false,
-                dtype,
-            )?)),
-            Ok("1") => Ok(Self::Pretransposed(src.dense_pretransposed(
-                DOTS_LM_HEAD_MODULE,
-                n,
-                k,
-                dtype,
-            )?)),
-            _ => Ok(Self::TransposedView(
-                Tensor::from_vec(
-                    src.dense_f32(DOTS_LM_HEAD_MODULE, n, k)?,
-                    (n, k),
-                    &Device::Cpu,
-                )?
-                .to_dtype(dtype)?
-                .to_device(src.device())?,
-            )),
-        }
+        Ok(Self::TransposedView(
+            Tensor::from_vec(
+                src.dense_f32(DOTS_LM_HEAD_MODULE, n, k)?,
+                (n, k),
+                &Device::Cpu,
+            )?
+            .to_dtype(dtype)?
+            .to_device(src.device())?,
+        ))
     }
 
     fn matmul_2d(&self, x: &Tensor, dims: &[usize], k: usize, n: usize) -> Result<Tensor> {
@@ -417,9 +381,7 @@ impl DotsHeadWeight {
         let leading: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((leading, k))?;
         let out2 = match self {
-            Self::Pretransposed(w_t) => x2.matmul(w_t)?,
             Self::TransposedView(w) => x2.matmul(&w.t()?)?,
-            Self::TransposeEveryCall(_) => unreachable!("Linear owns its own forward"),
             #[cfg(feature = "metal")]
             Self::W4Fused(h) => crate::dots_w4head::logits_f32(h, &x2.contiguous()?)?,
         };
@@ -430,11 +392,6 @@ impl DotsHeadWeight {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::TransposeEveryCall(lin) => lin.forward(x),
-            Self::Pretransposed(w_t) => {
-                let (k, n) = (w_t.dims()[0], w_t.dims()[1]);
-                self.matmul_2d(x, x.dims(), k, n)
-            }
             Self::TransposedView(w) => {
                 let (n, k) = (w.dims()[0], w.dims()[1]);
                 self.matmul_2d(x, x.dims(), k, n)
@@ -1250,14 +1207,14 @@ pub fn metal_command_batching_default() {
         ("NV_ATTN_GQA_GROUPED", "1"),
     ] {
         if std::env::var_os(key).is_none() {
-            std::env::set_var(key, val);
+            unsafe { std::env::set_var(key, val) };
         }
     }
 }
 
 pub fn run(args: &DotsTrainArgs, device: &Device) -> Result<DotsTrainSummary> {
-    if device.is_metal() && std::env::var_os("NV_DOTS_QLORA_W4HEAD").is_none() {
-        std::env::set_var("NV_DOTS_QLORA_W4HEAD", "1");
+    if device.is_metal() && !nv_config::env_arm_present_at_all_reread_every_call("NV_DOTS_QLORA_W4HEAD") {
+        unsafe { std::env::set_var("NV_DOTS_QLORA_W4HEAD", "1") };
     }
     let _ =
         METAL_NON_FINITE_GRADS_WERE_A_RANK5_STRIDED_REDUCE_OOB_NOT_A_RACE_SO_THE_WALK_RUNS_UNSYNCED;

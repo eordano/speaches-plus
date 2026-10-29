@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
@@ -191,29 +189,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shape_mismatch_is_reported() {
-        let vecs = 2 * 3 * 4 * HEAD_DIM;
-        let rows = 2 * 3 * 4;
-        let st = 2 * 4 * HEAD_DIM * HEAD_DIM;
-        check_shapes(vecs, vecs, vecs, rows, rows, vecs, st, 2, 4, 3).unwrap();
-        let e = check_shapes(vecs - 1, vecs, vecs, rows, rows, vecs, st, 2, 4, 3).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-        let e = check_shapes(vecs, vecs, vecs, rows - 1, rows, vecs, st, 2, 4, 3).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-        let e = check_shapes(vecs, vecs, vecs, rows, rows, vecs, st - 4, 2, 4, 3).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn four_wg32_column_groups_cover_the_head_dim_and_the_entry_uses_no_subgroup_ops() {
-        assert_eq!(
-            W32_COL_GROUPS_WG_Z_SPANS_THE_128_COLUMNS
-                * W32_LANES_ONE_WARP_STAGES_KQ_NO_SUBGROUP_OPS_SO_ANY_WIDTH_IS_CORRECT,
-            HEAD_DIM as u32
-        );
-        assert!(WGSL.contains(W32_ENTRY));
-        assert!(WGSL.contains("@workgroup_size(32)"));
-        assert!(!WGSL.contains("subgroup"));
-        assert!(!WGSL.contains("enable subgroups"));
+    fn shape_checks_and_the_four_wg32_column_groups_follow_the_shader_contract() {
+        {
+            let vecs = 2 * 3 * 4 * HEAD_DIM;
+            let rows = 2 * 3 * 4;
+            let st = 2 * 4 * HEAD_DIM * HEAD_DIM;
+            check_shapes(vecs, vecs, vecs, rows, rows, vecs, st, 2, 4, 3).unwrap();
+            let e = check_shapes(vecs - 1, vecs, vecs, rows, rows, vecs, st, 2, 4, 3).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+            let e = check_shapes(vecs, vecs, vecs, rows - 1, rows, vecs, st, 2, 4, 3).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+            let e = check_shapes(vecs, vecs, vecs, rows, rows, vecs, st - 4, 2, 4, 3).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            assert_eq!(
+                W32_COL_GROUPS_WG_Z_SPANS_THE_128_COLUMNS
+                    * W32_LANES_ONE_WARP_STAGES_KQ_NO_SUBGROUP_OPS_SO_ANY_WIDTH_IS_CORRECT,
+                HEAD_DIM as u32
+            );
+            assert!(WGSL.contains(W32_ENTRY));
+            assert!(WGSL.contains("@workgroup_size(32)"));
+            assert!(!WGSL.contains("subgroup"));
+            assert!(!WGSL.contains("enable subgroups"));
+        }
     }
 }

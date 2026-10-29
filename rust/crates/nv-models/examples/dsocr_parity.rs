@@ -76,7 +76,7 @@ fn main() -> Result<()> {
     let mut out: Option<PathBuf> = None;
     let mut markdown = false;
     let mut cpu = false;
-    let mut gen = 0usize;
+    let mut max_new = 0usize;
     let mut prompt_override: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -84,7 +84,7 @@ fn main() -> Result<()> {
             "--out" => out = Some(PathBuf::from(args.next().context("--out needs a value")?)),
             "--markdown" => markdown = true,
             "--cpu" => cpu = true,
-            "--gen" => gen = args.next().context("--gen needs a value")?.parse()?,
+            "--gen" => max_new = args.next().context("--gen needs a value")?.parse()?,
             "--prompt" => prompt_override = Some(args.next().context("--prompt needs a value")?),
             other => image = Some(PathBuf::from(other)),
         }
@@ -170,7 +170,7 @@ fn main() -> Result<()> {
         prep.vision_tokens(),
     )?;
     let dec = pipe.decoder();
-    let mut cache = dec.new_kv_cache(tokens.len() + gen + 8)?;
+    let mut cache = dec.new_kv_cache(tokens.len() + max_new + 8)?;
     let embeds = dec.embed_tokens_with_vision(&tokens, Some(&feats))?;
     d.put("embeds", &embeds)?;
     let mut taps: Vec<Tensor> = Vec::new();
@@ -211,10 +211,10 @@ fn main() -> Result<()> {
     ));
 
     let mut gen_tokens: Vec<u32> = Vec::new();
-    if gen > 0 {
+    if max_new > 0 {
         let mut next = idx[0] as u32;
         gen_tokens.push(next);
-        for _ in 1..gen {
+        for _ in 1..max_new {
             if next == nv_models::deepseek_ocr::EOS_TOKEN_ID {
                 break;
             }

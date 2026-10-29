@@ -5,6 +5,12 @@
 #include "nvk_gdn_conv.cuh"
 #include "nvk_grid.cuh"
 
+static __constant__ int nvk_gdn_prefill_output_gate_sigmoid_because_qwen4_exp_gates_norm_with_sigmoid_not_silu = 0;
+
+extern "C" int nv_kernels_gdn_prefill_output_gate_sigmoid_set(int on) {
+    return (int)cudaMemcpyToSymbol(nvk_gdn_prefill_output_gate_sigmoid_because_qwen4_exp_gates_norm_with_sigmoid_not_silu, &on, sizeof(int));
+}
+
 __global__ void gdn_prefill_qk_l2norm_from_mixed_kernel(
     const __nv_bfloat16* __restrict__ mixed,
     float* __restrict__ q_out,
@@ -63,137 +69,6 @@ extern "C" int nv_kernels_gdn_prefill_qk_l2norm_from_mixed(
     dim3 grid((unsigned)(BT * HK));
     gdn_prefill_qk_l2norm_from_mixed_kernel<<<grid, 128, 0, s>>>(
         (const __nv_bfloat16*)mixed, q_out, k_out, HK, conv_dim, key_dim, q_scale, l2_eps);
-    return (int)cudaGetLastError();
-}
-
-template <int K_DIM, int V_DIM, int COLS, int SUBS>
-__global__ void gdn_recurrent_stateful_gqa_regstate_kernel(
-    const float* __restrict__ qn,
-    const float* __restrict__ kn,
-    const __nv_bfloat16* __restrict__ mixed,
-    const float* __restrict__ g_exp,
-    const float* __restrict__ beta,
-    float* __restrict__ state_inout,
-    __nv_bfloat16* __restrict__ out,
-    int B, int T, int H, int HK,
-    int conv_dim, int v_channel_offset
-) {
-    const int VSPLIT = V_DIM / COLS;
-    const int KPS = K_DIM / SUBS;
-    int vblock = blockIdx.x % VSPLIT;
-    int bh = blockIdx.x / VSPLIT;
-    int h = bh % H;
-    int b = bh / H;
-    if (b >= B) return;
-    int kh = h / (H / HK);
-
-    int tid = threadIdx.x;
-    int col = tid / SUBS;
-    int sub = tid % SUBS;
-    int v_glob = vblock * COLS + col;
-
-    float st[KPS];
-    float* g_state = state_inout + (size_t)bh * K_DIM * V_DIM;
-#pragma unroll
-    for (int j = 0; j < KPS; ++j) {
-        st[j] = g_state[(size_t)(sub * KPS + j) * V_DIM + v_glob];
-    }
-
-    __shared__ float k_buf[K_DIM];
-    __shared__ float q_buf[K_DIM];
-
-    size_t qk_base0 = (((size_t)b * T) * HK + kh) * K_DIM;
-    float k_next = kn[qk_base0 + tid];
-    float q_next = qn[qk_base0 + tid];
-    float ge_next = g_exp[(size_t)b * T * H + h];
-    float bt_next = beta[(size_t)b * T * H + h];
-    float v_next = __bfloat162float(
-        mixed[(size_t)b * T * conv_dim + v_channel_offset + (size_t)h * V_DIM + v_glob]);
-
-    for (int t = 0; t < T; ++t) {
-        size_t bt_idx = (size_t)b * T + t;
-        float ge = ge_next;
-        float bt_c = bt_next;
-        float v_t = v_next;
-        __syncthreads();
-        k_buf[tid] = k_next;
-        q_buf[tid] = q_next;
-        __syncthreads();
-        if (t + 1 < T) {
-            size_t nb = bt_idx + 1;
-            size_t qk_base = (nb * HK + kh) * K_DIM;
-            k_next = kn[qk_base + tid];
-            q_next = qn[qk_base + tid];
-            ge_next = g_exp[nb * H + h];
-            bt_next = beta[nb * H + h];
-            v_next = __bfloat162float(
-                mixed[nb * conv_dim + v_channel_offset + (size_t)h * V_DIM + v_glob]);
-        }
-
-        float kv = 0.f;
-#pragma unroll
-        for (int j = 0; j < KPS; ++j) {
-            float s = st[j] * ge;
-            st[j] = s;
-            kv += s * k_buf[sub * KPS + j];
-        }
-#pragma unroll
-        for (int off = SUBS / 2; off > 0; off >>= 1) {
-            kv += __shfl_xor_sync(0xffffffffu, kv, off);
-        }
-        float delta = (v_t - kv) * bt_c;
-        float ov = 0.f;
-#pragma unroll
-        for (int j = 0; j < KPS; ++j) {
-            float s = st[j] + k_buf[sub * KPS + j] * delta;
-            st[j] = s;
-            ov += s * q_buf[sub * KPS + j];
-        }
-#pragma unroll
-        for (int off = SUBS / 2; off > 0; off >>= 1) {
-            ov += __shfl_xor_sync(0xffffffffu, ov, off);
-        }
-        if (sub == 0) {
-            out[(bt_idx * H + h) * V_DIM + v_glob] = __float2bfloat16(ov);
-        }
-    }
-
-#pragma unroll
-    for (int j = 0; j < KPS; ++j) {
-        g_state[(size_t)(sub * KPS + j) * V_DIM + v_glob] = st[j];
-    }
-}
-
-extern "C" int nv_kernels_gdn_recurrent_stateful_gqa_bf16out(
-    void* stream,
-    const float* qn,
-    const float* kn,
-    const uint16_t* mixed,
-    const float* g_exp,
-    const float* beta,
-    float* state_inout,
-    uint16_t* out,
-    int B,
-    int T,
-    int H,
-    int HK,
-    int K,
-    int V,
-    int conv_dim,
-    int v_channel_offset
-) {
-    cudaStream_t s = (cudaStream_t)stream;
-    if (B * T * H == 0) return 0;
-    if (K != 128 || V != 128) return -2;
-    if (HK <= 0 || H % HK != 0) return -3;
-    const int COLS = 16;
-    const int SUBS = 8;
-    const int VSPLIT = 128 / COLS;
-    int blocks = B * H * VSPLIT;
-    gdn_recurrent_stateful_gqa_regstate_kernel<128, 128, COLS, SUBS>
-        <<<blocks, COLS * SUBS, 0, s>>>(
-            qn, kn, (const __nv_bfloat16*)mixed, g_exp, beta, state_inout,
-            (__nv_bfloat16*)out, B, T, H, HK, conv_dim, v_channel_offset);
     return (int)cudaGetLastError();
 }
 
@@ -362,7 +237,8 @@ __global__ void gdn_prefill_rmsnorm_gate_kernel(
     float w = __bfloat162float(norm_weight[i]);
     __nv_bfloat16 normed = __float2bfloat16(x * inv * w);
     float zf = __bfloat162float(z[idx]);
-    float gate_f = zf / (1.0f + expf(-zf));
+    float gate_s = 1.0f / (1.0f + expf(-zf));
+    float gate_f = nvk_gdn_prefill_output_gate_sigmoid_because_qwen4_exp_gates_norm_with_sigmoid_not_silu ? gate_s : zf * gate_s;
     __nv_bfloat16 gate = __float2bfloat16(gate_f);
     gated[idx] = __hmul(normed, gate);
 }
@@ -498,18 +374,6 @@ static int launch_gdn_conv1d_silu_bt(
     return (int)cudaGetLastError();
 }
 
-static constexpr bool gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(const char* raw) {
-    return !raw || (raw[0] == '1' && raw[1] == '6' && raw[2] == '\0');
-}
-
-static_assert(gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(nullptr));
-static_assert(gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16("16"));
-static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16("0"));
-static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(""));
-static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16("1"));
-static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(" 16"));
-static_assert(!gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16("16 "));
-
 extern "C" int nv_kernels_gdn_conv1d_silu_bt_bf16(
     void* stream,
     const uint16_t* x,
@@ -522,8 +386,7 @@ extern "C" int nv_kernels_gdn_conv1d_silu_bt_bf16(
     int C,
     int K
 ) {
-    const char* rolling = std::getenv("NV_Q38_GDN_CONV_TILE");
-    if (B > 0 && T > 0 && C > 0 && K == 4 && gdn_conv_tile16_default_on_user_sign_off_2026_09_12_bitwise_393f02d51_served_abba_7cbfe1c08_unset_or_exact_16(rolling)) {
+    if (B > 0 && T > 0 && C > 0 && K == 4) {
         dim3 grid((unsigned)(B * (1 + (T - 1) / 16)), (unsigned)(1 + (C - 1) / 256));
         gdn_conv1d_silu_bt_rolling_kernel<<<grid, 256, 0, (cudaStream_t)stream>>>(
             (const __nv_bfloat16*)x, (const __nv_bfloat16*)state_in, (const __nv_bfloat16*)w,

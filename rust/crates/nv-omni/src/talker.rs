@@ -1,6 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 
+use crate::weights::{load_1d, load_2d};
 use nv_layers::attn::{sdpa, AttnConfig};
 use nv_layers::linear::Linear;
 use nv_layers::mlp::Mlp;
@@ -454,38 +455,6 @@ impl Talker {
     }
 }
 
-fn load_1d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    dim: usize,
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("{name}: expected [{}], got {:?}", dim, d);
-    }
-    Ok(w)
-}
-
-fn load_2d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    shape: (usize, usize),
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != shape.0 || d[1] != shape.1 {
-        anyhow::bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
-    }
-    Ok(w)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,25 +484,14 @@ mod tests {
     }
 
     #[test]
-    fn builds_on_cpu_with_defaults() {
+    fn a_zero_weight_talker_steps_to_token_zero_projects_only_when_dims_differ_and_rejects_wrong_hidden(
+    ) {
         let cfg = tiny_cfg();
         let t = Talker::new(cfg.clone(), &Device::Cpu).expect("Talker::new");
         assert_eq!(t.num_layers(), cfg.num_layers);
         assert_eq!(t.config().hidden_size, 32);
         assert!(t.input_proj.is_none(), "matching dims -> no input_proj");
-    }
-
-    #[test]
-    fn builds_with_input_proj_when_dims_differ() {
-        let cfg = tiny_cfg_with_proj();
-        let t = Talker::new(cfg, &Device::Cpu).unwrap();
-        assert!(t.input_proj.is_some());
-    }
-
-    #[test]
-    fn step_returns_valid_token_id() {
-        let cfg = tiny_cfg();
-        let t = Talker::new(cfg.clone(), &Device::Cpu).unwrap();
+        assert!(Talker::new(tiny_cfg_with_proj(), &Device::Cpu).unwrap().input_proj.is_some());
         let h = Tensor::zeros((4usize, cfg.hidden_size), DType::F32, &Device::Cpu).unwrap();
         let tok = t.step(&h, &[]).expect("step");
         assert!(
@@ -543,15 +501,11 @@ mod tests {
             cfg.speech_vocab_size
         );
         assert_eq!(tok, 0);
-    }
-
-    #[test]
-    fn step_accepts_prev_tokens() {
-        let cfg = tiny_cfg();
-        let t = Talker::new(cfg.clone(), &Device::Cpu).unwrap();
-        let h = Tensor::zeros((2usize, cfg.hidden_size), DType::F32, &Device::Cpu).unwrap();
         let tok = t.step(&h, &[1, 2, 3]).expect("step with prev");
         assert!((tok as usize) < cfg.speech_vocab_size);
+        let bad = Tensor::zeros((2usize, 64usize), DType::F32, &Device::Cpu).unwrap();
+        let err = t.step(&bad, &[]).unwrap_err();
+        assert!(err.to_string().contains("thinker_hidden"));
     }
 
     #[test]
@@ -578,12 +532,4 @@ mod tests {
         assert_eq!(out2, vec![5, 5, 5, 5]);
     }
 
-    #[test]
-    fn rejects_wrong_thinker_hidden() {
-        let cfg = tiny_cfg();
-        let t = Talker::new(cfg.clone(), &Device::Cpu).unwrap();
-        let bad = Tensor::zeros((2usize, 64usize), DType::F32, &Device::Cpu).unwrap();
-        let err = t.step(&bad, &[]).unwrap_err();
-        assert!(err.to_string().contains("thinker_hidden"));
-    }
 }

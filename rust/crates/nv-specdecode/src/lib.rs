@@ -10,6 +10,8 @@ pub mod gemma4_verifier;
 pub mod lora_spec;
 pub mod qwen38_mtp;
 pub mod qwen38_sufspec;
+#[cfg(feature = "cuda")]
+pub mod qwen4_exp_adapters;
 mod util;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_spec;
@@ -28,11 +30,11 @@ pub use nv_lookup::{suffix_arm_wins, AcceptEma, SuffixAutomaton};
 pub use qwen38_mtp::{
     assert_mtp_chain_depth_fits_verify_lm_head_rows_ceiling, mtp_chain_depth,
     mtp_chain_depth_from_env, mtp_draft_dir_override_from_env, mtp_drafter_selected,
-    mtp_drafter_selected_from_env, mtp_round_hidden_reanchor_index, mtp_verify_replay_selected,
-    mtp_verify_replay_selected_from_env, mtp_verify_rows_per_round, resolve_mtp_weight_files,
+    mtp_drafter_selected_from_env, mtp_round_hidden_reanchor_index, mtp_verify_rows_per_round,
+    resolve_mtp_weight_files,
     run_mtp_verify_round, validate_mtp_named_shapes, verify_lm_head_rows_per_call_ceiling,
     MtpBatchedVerifyRound, MtpBatchedVerifyTarget, Qwen38MtpGeometry, MTP_CHAIN_DEPTH_DEFAULT,
-    NV_Q38_MTP_VERIFY_REPLAY_ENV, QWEN38_27B_MTP_GEOMETRY,
+    QWEN38_27B_MTP_GEOMETRY,
 };
 #[cfg(feature = "cuda")]
 pub use qwen38_mtp::{

@@ -15,8 +15,8 @@ use crate::oapi::chat::{
     engine_event_error_by_surface, engine_start_error_by_surface, is_busy_shed, now_unix_secs,
     parse_model_tool_calls, rand_seed, render_chat_checked_kwargs, resolve_guided_think_close,
     resolve_tool_policy, retryable_message, retryable_response, split_thinking,
-    template_required_for, ChatAppState, ChatEngine, ChatEvent, ChatGenerateRequest, ChatMessageIn,
-    ClientDeadline, FunctionCall, FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess,
+    template_required_for, resolve_media_parts, ChatAppState, ChatEngine, ChatEvent, ChatGenerateRequest, ChatMessageIn,
+    ClientDeadline, ContentPart, FunctionCall, FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess,
     Tool, ToolCall, ToolChoice, ENGINE_INTERRUPTED, THINK_OPEN,
 };
 
@@ -161,6 +161,26 @@ pub struct ResponsesRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable, type = "{ format?: { type: \"text\" | \"json_object\" | \"json_schema\", schema?: { [key: string]: unknown }, name?: string, strict?: boolean } | null } | null"))]
+    pub text: Option<Value>,
+}
+
+#[allow(clippy::result_large_err)]
+fn requested_text_format(text: Option<&Value>) -> Result<Option<nv_grammar::GrammarSpec>, Response> {
+    let Some(fmt) = text.and_then(|t| t.get("format")).filter(|f| !f.is_null()) else {
+        return Ok(None);
+    };
+    let as_chat = match fmt.get("type").and_then(Value::as_str) {
+        Some("text") => return Ok(None),
+        Some("json_object") => serde_json::json!({"type": "json_object"}),
+        Some("json_schema") => serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"schema": fmt.get("schema").cloned().ok_or_else(|| invalid("text.format.schema: field required"))?}
+        }),
+        other => return Err(invalid(format!("text.format.type: expected text, json_object or json_schema, got {other:?}"))),
+    };
+    crate::oapi::chat::resolve_guided_fields(Some(&as_chat), None, None, None)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -215,6 +235,9 @@ pub struct ResponseInputPart {
     pub kind: Option<String>,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "string | { url: string } | null"))]
+    pub image_url: Option<Value>,
 }
 
 fn part_text(part: &ResponseInputPart) -> Result<String, Response> {
@@ -303,6 +326,31 @@ fn normalize_input(input: &ResponsesInput) -> Result<Vec<ChatMessageIn>, Respons
                     .ok_or_else(|| invalid("input message: role is required"))?;
                 let text = match &item.content {
                     Some(ResponseInputContent::Text(s)) => s.clone(),
+                    Some(ResponseInputContent::Parts(parts)) if parts.iter().any(|p| p.kind.as_deref() == Some("input_image")) => {
+                        let mut cps = Vec::with_capacity(parts.len());
+                        for p in parts {
+                            cps.push(match p.kind.as_deref() {
+                                Some("input_image") => {
+                                    let url = match &p.image_url {
+                                        Some(Value::String(u)) => u.clone(),
+                                        Some(v) => v.get("url").and_then(Value::as_str).unwrap_or_default().to_string(),
+                                        None => return Err(invalid("input_image: image_url is required (file_id is not supported)")),
+                                    };
+                                    ContentPart::Unsupported {
+                                        kind: "image_url".into(),
+                                        raw: serde_json::json!({"type": "image_url", "image_url": {"url": url}}),
+                                    }
+                                }
+                                _ => ContentPart::Text { text: part_text(p)? },
+                            });
+                        }
+                        out.push(ChatMessageIn {
+                            role: role.to_string(),
+                            content: Some(MessageContent::Parts(cps)),
+                            ..ChatMessageIn::default()
+                        });
+                        continue;
+                    }
                     Some(ResponseInputContent::Parts(parts)) => {
                         let mut t = String::new();
                         for p in parts {
@@ -691,7 +739,19 @@ pub async fn handle_responses(
     messages.extend(prior);
     messages.extend(new_turns);
 
-    let policy = resolve_tool_policy(&tools, &choice, None);
+    let (rendered_messages, mm) = match resolve_media_parts(engine.as_ref(), messages.clone()).await {
+        Ok(x) => x,
+        Err(resp) => return resp,
+    };
+
+    let base_guided = match requested_text_format(req.text.as_ref()) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
+    let policy = match resolve_tool_policy(&tools, &choice, base_guided) {
+        Ok(p) => p,
+        Err(msg) => return invalid(msg),
+    };
     let mut template_kwargs = TemplateKwargs::new();
     let guided_think_close = resolve_guided_think_close(
         engine.as_ref(),
@@ -701,7 +761,7 @@ pub async fn handle_responses(
     let render_tools = if policy.tools_active { &tools[..] } else { &[] };
     let prompt = match render_chat_checked_kwargs(
         engine.as_ref(),
-        &messages,
+        &rendered_messages,
         render_tools,
         &choice,
         template_required_for(engine.model_id()),
@@ -720,7 +780,7 @@ pub async fn handle_responses(
 
     let id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let stored = req.store.unwrap_or(true) && store_dir().is_some();
-    let gen = ChatGenerateRequest {
+    let gen_req = ChatGenerateRequest {
         prompt,
         max_new_tokens: req
             .max_output_tokens
@@ -742,7 +802,7 @@ pub async fn handle_responses(
         top_logprobs: 0,
         kv_resume: prior_id.clone(),
         kv_store: stored.then(|| id.clone()),
-        mm: None,
+        mm,
     };
 
     let client = ClientDeadline::from_request(None, &headers);
@@ -760,9 +820,9 @@ pub async fn handle_responses(
         force_name: policy.force_name,
     };
     if ctx.req.stream.unwrap_or(false) {
-        run_streaming(engine, gen, ctx, client).await
+        run_streaming(engine, gen_req, ctx, client).await
     } else {
-        run_non_streaming(engine, gen, ctx, client).await
+        run_non_streaming(engine, gen_req, ctx, client).await
     }
 }
 
@@ -815,12 +875,12 @@ fn finish_and_store(ctx: &RequestCtx, out: &Outcome) -> ResponseObject {
 
 async fn run_non_streaming(
     engine: Arc<dyn ChatEngine>,
-    gen: ChatGenerateRequest,
+    gen_req: ChatGenerateRequest,
     ctx: RequestCtx,
     client: Option<ClientDeadline>,
 ) -> Response {
     let (tx, mut rx) = mpsc::channel::<ChatEvent>(64);
-    if let Err(err) = engine.generate(gen, tx).await {
+    if let Err(err) = engine.generate(gen_req, tx).await {
         warn!(error = %err, "responses engine.generate failed to start");
         return engine_start_error(&err);
     }
@@ -1047,13 +1107,13 @@ async fn emit_function_call_events(
 
 async fn run_streaming(
     engine: Arc<dyn ChatEngine>,
-    gen: ChatGenerateRequest,
+    gen_req: ChatGenerateRequest,
     ctx: RequestCtx,
     client: Option<ClientDeadline>,
 ) -> Response {
     let (tx_bytes, rx_bytes) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let (tx_ev, mut rx_ev) = mpsc::channel::<ChatEvent>(64);
-    if let Err(err) = engine.generate(gen, tx_ev).await {
+    if let Err(err) = engine.generate(gen_req, tx_ev).await {
         warn!(error = %err, "responses engine.generate failed to start");
         return engine_start_error(&err);
     }
@@ -1432,5 +1492,40 @@ mod ts_wire {
         ContentPart(ResponseContentPartEvent),
         OutputTextDelta(ResponseOutputTextDeltaEvent),
         OutputTextDone(ResponseOutputTextDoneEvent),
+    }
+}
+
+#[cfg(test)]
+mod input_image_tests {
+    use super::*;
+
+    #[test]
+    fn input_image_parts_become_image_url_parts_in_order() {
+        let input: ResponsesInput = serde_json::from_value(serde_json::json!([{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is this"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                {"type": "input_image", "image_url": {"url": "data:image/png;base64,BBBB"}},
+            ],
+        }]))
+        .unwrap();
+        let msgs = normalize_input(&input).unwrap();
+        let Some(MessageContent::Parts(parts)) = &msgs[0].content else {
+            panic!("an input_image keeps the message as parts");
+        };
+        let got: Vec<String> = parts
+            .iter()
+            .map(|p| match p {
+                ContentPart::Text { text } => text.clone(),
+                ContentPart::Unsupported { raw, .. } => raw["image_url"]["url"].as_str().unwrap().to_string(),
+            })
+            .collect();
+        assert_eq!(got, ["what is this", "data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]);
+        let round: Vec<ChatMessageIn> = serde_json::from_str(&serde_json::to_string(&msgs).unwrap()).unwrap();
+        assert!(
+            matches!(&round[0].content, Some(MessageContent::Parts(p)) if matches!(&p[1], ContentPart::Unsupported { kind, .. } if kind == "image_url")),
+            "a stored response's image part survives the sidecar round trip so previous_response_id resends the image"
+        );
     }
 }

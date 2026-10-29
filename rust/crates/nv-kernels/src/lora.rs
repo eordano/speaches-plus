@@ -14,7 +14,6 @@ pub fn m1_shrink_tiling(k: usize) -> (usize, usize) {
     (tiles, k_tile)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn lora_m1_shrink_tiles(
     stream: *mut c_void,
     x_bf16: *const u16,
@@ -26,12 +25,13 @@ pub unsafe fn lora_m1_shrink_tiles(
     k_tile: i32,
     n_tiles: i32,
 ) -> i32 {
-    crate::nv_kernels_lora_m1_shrink_tiles(
-        stream, x_bf16, a_ptrs, partials, n_slices, rank, k, k_tile, n_tiles,
-    )
+    unsafe {
+        crate::nv_kernels_lora_m1_shrink_tiles(
+            stream, x_bf16, a_ptrs, partials, n_slices, rank, k, k_tile, n_tiles,
+        )
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn lora_m1_expand_tiles(
     stream: *mut c_void,
     partials: *const f32,
@@ -46,23 +46,24 @@ pub unsafe fn lora_m1_expand_tiles(
     win_off: i32,
     win_len: i32,
 ) -> i32 {
-    crate::nv_kernels_lora_m1_expand_tiles(
-        stream,
-        partials,
-        b_ptrs,
-        y_bf16,
-        slice_n,
-        slice_start,
-        n_slices,
-        rank,
-        n_tiles,
-        max_n,
-        win_off,
-        win_len,
-    )
+    unsafe {
+        crate::nv_kernels_lora_m1_expand_tiles(
+            stream,
+            partials,
+            b_ptrs,
+            y_bf16,
+            slice_n,
+            slice_start,
+            n_slices,
+            rank,
+            n_tiles,
+            max_n,
+            win_off,
+            win_len,
+        )
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn lora_shrink(
     stream: *mut c_void,
     x_bf16: *const u16,
@@ -81,27 +82,28 @@ pub unsafe fn lora_shrink(
     a_d0_stride: i64,
     scale: f32,
 ) -> i32 {
-    crate::nv_kernels_lora_shrink(
-        stream,
-        x_bf16,
-        a_ptrs,
-        buffer,
-        token_lora_mapping,
-        token_indices_sorted,
-        num_tokens_per_lora,
-        lora_token_start_loc,
-        active_lora_ids,
-        m,
-        rank,
-        k,
-        n_slices,
-        grid_loras,
-        a_d0_stride,
-        scale,
-    )
+    unsafe {
+        crate::nv_kernels_lora_shrink(
+            stream,
+            x_bf16,
+            a_ptrs,
+            buffer,
+            token_lora_mapping,
+            token_indices_sorted,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            active_lora_ids,
+            m,
+            rank,
+            k,
+            n_slices,
+            grid_loras,
+            a_d0_stride,
+            scale,
+        )
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn lora_fused(
     stream: *mut c_void,
     x_bf16: *const u16,
@@ -127,34 +129,35 @@ pub unsafe fn lora_fused(
     y_row_stride: i32,
     scale: f32,
 ) -> i32 {
-    crate::nv_kernels_lora_fused(
-        stream,
-        x_bf16,
-        a_ptrs,
-        b_ptrs,
-        y_bf16,
-        token_indices_sorted,
-        num_tokens_per_lora,
-        lora_token_start_loc,
-        active_lora_ids,
-        slice_n,
-        slice_start,
-        b_d0_stride,
-        m,
-        rank,
-        k,
-        max_n,
-        n_slices,
-        grid_loras,
-        a_d0_stride,
-        win_off,
-        win_len,
-        y_row_stride,
-        scale,
-    )
+    unsafe {
+        crate::nv_kernels_lora_fused(
+            stream,
+            x_bf16,
+            a_ptrs,
+            b_ptrs,
+            y_bf16,
+            token_indices_sorted,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            active_lora_ids,
+            slice_n,
+            slice_start,
+            b_d0_stride,
+            m,
+            rank,
+            k,
+            max_n,
+            n_slices,
+            grid_loras,
+            a_d0_stride,
+            win_off,
+            win_len,
+            y_row_stride,
+            scale,
+        )
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn lora_expand(
     stream: *mut c_void,
     buffer: *const f32,
@@ -174,23 +177,25 @@ pub unsafe fn lora_expand(
     grid_loras: i32,
     y_row_stride: i32,
 ) -> i32 {
-    crate::nv_kernels_lora_expand(
-        stream,
-        buffer,
-        b_ptrs,
-        y_bf16,
-        token_lora_mapping,
-        token_indices_sorted,
-        num_tokens_per_lora,
-        lora_token_start_loc,
-        active_lora_ids,
-        slice_n,
-        slice_start,
-        m,
-        rank,
-        max_n,
-        n_slices,
-        grid_loras,
-        y_row_stride,
-    )
+    unsafe {
+        crate::nv_kernels_lora_expand(
+            stream,
+            buffer,
+            b_ptrs,
+            y_bf16,
+            token_lora_mapping,
+            token_indices_sorted,
+            num_tokens_per_lora,
+            lora_token_start_loc,
+            active_lora_ids,
+            slice_n,
+            slice_start,
+            m,
+            rank,
+            max_n,
+            n_slices,
+            grid_loras,
+            y_row_stride,
+        )
+    }
 }

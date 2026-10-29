@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn golden_line_is_stable_because_downstream_greps_pin_it() {
+    fn the_golden_line_is_stable_roundtrips_every_field_and_model_at_rev_derives_from_the_hub_dir() {
         assert_eq!(
             sample().line(),
             "NV-MEASURE v1 instrument=ctx-scaling model=unsloth/Qwen3.8-27B-NVFP4@e850c69 \
@@ -276,52 +276,42 @@ mod tests {
              steps=64 warmup=200 value=21.7 unit=ms/tok \
              basis=eager_dense_wgpu_decode_step_synthetic_state_fill fill_s=3.1"
         );
-    }
-
-    #[test]
-    fn roundtrip_preserves_every_field_including_quoted_device_and_extras_order() {
         let m = sample();
-        let back = Measurement::parse(&m.line()).expect("parse own line");
-        assert_eq!(back, m);
-    }
-
-    #[test]
-    fn roundtrip_survives_quotes_backslashes_and_newlines_in_values() {
+        assert_eq!(Measurement::parse(&m.line()).expect("parse own line"), m);
         let mut m = sample();
         m.device = "adapter \"X\" \\ weird\nname".into();
         m = m.extra("note", "a b\"c\\d");
-        let back = Measurement::parse(&m.line()).expect("parse escaped line");
-        assert_eq!(back, m);
-    }
-
-    #[test]
-    fn value_roundtrips_bit_exactly_via_shortest_f64_display() {
+        assert_eq!(Measurement::parse(&m.line()).expect("parse escaped line"), m);
         let mut m = sample();
         m.value = 20.900000000000002;
         let back = Measurement::parse(&m.line()).expect("parse");
-        assert_eq!(back.value.to_bits(), m.value.to_bits());
+        assert_eq!(back.value.to_bits(), m.value.to_bits(), "shortest f64 display roundtrips bit-exactly");
+        let dir = std::path::Path::new(
+            "/home/x/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/e850c696e6d75f965367e816c16bc7dacd955ffa",
+        );
+        assert_eq!(
+            model_at_rev_owner_slash_repo_at_short_rev_from_the_hub_snapshot_dir_the_instrument_already_resolves(dir),
+            "unsloth/Qwen3.8-27B-NVFP4@e850c69"
+        );
+        let dir = std::path::Path::new("/data/checkpoints/my-export");
+        assert_eq!(
+            model_at_rev_owner_slash_repo_at_short_rev_from_the_hub_snapshot_dir_the_instrument_already_resolves(dir),
+            "local/my-export@unpinned"
+        );
     }
 
     #[test]
-    fn parse_rejects_a_line_missing_a_required_basis_field_naming_the_field() {
+    fn parse_rejects_a_missing_field_by_name_a_foreign_prefix_and_a_duplicate_field() {
         let line = sample().line().replace(" warmup=200", "");
         let err = Measurement::parse(&line).unwrap_err().to_string();
         assert!(
             err.contains("warmup"),
             "error must name the missing field: {err}"
         );
-    }
-
-    #[test]
-    fn parse_rejects_foreign_prefixes_so_legacy_lines_never_masquerade_as_canonical() {
-        assert!(Measurement::parse("CTX-SCALING qwen38-wgpu depth=256").is_err());
-        assert!(Measurement::parse("NV-MEASURE v2 instrument=x").is_err());
-    }
-
-    #[test]
-    fn parse_rejects_duplicate_basis_fields() {
+        assert!(Measurement::parse("CTX-SCALING qwen38-wgpu depth=256").is_err(), "foreign prefix");
+        assert!(Measurement::parse("NV-MEASURE v2 instrument=x").is_err(), "foreign version");
         let line = format!("{} tokens=512", sample().line());
-        assert!(Measurement::parse(&line).is_err());
+        assert!(Measurement::parse(&line).is_err(), "duplicate basis field");
     }
 
     #[test]
@@ -330,23 +320,4 @@ mod tests {
         let _ = sample().extra("tokens", "999");
     }
 
-    #[test]
-    fn model_at_rev_derives_owner_slash_repo_at_short_rev_from_a_hub_snapshot_dir() {
-        let dir = std::path::Path::new(
-            "/home/x/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/e850c696e6d75f965367e816c16bc7dacd955ffa",
-        );
-        assert_eq!(
-            model_at_rev_owner_slash_repo_at_short_rev_from_the_hub_snapshot_dir_the_instrument_already_resolves(dir),
-            "unsloth/Qwen3.8-27B-NVFP4@e850c69"
-        );
-    }
-
-    #[test]
-    fn model_at_rev_labels_a_loose_override_dir_as_local_and_unpinned_instead_of_inventing_a_rev() {
-        let dir = std::path::Path::new("/data/checkpoints/my-export");
-        assert_eq!(
-            model_at_rev_owner_slash_repo_at_short_rev_from_the_hub_snapshot_dir_the_instrument_already_resolves(dir),
-            "local/my-export@unpinned"
-        );
-    }
 }

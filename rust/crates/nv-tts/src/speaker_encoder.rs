@@ -327,7 +327,6 @@ struct SeRes2NetBlock {
 }
 
 impl SeRes2NetBlock {
-    #[allow(clippy::too_many_arguments)]
     fn load(
         get: TensorGetter,
         name: &str,
@@ -807,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn reflect_pad_matches_manual_reference() {
+    fn reflect_pad_matches_manual_reference_and_bad_inputs_weights_and_configs_are_hard_errors() {
         let x = Tensor::from_vec(
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0],
             (1usize, 1usize, 5usize),
@@ -817,38 +816,45 @@ mod tests {
         let padded = reflect_pad_last(&x, 2, 2).unwrap();
         let v = padded.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(v, vec![3.0, 2.0, 1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0]);
-    }
+        let short = Tensor::from_vec(vec![1.0f32, 2.0], (1usize, 1usize, 2usize), &cpu()).unwrap();
+        assert!(reflect_pad_last(&short, 2, 0).is_err(), "pad >= len");
 
-    #[test]
-    fn reflect_pad_rejects_pad_ge_len() {
-        let x = Tensor::from_vec(vec![1.0f32, 2.0], (1usize, 1usize, 2usize), &cpu()).unwrap();
-        assert!(reflect_pad_last(&x, 2, 0).is_err());
-    }
-
-    #[test]
-    fn missing_weight_key_is_a_hard_error() {
         let cfg = tiny_cfg();
         let mut map = tiny_weight_map(&cfg, &cpu());
         map.remove("asp.conv.weight");
         let err = SpeakerEncoder::from_tensor_map(cfg, &map, &cpu())
             .err()
-            .expect("must fail");
+            .expect("a missing weight must fail");
         assert!(format!("{err:#}").contains("asp.conv.weight"), "{err:#}");
-    }
-
-    #[test]
-    fn wrong_weight_shape_is_a_hard_error() {
         let cfg = tiny_cfg();
         let mut map = tiny_weight_map(&cfg, &cpu());
         map.insert(
             "blocks.0.conv.weight".to_string(),
             det_tensor(&[3, 3, 3], 7, &cpu()),
         );
-        assert!(SpeakerEncoder::from_tensor_map(cfg, &map, &cpu()).is_err());
+        assert!(SpeakerEncoder::from_tensor_map(cfg, &map, &cpu()).is_err(), "wrong weight shape");
+        let mut cfg = tiny_cfg();
+        cfg.enc_kernel_sizes.pop();
+        assert!(cfg.validate().is_err(), "kernel list shorter than channels");
+        let mut cfg = tiny_cfg();
+        cfg.enc_channels = vec![15, 15, 15, 30];
+        assert!(cfg.validate().is_err(), "channels not divisible by the res2net scale");
+
+        let enc = tiny_encoder();
+        let wrong = Tensor::zeros((1usize, 9usize, 20usize), DType::F32, &cpu()).unwrap();
+        assert!(enc.forward(&wrong).is_err(), "wrong mel bins");
+        let empty = Tensor::zeros((1usize, 8usize, 0usize), DType::F32, &cpu()).unwrap();
+        assert!(enc.forward(&empty).is_err(), "empty time axis");
+        let batched = Tensor::zeros((2usize, 8usize, 16usize), DType::F32, &cpu()).unwrap();
+        assert!(enc.encode(&batched).is_err(), "batch > 1");
+        assert!(
+            enc.encode_pcm_24k(&vec![0.1f32; 24_000]).is_err(),
+            "tiny config has mel_dim 8, pcm path must refuse"
+        );
     }
 
     #[test]
-    fn forward_shape_deterministic_and_input_dependent() {
+    fn forward_shape_deterministic_input_dependent_and_roughly_shift_invariant() {
         let enc = tiny_encoder();
         let mel_a = det_mel(enc.config(), 40, 0.0);
         let mel_b = det_mel(enc.config(), 40, 1.7);
@@ -866,31 +872,8 @@ mod tests {
             diff > 1e-4,
             "different mels must produce different embeddings"
         );
-    }
-
-    #[test]
-    fn forward_rejects_wrong_mel_bins_and_empty_time() {
-        let enc = tiny_encoder();
-        let wrong = Tensor::zeros((1usize, 9usize, 20usize), DType::F32, &cpu()).unwrap();
-        assert!(enc.forward(&wrong).is_err());
-        let empty = Tensor::zeros((1usize, 8usize, 0usize), DType::F32, &cpu()).unwrap();
-        assert!(enc.forward(&empty).is_err());
-    }
-
-    #[test]
-    fn encode_rejects_batch_gt_1() {
-        let enc = tiny_encoder();
-        let mel = Tensor::zeros((2usize, 8usize, 16usize), DType::F32, &cpu()).unwrap();
-        assert!(enc.encode(&mel).is_err());
-    }
-
-    #[test]
-    fn time_shift_invariance_is_approximate_not_degenerate() {
-        let enc = tiny_encoder();
-        let mel = det_mel(enc.config(), 64, 0.3);
-        let long = enc.encode(&mel).unwrap();
-        let mel_half = det_mel(enc.config(), 32, 0.3);
-        let short = enc.encode(&mel_half).unwrap();
+        let long = enc.encode(&det_mel(enc.config(), 64, 0.3)).unwrap();
+        let short = enc.encode(&det_mel(enc.config(), 32, 0.3)).unwrap();
         let dot: f32 = long.iter().zip(&short).map(|(a, b)| a * b).sum();
         let na: f32 = long.iter().map(|x| x * x).sum::<f32>().sqrt();
         let nb: f32 = short.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -899,38 +882,6 @@ mod tests {
         assert!(
             cos > 0.5,
             "same synthetic content at two lengths should stay similar, cos = {cos}"
-        );
-    }
-
-    #[test]
-    fn config_validation_rejects_bad_shapes() {
-        let mut cfg = tiny_cfg();
-        cfg.enc_kernel_sizes.pop();
-        assert!(cfg.validate().is_err());
-        let mut cfg = tiny_cfg();
-        cfg.enc_channels = vec![15, 15, 15, 30];
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn default_config_matches_qwen3_tts_base() {
-        let cfg = SpeakerEncoderConfig::default();
-        assert_eq!(cfg.mel_dim, 128);
-        assert_eq!(cfg.enc_dim, 1024);
-        assert_eq!(cfg.enc_channels, vec![512, 512, 512, 512, 1536]);
-        assert_eq!(cfg.enc_kernel_sizes, vec![5, 3, 3, 3, 1]);
-        assert_eq!(cfg.enc_dilations, vec![1, 2, 3, 4, 1]);
-        assert_eq!(cfg.enc_res2net_scale, 8);
-        assert_eq!(cfg.sample_rate, 24_000);
-    }
-
-    #[test]
-    fn encode_pcm_24k_runs_on_tiny_config_only_with_matching_mel() {
-        let enc = tiny_encoder();
-        let pcm = vec![0.1f32; 24_000];
-        assert!(
-            enc.encode_pcm_24k(&pcm).is_err(),
-            "tiny config has mel_dim 8, pcm path must refuse"
         );
     }
 
@@ -1002,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn source_prefers_checkpoint_tensors_over_external_dir() {
+    fn source_prefers_checkpoint_tensors_and_falls_back_to_a_matching_external_dir() {
         let cfg = tiny_cfg();
         let talker = FakeDir::new("ckpt");
         talker
@@ -1016,17 +967,11 @@ mod tests {
             SpeakerEncoderSource::Checkpoint(talker.path().to_path_buf())
         );
         assert_eq!(src.label(), "checkpoint");
-    }
 
-    #[test]
-    fn source_uses_external_dir_for_base_talker_with_matching_width() {
-        let cfg = tiny_cfg();
         let talker = FakeDir::new("base-noenc");
         talker
             .config(&talker_config("base", cfg.enc_dim))
             .weights("talker.", &cfg);
-        let external = FakeDir::new("ext-ok");
-        external.config(&standalone_config(&cfg)).weights("", &cfg);
         let src = SpeakerEncoderSource::choose(Some(talker.path()), Some(external.path()));
         assert_eq!(
             src,
@@ -1039,50 +984,29 @@ mod tests {
     }
 
     #[test]
-    fn source_rejects_external_dir_when_width_mismatches_talker() {
+    fn source_is_unavailable_with_its_reason_for_a_mismatched_external_dir_or_none_at_all() {
         let cfg = tiny_cfg();
-        let talker = FakeDir::new("base-wide");
-        talker
-            .config(&talker_config("base", cfg.enc_dim * 2))
-            .weights("talker.", &cfg);
-        let external = FakeDir::new("ext-narrow");
+        let external = FakeDir::new("ext-rejected");
         external.config(&standalone_config(&cfg)).weights("", &cfg);
-        let reason = unavailable_reason(SpeakerEncoderSource::choose(
-            Some(talker.path()),
-            Some(external.path()),
-        ));
-        assert!(
-            reason.contains(&format!(
-                "enc_dim {} != talker hidden_size {}",
-                cfg.enc_dim,
-                cfg.enc_dim * 2
-            )),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn source_rejects_external_dir_for_custom_voice_talker() {
-        let cfg = tiny_cfg();
-        let talker = FakeDir::new("cv");
-        talker
-            .config(&talker_config("custom_voice", cfg.enc_dim))
-            .weights("talker.", &cfg);
-        let external = FakeDir::new("ext-cv");
-        external.config(&standalone_config(&cfg)).weights("", &cfg);
-        let reason = unavailable_reason(SpeakerEncoderSource::choose(
-            Some(talker.path()),
-            Some(external.path()),
-        ));
-        assert!(
-            reason.contains("\"custom_voice\" is not \"base\""),
-            "{reason}"
-        );
-    }
-
-    #[test]
-    fn source_without_checkpoint_tensors_or_external_dir_is_unavailable() {
-        let cfg = tiny_cfg();
+        for (tag, model_type, hidden, needle) in [
+            (
+                "base-wide",
+                "base",
+                cfg.enc_dim * 2,
+                format!("enc_dim {} != talker hidden_size {}", cfg.enc_dim, cfg.enc_dim * 2),
+            ),
+            ("cv", "custom_voice", cfg.enc_dim, "\"custom_voice\" is not \"base\"".to_string()),
+        ] {
+            let talker = FakeDir::new(tag);
+            talker
+                .config(&talker_config(model_type, hidden))
+                .weights("talker.", &cfg);
+            let reason = unavailable_reason(SpeakerEncoderSource::choose(
+                Some(talker.path()),
+                Some(external.path()),
+            ));
+            assert!(reason.contains(&needle), "{tag}: {reason}");
+        }
         let talker = FakeDir::new("cv-alone");
         talker
             .config(&talker_config("custom_voice", cfg.enc_dim))

@@ -9,8 +9,6 @@ pub mod buffer;
 
 pub use buffer::{GpuBind, GpuTensor, GpuUniform};
 
-pub const DEFAULT_WORKGROUP_SIZE: u32 = 256;
-
 pub fn storage_from_slice<T: bytemuck::Pod>(
     ctx: &WgpuContext,
     label: &str,
@@ -69,7 +67,6 @@ const NOZI_AUDITED_ENTRIES: &[&str] = &[
     "argmax_softcap_bf16_stage1",
     "dv_rmsnorm_f16",
     "dv_rmsnorm_f32_inplace",
-    "dv_softmax_rows",
     "flash_splitk_stage1_bf16kv",
     "flash_splitk_stage1_bf16kv_mk",
     "flash_splitk_stage1_bf16kv_mk_u",
@@ -140,41 +137,35 @@ const NOZI_PENDING_ENTRIES: &[&str] = &["gemv_nvfp4_bf16", "gemv_nvfp4_fmlut_pk"
 #[cfg(test)]
 mod nozi_list_tests {
     #[test]
-    fn audited_entry_list_is_sorted_and_unique() {
-        assert!(super::NOZI_AUDITED_ENTRIES.windows(2).all(|w| w[0] < w[1]));
-    }
-
-    #[test]
-    fn pending_entry_list_is_sorted_and_unique() {
-        assert!(super::NOZI_PENDING_ENTRIES.windows(2).all(|w| w[0] < w[1]));
-    }
-
-    #[test]
-    fn pending_entries_are_not_already_audited() {
-        for e in super::NOZI_PENDING_ENTRIES {
-            assert!(
-                super::NOZI_AUDITED_ENTRIES.binary_search(e).is_err(),
-                "{e} is in both the audited and the pending list"
-            );
+    fn the_nozi_lists_are_sorted_disjoint_and_the_gate_reaches_only_pending_entries() {
+        {
+            assert!(super::NOZI_AUDITED_ENTRIES.windows(2).all(|w| w[0] < w[1]));
         }
-    }
-
-    #[test]
-    fn pending_entries_are_inert_until_the_gate_opens() {
-        for e in super::NOZI_PENDING_ENTRIES {
-            assert!(!super::nozi_entry_listed(e, false));
-            assert!(super::nozi_entry_listed(e, true));
+        {
+            assert!(super::NOZI_PENDING_ENTRIES.windows(2).all(|w| w[0] < w[1]));
         }
-    }
-
-    #[test]
-    fn the_gate_does_not_reach_audited_or_unknown_entries() {
-        for e in super::NOZI_AUDITED_ENTRIES {
-            assert!(super::nozi_entry_listed(e, false));
-            assert!(super::nozi_entry_listed(e, true));
+        {
+            for e in super::NOZI_PENDING_ENTRIES {
+                assert!(
+                    super::NOZI_AUDITED_ENTRIES.binary_search(e).is_err(),
+                    "{e} is in both the audited and the pending list"
+                );
+            }
         }
-        assert!(!super::nozi_entry_listed("gemv_nvfp4_fmlut", true));
-        assert!(!super::nozi_entry_listed("no_such_entry", true));
+        {
+            for e in super::NOZI_PENDING_ENTRIES {
+                assert!(!super::nozi_entry_listed(e, false));
+                assert!(super::nozi_entry_listed(e, true));
+            }
+        }
+        {
+            for e in super::NOZI_AUDITED_ENTRIES {
+                assert!(super::nozi_entry_listed(e, false));
+                assert!(super::nozi_entry_listed(e, true));
+            }
+            assert!(!super::nozi_entry_listed("gemv_nvfp4_fmlut", true));
+            assert!(!super::nozi_entry_listed("no_such_entry", true));
+        }
     }
 }
 
@@ -201,99 +192,92 @@ mod coop_guard_tests {
     }
 
     #[test]
-    fn the_f32_ab_probe_variant_is_refused_on_the_advertised_list() {
-        let err = coop_matrix_guard_against(
-            &strix_halo(),
-            false,
-            "probe",
-            &probe_src(16, "f32", "f32"),
-            "probe",
-        )
-        .expect_err("f32 A/B at 16x16x16 must not reach the driver");
-        let msg = err.to_string();
-        assert!(msg.contains("16x16x16 f32xf32->f32"), "{msg}");
-        assert!(msg.contains("NV_KERNELS_WGPU_COOP_UNSAFE_SWEEP"), "{msg}");
-    }
-
-    #[test]
-    fn the_advertised_variants_pass_and_the_unadvertised_tile_does_not() {
-        let adv = strix_halo();
-        for (ab, c) in [("f16", "f16"), ("f16", "f32")] {
-            coop_matrix_guard_against(&adv, false, "probe", &probe_src(16, ab, c), "probe")
-                .unwrap_or_else(|e| panic!("advertised {ab}->{c} was refused: {e}"));
+    fn the_guard_judges_every_shader_against_the_advertised_list_unless_the_unsafe_env_gate_is_set()
+    {
+        {
+            let err = coop_matrix_guard_against(
+                &strix_halo(),
+                false,
+                "probe",
+                &probe_src(16, "f32", "f32"),
+                "probe",
+            )
+            .expect_err("f32 A/B at 16x16x16 must not reach the driver");
+            let msg = err.to_string();
+            assert!(msg.contains("16x16x16 f32xf32->f32"), "{msg}");
+            assert!(msg.contains("NV_KERNELS_WGPU_COOP_UNSAFE_SWEEP"), "{msg}");
         }
-        assert!(
-            coop_matrix_guard_against(&adv, false, "probe", &probe_src(8, "f16", "f32"), "probe")
+        {
+            let adv = strix_halo();
+            for (ab, c) in [("f16", "f16"), ("f16", "f32")] {
+                coop_matrix_guard_against(&adv, false, "probe", &probe_src(16, ab, c), "probe")
+                    .unwrap_or_else(|e| panic!("advertised {ab}->{c} was refused: {e}"));
+            }
+            assert!(
+                coop_matrix_guard_against(
+                    &adv,
+                    false,
+                    "probe",
+                    &probe_src(8, "f16", "f32"),
+                    "probe"
+                )
                 .is_err(),
-            "8x8x8 is not on this adapter's list"
-        );
-    }
-
-    #[test]
-    fn the_unsafe_env_gate_lets_the_crashing_config_through() {
-        coop_matrix_guard_against(
-            &strix_halo(),
-            true,
-            "probe",
-            &probe_src(16, "f32", "f32"),
-            "probe",
-        )
-        .expect("the opt-in must restore the old ask-anyway behaviour");
-    }
-
-    #[test]
-    fn sources_without_a_coop_matrix_type_are_untouched() {
-        coop_matrix_guard_against(&[], false, "plain", "@compute fn main() {}", "main")
-            .expect("a shader with no coop_mat type must not be judged");
-        coop_matrix_guard_against(&[], false, "plain", &gemm_nvfp4::scalar_source(), "x")
-            .expect("the scalar nvfp4 shader has no coop_mat type");
-    }
-
-    #[test]
-    fn the_shipped_shaders_are_judged_against_the_list_they_need() {
-        let coop16 = vec![CoopConfig::new(
-            16,
-            16,
-            16,
-            CoopScalar::F16,
-            CoopScalar::F32,
-        )];
-        coop_matrix_guard_against(&coop16, false, "nvfp4", &gemm_nvfp4::coop_source(), "e")
-            .expect("16x16x16 f16->f32 is exactly what the nvfp4 coop shader declares");
-        assert!(
+                "8x8x8 is not on this adapter's list"
+            );
+        }
+        {
             coop_matrix_guard_against(
                 &strix_halo(),
+                true,
+                "probe",
+                &probe_src(16, "f32", "f32"),
+                "probe",
+            )
+            .expect("the opt-in must restore the old ask-anyway behaviour");
+        }
+        {
+            coop_matrix_guard_against(&[], false, "plain", "@compute fn main() {}", "main")
+                .expect("a shader with no coop_mat type must not be judged");
+            coop_matrix_guard_against(&[], false, "plain", &gemm_nvfp4::scalar_source(), "x")
+                .expect("the scalar nvfp4 shader has no coop_mat type");
+        }
+        {
+            let coop16 = vec![CoopConfig::new(
+                16,
+                16,
+                16,
+                CoopScalar::F16,
+                CoopScalar::F32,
+            )];
+            coop_matrix_guard_against(&coop16, false, "nvfp4", &gemm_nvfp4::coop_source(), "e")
+                .expect("16x16x16 f16->f32 is exactly what the nvfp4 coop shader declares");
+            assert!(
+                coop_matrix_guard_against(
+                    &strix_halo(),
+                    false,
+                    "gemm8",
+                    &gemm_coop_f16::source(2, 8, 4, 1),
+                    "e"
+                )
+                .is_err(),
+                "the 8x8 prefill GEMM must be refused where only 16x16x16 is advertised"
+            );
+            let coop8 = vec![CoopConfig::new(8, 8, 8, CoopScalar::F16, CoopScalar::F32)];
+            coop_matrix_guard_against(
+                &coop8,
                 false,
                 "gemm8",
                 &gemm_coop_f16::source(2, 8, 4, 1),
-                "e"
+                "e",
             )
-            .is_err(),
-            "the 8x8 prefill GEMM must be refused where only 16x16x16 is advertised"
-        );
-        let coop8 = vec![CoopConfig::new(8, 8, 8, CoopScalar::F16, CoopScalar::F32)];
-        coop_matrix_guard_against(
-            &coop8,
-            false,
-            "gemm8",
-            &gemm_coop_f16::source(2, 8, 4, 1),
-            "e",
-        )
-        .expect("8x8x8 f16->f32 is what the prefill GEMM declares");
-        assert!(
-            coop_matrix_guard_against(&coop8, false, "nvfp4", &gemm_nvfp4::coop_source(), "e")
-                .is_err(),
-            "an 8x8x8-only adapter must not be handed the 16x16x16 nvfp4 shader"
-        );
+            .expect("8x8x8 f16->f32 is what the prefill GEMM declares");
+            assert!(
+                coop_matrix_guard_against(&coop8, false, "nvfp4", &gemm_nvfp4::coop_source(), "e")
+                    .is_err(),
+                "an 8x8x8-only adapter must not be handed the 16x16x16 nvfp4 shader"
+            );
+        }
     }
-}
-
-pub fn nozi_audited_entries() -> &'static [&'static str] {
-    NOZI_AUDITED_ENTRIES
-}
-
-pub fn nozi_env_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_WGPU_NOZI")
 }
 
 pub fn nozi_pending_enabled() -> bool {
@@ -306,7 +290,7 @@ pub fn nozi_entry_listed(entry: &str, pending: bool) -> bool {
 }
 
 fn nozi_for_entry(entry: &str) -> bool {
-    nozi_env_enabled() && nozi_entry_listed(entry, nozi_pending_enabled())
+    nozi_entry_listed(entry, nozi_pending_enabled())
 }
 
 pub fn diag_sink_is_off(env: &str) -> bool {
@@ -781,7 +765,7 @@ pub mod profile {
         pub(super) device: wgpu::Device,
         pub(super) queue: wgpu::Queue,
         pub(super) resolve: wgpu::Buffer,
-        pub(super) sets: Vec<wgpu::QuerySet>,
+        pub(super) _sets: Vec<wgpu::QuerySet>,
         pub(super) labels: Vec<String>,
         pub(super) per_chunk: usize,
         pub(super) period: f64,
@@ -1164,7 +1148,7 @@ where
         device: ctx.device.clone(),
         queue: ctx.queue.clone(),
         resolve,
-        sets,
+        _sets: sets,
         labels: names,
         per_chunk,
         period: ctx.queue.get_timestamp_period() as f64,
@@ -1203,7 +1187,7 @@ mod submit_chunk_default_tests {
     #[test]
     fn unset_resolves_to_32_eq_0_restores_the_single_submit_and_explicit_values_keep_their_meaning()
     {
-        std::env::remove_var(SUBMIT_CHUNK_ENV);
+        unsafe { std::env::remove_var(SUBMIT_CHUNK_ENV) };
         assert_eq!(DEFAULT_CHUNK, 32);
         assert_eq!(
             submit_chunk_overlapping_encode_with_execution(),
@@ -1211,25 +1195,25 @@ mod submit_chunk_default_tests {
             "unset must resolve to the signed-off chunked default, closing the harness-uniformity \
              hazard where wgpu rows silently inherited different chunking"
         );
-        std::env::set_var(SUBMIT_CHUNK_ENV, "0");
+        unsafe { std::env::set_var(SUBMIT_CHUNK_ENV, "0") };
         assert_eq!(
             submit_chunk_overlapping_encode_with_execution(),
             None,
             "explicit =0 is the kept escape back to the old single end-of-step submit"
         );
-        std::env::set_var(SUBMIT_CHUNK_ENV, "13");
+        unsafe { std::env::set_var(SUBMIT_CHUNK_ENV, "13") };
         assert_eq!(submit_chunk_overlapping_encode_with_execution(), Some(13));
-        std::env::set_var(SUBMIT_CHUNK_ENV, "512");
+        unsafe { std::env::set_var(SUBMIT_CHUNK_ENV, "512") };
         assert_eq!(submit_chunk_overlapping_encode_with_execution(), Some(512));
-        std::env::set_var(SUBMIT_CHUNK_ENV, "not-a-number");
+        unsafe { std::env::set_var(SUBMIT_CHUNK_ENV, "not-a-number") };
         assert_eq!(
             submit_chunk_overlapping_encode_with_execution(),
             None,
             "an explicitly set unparsable value keeps its pre-flip single-submit meaning"
         );
-        std::env::set_var(SUBMIT_CHUNK_ENV, "");
+        unsafe { std::env::set_var(SUBMIT_CHUNK_ENV, "") };
         assert_eq!(submit_chunk_overlapping_encode_with_execution(), None);
-        std::env::remove_var(SUBMIT_CHUNK_ENV);
+        unsafe { std::env::remove_var(SUBMIT_CHUNK_ENV) };
     }
 }
 
@@ -1630,15 +1614,7 @@ impl Default for Recorded {
     }
 }
 
-impl<'a> Chain<'a> {
-    pub fn into_recorded(self) -> Recorded {
-        Recorded {
-            passes: self.passes,
-            labels: self.labels,
-            validated: false,
-        }
-    }
-}
+impl<'a> Chain<'a> {}
 
 pub fn read_back<T: bytemuck::Pod>(
     ctx: &WgpuContext,
@@ -1784,6 +1760,8 @@ impl PendingReadback {
 
     pub async fn pumped<T: bytemuck::Pod>(self, ctx: &WgpuContext) -> Result<Vec<T>> {
         let _ = PUMP_SELF_WAKES_ON_NATIVE_BECAUSE_MAP_CALLBACKS_FIRE_ONLY_INSIDE_DEVICE_POLL;
+        #[cfg(target_arch = "wasm32")]
+        let _ = ctx;
         let Some(staging) = self.staging else {
             return Ok(Vec::new());
         };

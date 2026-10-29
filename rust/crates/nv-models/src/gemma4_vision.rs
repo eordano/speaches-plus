@@ -1,9 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use nv_layers::linear::Linear;
 use nv_layers::norm::RmsNorm;
+#[cfg(feature = "cuda")]
+use nv_quant::nvfp4::MIN_TILE;
 use nv_weights::WeightLoader;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -52,35 +55,31 @@ impl Gemma4VisionConfig {
     nv_weights::hf_json_from_file!(from_hf_json_file, from_hf_json_str);
 
     pub fn from_hf_json_str(s: &str) -> Result<Self> {
-        let v: serde_json::Value =
-            serde_json::from_str(s).context("parse gemma4 vision config json")?;
+        let v: Value = serde_json::from_str(s).context("parse gemma4 vision config json")?;
         let root = v
             .as_object()
             .context("gemma4 vision config not an object")?;
         let (mut vis_obj, soft) = match root.get("vision_config") {
-            Some(serde_json::Value::Object(o)) => (
+            Some(Value::Object(o)) => (
                 o.clone(),
                 root.get("vision_soft_tokens_per_image")
                     .and_then(|x| x.as_u64()),
             ),
-            Some(_) => anyhow::bail!("vision_config must be an object"),
+            Some(_) => bail!("vision_config must be an object"),
             None => (root.clone(), None),
         };
         if let Some(n) = soft {
-            vis_obj.insert(
-                "vision_soft_tokens_per_image".into(),
-                serde_json::Value::from(n),
-            );
+            vis_obj.insert("vision_soft_tokens_per_image".into(), Value::from(n));
         }
-        let cfg: Gemma4VisionConfig = serde_json::from_value(serde_json::Value::Object(vis_obj))
+        let cfg: Gemma4VisionConfig = serde_json::from_value(Value::Object(vis_obj))
             .context("deserialize gemma4 vision_config")?;
         if let Some(mt) = &cfg.model_type {
             if mt != "gemma4_vision" {
-                anyhow::bail!("expected model_type gemma4_vision, got {mt}");
+                bail!("expected model_type gemma4_vision, got {mt}");
             }
         }
         if cfg.num_attention_heads * cfg.head_dim != cfg.hidden_size {
-            anyhow::bail!(
+            bail!(
                 "gemma4 vision: heads {} * head_dim {} != hidden {}",
                 cfg.num_attention_heads,
                 cfg.head_dim,
@@ -88,7 +87,7 @@ impl Gemma4VisionConfig {
             );
         }
         if !cfg.head_dim.is_multiple_of(4) {
-            anyhow::bail!(
+            bail!(
                 "gemma4 vision: head_dim {} not divisible by 4",
                 cfg.head_dim
             );
@@ -191,7 +190,7 @@ impl VisLinear {
             VisLinear::Nvfp4KPadded { lin, in_logical } => {
                 let dims = x.dims();
                 let last = dims.len() - 1;
-                anyhow::ensure!(
+                ensure!(
                     dims[last] == *in_logical,
                     "nvfp4 k-padded vis linear: input last dim {} != {in_logical}",
                     dims[last]
@@ -457,7 +456,7 @@ impl VisionLayer {
 
         let scale = 1.0 / (hd as f64).sqrt();
         let use_flash = mask.is_none()
-            && matches!(x.device(), Device::Cuda(_))
+            && x.device().is_cuda()
             && matches!(dtype, DType::BF16 | DType::F16);
         let attn = if use_flash {
             let cfg = nv_layers::attn::AttnConfig {
@@ -599,7 +598,7 @@ fn nvfp4_smoke_forward_is_finite(
             .to_dtype(DType::F32)?
             .sum_all()?
             .to_scalar::<f32>()?;
-        anyhow::ensure!(
+        ensure!(
             sum.is_finite(),
             "smoke gemm at m={m} produced a non-finite sum {sum}"
         );
@@ -616,8 +615,7 @@ fn nvfp4_quantize_vis_linear(
     let w = match lin.dense_weight() {
         Some(w) => {
             let d = w.dims();
-            if d.len() != 2 || d[0] < nv_quant::nvfp4::MIN_TILE || d[1] < nv_quant::nvfp4::MIN_TILE
-            {
+            if d.len() != 2 || d[0] < MIN_TILE || d[1] < MIN_TILE {
                 return Ok(false);
             }
             w.clone()
@@ -764,7 +762,7 @@ fn load_linear(
         .with_context(|| format!("load {name}"))?;
     let d = w.dims();
     if d.len() != 2 || d[0] != shape.0 || d[1] != shape.1 {
-        anyhow::bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
+        bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
     }
     if dtype == DType::U8 {
         VisLinear::quantize_int8_rows(w)
@@ -847,7 +845,7 @@ impl Gemma4VisionTower {
         dtype: DType,
     ) -> Result<Self> {
         if cfg.num_key_value_heads != cfg.num_attention_heads {
-            anyhow::bail!(
+            bail!(
                 "gemma4 vision tower expects MHA (kv heads {} != heads {})",
                 cfg.num_key_value_heads,
                 cfg.num_attention_heads
@@ -908,7 +906,7 @@ impl Gemma4VisionTower {
         dtype: DType,
     ) -> Result<Self> {
         if cfg.num_key_value_heads != cfg.num_attention_heads {
-            anyhow::bail!(
+            bail!(
                 "gemma4 vision tower expects MHA (kv heads {} != heads {})",
                 cfg.num_key_value_heads,
                 cfg.num_attention_heads
@@ -919,14 +917,14 @@ impl Gemma4VisionTower {
         } else if weights.has("vision_tower.patch_embedder.input_proj.weight") {
             "vision_tower"
         } else {
-            anyhow::bail!("no gemma4 vision tower tensors found in checkpoint")
+            bail!("no gemma4 vision tower tensors found in checkpoint")
         };
         let embed_name = if weights.has("model.embed_vision.embedding_projection.weight") {
             "model.embed_vision.embedding_projection.weight"
         } else if weights.has("embed_vision.embedding_projection.weight") {
             "embed_vision.embedding_projection.weight"
         } else {
-            anyhow::bail!("no gemma4 embed_vision projection found in checkpoint")
+            bail!("no gemma4 embed_vision projection found in checkpoint")
         };
 
         let h = cfg.hidden_size;
@@ -940,7 +938,7 @@ impl Gemma4VisionTower {
             .shape_of(embed_name)
             .context("shape of embed_vision projection")?;
         if proj_shape.len() != 2 || proj_shape[1] != h {
-            anyhow::bail!("{embed_name}: expected [text_hidden, {h}], got {proj_shape:?}");
+            bail!("{embed_name}: expected [text_hidden, {h}], got {proj_shape:?}");
         }
         let text_hidden_size = proj_shape[0];
         let embedding_projection = load_linear(weights, embed_name, (text_hidden_size, h), dtype)?;
@@ -953,7 +951,7 @@ impl Gemma4VisionTower {
             .context("load position_embedding_table")?;
         let td = table.dims();
         if td != [2, pes, h] {
-            anyhow::bail!("position_embedding_table: expected [2, {pes}, {h}], got {td:?}");
+            bail!("position_embedding_table: expected [2, {pes}, {h}], got {td:?}");
         }
         let patch_embedder = PatchEmbedder {
             input_proj: load_linear(
@@ -1082,14 +1080,13 @@ impl Gemma4VisionTower {
     #[cfg(feature = "cuda")]
     pub fn quantize_linears_nvfp4(&mut self) -> Result<usize> {
         use std::sync::{Arc, Mutex};
-        anyhow::ensure!(
+        ensure!(
             matches!(self.dtype, DType::BF16 | DType::F16),
             "nvfp4 vision projections need bf16/f16 activations, tower dtype is {:?}",
             self.dtype
         );
-        let cuda = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("nvfp4 vision projections require a CUDA device"),
+        let Device::Cuda(cuda) = self.device.clone() else {
+            bail!("nvfp4 vision projections require a CUDA device")
         };
         let stream = cuda.cuda_stream();
         let runner = Arc::new(Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
@@ -1120,23 +1117,23 @@ impl Gemma4VisionTower {
                 )?);
             }
         }
-        anyhow::ensure!(
+        ensure!(
             quantized > 0,
             "nvfp4 vision quantization matched no projections (every dim below MIN_TILE {} or \
              already non-dense)",
-            nv_quant::nvfp4::MIN_TILE
+            MIN_TILE
         );
         Ok(quantized)
     }
 
     #[cfg(not(feature = "cuda"))]
     pub fn quantize_linears_nvfp4(&mut self) -> Result<usize> {
-        anyhow::bail!("nvfp4 vision projections require a cuda build")
+        bail!("nvfp4 vision projections require a cuda build")
     }
 
     pub fn plan_full_grid(&self, grid_w: usize, grid_h: usize) -> Result<FullGridPlan> {
         let pk = self.cfg.pooling_kernel_size;
-        anyhow::ensure!(
+        ensure!(
             grid_w > 0 && grid_h > 0 && grid_w.is_multiple_of(pk) && grid_h.is_multiple_of(pk),
             "plan_full_grid: grid {grid_w}x{grid_h} not a positive multiple of pooling kernel {pk}"
         );
@@ -1163,7 +1160,7 @@ impl Gemma4VisionTower {
 
     pub fn forward_full_grid(&self, pixel_values: &Tensor, plan: &FullGridPlan) -> Result<Tensor> {
         let (n, pp) = pixel_values.dims2()?;
-        anyhow::ensure!(
+        ensure!(
             pp == self.cfg.patch_pixels() && n == plan.num_patches(),
             "forward_full_grid: pixel_values [{n}, {pp}] does not match plan grid {}x{} with \
              patch_pixels {}",
@@ -1213,7 +1210,7 @@ impl Gemma4VisionTower {
             cells.entry((y / pk, x / pk)).or_default().push(i as u32);
         }
         if cells.is_empty() {
-            anyhow::bail!("gemma4 vision pool: no valid patches");
+            bail!("gemma4 vision pool: no valid patches");
         }
         let mut pooled = Vec::with_capacity(cells.len());
         for rows in cells.values() {
@@ -1228,7 +1225,7 @@ impl Gemma4VisionTower {
     pub fn forward(&self, pixel_values: &Tensor, pixel_position_ids: &Tensor) -> Result<Tensor> {
         let (n, pp) = pixel_values.dims2()?;
         if pp != self.cfg.patch_pixels() {
-            anyhow::bail!(
+            bail!(
                 "pixel_values patch dim {} != patch_pixels {}",
                 pp,
                 self.cfg.patch_pixels()
@@ -1236,7 +1233,7 @@ impl Gemma4VisionTower {
         }
         let pd = pixel_position_ids.dims();
         if pd != [n, 2] {
-            anyhow::bail!("pixel_position_ids: expected [{n}, 2], got {pd:?}");
+            bail!("pixel_position_ids: expected [{n}, 2], got {pd:?}");
         }
         let pos_rows = pixel_position_ids.to_dtype(DType::I64)?.to_vec2::<i64>()?;
         let positions: Vec<(i64, i64)> = pos_rows.iter().map(|r| (r[0], r[1])).collect();

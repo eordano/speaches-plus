@@ -30,7 +30,7 @@ compiler.
 
 ```sh
 cd whisper_bindings
-pip install .                         # installs as a separate package
+uv pip install .                      # installs as a separate package
 # -- or --
 python setup.py build_ext --inplace   # produces _whisper.cpython-*.so here
 ```
@@ -57,7 +57,7 @@ package: add `pkgs.whisper-cpp` to the dev shell's `packages` /
 The sibling `stt/whisper_cpp.py` `WhisperCppBackend` checks in this order:
 
 1. `from whisper_bindings import _whisper` (the local extension built here).
-2. *(no PyPI fallback)* -- whisper.cpp has no canonical PyPI wheel. The
+2. (no PyPI fallback) -- whisper.cpp has no canonical PyPI wheel. The
    closest is `pywhispercpp`, which carries a different ABI and would need
    a separate adapter; we don't bundle it.
 3. Otherwise raises an informative `RuntimeError` pointing back here.
@@ -65,11 +65,11 @@ The sibling `stt/whisper_cpp.py` `WhisperCppBackend` checks in this order:
 Casual users on a dev shell without `libwhisper` therefore can't use the
 whisper.cpp backend -- build this extension or fall back to
 `Ct2WhisperBackend` (which does have a PyPI fallback via
-`pip install '.[ct2]'`).
+`uv pip install '.[ct2]'`).
 
 ## Why a separate buildable
 
 Same reasoning as `../ct2_bindings/README.md` § "Why a separate buildable":
 the main package must install cleanly without `libwhisper` headers, and
 isolating the C++ extension means a broken `whisper_bindings` build can
-never break a `pip install .` of `speaches-plus-python`.
+never break a `uv pip install .` of `speaches-plus-python`.

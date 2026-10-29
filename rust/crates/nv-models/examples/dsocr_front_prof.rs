@@ -69,41 +69,6 @@ fn main() -> Result<()> {
         pages.push((p.clone(), load_rgb(p)?));
     }
 
-    if std::env::var("NV_H2D_CHECK").is_ok() {
-        let mut bad = 0usize;
-        for (path, img) in &pages {
-            let prep = preprocess::prepare(img, ResolutionMode::Gundam)?;
-            std::env::set_var("NV_DSOCR_H2D_PINNED", "0");
-            let a = pipe.vision().encode_prepared(&prep)?;
-            std::env::set_var("NV_DSOCR_H2D_PINNED", "1");
-            let b = pipe.vision().encode_prepared(&prep)?;
-            let av: Vec<f32> = a
-                .flatten_all()?
-                .to_dtype(candle_core::DType::F32)?
-                .to_vec1()?;
-            let bv: Vec<f32> = b
-                .flatten_all()?
-                .to_dtype(candle_core::DType::F32)?
-                .to_vec1()?;
-            let diff = av
-                .iter()
-                .zip(&bv)
-                .filter(|(x, y)| x.to_bits() != y.to_bits())
-                .count();
-            println!(
-                "{}: vision features {} elems, {diff} bit-differing",
-                path.file_name().unwrap().to_string_lossy(),
-                av.len()
-            );
-            bad += diff;
-        }
-        println!(
-            "H2D pinned-bf16 vs pageable-f32+cast: {}",
-            if bad == 0 { "BIT-IDENTICAL" } else { "DIFFERS" }
-        );
-        return Ok(());
-    }
-
     let run_front = |img: &RgbImage, a: &mut Acc| -> Result<()> {
         let t_page = Instant::now();
         let t = Instant::now();

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use nv_models::laguna_train::{self, LagunaTrainArgs};
 use nv_models::train_runner::{self, TrainArgs};
 use nv_train::dots::{self, DotsTrainArgs};
+use nv_train::laya::{self, LayaTrainArgs};
 use nv_train::qwen38::{self, Q38JsonlArgs};
 
 use super::{kind, openai_error};
@@ -24,7 +25,10 @@ pub enum TrainerFamily {
     GemmaTrainRunner,
     LagunaFullGraph,
     DotsQloraWindowed,
+    LayaDecision,
 }
+
+pub const A_LAYA_BASE_IS_RECOGNISED_BY_THIS_FILE_BECAUSE_ITS_CONFIG_LIVES_UNDER_ENCODER_NOT_AT_THE_ROOT: &str = "rl_agent_config.json";
 
 pub fn trainer_family_for_config(raw_cfg: &str) -> TrainerFamily {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_cfg) else {
@@ -44,6 +48,9 @@ pub fn trainer_family_for_config(raw_cfg: &str) -> TrainerFamily {
 }
 
 pub fn trainer_family_for_base(base: &std::path::Path) -> TrainerFamily {
+    if base.join(A_LAYA_BASE_IS_RECOGNISED_BY_THIS_FILE_BECAUSE_ITS_CONFIG_LIVES_UNDER_ENCODER_NOT_AT_THE_ROOT).is_file() {
+        return TrainerFamily::LayaDecision;
+    }
     match std::fs::read_to_string(base.join("config.json")) {
         Ok(raw) => trainer_family_for_config(&raw),
         Err(_) => TrainerFamily::GemmaTrainRunner,
@@ -52,6 +59,12 @@ pub fn trainer_family_for_base(base: &std::path::Path) -> TrainerFamily {
 
 pub const QWEN_GRAD_LAYERS_DEFAULT_IS_THE_CLI_WINDOW_BECAUSE_GDN_ACTIVATION_MEMORY_BOUNDS_THE_WINDOW_NOT_THE_WEIGHTS:
     usize = 4;
+
+pub const LAYA_BATCH_DEFAULT_IS_THE_SIZE_THE_CUDA_AND_METAL_RUNS_WERE_VERIFIED_AT: usize = 16;
+pub const LAYA_LEARNING_RATE_DEFAULT_IS_THE_RATE_THE_CUDA_AND_METAL_RUNS_WERE_VERIFIED_AT: f64 =
+    2e-4;
+pub const A_SYSTEMONE_MODEL_NAME_RESOLVES_AGAINST_THE_SERVED_CHECKPOINT_DIRECTORY_SO_A_CLIENT_NEED_NOT_KNOW_SERVER_PATHS: &str =
+    "model may be laya, laya-multilingual, laya-typed-decisions or any alias /v1/systemone accepts; it resolves under NV_LAYA_MODEL_DIR";
 
 pub const DOTS_GRAD_LAYERS_DEFAULT_IS_8_BECAUSE_THE_QLORA_SMOKE_MEASURED_ITS_FOOTPRINT_THERE:
     usize = 8;
@@ -62,6 +75,10 @@ fn default_targets_for(family: TrainerFamily) -> Vec<String> {
         TrainerFamily::GemmaTrainRunner => TrainArgs::default_targets(),
         TrainerFamily::LagunaFullGraph => LagunaTrainArgs::default_targets(),
         TrainerFamily::DotsQloraWindowed => dots::dots_default_targets(),
+        TrainerFamily::LayaDecision => laya::ENCODER_TARGETS
+            .iter()
+            .map(|t| t.to_string())
+            .collect(),
     }
 }
 
@@ -72,6 +89,7 @@ fn default_targets_for(family: TrainerFamily) -> Vec<String> {
     ts(export, optional_fields = nullable)
 )]
 pub struct Hyperparameters {
+    pub max_sequence_length: Option<usize>,
     pub rank: Option<usize>,
 
     pub alpha: Option<f64>,
@@ -89,6 +107,10 @@ pub struct Hyperparameters {
     pub grad_layers: Option<usize>,
 
     pub b_lr_ratio: Option<f64>,
+
+    pub base_bits: Option<u32>,
+
+    pub batch_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,6 +154,28 @@ pub const EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS: &str =
 pub const SPECULATOR_SUBDIR_INSIDE_OUT_DIR_RIDES_THE_SAME_STAMP_SYMLINK_AND_HOT_LOAD_AS_THE_TARGET_ADAPTER:
     &str = "speculator";
 
+pub const AN_INLINE_ROW_KEEPS_THE_CLIENTS_KEY_ORDER_BECAUSE_SERDE_JSON_VALUE_SORTS_KEYS_HERE_AND_A_LAYA_STATE_IS_SERIALIZED_IN_KEY_ORDER: &str =
+    "serde_json::Value is a sorted map in this workspace. A Laya row's state reaches the model as its keys in order, so a row \
+     re-serialized from a Value trains on {\"body\", \"subject\"} while /v1/systemone later serves {\"subject\", \"body\"}: the job \
+     succeeds, its own held-out numbers look right, and the served model answers worse than it was measured. Rows parse through \
+     nv_laya::json::Json, which keeps order, and are written to the job's jsonl as that text.";
+
+#[derive(Debug, Clone)]
+pub struct InlineRow(String);
+
+impl<'de> Deserialize<'de> for InlineRow {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let _ = AN_INLINE_ROW_KEEPS_THE_CLIENTS_KEY_ORDER_BECAUSE_SERDE_JSON_VALUE_SORTS_KEYS_HERE_AND_A_LAYA_STATE_IS_SERIALIZED_IN_KEY_ORDER;
+        nv_laya::json::Json::deserialize(deserializer).map(|row| Self(row.to_string()))
+    }
+}
+
+impl From<serde_json::Value> for InlineRow {
+    fn from(row: serde_json::Value) -> Self {
+        Self(row.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(
     feature = "ts-bindings",
@@ -139,15 +183,18 @@ pub const SPECULATOR_SUBDIR_INSIDE_OUT_DIR_RIDES_THE_SAME_STAMP_SYMLINK_AND_HOT_
     ts(export, optional_fields = nullable)
 )]
 pub struct CreateFineTuningJobRequest {
+    pub input_adapter: Option<String>,
     pub model: String,
 
     pub training_file: Option<String>,
 
-    pub training_data: Option<Vec<serde_json::Value>>,
+    #[cfg_attr(feature = "ts-bindings", ts(type = "Array<unknown> | null"))]
+    pub training_data: Option<Vec<InlineRow>>,
 
     pub validation_file: Option<String>,
 
-    pub validation_data: Option<Vec<serde_json::Value>>,
+    #[cfg_attr(feature = "ts-bindings", ts(type = "Array<unknown> | null"))]
+    pub validation_data: Option<Vec<InlineRow>>,
 
     pub suffix: Option<String>,
 
@@ -172,6 +219,9 @@ pub struct CreateFineTuningJobBody {
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct JobHyperparameters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub max_sequence_length: Option<usize>,
     pub rank: usize,
     pub alpha: f64,
     pub steps: usize,
@@ -184,11 +234,18 @@ pub struct JobHyperparameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-bindings", ts(optional))]
     pub b_lr_ratio: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub base_bits: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub batch_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct FineTuningJob {
+    pub input_adapter: Option<String>,
     #[cfg_attr(feature = "ts-bindings", ts(type = "\"fine_tuning.job\""))]
     pub object: &'static str,
     pub id: String,
@@ -265,7 +322,48 @@ fn resolve_hp(
         seed: None,
         grad_layers: None,
         b_lr_ratio: None,
+        max_sequence_length: None,
+        base_bits: None,
+        batch_size: None,
     });
+    let laya_family = family == TrainerFamily::LayaDecision;
+    if !laya_family && (hp.base_bits.is_some() || hp.batch_size.is_some()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "base_bits and batch_size are knobs of the Laya decision trainer; this base routes elsewhere and would silently ignore them".into(),
+        ));
+    }
+    let base_bits = laya_family.then(|| hp.base_bits.unwrap_or(laya::BASE_BITS_DEFAULT_IS_THE_STORED_WEIGHTS_BECAUSE_NOTHING_THIS_SMALL_NEEDS_A_QUANTIZED_BASE));
+    if let Some(bits) = base_bits.filter(|b| {
+        !laya::BASE_BITS_THE_TRAINER_ACCEPTS_WHERE_SIXTEEN_IS_THE_STORED_WEIGHTS_UNTOUCHED
+            .contains(b)
+    }) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("base_bits {bits} is not one of 4, 8 or 16"),
+        ));
+    }
+    let batch_size = laya_family.then(|| {
+        hp.batch_size
+            .unwrap_or(LAYA_BATCH_DEFAULT_IS_THE_SIZE_THE_CUDA_AND_METAL_RUNS_WERE_VERIFIED_AT)
+            .max(1)
+    });
+    let max_sequence_length = if family == TrainerFamily::LagunaFullGraph {
+        let value = hp
+            .max_sequence_length
+            .unwrap_or(laguna_train::DEFAULT_TRAIN_SEQUENCE_LENGTH);
+        laguna_train::validate_sequence_length(value)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        Some(value)
+    } else {
+        if hp.max_sequence_length.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "max_sequence_length is supported only by the Laguna trainer".into(),
+            ));
+        }
+        None
+    };
     let (grad_layers, b_lr_ratio) = match family {
         TrainerFamily::Qwen3_5DenseWindowed => (
             Some(
@@ -287,10 +385,11 @@ fn resolve_hp(
                 nv_train::qwen38::B_LR_RATIO_DEFAULT_OF_ONE_IS_EXACTLY_THE_SINGLE_OPTIMIZER_PATH_AND_ABOVE_ONE_IS_LORA_PLUS,
             )),
         ),
-        TrainerFamily::GemmaTrainRunner | TrainerFamily::LagunaFullGraph => {
+        TrainerFamily::GemmaTrainRunner | TrainerFamily::LagunaFullGraph | TrainerFamily::LayaDecision => {
             if hp.grad_layers.is_some() || hp.b_lr_ratio.is_some() {
                 let trainer = match family {
                     TrainerFamily::GemmaTrainRunner => "train_runner",
+                    TrainerFamily::LayaDecision => "the laya decision trainer",
                     _ => "the laguna full-graph trainer",
                 };
                 return Err((
@@ -306,7 +405,10 @@ fn resolve_hp(
         }
     };
     let dots = family == TrainerFamily::DotsQloraWindowed;
-    let rank = hp.rank.unwrap_or(if dots { 16 } else { 8 }).max(1);
+    let rank = hp
+        .rank
+        .unwrap_or(if dots || laya_family { 16 } else { 8 })
+        .max(1);
     if dots && !rank.is_multiple_of(2) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -318,19 +420,25 @@ fn resolve_hp(
         ));
     }
     Ok(JobHyperparameters {
+        max_sequence_length,
         rank,
         alpha: hp
             .alpha
             .unwrap_or(if dots { rank as f64 * 2.0 } else { rank as f64 }),
         steps: hp.steps.or(hp.n_steps).unwrap_or(20),
-        learning_rate: hp
-            .lr
-            .or(hp.learning_rate)
-            .unwrap_or(if dots { 1e-4 } else { 0.05 }),
+        learning_rate: hp.lr.or(hp.learning_rate).unwrap_or(if dots {
+            1e-4
+        } else if laya_family {
+            LAYA_LEARNING_RATE_DEFAULT_IS_THE_RATE_THE_CUDA_AND_METAL_RUNS_WERE_VERIFIED_AT
+        } else {
+            0.05
+        }),
         target: hp.target.unwrap_or_else(|| default_targets_for(family)),
         seed: hp.seed.unwrap_or(0),
         grad_layers,
         b_lr_ratio,
+        base_bits,
+        batch_size,
     })
 }
 
@@ -478,7 +586,7 @@ fn resolve_speculator(
 }
 
 fn materialize_jsonl(
-    inline: &Option<Vec<serde_json::Value>>,
+    inline: &Option<Vec<InlineRow>>,
     file: &Option<String>,
     field: &str,
     job_dir: &std::path::Path,
@@ -497,7 +605,7 @@ fn materialize_jsonl(
         let path = job_dir.join(leaf);
         let mut body = String::new();
         for v in inline {
-            body.push_str(&v.to_string());
+            body.push_str(&v.0);
             body.push('\n');
         }
         std::fs::write(&path, body).map_err(|e| {
@@ -544,7 +652,7 @@ fn prepare_dataset(
 }
 
 fn dots_dump_dir(
-    inline: &Option<Vec<serde_json::Value>>,
+    inline: &Option<Vec<InlineRow>>,
     file: &Option<String>,
     field_inline: &str,
     field_file: &str,
@@ -587,8 +695,9 @@ fn model_leaf(model: &str) -> String {
 enum PreparedTrain {
     Runner(TrainArgs, Option<train_runner::SpeculatorSpec>),
     Qwen38(Q38JsonlArgs, Option<qwen38::Q38MtpCoTrainArgs>),
-    Laguna(LagunaTrainArgs),
+    Laguna(LagunaTrainArgs, usize),
     Dots(DotsTrainArgs),
+    Laya(LayaTrainArgs),
 }
 
 struct PreparedJob {
@@ -744,9 +853,59 @@ fn trained_from_dots(s: dots::DotsTrainSummary) -> Trained {
     }
 }
 
+fn trained_from_laya(s: laya::LayaTrainSummary, out: &std::path::Path) -> Trained {
+    let eval = |e: &laya::Eval| serde_json::json!({"loss": e.loss, "accuracy": e.accuracy});
+    let metrics = match serde_json::json!({
+        "trainer": LAYA_TRAINER_TAG,
+        "device": s.device,
+        "num_examples": s.train_items,
+        "num_eval_examples": s.eval_items,
+        "eval_stored_weights": s.eval_dense_base.as_ref().map(eval),
+        "eval_base": eval(&s.eval_trained_base),
+        "eval_adapter": eval(&s.eval_adapter),
+        "min_module_delta_amax": s.smallest_lora_b_amax,
+        "modules": s.adapter_modules,
+        "all_grads_finite": s.every_gradient_was_finite,
+        "merged_checkpoint": out.join(laya::MERGED_CHECKPOINT_LEAF_BESIDE_THE_ADAPTER).display().to_string(),
+    }) {
+        serde_json::Value::Object(m) => m,
+        _ => unreachable!("json! object literal"),
+    };
+    Trained {
+        adapter_path: out.join(super::lora::ADAPTER_WEIGHTS_FILE),
+        config_path: out.join(super::lora::ADAPTER_CONFIG_FILE),
+        losses: s.losses,
+        all_grads_finite: s.every_gradient_was_finite,
+        speculator_dir: None,
+        metrics,
+    }
+}
+
+const LAYA_TRAINER_TAG: &str = "laya_decision";
+
+pub const THE_SHARED_SELECTOR_KEEPS_CUDA_TRAINING_ON_THE_CPU_BECAUSE_A_CHAT_BASE_WOULD_NOT_FIT_BESIDE_SERVING_BUT_A_LAYA_BASE_IS_UNDER_A_GIGABYTE: &str =
+    "train_runner::select_device defaults a CUDA build to the CPU so a multi-gigabyte chat base never lands on a GPU that is \
+     already serving. A Laya checkpoint and its batch fit in a few GiB, and the same job takes minutes on the CPU and seconds \
+     on the GPU, so this family opens the CUDA device when NV_TRAIN_DEVICE is unset. NV_TRAIN_DEVICE=cpu keeps it off the GPU.";
+
+fn the_laya_device_is_the_accelerator_unless_nv_train_device_says_otherwise(
+) -> anyhow::Result<candle_core::Device> {
+    let _ = THE_SHARED_SELECTOR_KEEPS_CUDA_TRAINING_ON_THE_CPU_BECAUSE_A_CHAT_BASE_WOULD_NOT_FIT_BESIDE_SERVING_BUT_A_LAYA_BASE_IS_UNDER_A_GIGABYTE;
+    #[cfg(feature = "cuda")]
+    if !nv_config::env_arm_present_at_all_reread_every_call("NV_TRAIN_DEVICE") {
+        return candle_core::Device::new_cuda(0).map_err(|e| {
+            anyhow::anyhow!(
+                "open CUDA device 0 for the laya trainer (NV_TRAIN_DEVICE=cpu opts out): {e}"
+            )
+        });
+    }
+    train_runner::select_device()
+}
+
 fn trained_from_laguna(s: laguna_train::LagunaTrainSummary) -> Trained {
     let metrics = match serde_json::json!({
         "trainer": "laguna_full_graph",
+        "max_sequence_length": s.max_sequence_length,
         "packed_linears": s.packed_linears,
         "grouped_moe_copies": s.grouped_moe_copies,
         "eval_loss_adapter": s.eval_loss_adapter,
@@ -827,7 +986,12 @@ fn prepare_job(
     req: &CreateFineTuningJobRequest,
     speculator: &Option<SpeculatorSpec>,
 ) -> Result<(FineTuningJob, PreparedJob), (StatusCode, String)> {
-    let base = PathBuf::from(&req.model);
+    let _ = A_SYSTEMONE_MODEL_NAME_RESOLVES_AGAINST_THE_SERVED_CHECKPOINT_DIRECTORY_SO_A_CLIENT_NEED_NOT_KNOW_SERVER_PATHS;
+    let served_laya = nv_laya::router::normalise(&req.model)
+        .ok()
+        .and_then(|m| super::systemone::model_dir().map(|d| d.join(nv_laya::router::directory(m))))
+        .filter(|d| d.is_dir());
+    let base = served_laya.unwrap_or_else(|| PathBuf::from(&req.model));
     let base_ok = base.extension().and_then(|e| e.to_str()) == Some("gguf") && base.is_file();
     if !base_ok && !base.is_dir() {
         return Err((
@@ -845,6 +1009,12 @@ fn prepare_job(
     } else {
         trainer_family_for_base(&base)
     };
+    if req.input_adapter.is_some() && !matches!(family, TrainerFamily::LagunaFullGraph) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "input_adapter is supported only for Laguna training".into(),
+        ));
+    }
     let hp = resolve_hp(&req.hyperparameters, family)?;
     let speculator = resolve_speculator(speculator, family)?;
     let id = format!("ftjob-{}", uuid::Uuid::new_v4().simple());
@@ -900,6 +1070,7 @@ fn prepare_job(
     let ft_model = format!("ft:{}:{}:{}", model_leaf(&req.model), suffix, short);
 
     let job = FineTuningJob {
+        input_adapter: req.input_adapter.clone(),
         object: "fine_tuning.job",
         id: id.clone(),
         created_at: now_secs(),
@@ -962,17 +1133,42 @@ fn prepare_job(
             seed: hp.seed,
             dtype: candle_core::DType::F32,
         }),
-        TrainerFamily::LagunaFullGraph => PreparedTrain::Laguna(LagunaTrainArgs {
+        TrainerFamily::LagunaFullGraph => PreparedTrain::Laguna(
+            LagunaTrainArgs {
+                input_adapter: req.input_adapter.as_ref().map(PathBuf::from),
+                base,
+                data: data_path,
+                eval_data: eval_path,
+                out: out_dir.clone(),
+                rank: hp.rank,
+                alpha: hp.alpha,
+                targets: hp.target.clone(),
+                steps: hp.steps,
+                lr: hp.learning_rate,
+                seed: hp.seed,
+            },
+            hp.max_sequence_length
+                .expect("Laguna sequence length resolved"),
+        ),
+        TrainerFamily::LayaDecision => PreparedTrain::Laya(LayaTrainArgs {
             base,
             data: data_path,
             eval_data: eval_path,
             out: out_dir.clone(),
+            merged_out: Some(out_dir.join(laya::MERGED_CHECKPOINT_LEAF_BESIDE_THE_ADAPTER)),
             rank: hp.rank,
-            alpha: hp.alpha,
-            targets: hp.target.clone(),
-            steps: hp.steps,
+            alpha: Some(hp.alpha),
             lr: hp.learning_rate,
+            steps: hp.steps,
+            batch: hp
+                .batch_size
+                .expect("resolve_hp fills batch_size for the laya family"),
             seed: hp.seed,
+            targets: hp.target.clone(),
+            base_bits: hp
+                .base_bits
+                .expect("resolve_hp fills base_bits for the laya family"),
+            shuffle_options: true,
         }),
         TrainerFamily::GemmaTrainRunner => PreparedTrain::Runner(
             TrainArgs {
@@ -998,6 +1194,12 @@ fn prepare_job(
         ),
     };
 
+    if let PreparedTrain::Laguna(args, _) = &train {
+        if let Some(path) = &args.input_adapter {
+            laguna_train::validate_input_adapter(args, path)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+        }
+    }
     Ok((
         job,
         PreparedJob {
@@ -1044,7 +1246,9 @@ fn run_training_on_a_wide_stack(train: PreparedTrain) -> anyhow::Result<Trained>
                         .map(|(s, c)| trained_from_qwen38(s, Some(c))),
                 }
             }),
-            PreparedTrain::Laguna(args) => laguna_train::run(args).map(trained_from_laguna),
+            PreparedTrain::Laguna(args, sequence_length) => laguna_train::run_with_sequence_length(args, *sequence_length).map(trained_from_laguna),
+            PreparedTrain::Laya(args) => the_laya_device_is_the_accelerator_unless_nv_train_device_says_otherwise()
+                .and_then(|device| laya::run(args, &device).map(|s| trained_from_laya(s, &args.out))),
             PreparedTrain::Dots(args) => {
                 dots::metal_command_batching_default();
                 train_runner::select_device()
@@ -1209,6 +1413,44 @@ fn finish_success_registering_and_hot_loading(
         "job success does not persist a boot default; the held-out gate owner \
          promotes via POST /v1/adapters/promote, which rolls the current symlink"
     );
+    if summary.metrics.get("trainer").and_then(|v| v.as_str()) == Some(LAYA_TRAINER_TAG) {
+        let merged = out_dir.join(laya::MERGED_CHECKPOINT_LEAF_BESIDE_THE_ADAPTER);
+        let registered = match super::systemone::register_fine_tuned(&ft_model, &merged) {
+            Ok(()) => {
+                tracing::info!(model = %ft_model, dir = %merged.display(), "fine-tuned Laya checkpoint registered; /v1/systemone serves it by this model id without a restart");
+                true
+            }
+            Err(err) => {
+                tracing::warn!(model = %ft_model, dir = %merged.display(), error = %err, "fine-tuned Laya checkpoint trained but could not be registered with /v1/systemone");
+                false
+            }
+        };
+        let result_files = vec![
+            out_dir.display().to_string(),
+            summary.adapter_path.display().to_string(),
+            summary.config_path.display().to_string(),
+            merged.display().to_string(),
+        ];
+        return Box::new(move |job| {
+            job.status = "succeeded".into();
+            job.finished_at = Some(now_secs());
+            job.fine_tuned_model = Some(ft_model);
+            job.result_files = result_files;
+            let mut metrics = summary.metrics;
+            metrics.insert(
+                "loss_first".into(),
+                serde_json::json!(summary.losses.first().copied()),
+            );
+            metrics.insert(
+                "loss_last".into(),
+                serde_json::json!(summary.losses.last().copied()),
+            );
+            metrics.insert("registered".into(), serde_json::json!(registered));
+            metrics.insert("hot_loaded".into(), serde_json::json!(registered));
+            metrics.insert("serving_route".into(), serde_json::json!("systemone"));
+            job.metrics = Some(serde_json::Value::Object(metrics));
+        });
+    }
     if summary.metrics.get("trainer").and_then(|v| v.as_str()) == Some("dots_qlora_windowed") {
         tracing::info!(
             adapter = %ft_model,
@@ -1372,12 +1614,6 @@ fn update_job_then_persist_beside_the_adapter(
     persist_job_record_into_out_dir_for_the_gate_script_and_post_restart_forensics(out_dir, id);
 }
 
-pub fn create_job_async(
-    req: &CreateFineTuningJobRequest,
-) -> Result<FineTuningJob, (StatusCode, String)> {
-    create_job_async_with_speculator(req, &None)
-}
-
 pub fn create_job_async_with_speculator(
     req: &CreateFineTuningJobRequest,
     speculator: &Option<SpeculatorSpec>,
@@ -1515,7 +1751,7 @@ mod tests {
 
     impl Drop for VarRemovedOnDropSoAFailedAssertCannotLeakItIntoLaterTests {
         fn drop(&mut self) {
-            std::env::remove_var(self.0);
+            unsafe { std::env::remove_var(self.0) };
         }
     }
 
@@ -1525,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn a_qwen38_dense_config_routes_to_the_windowed_trainer_and_everything_else_to_train_runner() {
+    fn each_config_routes_to_its_trainer_family_and_a_missing_config_stays_on_train_runner() {
         assert_eq!(
             trainer_family_for_config(qwen38_dense_cfg()),
             TrainerFamily::Qwen3_5DenseWindowed
@@ -1554,71 +1790,133 @@ mod tests {
                 "{other}"
             );
         }
-    }
-
-    #[test]
-    fn a_dots_config_routes_to_the_qlora_trainer_with_its_own_defaults() {
-        for cfg in [
-            r#"{"model_type":"dots_ocr"}"#,
-            r#"{"architectures":["DotsOCRForCausalLM"],"model_type":"dots_ocr"}"#,
-        ] {
+        {
+            for cfg in [
+                r#"{"model_type":"dots_ocr"}"#,
+                r#"{"architectures":["DotsOCRForCausalLM"],"model_type":"dots_ocr"}"#,
+            ] {
+                assert_eq!(
+                    trainer_family_for_config(cfg),
+                    TrainerFamily::DotsQloraWindowed,
+                    "{cfg}"
+                );
+            }
+            let hp = resolve_hp(&None, TrainerFamily::DotsQloraWindowed).unwrap();
+            assert_eq!(hp.rank, 16);
+            assert_eq!(hp.alpha, 32.0);
+            assert_eq!(hp.learning_rate, 1e-4);
             assert_eq!(
-                trainer_family_for_config(cfg),
-                TrainerFamily::DotsQloraWindowed,
-                "{cfg}"
+                hp.grad_layers,
+                Some(
+                    DOTS_GRAD_LAYERS_DEFAULT_IS_8_BECAUSE_THE_QLORA_SMOKE_MEASURED_ITS_FOOTPRINT_THERE
+                )
+            );
+            assert_eq!(hp.b_lr_ratio, Some(1.0));
+            assert_eq!(
+                hp.target,
+                nv_train::dots::dots_default_targets(),
+                "the api defaults must be the trainer's own"
             );
         }
-        let hp = resolve_hp(&None, TrainerFamily::DotsQloraWindowed).unwrap();
-        assert_eq!(hp.rank, 16);
-        assert_eq!(hp.alpha, 32.0);
-        assert_eq!(hp.learning_rate, 1e-4);
-        assert_eq!(
-            hp.grad_layers,
-            Some(
-                DOTS_GRAD_LAYERS_DEFAULT_IS_8_BECAUSE_THE_QLORA_SMOKE_MEASURED_ITS_FOOTPRINT_THERE
-            )
-        );
-        assert_eq!(hp.b_lr_ratio, Some(1.0));
-        assert_eq!(
-            hp.target,
-            nv_train::dots::dots_default_targets(),
-            "the api defaults must be the trainer's own"
-        );
+        {
+            assert_eq!(
+                trainer_family_for_config(laguna_cfg()),
+                TrainerFamily::LagunaFullGraph
+            );
+            assert_eq!(
+                trainer_family_for_config(r#"{"model_type":"laguna"}"#),
+                TrainerFamily::LagunaFullGraph,
+                "model_type alone must classify, mirroring backend_select's laguna id match"
+            );
+            assert_eq!(
+                trainer_family_for_config(&nv_models::laguna_train::tiny_laguna_config_json()),
+                TrainerFamily::LagunaFullGraph,
+                "the tiny laguna fixture must route to the trainer that can actually load it"
+            );
+            assert_eq!(
+                default_targets_for(TrainerFamily::LagunaFullGraph),
+                nv_models::laguna_train::LagunaTrainArgs::default_targets(),
+                "the endpoint default must be exactly the laguna trainer's attachable set"
+            );
+        }
+        {
+            let root = std::env::temp_dir().join(format!("ft-family-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let qwen = root.join("qwen");
+            std::fs::create_dir_all(&qwen).unwrap();
+            std::fs::write(qwen.join("config.json"), qwen38_dense_cfg()).unwrap();
+            assert_eq!(
+                trainer_family_for_base(&qwen),
+                TrainerFamily::Qwen3_5DenseWindowed
+            );
+            let bare = root.join("bare");
+            std::fs::create_dir_all(&bare).unwrap();
+            assert_eq!(
+                trainer_family_for_base(&bare),
+                TrainerFamily::GemmaTrainRunner
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
-    fn family_detection_reads_the_model_dirs_config_json_and_a_missing_one_stays_on_train_runner() {
-        let root = std::env::temp_dir().join(format!("ft-family-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let qwen = root.join("qwen");
-        std::fs::create_dir_all(&qwen).unwrap();
-        std::fs::write(qwen.join("config.json"), qwen38_dense_cfg()).unwrap();
-        assert_eq!(
-            trainer_family_for_base(&qwen),
-            TrainerFamily::Qwen3_5DenseWindowed
-        );
-        let bare = root.join("bare");
-        std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(
-            trainer_family_for_base(&bare),
-            TrainerFamily::GemmaTrainRunner
-        );
-        let _ = std::fs::remove_dir_all(&root);
+    fn continuation_request_deserializes_and_rejects_other_model_families() {
+        let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
+        let root = std::env::temp_dir().join(format!("ft-continuation-api-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.json"), qwen38_dense_cfg()).unwrap();
+        let request: CreateFineTuningJobRequest = serde_json::from_value(serde_json::json!({
+            "model": root.to_string_lossy(), "input_adapter": "/previous/adapter",
+            "training_data": [{"prompt": "new", "completion": "answer"}]
+        }))
+        .unwrap();
+        assert_eq!(request.input_adapter.as_deref(), Some("/previous/adapter"));
+        let error = prepare_job(&request, &None).err().unwrap();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("only for Laguna"));
+        let base = root.join("laguna");
+        nv_models::laguna_train::write_tiny_laguna_checkpoint(&base);
+        let adapter = root.join("adapter");
+        std::fs::create_dir_all(&adapter).unwrap();
+        std::fs::write(
+            adapter.join("adapter_config.json"),
+            serde_json::json!({
+                "peft_type":"LORA", "r":4, "lora_alpha":4.0,
+                "base_model_name_or_path":base.to_string_lossy()
+            })
+            .to_string(),
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
+        let request: CreateFineTuningJobRequest = serde_json::from_value(serde_json::json!({
+            "model":base.to_string_lossy(), "input_adapter":adapter.to_string_lossy(),
+            "training_data":[{"text":"new SFT"}],
+            "hyperparameters":{"rank":4,"alpha":4.0}
+        }))
+        .unwrap();
+        let (job, prepared) = prepare_job(&request, &None).unwrap();
+        assert_eq!(job.input_adapter, request.input_adapter);
+        match prepared.train {
+            PreparedTrain::Laguna(args, _) => assert_eq!(args.input_adapter, Some(adapter)),
+            _ => panic!("Laguna continuation must route to its trainer"),
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn prepare_job_dispatches_on_the_config_without_touching_any_weights() {
+    fn prepare_job_dispatches_on_the_config_and_an_absent_speculator_keeps_the_record_byte_identical() {
         let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
         let root = std::env::temp_dir().join(format!("ft-dispatch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs"));
+        unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
         let qwen = root.join("qwen-base");
         std::fs::create_dir_all(&qwen).unwrap();
         std::fs::write(qwen.join("config.json"), qwen38_dense_cfg()).unwrap();
         let req = CreateFineTuningJobRequest {
+            input_adapter: None,
             model: qwen.display().to_string(),
             training_file: None,
-            training_data: Some(vec![serde_json::json!({"text": "hello world"})]),
+            training_data: Some(vec![serde_json::json!({"text": "hello world"}).into()]),
             validation_file: None,
             validation_data: None,
             suffix: None,
@@ -1644,6 +1942,7 @@ mod tests {
         )
         .unwrap();
         let req = CreateFineTuningJobRequest {
+            input_adapter: None,
             model: gemma.display().to_string(),
             ..req
         };
@@ -1651,10 +1950,67 @@ mod tests {
         assert!(matches!(prepared.train, PreparedTrain::Runner(..)));
         assert_eq!(job.hyperparameters.target, TrainArgs::default_targets());
         let _ = std::fs::remove_dir_all(&root);
+        {
+            let body: CreateFineTuningJobBody = serde_json::from_str(
+                r#"{"model":"m","training_data":[{"text":"x"}],
+                    "speculator":{"kind":"mtp","rank":16,"lr_ratio":2.5}}"#,
+            )
+            .unwrap();
+            assert_eq!(body.job.model, "m");
+            let parsed = body.speculator.expect("speculator field parses");
+            assert_eq!(
+                (parsed.kind.as_str(), parsed.rank, parsed.lr_ratio),
+                ("mtp", Some(16), Some(2.5))
+            );
+            let body: CreateFineTuningJobBody =
+                serde_json::from_str(r#"{"model":"m","training_data":[{"text":"x"}]}"#).unwrap();
+            assert!(body.speculator.is_none());
+            assert_eq!(body.job.model, "m");
+
+            let root = std::env::temp_dir().join(format!("ft-spec-absent-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
+            let qwen = root.join("qwen-base");
+            std::fs::create_dir_all(&qwen).unwrap();
+            std::fs::write(qwen.join("config.json"), qwen38_dense_cfg()).unwrap();
+            let req = CreateFineTuningJobRequest {
+                input_adapter: None,
+                model: qwen.display().to_string(),
+                training_file: None,
+                training_data: Some(vec![serde_json::json!({"text": "hello world"}).into()]),
+                validation_file: None,
+                validation_data: None,
+                suffix: None,
+                output_dir: None,
+                hyperparameters: None,
+            };
+            let (mut job, prepared) = prepare_job(&req, &None).unwrap();
+            assert!(
+                matches!(prepared.train, PreparedTrain::Qwen38(_, None)),
+                "no speculator in the request means the plain run_jsonl path, byte-identical to today"
+            );
+            assert!(
+                !a_speculator_was_requested(&prepared.train),
+                "the dropped-knob guard must stay silent on the plain path or every job fails"
+            );
+            let json = serde_json::to_string(&job).unwrap();
+            assert!(
+                !json.contains("speculator"),
+                "a job without a speculator request must serialize exactly as before: {json}"
+            );
+            job.speculator_trained = true;
+            assert!(
+                serde_json::to_string(&job)
+                    .unwrap()
+                    .contains("\"speculator_trained\":true"),
+                "the flag appears once a co-trained speculator artifact ships"
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
-    fn qwen_default_targets_are_exactly_the_q38_trainer_defaults_now_that_serving_covers_gdn() {
+    fn qwen_defaults_are_the_q38_trainer_defaults_and_a_requested_grad_layers_depth_reaches_the_trainer() {
         let defaults = default_targets_for(TrainerFamily::Qwen3_5DenseWindowed);
         assert_eq!(
             defaults,
@@ -1674,6 +2030,9 @@ mod tests {
             seed: None,
             grad_layers: None,
             b_lr_ratio: None,
+            max_sequence_length: None,
+            base_bits: None,
+            batch_size: None,
         };
         assert_eq!(
             resolve_hp(&Some(explicit), TrainerFamily::Qwen3_5DenseWindowed)
@@ -1682,82 +2041,86 @@ mod tests {
             vec!["in_proj_qkv".to_string()],
             "GDN targets stay reachable by explicit request"
         );
-    }
-
-    #[test]
-    fn grad_layers_defaults_to_the_gdn_bounded_window_and_a_requested_depth_reaches_the_qwen_trainer(
-    ) {
-        assert_eq!(
-            resolve_hp(&None, TrainerFamily::Qwen3_5DenseWindowed)
+        {
+            assert_eq!(
+                resolve_hp(&None, TrainerFamily::Qwen3_5DenseWindowed)
+                    .unwrap()
+                    .grad_layers,
+                Some(QWEN_GRAD_LAYERS_DEFAULT_IS_THE_CLI_WINDOW_BECAUSE_GDN_ACTIVATION_MEMORY_BOUNDS_THE_WINDOW_NOT_THE_WEIGHTS)
+            );
+            let deep = Hyperparameters {
+                rank: None,
+                alpha: None,
+                steps: None,
+                n_steps: None,
+                lr: None,
+                learning_rate: None,
+                target: None,
+                seed: None,
+                grad_layers: Some(9),
+                b_lr_ratio: None,
+                max_sequence_length: None,
+                base_bits: None,
+                batch_size: None,
+            };
+            assert_eq!(
+                resolve_hp(&Some(deep.clone()), TrainerFamily::Qwen3_5DenseWindowed)
+                    .unwrap()
+                    .grad_layers,
+                Some(9)
+            );
+            assert_eq!(
+                resolve_hp(
+                    &Some(Hyperparameters {
+                        grad_layers: Some(0),
+                        ..deep.clone()
+                    }),
+                    TrainerFamily::Qwen3_5DenseWindowed
+                )
                 .unwrap()
                 .grad_layers,
-            Some(QWEN_GRAD_LAYERS_DEFAULT_IS_THE_CLI_WINDOW_BECAUSE_GDN_ACTIVATION_MEMORY_BOUNDS_THE_WINDOW_NOT_THE_WEIGHTS)
-        );
-        let deep = Hyperparameters {
-            rank: None,
-            alpha: None,
-            steps: None,
-            n_steps: None,
-            lr: None,
-            learning_rate: None,
-            target: None,
-            seed: None,
-            grad_layers: Some(9),
-            b_lr_ratio: None,
-        };
-        assert_eq!(
-            resolve_hp(&Some(deep.clone()), TrainerFamily::Qwen3_5DenseWindowed)
-                .unwrap()
-                .grad_layers,
-            Some(9)
-        );
-        assert_eq!(
-            resolve_hp(
-                &Some(Hyperparameters {
-                    grad_layers: Some(0),
-                    ..deep.clone()
-                }),
-                TrainerFamily::Qwen3_5DenseWindowed
-            )
-            .unwrap()
-            .grad_layers,
-            Some(1),
-            "a zero window trains nothing; run_jsonl clamps the top to num_hidden_layers"
-        );
+                Some(1),
+                "a zero window trains nothing; run_jsonl clamps the top to num_hidden_layers"
+            );
 
-        let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
-        let root = std::env::temp_dir().join(format!("ft-gradlayers-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs"));
-        let qwen = root.join("qwen-base");
-        std::fs::create_dir_all(&qwen).unwrap();
-        std::fs::write(qwen.join("config.json"), qwen38_dense_cfg()).unwrap();
-        let req = CreateFineTuningJobRequest {
-            model: qwen.display().to_string(),
-            training_file: None,
-            training_data: Some(vec![serde_json::json!({"text": "hello world"})]),
-            validation_file: None,
-            validation_data: None,
-            suffix: None,
-            output_dir: None,
-            hyperparameters: Some(deep),
-        };
-        let (job, prepared) = prepare_job(&req, &None).unwrap();
-        assert_eq!(job.hyperparameters.grad_layers, Some(9));
-        match prepared.train {
-            PreparedTrain::Qwen38(args, _) => assert_eq!(
-                args.grad_layers, 9,
-                "the requested window depth must reach Q38JsonlArgs, not the fixed default"
-            ),
-            PreparedTrain::Runner(..) | PreparedTrain::Laguna(..) | PreparedTrain::Dots(..) => {
-                panic!("a qwen base must route to the windowed trainer")
+            let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
+            let root = std::env::temp_dir().join(format!("ft-gradlayers-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
+            let qwen = root.join("qwen-base");
+            std::fs::create_dir_all(&qwen).unwrap();
+            std::fs::write(qwen.join("config.json"), qwen38_dense_cfg()).unwrap();
+            let req = CreateFineTuningJobRequest {
+                input_adapter: None,
+                model: qwen.display().to_string(),
+                training_file: None,
+                training_data: Some(vec![serde_json::json!({"text": "hello world"}).into()]),
+                validation_file: None,
+                validation_data: None,
+                suffix: None,
+                output_dir: None,
+                hyperparameters: Some(deep),
+            };
+            let (job, prepared) = prepare_job(&req, &None).unwrap();
+            assert_eq!(job.hyperparameters.grad_layers, Some(9));
+            match prepared.train {
+                PreparedTrain::Qwen38(args, _) => assert_eq!(
+                    args.grad_layers, 9,
+                    "the requested window depth must reach Q38JsonlArgs, not the fixed default"
+                ),
+                PreparedTrain::Runner(..)
+                | PreparedTrain::Laguna(..)
+                | PreparedTrain::Dots(..)
+                | PreparedTrain::Laya(..) => {
+                    panic!("a qwen base must route to the windowed trainer")
+                }
             }
+            let _ = std::fs::remove_dir_all(&root);
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn the_runner_family_rejects_the_qwen_only_knobs_instead_of_silently_ignoring_them() {
+    fn each_family_rejects_the_knobs_and_speculator_kinds_it_cannot_honour() {
         let unset = resolve_hp(&None, TrainerFamily::GemmaTrainRunner).unwrap();
         assert_eq!(
             (unset.grad_layers, unset.b_lr_ratio),
@@ -1775,6 +2138,9 @@ mod tests {
             seed: None,
             grad_layers: Some(2),
             b_lr_ratio: Some(8.0),
+            max_sequence_length: None,
+            base_bits: None,
+            batch_size: None,
         };
         let (status, msg) = resolve_hp(&Some(with_knobs.clone()), TrainerFamily::GemmaTrainRunner)
             .expect_err(
@@ -1786,6 +2152,7 @@ mod tests {
         for one in [
             Hyperparameters {
                 b_lr_ratio: None,
+                max_sequence_length: None,
                 ..with_knobs.clone()
             },
             Hyperparameters {
@@ -1799,7 +2166,7 @@ mod tests {
         let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
         let root = std::env::temp_dir().join(format!("ft-runner-knobs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs"));
+        unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
         let gemma = root.join("gemma-base");
         std::fs::create_dir_all(&gemma).unwrap();
         std::fs::write(
@@ -1808,9 +2175,10 @@ mod tests {
         )
         .unwrap();
         let req = CreateFineTuningJobRequest {
+            input_adapter: None,
             model: gemma.display().to_string(),
             training_file: None,
-            training_data: Some(vec![serde_json::json!({"text": "hello world"})]),
+            training_data: Some(vec![serde_json::json!({"text": "hello world"}).into()]),
             validation_file: None,
             validation_data: None,
             suffix: None,
@@ -1826,6 +2194,9 @@ mod tests {
                 seed: None,
                 grad_layers: Some(2),
                 b_lr_ratio: None,
+                max_sequence_length: None,
+                base_bits: None,
+                batch_size: None,
             }),
         };
         let (status, _) = prepare_job(&req, &None)
@@ -1833,6 +2204,7 @@ mod tests {
             .expect("prepare_job must refuse");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let req = CreateFineTuningJobRequest {
+            input_adapter: None,
             hyperparameters: None,
             ..req
         };
@@ -1846,10 +2218,107 @@ mod tests {
             "the stored record omits knobs that never reached the trainer"
         );
         let _ = std::fs::remove_dir_all(&root);
+        {
+            let unset = resolve_hp(&None, TrainerFamily::LagunaFullGraph).unwrap();
+            assert_eq!((unset.grad_layers, unset.b_lr_ratio), (None, None));
+            let with_knobs = Hyperparameters {
+                rank: None,
+                alpha: None,
+                steps: None,
+                n_steps: None,
+                lr: None,
+                learning_rate: None,
+                target: None,
+                seed: None,
+                grad_layers: Some(2),
+                b_lr_ratio: Some(8.0),
+                max_sequence_length: None,
+                base_bits: None,
+                batch_size: None,
+            };
+            let (status, msg) = resolve_hp(&Some(with_knobs), TrainerFamily::LagunaFullGraph)
+                .expect_err(
+                    "the laguna trainer has no window or LoRA+ path, so accepting the knobs \
+                         would train something other than what the job record claims",
+                );
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(msg.contains("laguna full-graph"), "{msg}");
+
+            for kind in ["mtp", "eagle3"] {
+                let (status, msg) =
+                    resolve_speculator(&Some(spec(kind)), TrainerFamily::LagunaFullGraph)
+                        .expect_err("laguna has no MTP head and no eagle3 tap path");
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(
+                    msg.contains(kind) && msg.contains("laguna"),
+                    "the refusal must name the requested kind and the family: {msg}"
+                );
+            }
+            assert!(resolve_speculator(&None, TrainerFamily::LagunaFullGraph)
+                .unwrap()
+                .is_none());
+        }
+        {
+            let (status, msg) = resolve_speculator(&Some(spec("mtp")), TrainerFamily::GemmaTrainRunner)
+                .expect_err("train_runner bases have no MTP head to co-train");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(msg.contains("mtp") && msg.contains("train_runner"), "{msg}");
+            let (status, msg) =
+                resolve_speculator(&Some(spec("eagle3")), TrainerFamily::Qwen3_5DenseWindowed)
+                    .expect_err("the qwen family self-drafts via its MTP head, not a separate drafter");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(msg.contains("eagle3") && msg.contains("mtp"), "{msg}");
+            let (status, msg) =
+                resolve_speculator(&Some(spec("medusa")), TrainerFamily::Qwen3_5DenseWindowed)
+                    .expect_err("unknown kinds must be refused, not silently dropped");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(msg.contains("medusa"), "{msg}");
+            for family in [
+                TrainerFamily::Qwen3_5DenseWindowed,
+                TrainerFamily::GemmaTrainRunner,
+            ] {
+                assert!(
+                    resolve_speculator(&None, family).unwrap().is_none(),
+                    "an absent speculator resolves to nothing for every family"
+                );
+            }
+        }
+        {
+            assert_eq!(
+                resolve_hp(&None, TrainerFamily::LagunaFullGraph)
+                    .unwrap()
+                    .max_sequence_length,
+                Some(512)
+            );
+            for value in [2, 2048, 32768] {
+                let hp =
+                    serde_json::from_value(serde_json::json!({"max_sequence_length": value})).unwrap();
+                assert_eq!(
+                    resolve_hp(&Some(hp), TrainerFamily::LagunaFullGraph)
+                        .unwrap()
+                        .max_sequence_length,
+                    Some(value)
+                );
+            }
+            for value in [0, 1, 32769] {
+                let hp =
+                    serde_json::from_value(serde_json::json!({"max_sequence_length": value})).unwrap();
+                assert!(resolve_hp(&Some(hp), TrainerFamily::LagunaFullGraph).is_err());
+            }
+            for family in [
+                TrainerFamily::Qwen3_5DenseWindowed,
+                TrainerFamily::DotsQloraWindowed,
+                TrainerFamily::GemmaTrainRunner,
+            ] {
+                let hp =
+                    serde_json::from_value(serde_json::json!({"max_sequence_length": 2048})).unwrap();
+                assert!(resolve_hp(&Some(hp), family).is_err());
+            }
+        }
     }
 
     #[test]
-    fn a_qwen38_summary_reporting_a_non_finite_gradient_surfaces_the_flag_run_job_fails_on() {
+    fn a_summary_reporting_a_non_finite_gradient_surfaces_the_flag_run_job_fails_on_for_both_arms() {
         let summary = |finite: bool| qwen38::Q38JsonlSummary {
             losses: vec![4.9, f32::NAN],
             eval_loss_adapter: None,
@@ -1910,71 +2379,69 @@ mod tests {
             joint.metrics["speculator"]["kind"],
             serde_json::json!("qwen38_mtp_head")
         );
-    }
+        {
+            let summary = |finite: bool| train_runner::TrainSummary {
+                losses: vec![4.9, f32::NAN],
+                eval_loss_adapter: None,
+                eval_loss_base: None,
+                eval_ce_adapter: vec![],
+                eval_ce_base: vec![],
+                serving_equiv_maxabs: 0.0,
+                trainable_vars: 0,
+                num_examples: 1,
+                num_eval_examples: 0,
+                base_dtype: "BF16".into(),
+                resident_base: false,
+                nvfp4_base: false,
+                dense_base: true,
+                layers_built: 1,
+                config_layers: 1,
+                deterministic: false,
+                device: "cuda".into(),
+                checkpointed: false,
+                all_grads_finite: finite,
+                lmhead_chunk: 0,
+                modules: vec![],
+                adapter_path: PathBuf::from("adapter/adapter_model.safetensors"),
+                config_path: PathBuf::from("adapter/adapter_config.json"),
+            };
+            let bad = trained_from_runner(summary(false), None);
+            assert!(
+                !bad.all_grads_finite,
+                "the gemma arm must fail the job on a NaN gradient exactly like the qwen arm; a \
+                 hardcoded pass here re-opens the NaN-adapter-hot-load hole on every non-qwen base"
+            );
+            assert_eq!(bad.metrics["all_grads_finite"], serde_json::json!(false));
+            let good = trained_from_runner(summary(true), None);
+            assert!(good.all_grads_finite);
+            assert_eq!(good.metrics["all_grads_finite"], serde_json::json!(true));
+            assert!(good.speculator_dir.is_none());
 
-    #[test]
-    fn a_runner_summary_reporting_a_non_finite_gradient_surfaces_the_flag_run_job_fails_on() {
-        let summary = |finite: bool| train_runner::TrainSummary {
-            losses: vec![4.9, f32::NAN],
-            eval_loss_adapter: None,
-            eval_loss_base: None,
-            eval_ce_adapter: vec![],
-            eval_ce_base: vec![],
-            serving_equiv_maxabs: 0.0,
-            trainable_vars: 0,
-            num_examples: 1,
-            num_eval_examples: 0,
-            base_dtype: "BF16".into(),
-            resident_base: false,
-            nvfp4_base: false,
-            dense_base: true,
-            layers_built: 1,
-            config_layers: 1,
-            deterministic: false,
-            device: "cuda".into(),
-            checkpointed: false,
-            all_grads_finite: finite,
-            lmhead_chunk: 0,
-            modules: vec![],
-            adapter_path: PathBuf::from("adapter/adapter_model.safetensors"),
-            config_path: PathBuf::from("adapter/adapter_config.json"),
-        };
-        let bad = trained_from_runner(summary(false), None);
-        assert!(
-            !bad.all_grads_finite,
-            "the gemma arm must fail the job on a NaN gradient exactly like the qwen arm; a \
-             hardcoded pass here re-opens the NaN-adapter-hot-load hole on every non-qwen base"
-        );
-        assert_eq!(bad.metrics["all_grads_finite"], serde_json::json!(false));
-        let good = trained_from_runner(summary(true), None);
-        assert!(good.all_grads_finite);
-        assert_eq!(good.metrics["all_grads_finite"], serde_json::json!(true));
-        assert!(good.speculator_dir.is_none());
-
-        let sp = |finite: bool| train_runner::SpeculatorTrainSummary {
-            kind: "eagle3".into(),
-            losses: vec![5.0, 4.0],
-            trainable_vars: 8,
-            all_grads_finite: finite,
-            modules: vec!["fc".into()],
-            adapter_path: PathBuf::from("adapter/speculator/adapter_model.safetensors"),
-            config_path: PathBuf::from("adapter/speculator/adapter_config.json"),
-        };
-        let joint = trained_from_runner(summary(true), Some(sp(false)));
-        assert!(
-            !joint.all_grads_finite,
-            "a NaN eagle3 gradient must fail the job like a NaN target gradient"
-        );
-        let joint = trained_from_runner(summary(true), Some(sp(true)));
-        assert!(joint.all_grads_finite);
-        assert_eq!(
-            joint.speculator_dir,
-            Some(PathBuf::from("adapter/speculator"))
-        );
-        assert_eq!(
-            joint.metrics["speculator"]["kind"],
-            serde_json::json!("eagle3")
-        );
+            let sp = |finite: bool| train_runner::SpeculatorTrainSummary {
+                kind: "eagle3".into(),
+                losses: vec![5.0, 4.0],
+                trainable_vars: 8,
+                all_grads_finite: finite,
+                modules: vec!["fc".into()],
+                adapter_path: PathBuf::from("adapter/speculator/adapter_model.safetensors"),
+                config_path: PathBuf::from("adapter/speculator/adapter_config.json"),
+            };
+            let joint = trained_from_runner(summary(true), Some(sp(false)));
+            assert!(
+                !joint.all_grads_finite,
+                "a NaN eagle3 gradient must fail the job like a NaN target gradient"
+            );
+            let joint = trained_from_runner(summary(true), Some(sp(true)));
+            assert!(joint.all_grads_finite);
+            assert_eq!(
+                joint.speculator_dir,
+                Some(PathBuf::from("adapter/speculator"))
+            );
+            assert_eq!(
+                joint.metrics["speculator"]["kind"],
+                serde_json::json!("eagle3")
+            );
+        }
     }
 
     #[cfg(feature = "wgpu")]
@@ -2019,112 +2486,57 @@ mod tests {
     }
 
     #[test]
-    fn a_laguna_config_routes_to_the_full_graph_trainer_with_the_attention_target_set() {
-        assert_eq!(
-            trainer_family_for_config(laguna_cfg()),
-            TrainerFamily::LagunaFullGraph
-        );
-        assert_eq!(
-            trainer_family_for_config(r#"{"model_type":"laguna"}"#),
-            TrainerFamily::LagunaFullGraph,
-            "model_type alone must classify, mirroring backend_select's laguna id match"
-        );
-        assert_eq!(
-            trainer_family_for_config(&nv_models::laguna_train::tiny_laguna_config_json()),
-            TrainerFamily::LagunaFullGraph,
-            "the tiny laguna fixture must route to the trainer that can actually load it"
-        );
-        assert_eq!(
-            default_targets_for(TrainerFamily::LagunaFullGraph),
-            nv_models::laguna_train::LagunaTrainArgs::default_targets(),
-            "the endpoint default must be exactly the laguna trainer's attachable set"
-        );
-    }
-
-    #[test]
-    fn the_laguna_family_rejects_the_qwen_only_knobs_and_every_speculator_kind() {
-        let unset = resolve_hp(&None, TrainerFamily::LagunaFullGraph).unwrap();
-        assert_eq!((unset.grad_layers, unset.b_lr_ratio), (None, None));
-        let with_knobs = Hyperparameters {
-            rank: None,
-            alpha: None,
-            steps: None,
-            n_steps: None,
-            lr: None,
-            learning_rate: None,
-            target: None,
-            seed: None,
-            grad_layers: Some(2),
-            b_lr_ratio: Some(8.0),
-        };
-        let (status, msg) = resolve_hp(&Some(with_knobs), TrainerFamily::LagunaFullGraph)
-            .expect_err(
-                "the laguna trainer has no window or LoRA+ path, so accepting the knobs \
-                     would train something other than what the job record claims",
-            );
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(msg.contains("laguna full-graph"), "{msg}");
-
-        for kind in ["mtp", "eagle3"] {
-            let (status, msg) =
-                resolve_speculator(&Some(spec(kind)), TrainerFamily::LagunaFullGraph)
-                    .expect_err("laguna has no MTP head and no eagle3 tap path");
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert!(
-                msg.contains(kind) && msg.contains("laguna"),
-                "the refusal must name the requested kind and the family: {msg}"
-            );
-        }
-        assert!(resolve_speculator(&None, TrainerFamily::LagunaFullGraph)
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
     fn a_laguna_base_prepares_the_laguna_trainer_and_a_fixture_job_ships_the_gated_artifact() {
         let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
         let root = std::env::temp_dir().join(format!("ft-laguna-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs"));
-        std::env::remove_var("NV_TRAIN_DEVICE");
+        unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
+        unsafe { std::env::remove_var("NV_TRAIN_DEVICE") };
         let base = root.join("base");
         nv_models::laguna_train::write_tiny_laguna_checkpoint(&base);
-        let req = CreateFineTuningJobRequest {
-            model: base.display().to_string(),
-            training_file: None,
-            training_data: Some(vec![
+        let req =
+            CreateFineTuningJobRequest {
+                input_adapter: None,
+                model: base.display().to_string(),
+                training_file: None,
+                training_data: Some(vec![
                 serde_json::json!({
                     "text": "The battle system alternates a command map with an action phase."
-                }),
+                }).into(),
                 serde_json::json!({
                     "text": "Critics praised the art direction and the score of the third entry."
-                }),
+                }).into(),
             ]),
-            validation_file: None,
-            validation_data: Some(vec![
-                serde_json::json!({
-                    "text": "The remake keeps the overworld theme and rescores the finale."
+                validation_file: None,
+                validation_data: Some(vec![
+                    serde_json::json!({
+                        "text": "The remake keeps the overworld theme and rescores the finale."
+                    })
+                    .into(),
+                    serde_json::json!({"text": "A hidden dungeon opens after the credits roll."})
+                        .into(),
+                ]),
+                suffix: Some("laguna".into()),
+                output_dir: None,
+                hyperparameters: Some(Hyperparameters {
+                    rank: Some(4),
+                    alpha: Some(4.0),
+                    steps: Some(3),
+                    n_steps: None,
+                    lr: Some(5e-3),
+                    learning_rate: None,
+                    target: None,
+                    seed: Some(11),
+                    grad_layers: None,
+                    b_lr_ratio: None,
+                    max_sequence_length: Some(1024),
+                    base_bits: None,
+                    batch_size: None,
                 }),
-                serde_json::json!({"text": "A hidden dungeon opens after the credits roll."}),
-            ]),
-            suffix: Some("laguna".into()),
-            output_dir: None,
-            hyperparameters: Some(Hyperparameters {
-                rank: Some(4),
-                alpha: Some(4.0),
-                steps: Some(3),
-                n_steps: None,
-                lr: Some(5e-3),
-                learning_rate: None,
-                target: None,
-                seed: Some(11),
-                grad_layers: None,
-                b_lr_ratio: None,
-            }),
-        };
+            };
         let (_, prepared) = prepare_job(&req, &None).unwrap();
         assert!(
-            matches!(prepared.train, PreparedTrain::Laguna(_)),
+            matches!(prepared.train, PreparedTrain::Laguna(_, 1024)),
             "a laguna config.json must select the laguna full-graph trainer"
         );
         assert!(!a_speculator_was_requested(&prepared.train));
@@ -2182,35 +2594,7 @@ mod tests {
     }
 
     #[test]
-    fn a_speculator_kind_that_mismatches_the_trainer_family_gets_the_same_400_shape_as_the_qwen_only_knobs(
-    ) {
-        let (status, msg) = resolve_speculator(&Some(spec("mtp")), TrainerFamily::GemmaTrainRunner)
-            .expect_err("train_runner bases have no MTP head to co-train");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(msg.contains("mtp") && msg.contains("train_runner"), "{msg}");
-        let (status, msg) =
-            resolve_speculator(&Some(spec("eagle3")), TrainerFamily::Qwen3_5DenseWindowed)
-                .expect_err("the qwen family self-drafts via its MTP head, not a separate drafter");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(msg.contains("eagle3") && msg.contains("mtp"), "{msg}");
-        let (status, msg) =
-            resolve_speculator(&Some(spec("medusa")), TrainerFamily::Qwen3_5DenseWindowed)
-                .expect_err("unknown kinds must be refused, not silently dropped");
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(msg.contains("medusa"), "{msg}");
-        for family in [
-            TrainerFamily::Qwen3_5DenseWindowed,
-            TrainerFamily::GemmaTrainRunner,
-        ] {
-            assert!(
-                resolve_speculator(&None, family).unwrap().is_none(),
-                "an absent speculator resolves to nothing for every family"
-            );
-        }
-    }
-
-    #[test]
-    fn a_valid_speculator_spec_resolves_medusa_2_defaults_and_explicit_values_pass_through() {
+    fn a_speculator_spec_resolves_medusa_2_defaults_and_eagle3_needs_drafter_weights() {
         let resolved = resolve_speculator(&Some(spec("mtp")), TrainerFamily::Qwen3_5DenseWindowed)
             .unwrap()
             .expect("mtp on the qwen family is the valid pairing");
@@ -2281,83 +2665,85 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(msg.contains("model_mtp.safetensors"), "{msg}");
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn eagle3_needs_drafter_weights_from_the_request_or_the_serving_env_var() {
-        let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
-        let _unset = VarRemovedOnDropSoAFailedAssertCannotLeakItIntoLaterTests(
-            EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS,
-        );
-        std::env::remove_var(EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS);
-        let (status, msg) =
-            resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner).expect_err(
-                "no drafter_dir and no env var leaves eagle3 without weights to co-train",
+        {
+            let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
+            let _unset = VarRemovedOnDropSoAFailedAssertCannotLeakItIntoLaterTests(
+                EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS,
             );
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            msg.contains(EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS),
-            "{msg}"
-        );
-
-        let root = std::env::temp_dir().join(format!("ft-spec-eagle3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let drafter = root.join("drafter");
-        std::fs::create_dir_all(&drafter).unwrap();
-
-        let missing = root.join("missing");
-        let (status, msg) = resolve_speculator(
-            &Some(SpeculatorSpec {
-                drafter_dir: Some(missing.display().to_string()),
-                ..spec("eagle3")
-            }),
-            TrainerFamily::GemmaTrainRunner,
-        )
-        .expect_err(
-            "a drafter_dir that is not a directory must 400, mirroring the base model check",
-        );
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(msg.contains("not a directory"), "{msg}");
-
-        let resolved = resolve_speculator(
-            &Some(SpeculatorSpec {
-                drafter_dir: Some(drafter.display().to_string()),
-                ..spec("eagle3")
-            }),
-            TrainerFamily::GemmaTrainRunner,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(resolved.kind, SpeculatorKind::Eagle3SeparateDrafter);
-        assert_eq!(resolved.drafter_dir, Some(drafter.clone()));
-
-        std::env::set_var(
-            EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS,
-            &missing,
-        );
-        let (status, msg) =
-            resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner).expect_err(
-                "an env var the operator already set must not be silently discarded into the \
-                 generic set-the-env-var 400",
+            unsafe { std::env::remove_var(EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS) };
+            let (status, msg) =
+                resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner).expect_err(
+                    "no drafter_dir and no env var leaves eagle3 without weights to co-train",
+                );
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                msg.contains(EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS),
+                "{msg}"
             );
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            msg.contains(EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS)
-                && msg.contains("is set to")
-                && msg.contains("not a directory"),
-            "the refusal must say the set env var itself is the broken path, mirroring \
-             chat_engine's spec-decode-disabled log for the same condition: {msg}"
-        );
 
-        std::env::set_var(
-            EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS,
-            &drafter,
-        );
-        let resolved = resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner)
+            let root = std::env::temp_dir().join(format!("ft-spec-eagle3-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let drafter = root.join("drafter");
+            std::fs::create_dir_all(&drafter).unwrap();
+
+            let missing = root.join("missing");
+            let (status, msg) = resolve_speculator(
+                &Some(SpeculatorSpec {
+                    drafter_dir: Some(missing.display().to_string()),
+                    ..spec("eagle3")
+                }),
+                TrainerFamily::GemmaTrainRunner,
+            )
+            .expect_err(
+                "a drafter_dir that is not a directory must 400, mirroring the base model check",
+            );
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(msg.contains("not a directory"), "{msg}");
+
+            let resolved = resolve_speculator(
+                &Some(SpeculatorSpec {
+                    drafter_dir: Some(drafter.display().to_string()),
+                    ..spec("eagle3")
+                }),
+                TrainerFamily::GemmaTrainRunner,
+            )
             .unwrap()
             .unwrap();
-        assert_eq!(resolved.drafter_dir, Some(drafter));
-        let _ = std::fs::remove_dir_all(&root);
+            assert_eq!(resolved.kind, SpeculatorKind::Eagle3SeparateDrafter);
+            assert_eq!(resolved.drafter_dir, Some(drafter.clone()));
+
+            unsafe {
+                std::env::set_var(
+                    EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS,
+                    &missing,
+                )
+            };
+            let (status, msg) =
+                resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner).expect_err(
+                    "an env var the operator already set must not be silently discarded into the \
+                     generic set-the-env-var 400",
+                );
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(
+                msg.contains(EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS)
+                    && msg.contains("is set to")
+                    && msg.contains("not a directory"),
+                "the refusal must say the set env var itself is the broken path, mirroring \
+                 chat_engine's spec-decode-disabled log for the same condition: {msg}"
+            );
+
+            unsafe {
+                std::env::set_var(
+                    EAGLE3_DRAFTER_DIR_FALLBACK_IS_THE_SAME_ENV_VAR_SERVING_READS,
+                    &drafter,
+                )
+            };
+            let resolved = resolve_speculator(&Some(spec("eagle3")), TrainerFamily::GemmaTrainRunner)
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.drafter_dir, Some(drafter));
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
@@ -2365,14 +2751,15 @@ mod tests {
         let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
         let root = std::env::temp_dir().join(format!("ft-spec-thread-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs"));
+        unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
         let qwen = root.join("qwen-base");
         std::fs::create_dir_all(&qwen).unwrap();
         std::fs::write(qwen.join("config.json"), qwen38_dense_cfg()).unwrap();
         let req = CreateFineTuningJobRequest {
+            input_adapter: None,
             model: qwen.display().to_string(),
             training_file: None,
-            training_data: Some(vec![serde_json::json!({"text": "hello world"})]),
+            training_data: Some(vec![serde_json::json!({"text": "hello world"}).into()]),
             validation_file: None,
             validation_data: None,
             suffix: None,
@@ -2409,6 +2796,7 @@ mod tests {
         let drafter = root.join("drafter");
         std::fs::create_dir_all(&drafter).unwrap();
         let req = CreateFineTuningJobRequest {
+            input_adapter: None,
             model: gemma.display().to_string(),
             ..req
         };
@@ -2446,65 +2834,6 @@ mod tests {
             nv_train::SPECULATOR_SUBDIR,
             "the untrained-module gate labels speculator modules with this prefix, so it must \
              name the same subdir the trainers' save path writes"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn an_absent_speculator_keeps_the_request_parse_and_the_job_record_byte_identical() {
-        let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
-        let body: CreateFineTuningJobBody = serde_json::from_str(
-            r#"{"model":"m","training_data":[{"text":"x"}],
-                "speculator":{"kind":"mtp","rank":16,"lr_ratio":2.5}}"#,
-        )
-        .unwrap();
-        assert_eq!(body.job.model, "m");
-        let parsed = body.speculator.expect("speculator field parses");
-        assert_eq!(
-            (parsed.kind.as_str(), parsed.rank, parsed.lr_ratio),
-            ("mtp", Some(16), Some(2.5))
-        );
-        let body: CreateFineTuningJobBody =
-            serde_json::from_str(r#"{"model":"m","training_data":[{"text":"x"}]}"#).unwrap();
-        assert!(body.speculator.is_none());
-        assert_eq!(body.job.model, "m");
-
-        let root = std::env::temp_dir().join(format!("ft-spec-absent-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs"));
-        let qwen = root.join("qwen-base");
-        std::fs::create_dir_all(&qwen).unwrap();
-        std::fs::write(qwen.join("config.json"), qwen38_dense_cfg()).unwrap();
-        let req = CreateFineTuningJobRequest {
-            model: qwen.display().to_string(),
-            training_file: None,
-            training_data: Some(vec![serde_json::json!({"text": "hello world"})]),
-            validation_file: None,
-            validation_data: None,
-            suffix: None,
-            output_dir: None,
-            hyperparameters: None,
-        };
-        let (mut job, prepared) = prepare_job(&req, &None).unwrap();
-        assert!(
-            matches!(prepared.train, PreparedTrain::Qwen38(_, None)),
-            "no speculator in the request means the plain run_jsonl path, byte-identical to today"
-        );
-        assert!(
-            !a_speculator_was_requested(&prepared.train),
-            "the dropped-knob guard must stay silent on the plain path or every job fails"
-        );
-        let json = serde_json::to_string(&job).unwrap();
-        assert!(
-            !json.contains("speculator"),
-            "a job without a speculator request must serialize exactly as before: {json}"
-        );
-        job.speculator_trained = true;
-        assert!(
-            serde_json::to_string(&job)
-                .unwrap()
-                .contains("\"speculator_trained\":true"),
-            "the flag appears once a co-trained speculator artifact ships"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2556,46 +2885,53 @@ mod tests {
         let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
         let root = std::env::temp_dir().join(format!("ft-spec-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs"));
-        std::env::remove_var("NV_TRAIN_DEVICE");
+        unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
+        unsafe { std::env::remove_var("NV_TRAIN_DEVICE") };
         let base = root.join("base");
         let cfg = nv_train::qwen38_fixture::write_tiny_checkpoint(&base);
         write_a_tiny_mtp_head_shaped_like_nv_trains_test_fixture(&base, &cfg);
-        let req = CreateFineTuningJobRequest {
-            model: base.display().to_string(),
-            training_file: None,
-            training_data: Some(vec![
+        let req =
+            CreateFineTuningJobRequest {
+                input_adapter: None,
+                model: base.display().to_string(),
+                training_file: None,
+                training_data: Some(vec![
                 serde_json::json!({
                     "text": "The battle system alternates a command map with an action phase."
-                }),
+                }).into(),
                 serde_json::json!({
                     "text": "Critics praised the art direction and the score of the third entry."
-                }),
+                }).into(),
             ]),
-            validation_file: None,
-            validation_data: Some(vec![
-                serde_json::json!({
-                    "text": "The remake keeps the overworld theme and rescores the finale."
+                validation_file: None,
+                validation_data: Some(vec![
+                    serde_json::json!({
+                        "text": "The remake keeps the overworld theme and rescores the finale."
+                    })
+                    .into(),
+                    serde_json::json!({
+                        "text": "A hidden dungeon opens after the credits roll."
+                    })
+                    .into(),
+                ]),
+                suffix: Some("cospec".into()),
+                output_dir: None,
+                hyperparameters: Some(Hyperparameters {
+                    rank: Some(4),
+                    alpha: Some(4.0),
+                    steps: Some(4),
+                    n_steps: None,
+                    lr: Some(5e-3),
+                    learning_rate: None,
+                    target: None,
+                    seed: Some(19),
+                    grad_layers: None,
+                    b_lr_ratio: None,
+                    max_sequence_length: None,
+                    base_bits: None,
+                    batch_size: None,
                 }),
-                serde_json::json!({
-                    "text": "A hidden dungeon opens after the credits roll."
-                }),
-            ]),
-            suffix: Some("cospec".into()),
-            output_dir: None,
-            hyperparameters: Some(Hyperparameters {
-                rank: Some(4),
-                alpha: Some(4.0),
-                steps: Some(4),
-                n_steps: None,
-                lr: Some(5e-3),
-                learning_rate: None,
-                target: None,
-                seed: Some(19),
-                grad_layers: None,
-                b_lr_ratio: None,
-            }),
-        };
+            };
         let job = create_job_with_speculator(
             &req,
             &Some(SpeculatorSpec {
@@ -2693,6 +3029,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let out_dir = root.join("out");
         let job = FineTuningJob {
+            input_adapter: None,
             object: "fine_tuning.job",
             id: "ftjob-persisttest".into(),
             created_at: 7,
@@ -2710,6 +3047,9 @@ mod tests {
                 seed: 0,
                 grad_layers: None,
                 b_lr_ratio: None,
+                max_sequence_length: None,
+                base_bits: None,
+                batch_size: None,
             },
             result_files: Vec::new(),
             trained_tokens: None,
@@ -2779,15 +3119,16 @@ mod tests {
         let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
         let root = std::env::temp_dir().join(format!("ft-runjob-wiring-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs"));
-        std::env::remove_var("NV_TRAIN_DEVICE");
+        unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
+        unsafe { std::env::remove_var("NV_TRAIN_DEVICE") };
         let base = root.join("base");
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("config.json"), qwen38_dense_cfg()).unwrap();
         let req = CreateFineTuningJobRequest {
+            input_adapter: None,
             model: base.display().to_string(),
             training_file: None,
-            training_data: Some(vec![serde_json::json!({"text": "hello world"})]),
+            training_data: Some(vec![serde_json::json!({"text": "hello world"}).into()]),
             validation_file: None,
             validation_data: None,
             suffix: None,
@@ -2872,11 +3213,11 @@ mod tests {
     }
 
     #[test]
-    fn a_job_success_writes_no_boot_default_and_promote_is_what_rolls_the_symlink() {
+    fn promote_rolls_the_symlink_for_a_known_adapter_and_refuses_an_unknown_one() {
         let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
         let root = std::env::temp_dir().join(format!("ft-promote-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs"));
+        unsafe { std::env::set_var("NV_FINE_TUNING_DIR", root.join("jobs")) };
         let current = jobs_root().join(
             super::super::lora::CURRENT_LINKS_DIR_HOLDS_ONE_SYMLINK_PER_MODEL_SUFFIX_SO_BOOT_LOADS_THE_ROLLING_ADAPTER_NOT_EVERY_PAST_JOB,
         );
@@ -2905,19 +3246,17 @@ mod tests {
             "promote must point the boot default at the gated adapter dir"
         );
         std::fs::remove_dir_all(&root).unwrap();
+        {
+            let err = super::super::lora_runtime::promote_to_boot_default("ft:no:such:adapter")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("ft:no:such:adapter"),
+                "refusal must name the adapter: {err}"
+            );
+        }
     }
 
-    #[test]
-    fn promoting_an_unknown_adapter_refuses_naming_it() {
-        let _env = lock_serializing_every_test_that_mutates_the_process_global_env();
-        let err = super::super::lora_runtime::promote_to_boot_default("ft:no:such:adapter")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("ft:no:such:adapter"),
-            "refusal must name the adapter: {err}"
-        );
-    }
 }
 
 #[cfg(feature = "ts-bindings")]

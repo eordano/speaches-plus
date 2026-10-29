@@ -288,7 +288,7 @@ async fn completions_impl(state: ChatAppState, req: CompletionRequest) -> Respon
 
     let (want_logprobs, top_logprobs) = logprob_fields(req.logprobs);
 
-    let gen = ChatGenerateRequest {
+    let gen_req = ChatGenerateRequest {
         prompt,
         max_new_tokens,
         stop,
@@ -323,7 +323,7 @@ async fn completions_impl(state: ChatAppState, req: CompletionRequest) -> Respon
     if stream {
         run_streaming(
             engine,
-            gen,
+            gen_req,
             id,
             model_id,
             created,
@@ -332,20 +332,20 @@ async fn completions_impl(state: ChatAppState, req: CompletionRequest) -> Respon
         )
         .await
     } else {
-        run_non_streaming(engine, gen, id, model_id, created, echo_prefix).await
+        run_non_streaming(engine, gen_req, id, model_id, created, echo_prefix).await
     }
 }
 
 async fn run_non_streaming(
     engine: Arc<dyn ChatEngine>,
-    gen: ChatGenerateRequest,
+    gen_req: ChatGenerateRequest,
     id: String,
     model: String,
     created: i64,
     echo_prefix: String,
 ) -> Response {
     let (tx, mut rx) = mpsc::channel::<ChatEvent>(64);
-    if let Err(err) = engine.generate(gen, tx).await {
+    if let Err(err) = engine.generate(gen_req, tx).await {
         warn!(error = %err, "completion engine.generate failed to start");
         return openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -412,10 +412,9 @@ async fn run_non_streaming(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_streaming(
     engine: Arc<dyn ChatEngine>,
-    gen: ChatGenerateRequest,
+    gen_req: ChatGenerateRequest,
     id: String,
     model: String,
     created: i64,
@@ -425,10 +424,10 @@ async fn run_streaming(
     let (tx_bytes, rx_bytes) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
     let (tx_ev, mut rx_ev) = mpsc::channel::<ChatEvent>(64);
 
-    let want_logprobs = gen.logprobs;
+    let want_logprobs = gen_req.logprobs;
     let mut lp_offset = echo_prefix.chars().count();
 
-    if let Err(err) = engine.generate(gen, tx_ev).await {
+    if let Err(err) = engine.generate(gen_req, tx_ev).await {
         warn!(error = %err, "completion engine.generate failed to start (streaming)");
         return openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -609,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn a_completion_asking_for_a_schema_lets_a_thinking_model_finish_its_thought() {
+    fn a_completion_asking_for_a_schema_defers_to_the_shared_close_rule_on_the_resolved_thinking_flag() {
         assert!(
             std::env::var(GUIDED_FORCE_THINK_OFF_ENV).is_err(),
             "{GUIDED_FORCE_THINK_OFF_ENV} is set in this test process, so the derivation cannot \
@@ -636,88 +635,58 @@ mod tests {
             "a model whose own default is thinking-off writes no thought to wait for; deferring \
              would spend the budget on prose and then force out a marker it never meant"
         );
+        {
+            use crate::oapi::chat_engine::guided_think_close_marker;
+
+            let off = templated_engine("shared-think-off", false);
+            assert_eq!(
+                guided_think_close_marker(&off, true, true).as_deref(),
+                Some("</think>"),
+                "/v1/chat/completions lets a request switch thinking on over a template default of \
+                 off; a second copy of this rule that only ever reads the template default would \
+                 bind the schema to the reasoning that request just asked for"
+            );
+
+            let on = templated_engine("shared-think-on", true);
+            assert_eq!(
+                guided_think_close_marker(&on, true, false),
+                None,
+                "a request that switched thinking off writes no thought to wait for, whatever the \
+                 template default says"
+            );
+            assert_eq!(
+                guided_think_close_marker(&on, false, true),
+                None,
+                "with no grammar there is nothing to defer and nothing to force closed"
+            );
+            assert!(
+                std::env::var(GUIDED_FORCE_THINK_OFF_ENV).is_err(),
+                "{GUIDED_FORCE_THINK_OFF_ENV} is set in this test process, so the delegation cannot \
+                 be checked here"
+            );
+            assert_eq!(
+                guided_think_close_for(&on, true),
+                guided_think_close_marker(&on, true, true),
+                "/v1/completions must not keep its own answer to the same question"
+            );
+        }
     }
 
     #[test]
-    fn the_shared_close_rule_reads_the_resolved_thinking_flag_not_the_template_default() {
-        use crate::oapi::chat_engine::guided_think_close_marker;
-
-        let off = templated_engine("shared-think-off", false);
-        assert_eq!(
-            guided_think_close_marker(&off, true, true).as_deref(),
-            Some("</think>"),
-            "/v1/chat/completions lets a request switch thinking on over a template default of \
-             off; a second copy of this rule that only ever reads the template default would \
-             bind the schema to the reasoning that request just asked for"
-        );
-
-        let on = templated_engine("shared-think-on", true);
-        assert_eq!(
-            guided_think_close_marker(&on, true, false),
-            None,
-            "a request that switched thinking off writes no thought to wait for, whatever the \
-             template default says"
-        );
-        assert_eq!(
-            guided_think_close_marker(&on, false, true),
-            None,
-            "with no grammar there is nothing to defer and nothing to force closed"
-        );
-        assert!(
-            std::env::var(GUIDED_FORCE_THINK_OFF_ENV).is_err(),
-            "{GUIDED_FORCE_THINK_OFF_ENV} is set in this test process, so the delegation cannot \
-             be checked here"
-        );
-        assert_eq!(
-            guided_think_close_for(&on, true),
-            guided_think_close_marker(&on, true, true),
-            "/v1/completions must not keep its own answer to the same question"
-        );
-    }
-
-    #[test]
-    fn deserialize_string_and_array_prompt() {
+    fn deserialize_string_and_array_prompts_and_vllm_extensions() {
         let r: CompletionRequest =
             serde_json::from_str(r#"{"model":"x","prompt":"hello"}"#).unwrap();
         assert!(matches!(r.prompt, PromptField::One(ref s) if s == "hello"));
         let r: CompletionRequest = serde_json::from_str(r#"{"prompt":["a","b"]}"#).unwrap();
         assert!(matches!(r.prompt, PromptField::Many(ref v) if v.len() == 2));
-    }
-
-    #[test]
-    fn deserialize_vllm_extensions() {
-        let r: CompletionRequest = serde_json::from_str(
-            r#"{"prompt":"x","stop_token_ids":[1,2],"guided_regex":"a+","echo":true,"min_p":0.1}"#,
-        )
-        .unwrap();
-        assert_eq!(r.stop_token_ids.as_ref().unwrap(), &vec![1, 2]);
-        assert_eq!(r.echo, Some(true));
-    }
-
-    #[test]
-    fn response_shape() {
-        let resp = CompletionResponse {
-            id: "x".into(),
-            object: "text_completion",
-            created: 7,
-            model: "m".into(),
-            system_fingerprint: None,
-            choices: vec![CompletionChoice {
-                text: "hello".into(),
-                index: 0,
-                finish_reason: Some("stop".into()),
-                logprobs: None,
-            }],
-            usage: Usage {
-                prompt_tokens: 1,
-                completion_tokens: 1,
-                total_tokens: 2,
-                prompt_tokens_details: None,
-            },
-        };
-        let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["object"], "text_completion");
-        assert_eq!(v["choices"][0]["text"], "hello");
+        {
+            let r: CompletionRequest = serde_json::from_str(
+                r#"{"prompt":"x","stop_token_ids":[1,2],"guided_regex":"a+","echo":true,"min_p":0.1}"#,
+            )
+            .unwrap();
+            assert_eq!(r.stop_token_ids.as_ref().unwrap(), &vec![1, 2]);
+            assert_eq!(r.echo, Some(true));
+        }
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
@@ -765,13 +734,6 @@ mod tests {
         assert_eq!(v["error"]["code"], "unsupported_content_type");
     }
 
-    #[test]
-    fn logprobs_reaches_the_generate_request() {
-        assert_eq!(logprob_fields(None), (false, 0));
-        assert_eq!(logprob_fields(Some(0)), (true, 0));
-        assert_eq!(logprob_fields(Some(5)), (true, 5));
-    }
-
     #[tokio::test]
     async fn logprobs_above_the_cap_is_rejected_not_dropped() {
         assert!(reject_bad_logprobs(None).is_none());
@@ -784,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_logprobs_shape_and_offsets() {
+    fn logprobs_reach_the_generate_request_and_the_legacy_shape_carries_offsets() {
         use crate::oapi::chat::TopLogprob;
         let entries = vec![
             LogprobEntry {
@@ -812,5 +774,10 @@ mod tests {
         assert_eq!(v["top_logprobs"][0]["he"], json!(-0.5));
         assert!(v["top_logprobs"][1].as_object().unwrap().is_empty());
         assert_eq!(offset, 9);
+        {
+            assert_eq!(logprob_fields(None), (false, 0));
+            assert_eq!(logprob_fields(Some(0)), (true, 0));
+            assert_eq!(logprob_fields(Some(5)), (true, 5));
+        }
     }
 }

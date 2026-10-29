@@ -58,7 +58,7 @@ diff -ruN -x .fetch-stamp a/src/backend/webgpu.rs b/src/backend/webgpu.rs
 +    /// Destroys the GPU allocation when the last clone drops, as the native
 +    /// backends do, instead of waiting for the JS garbage collector to reach
 +    /// the `GPUBuffer` wrapper.
-+    release: Rc<DropGuard>,
++    _release: Rc<DropGuard>,
      /// Unique identifier for this Buffer.
      ident: crate::cmp::Identifier,
  }
@@ -73,7 +73,7 @@ diff -ruN -x .fetch-stamp a/src/backend/webgpu.rs b/src/backend/webgpu.rs
                  mapped_buffer: None,
                  range: 0..desc.size,
              })),
-+            release: Rc::new(DropGuard::new(Some(Box::new(move || handle.destroy())))),
++            _release: Rc::new(DropGuard::new(Some(Box::new(move || handle.destroy())))),
              ident: crate::cmp::Identifier::create(),
          }
      }
@@ -82,7 +82,7 @@ diff -ruN -x .fetch-stamp a/src/backend/webgpu.rs b/src/backend/webgpu.rs
  impl Drop for WebBuffer {
      fn drop(&mut self) {
 -        // no-op
-+        // no-op: `release` destroys the GPU allocation when the last clone drops.
++        // no-op: `_release` destroys the GPU allocation when the last clone drops.
      }
  }
  

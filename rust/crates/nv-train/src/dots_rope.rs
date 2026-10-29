@@ -182,7 +182,6 @@ fn metal_buf_and_off(t: &Tensor, what: &'static str) -> candle_core::Result<(Buf
     Ok((s.buffer().clone(), start * t.dtype().size_in_bytes()))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn encode_rope(
     tables: &DotsRopeFused,
     pos: &Tensor,
@@ -385,7 +384,7 @@ pub fn fused_qk(
     positions: &Tensor,
 ) -> Result<Option<(Tensor, Tensor)>> {
     if !rope_fused_requested_via_env()
-        || !matches!(q.device(), Device::Metal(_))
+        || !q.device().is_metal()
         || q.dtype() != DType::F32
         || k.dtype() != DType::F32
         || positions.dtype() != DType::U32

@@ -1,8 +1,14 @@
-use anyhow::{ensure, Result};
+#[cfg(feature = "cuda")]
+use anyhow::Result;
+#[cfg(feature = "cuda")]
+use candle_core::CudaStorage;
+#[cfg(feature = "cuda")]
+use candle_core::Error;
+#[cfg(feature = "cuda")]
+use candle_core::Shape;
 use candle_core::{DType, Tensor};
-
-pub const NV_Q38_GDN_HEAD_KERNEL_DEFAULT_ON_0_RESTORES_THE_CANDLE_CONV_SILU_EXPAND_L2NORM_CHAIN: &str =
-    "NV_Q38_GDN_HEAD_KERNEL";
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
 
 pub const PACKED_ROW_IS_Q_SCALED_THEN_K_GRP_THEN_V_PER_VALUE_HEAD: usize = 3;
 
@@ -19,12 +25,9 @@ pub struct GdnHeadDims {
 }
 
 pub fn fused_head_kernel_serves(x: &Tensor, d: &GdnHeadDims) -> bool {
-    std::env::var(NV_Q38_GDN_HEAD_KERNEL_DEFAULT_ON_0_RESTORES_THE_CANDLE_CONV_SILU_EXPAND_L2NORM_CHAIN)
-        .as_deref()
-        != Ok("0")
-        && cfg!(feature = "cuda")
+    cfg!(feature = "cuda")
         && x.dtype() == DType::BF16
-        && matches!(x.device(), candle_core::Device::Cuda(_))
+        && x.device().is_cuda()
         && d.head_dim == 128
         && d.conv_k == 4
         && d.conv_dim % 1024 == 0
@@ -55,11 +58,14 @@ impl GdnHeadPackedOp {
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_f32_ptr(t: &Tensor, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> candle_core::Result<u64> {
+fn cuda_f32_ptr(
+    t: &Tensor,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> candle_core::Result<u64> {
     use cudarc::driver::DevicePtr;
     let (st, l) = t.storage_and_layout();
     let candle_core::Storage::Cuda(c) = &*st else {
-        return Err(candle_core::Error::Msg("gdn head op: operand not cuda".into()));
+        return Err(Error::Msg("gdn head op: operand not cuda".into()));
     };
     let (p, _g) = c.as_cuda_slice::<f32>()?.device_ptr(stream);
     Ok(p + (l.start_offset() * 4) as u64)
@@ -75,25 +81,25 @@ impl candle_core::CustomOp1 for GdnHeadPackedOp {
         &self,
         _s: &candle_core::CpuStorage,
         _l: &candle_core::Layout,
-    ) -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
-        Err(candle_core::Error::Msg("gdn_head_packed is CUDA-only".into()))
+    ) -> candle_core::Result<(candle_core::CpuStorage, Shape)> {
+        Err(Error::Msg("gdn_head_packed is CUDA-only".into()))
     }
 
     fn cuda_fwd(
         &self,
-        s: &candle_core::CudaStorage,
+        s: &CudaStorage,
         l: &candle_core::Layout,
-    ) -> candle_core::Result<(candle_core::CudaStorage, candle_core::Shape)> {
+    ) -> candle_core::Result<(CudaStorage, Shape)> {
         use candle_core::backend::BackendStorage;
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let d = self.d;
         let dev = s.device().clone();
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let Some((start, _end)) = l.contiguous_offsets() else {
-            return Err(candle_core::Error::Msg("gdn head op: input must be contiguous".into()));
+            return Err(Error::Msg("gdn head op: input must be contiguous".into()));
         };
         if l.shape().dims() != [d.b, d.t, d.conv_dim] {
-            return Err(candle_core::Error::Msg(format!(
+            return Err(Error::Msg(format!(
                 "gdn head op: input {:?} vs [{}, {}, {}]",
                 l.shape(),
                 d.b,
@@ -106,9 +112,9 @@ impl candle_core::CustomOp1 for GdnHeadPackedOp {
         let (xp, _g) = x_view.device_ptr(&stream);
         let wp = cuda_f32_ptr(&self.w, &stream)?;
         let cols = PACKED_ROW_IS_Q_SCALED_THEN_K_GRP_THEN_V_PER_VALUE_HEAD * d.head_dim;
-        let mut packed: cudarc::driver::CudaSlice<f32> =
+        let mut packed: CudaSlice<f32> =
             unsafe { stream.alloc::<f32>(d.b * d.t * d.n_v * cols) }
-                .map_err(|e| candle_core::Error::Msg(format!("gdn head op alloc: {e:?}")))?;
+                .map_err(|e| Error::Msg(format!("gdn head op alloc: {e:?}")))?;
         let rc = unsafe {
             let (pp, _g2) = packed.device_ptr_mut(&stream);
             nv_kernels::cuda::gdn_train_head_fwd(
@@ -127,11 +133,11 @@ impl candle_core::CustomOp1 for GdnHeadPackedOp {
             )
         };
         if rc != 0 {
-            return Err(candle_core::Error::Msg(format!("gdn_train_head_fwd rc={rc}")));
+            return Err(Error::Msg(format!("gdn_train_head_fwd rc={rc}")));
         }
         Ok((
-            candle_core::CudaStorage::wrap_cuda_slice(packed, dev),
-            candle_core::Shape::from((d.b, d.t, d.n_v, cols)),
+            CudaStorage::wrap_cuda_slice(packed, dev),
+            Shape::from((d.b, d.t, d.n_v, cols)),
         ))
     }
 
@@ -144,21 +150,20 @@ impl candle_core::CustomOp1 for GdnHeadPackedOp {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let d = self.d;
         let candle_core::Device::Cuda(dev) = arg.device() else {
-            return Err(candle_core::Error::Msg("gdn head op bwd: not cuda".into()));
+            return Err(Error::Msg("gdn head op bwd: not cuda".into()));
         };
         let stream = nv_layers::cuda_stream::current_stream(dev);
         let x = arg.detach().to_dtype(DType::BF16)?.contiguous()?;
         let g = grad_res.detach().to_dtype(DType::F32)?.contiguous()?;
-        let mut dy: cudarc::driver::CudaSlice<f32> =
-            unsafe { stream.alloc::<f32>(d.b * d.t * d.conv_dim) }
-                .map_err(|e| candle_core::Error::Msg(format!("gdn head op alloc: {e:?}")))?;
-        let mut dx: cudarc::driver::CudaSlice<half::bf16> =
+        let mut dy: CudaSlice<f32> = unsafe { stream.alloc::<f32>(d.b * d.t * d.conv_dim) }
+            .map_err(|e| Error::Msg(format!("gdn head op alloc: {e:?}")))?;
+        let mut dx: CudaSlice<half::bf16> =
             unsafe { stream.alloc::<half::bf16>(d.b * d.t * d.conv_dim) }
-                .map_err(|e| candle_core::Error::Msg(format!("gdn head op alloc: {e:?}")))?;
+                .map_err(|e| Error::Msg(format!("gdn head op alloc: {e:?}")))?;
         let rc = {
             let (xs, xl) = x.storage_and_layout();
             let candle_core::Storage::Cuda(xc) = &*xs else {
-                return Err(candle_core::Error::Msg("gdn head op bwd: x not cuda".into()));
+                return Err(Error::Msg("gdn head op bwd: x not cuda".into()));
             };
             let (xp, _g1) = xc.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
             let xp = xp + (xl.start_offset() * 2) as u64;
@@ -186,19 +191,14 @@ impl candle_core::CustomOp1 for GdnHeadPackedOp {
             }
         };
         if rc != 0 {
-            return Err(candle_core::Error::Msg(format!("gdn_train_head_bwd rc={rc}")));
+            return Err(Error::Msg(format!("gdn_train_head_bwd rc={rc}")));
         }
         let dx_t = Tensor::from_storage(
-            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(dx, dev.clone())),
+            candle_core::Storage::Cuda(CudaStorage::wrap_cuda_slice(dx, dev.clone())),
             (d.b, d.t, d.conv_dim),
             candle_core::op::BackpropOp::none(),
             false,
         );
         Ok(Some(dx_t.to_dtype(arg.dtype())?))
     }
-}
-
-pub fn packed_dims_hold(d: &GdnHeadDims) -> Result<()> {
-    ensure!(d.head_dim == 128 && d.conv_k == 4, "the fused gdn head serves head_dim 128 and conv kernel 4");
-    Ok(())
 }

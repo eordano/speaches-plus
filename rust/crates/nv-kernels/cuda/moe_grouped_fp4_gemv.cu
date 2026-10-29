@@ -109,6 +109,8 @@ __device__ __forceinline__ float dot16_e2m1(unsigned long long wq,
     return d;
 }
 
+constexpr int kM1RowsPerWarpSharingTheActivationLoads = 4;
+
 template <bool DP4A>
 __global__ void moe_grouped_fp4_gemv_m1_bf16_kernel(
     const uint8_t* __restrict__ a_packed,
@@ -124,17 +126,18 @@ __global__ void moe_grouped_fp4_gemv_m1_bf16_kernel(
     int a_tile_stride_rows,
     long long d_group_stride_elems
 ) {
+    constexpr int R = kM1RowsPerWarpSharingTheActivationLoads;
     NVK_PDL_PROLOG();
     int lane = threadIdx.x & (kWarpSize - 1);
     int warp = threadIdx.x / kWarpSize;
-    int n = blockIdx.x * kRowsPerCta + warp;
+    int n0 = (blockIdx.x * kRowsPerCta + warp) * R;
     int g = blockIdx.y;
-    if (n >= n_dim) return;
+    if (n0 >= n_dim) return;
 
-    long long d_idx = (long long)g * d_group_stride_elems + n;
+    long long d_base = (long long)g * d_group_stride_elems;
     int e = ids[g];
     if (e < 0 || e >= num_experts_total) {
-        if (lane == 0) d[d_idx] = __float2bfloat16(0.f);
+        if (lane < R && n0 + lane < n_dim) d[d_base + n0 + lane] = __float2bfloat16(0.f);
         return;
     }
 
@@ -144,9 +147,6 @@ __global__ void moe_grouped_fp4_gemv_m1_bf16_kernel(
     int group_k_pad = k_tiles * 4;
     long long n_pad = (((long long)n_dim + 127) / 128) * 128;
 
-    const unsigned long long* w_row =
-        reinterpret_cast<const unsigned long long*>(
-            b_packed + ((size_t)e * (size_t)n_dim + (size_t)n) * (size_t)half_k);
     const unsigned long long* a_row =
         reinterpret_cast<const unsigned long long*>(
             a_packed + (size_t)g * (size_t)a_tile_stride_rows * (size_t)half_k);
@@ -154,22 +154,46 @@ __global__ void moe_grouped_fp4_gemv_m1_bf16_kernel(
     const uint8_t* a_sf = a_scales +
         (size_t)g * (size_t)(a_tile_stride_rows / 128) * (size_t)group_k_pad * 128;
 
-    float acc = 0.f;
+    float acc[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.f;
     for (int kb = lane; kb < group_k; kb += kWarpSize) {
-        float w_scale =
-            decode_ue4m3_dev(__ldg(&w_sf[swizzled_scale_dst(n, kb, group_k)]));
         float a_scale = decode_ue4m3_dev(__ldg(&a_sf[(kb / 4) * 512 + (kb & 3)]));
-        unsigned long long wq = __ldg(&w_row[kb]);
         unsigned long long aq = __ldg(&a_row[kb]);
-        acc += (w_scale * a_scale) * dot16_e2m1<DP4A>(wq, aq);
+        unsigned long long wq[R];
+        uint8_t ws[R];
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            int n = n0 + r;
+            if (n < n_dim) {
+                const unsigned long long* w_row = reinterpret_cast<const unsigned long long*>(
+                    b_packed + ((size_t)e * (size_t)n_dim + (size_t)n) * (size_t)half_k);
+                wq[r] = __ldg(&w_row[kb]);
+                ws[r] = __ldg(&w_sf[swizzled_scale_dst(n, kb, group_k)]);
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (n0 + r < n_dim) {
+                float w_scale = decode_ue4m3_dev(ws[r]);
+                acc[r] += (w_scale * a_scale) * dot16_e2m1<DP4A>(wq[r], aq);
+            }
+        }
     }
 
     #pragma unroll
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
+    for (int r = 0; r < R; ++r) {
+        #pragma unroll
+        for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], offset);
+        }
     }
     if (lane == 0) {
-        d[d_idx] = __float2bfloat16(acc * __ldg(&alphas[e]));
+        float al = __ldg(&alphas[e]);
+        #pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (n0 + r < n_dim) d[d_base + n0 + r] = __float2bfloat16(acc[r] * al);
+        }
     }
     NVK_PDL_EPILOG();
 }
@@ -365,7 +389,8 @@ int launch_moe_grouped_fp4_gemv_m1_bf16(
     if (((uintptr_t)a_packed & 7) != 0 || ((uintptr_t)b_packed & 7) != 0) return -2;
     if (num_groups > 65535) return NVK_ERR_GRID_AXIS;
     cudaStream_t s = (cudaStream_t)stream;
-    dim3 grid((unsigned)((n + kRowsPerCta - 1) / kRowsPerCta),
+    dim3 grid((unsigned)((n + kRowsPerCta * kM1RowsPerWarpSharingTheActivationLoads - 1)
+                         / (kRowsPerCta * kM1RowsPerWarpSharingTheActivationLoads)),
               (unsigned)num_groups);
     if (nvk_pdl_enabled()) {
         NVK_PDL_ATTR(cfg, grid, dim3(kBlockDim), 0, s);

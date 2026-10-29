@@ -259,8 +259,8 @@ fn main() {
     let model_path = PathBuf::from(&args[1]);
     let pages = corpus_pages(Path::new(&args[2]));
     assert!(!pages.is_empty(), "no pages in corpus dir");
-    if std::env::var_os("NV_OCR_THREADS").is_none() {
-        std::env::set_var("NV_OCR_THREADS", "1");
+    if !nv_config::env_arm_present_at_all_reread_every_call("NV_OCR_THREADS") {
+        unsafe { std::env::set_var("NV_OCR_THREADS", "1") };
     }
     match args[3].as_str() {
         "stage" => run_stage(&model_path, &pages),

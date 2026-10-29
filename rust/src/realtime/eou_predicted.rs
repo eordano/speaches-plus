@@ -1,6 +1,4 @@
-#![allow(dead_code)]
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -12,53 +10,6 @@ use super::state::{PredictedRunner, PredictedSharedState};
 use crate::conversation::llm::{complete_stream_messages, ChatMessage, LlmConfig};
 use crate::stt::WhisperHandle;
 use crate::types::MonoF32At16k;
-
-pub struct PredictedTokenBuffer {
-    cap: usize,
-    inner: VecDeque<String>,
-    dropped: u32,
-}
-
-impl PredictedTokenBuffer {
-    pub fn new(cap: u32) -> Self {
-        let cap = cap.max(1) as usize;
-        Self {
-            cap,
-            inner: VecDeque::with_capacity(cap),
-            dropped: 0,
-        }
-    }
-
-    pub fn push(&mut self, token: String) -> bool {
-        let overflowed = self.inner.len() == self.cap;
-        if overflowed {
-            self.inner.pop_front();
-            self.dropped = self.dropped.saturating_add(1);
-        }
-        self.inner.push_back(token);
-        overflowed
-    }
-
-    pub fn cap(&self) -> usize {
-        self.cap
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub fn dropped_count(&self) -> u32 {
-        self.dropped
-    }
-
-    pub fn drain(&mut self) -> Vec<String> {
-        self.inner.drain(..).collect()
-    }
-}
 
 pub(super) fn spawn_predicted_stt(
     cancel: &super::cancel::SessionCancel,
@@ -101,14 +52,24 @@ pub async fn await_predicted_stt(runner: &PredictedRunner) -> Result<String, Str
 pub(super) async fn await_predicted_stt_shared(
     shared: &Arc<PredictedSharedState>,
 ) -> Result<String, String> {
+    wait_until_ready(&shared.done, || async move {
+        shared.user_transcript.lock().await.clone()
+    })
+    .await
+}
+
+async fn wait_until_ready<T, F>(wakeup: &Notify, mut probe: impl FnMut() -> F) -> T
+where
+    F: std::future::Future<Output = Option<T>>,
+{
     loop {
-        {
-            let guard = shared.user_transcript.lock().await;
-            if let Some(r) = guard.as_ref() {
-                return r.clone();
-            }
+        let woken = wakeup.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        if let Some(ready) = probe().await {
+            return ready;
         }
-        shared.done.notified().await;
+        woken.await;
     }
 }
 
@@ -197,12 +158,10 @@ impl PredictedLlmRunner {
     }
 
     pub async fn wait_finished(&self) {
-        loop {
-            if self.is_done() || self.is_cancelled() {
-                return;
-            }
-            self.shared.finished.notified().await;
-        }
+        wait_until_ready(&self.shared.finished, || async move {
+            (self.is_done() || self.is_cancelled()).then_some(())
+        })
+        .await
     }
 }
 
@@ -255,6 +214,7 @@ fn mark_llm_shared_finished(shared: &Arc<PredictedLlmShared>) {
     shared.progress.notify_waiters();
 }
 
+#[cfg(test)]
 pub(super) fn spawn_predicted_llm(
     cancel: &super::cancel::SessionCancel,
     cfg: LlmConfig,
@@ -314,29 +274,6 @@ pub(super) fn spawn_predicted_llm_after_stt(
 mod tests {
     use super::*;
 
-    #[test]
-    fn predicted_token_buffer_drops_oldest_on_overflow() {
-        let mut b = PredictedTokenBuffer::new(3);
-        b.push("a".into());
-        b.push("b".into());
-        b.push("c".into());
-        assert_eq!(b.dropped_count(), 0);
-        b.push("d".into());
-        b.push("e".into());
-        assert_eq!(b.dropped_count(), 2);
-        let out = b.drain();
-        assert_eq!(out, vec!["c", "d", "e"]);
-    }
-
-    #[test]
-    fn predicted_token_buffer_default_cap_at_least_one() {
-        let mut b = PredictedTokenBuffer::new(0);
-        b.push("only".into());
-        assert_eq!(b.len(), 1);
-        b.push("overflow".into());
-        assert!(b.dropped_count() >= 1);
-    }
-
     #[tokio::test]
     async fn shared_state_starts_empty() {
         let s = PredictedSharedState::new();
@@ -359,6 +296,27 @@ mod tests {
         };
         let r = await_predicted_stt(&runner).await;
         assert_eq!(r.ok().as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn a_result_stored_and_notified_between_the_check_and_the_wait_is_not_lost() {
+        let shared = PredictedSharedState::new();
+        let checks = AtomicU32::new(0);
+        let (shared, checks) = (&shared, &checks);
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            wait_until_ready(&shared.done, || async move {
+                let seen = shared.user_transcript.lock().await.clone();
+                if checks.fetch_add(1, Ordering::SeqCst) == 0 {
+                    *shared.user_transcript.lock().await = Some(Ok("hello".into()));
+                    shared.done.notify_waiters();
+                }
+                seen
+            }),
+        )
+        .await
+        .expect("the wakeup sent between the empty check and the wait was lost");
+        assert_eq!(got.ok().as_deref(), Some("hello"));
     }
 }
 

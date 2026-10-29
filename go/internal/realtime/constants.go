@@ -91,9 +91,6 @@ const (
 	defaultInputAudioFormat  = AudioFormatPCM16
 	defaultOutputAudioFormat = AudioFormatPCM16
 
-	defaultFusionRule       = "gated"
-	defaultFusionWeightText = 0.5
-
 	inspectorBusBufferPerSub     = 256
 	inspectorWSWriteTimeout      = 5
 	inspectStreamWriteTimeoutSec = 5

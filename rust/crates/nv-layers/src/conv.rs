@@ -267,46 +267,16 @@ mod tests {
     use candle_core::{DType, Device};
 
     #[test]
-    fn conv2d_subsamples_correctly() {
+    fn conv_layers_produce_the_subsampled_padded_and_upsampled_output_shapes() {
         let dev = Device::Cpu;
-        let w = Tensor::zeros((8, 4, 3, 3), DType::F32, &dev).unwrap();
-        let b = Tensor::zeros(8, DType::F32, &dev).unwrap();
-        let c = Conv2d::new(w, Some(b), 2, 1).unwrap();
-        let x = Tensor::zeros((1, 4, 16, 16), DType::F32, &dev).unwrap();
-        let y = c.forward(&x).unwrap();
-
-        assert_eq!(y.dims(), &[1, 8, 8, 8]);
-    }
-
-    #[test]
-    fn conv1d_no_bias() {
-        let dev = Device::Cpu;
-        let w = Tensor::zeros((4, 2, 5), DType::F32, &dev).unwrap();
-        let c = Conv1d::new(w, None, 1, 2).unwrap();
-        let x = Tensor::zeros((1, 2, 32), DType::F32, &dev).unwrap();
-        let y = c.forward(&x).unwrap();
-
-        assert_eq!(y.dims(), &[1, 4, 32]);
-    }
-
-    #[test]
-    fn conv_transpose1d_upsamples_by_stride() {
-        let dev = Device::Cpu;
-        let w = Tensor::zeros((2, 4, 4), DType::F32, &dev).unwrap();
-        let b = Tensor::zeros(4, DType::F32, &dev).unwrap();
-        let ct = ConvTranspose1d::new(w, Some(b), 2, 0, 0).unwrap();
-        let x = Tensor::zeros((1, 2, 8), DType::F32, &dev).unwrap();
-        let y = ct.forward(&x).unwrap();
-        assert_eq!(y.dims(), &[1, 4, 18]);
-    }
-
-    #[test]
-    fn conv_transpose1d_with_padding_and_output_padding() {
-        let dev = Device::Cpu;
-        let w = Tensor::zeros((3, 2, 10), DType::F32, &dev).unwrap();
-        let ct = ConvTranspose1d::new(w, None, 5, 2, 1).unwrap();
-        let x = Tensor::zeros((1, 3, 4), DType::F32, &dev).unwrap();
-        let y = ct.forward(&x).unwrap();
-        assert_eq!(y.dims(), &[1, 2, 22]);
+        let z = |shape: &[usize]| Tensor::zeros(shape, DType::F32, &dev).unwrap();
+        let conv2d = Conv2d::new(z(&[8, 4, 3, 3]), Some(z(&[8])), 2, 1).unwrap();
+        assert_eq!(conv2d.forward(&z(&[1, 4, 16, 16])).unwrap().dims(), &[1, 8, 8, 8]);
+        let conv1d = Conv1d::new(z(&[4, 2, 5]), None, 1, 2).unwrap();
+        assert_eq!(conv1d.forward(&z(&[1, 2, 32])).unwrap().dims(), &[1, 4, 32]);
+        let up = ConvTranspose1d::new(z(&[2, 4, 4]), Some(z(&[4])), 2, 0, 0).unwrap();
+        assert_eq!(up.forward(&z(&[1, 2, 8])).unwrap().dims(), &[1, 4, 18]);
+        let padded = ConvTranspose1d::new(z(&[3, 2, 10]), None, 5, 2, 1).unwrap();
+        assert_eq!(padded.forward(&z(&[1, 3, 4])).unwrap().dims(), &[1, 2, 22]);
     }
 }

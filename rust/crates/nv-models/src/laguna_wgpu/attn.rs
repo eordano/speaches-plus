@@ -1,4 +1,6 @@
-use anyhow::Result;
+use anyhow::{ensure, Result};
+use std::env;
+use wgpu::Buffer;
 
 use super::config::{window_start, GateKind, LagunaShapes, LayerShape, MAX_HEAD_DIM};
 use super::gpu::{
@@ -8,57 +10,52 @@ use super::gpu::{
 use super::lora::LoraSiteCtx;
 use super::weights::{bf16_val, pack_pairs, HostAttention};
 use super::{rbf, ref_gemv_lin, softplus, RefState};
+use crate::pod;
 
-pub const ATTN_WGSL: &str = include_str!("../../../nv-kernels/wgsl/laguna_attn.wgsl");
+pub const ATTN_WGSL: &str = nv_kernels::wgsl!("../../../nv-kernels/wgsl/laguna_attn.wgsl");
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct NormRopeParams {
-    pub n_rows: u32,
-    pub head_dim: u32,
-    pub src_stride: u32,
-    pub rot_half: u32,
-    pub eps: f32,
-    pub out_scale: f32,
-    pub rope_table_half: u32,
-    pub tok_stride_words: u32,
-}
+pod! {
+    pub struct NormRopeParams {
+        pub n_rows: u32,
+        pub head_dim: u32,
+        pub src_stride: u32,
+        pub rot_half: u32,
+        pub eps: f32,
+        pub out_scale: f32,
+        pub rope_table_half: u32,
+        pub tok_stride_words: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct KvWriteParams {
-    pub kv_words: u32,
-    pub kv_capacity: u32,
-    pub pad0: u32,
-    pub pad1: u32,
-}
+    pub struct KvWriteParams {
+        pub kv_words: u32,
+        pub kv_capacity: u32,
+        pub pad0: u32,
+        pub pad1: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct AttnDecodeParams {
-    pub n_q_heads: u32,
-    pub n_kv_heads: u32,
-    pub head_dim: u32,
-    pub gqa_group: u32,
-    pub kv_capacity: u32,
-    pub is_sliding: u32,
-    pub scale: f32,
-    pub pad0: u32,
-}
+    pub struct AttnDecodeParams {
+        pub n_q_heads: u32,
+        pub n_kv_heads: u32,
+        pub head_dim: u32,
+        pub gqa_group: u32,
+        pub kv_capacity: u32,
+        pub is_sliding: u32,
+        pub scale: f32,
+        pub pad0: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct AttnSplitParams {
-    pub n_slices: u32,
-    pub pad0: u32,
-    pub pad1: u32,
-    pub pad2: u32,
+    pub struct AttnSplitParams {
+        pub n_slices: u32,
+        pub pad0: u32,
+        pub pad1: u32,
+        pub pad2: u32,
+    }
 }
 
 pub const ATTN_SPLIT_MAX_SLICES_KEEPS_PARTIALS_SMALL_AND_GRID_Z_SANE: u32 = 32;
 
 pub fn attn_split_slices() -> u32 {
-    std::env::var("NV_LAGUNA_WGPU_ATTN_SPLIT")
+    env::var("NV_LAGUNA_WGPU_ATTN_SPLIT")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|s| *s >= 2)
@@ -67,25 +64,25 @@ pub fn attn_split_slices() -> u32 {
 }
 
 pub fn attn_abl_arm() -> u32 {
-    std::env::var("NV_LAGUNA_ATTN_ABL")
+    env::var("NV_LAGUNA_ATTN_ABL")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|a| (1..=3).contains(a))
         .unwrap_or(0)
 }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct AttnGateParams {
-    pub n_words: u32,
-    pub head_dim: u32,
-    pub gate_kind: u32,
-    pub n_q_heads: u32,
+pod! {
+    pub struct AttnGateParams {
+        pub n_words: u32,
+        pub head_dim: u32,
+        pub gate_kind: u32,
+        pub n_q_heads: u32,
+    }
 }
 
 pub struct RopeTablesGpu {
-    pub cos: wgpu::Buffer,
-    pub sin: wgpu::Buffer,
+    pub cos: Buffer,
+    pub sin: Buffer,
     pub half: usize,
 }
 
@@ -95,10 +92,10 @@ pub struct AttnGpu {
     pub vw: LinGpu,
     pub ow: LinGpu,
     pub gw: Option<LinGpu>,
-    pub qn: wgpu::Buffer,
-    pub kn: wgpu::Buffer,
-    pub kc: wgpu::Buffer,
-    pub vc: wgpu::Buffer,
+    pub qn: Buffer,
+    pub kn: Buffer,
+    pub kc: Buffer,
+    pub vc: Buffer,
 }
 
 pub fn gate_code(kind: GateKind) -> u32 {
@@ -113,15 +110,14 @@ fn wbytes(elems: usize) -> u64 {
     (elems.div_ceil(2).max(1) * 4) as u64
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_attn_layer(
     b: &mut Builder,
     s: &Sources,
     shapes: &LagunaShapes,
     layer: &LayerShape,
     w: &HostAttention,
-    x_normed_packed: &wgpu::Buffer,
-    out_packed: &wgpu::Buffer,
+    x_normed_packed: &Buffer,
+    out_packed: &Buffer,
     step: &StepBuffers,
     rope: &RopeTablesGpu,
     lora: Option<&LoraSiteCtx>,
@@ -136,56 +132,56 @@ pub fn build_attn_layer(
     let words = hd / 2;
     let rot_half = layer.rotary_dim / 2;
 
-    anyhow::ensure!(
+    ensure!(
         hd.is_multiple_of(2) && hd <= MAX_HEAD_DIM,
         "layer {li}: head_dim {hd} must be even and <= {MAX_HEAD_DIM}"
     );
-    anyhow::ensure!(
+    ensure!(
         n_kv > 0 && layer.gqa_group * n_kv == n_q,
         "layer {li}: {n_q} q heads not a multiple of {n_kv} kv heads"
     );
-    anyhow::ensure!(
+    ensure!(
         rope.half == rot_half,
         "layer {li}: rope table half {} != rotary_dim/2 {rot_half}",
         rope.half
     );
-    anyhow::ensure!(
+    ensure!(
         w.q.n() == q_rows && w.q.k() == hidden,
         "layer {li}: q_proj is [{},{}], want [{q_rows},{hidden}]",
         w.q.n(),
         w.q.k()
     );
-    anyhow::ensure!(
+    ensure!(
         w.k.n() == kv_rows && w.k.k() == hidden,
         "layer {li}: k_proj is [{},{}], want [{kv_rows},{hidden}]",
         w.k.n(),
         w.k.k()
     );
-    anyhow::ensure!(
+    ensure!(
         w.v.n() == kv_rows && w.v.k() == hidden,
         "layer {li}: v_proj is [{},{}], want [{kv_rows},{hidden}]",
         w.v.n(),
         w.v.k()
     );
-    anyhow::ensure!(
+    ensure!(
         w.o.n() == hidden && w.o.k() == q_rows,
         "layer {li}: o_proj is [{},{}], want [{hidden},{q_rows}]",
         w.o.n(),
         w.o.k()
     );
-    anyhow::ensure!(
+    ensure!(
         w.q_norm.len() == hd && w.k_norm.len() == hd,
         "layer {li}: q_norm/k_norm must be [{hd}], got {}/{}",
         w.q_norm.len(),
         w.k_norm.len()
     );
-    anyhow::ensure!(
+    ensure!(
         (shapes.gate_kind == GateKind::None) == w.g.is_none(),
         "layer {li}: gating {:?} disagrees with g_proj presence",
         shapes.gate_kind
     );
     if let Some(g) = &w.g {
-        anyhow::ensure!(
+        ensure!(
             g.n() == layer.gate_rows && g.k() == hidden,
             "layer {li}: g_proj is [{},{}], want [{},{hidden}]",
             g.n(),
@@ -457,24 +453,23 @@ pub fn build_attn_layer(
     })
 }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct AttnGateRowsParams {
-    pub n_words: u32,
-    pub head_dim: u32,
-    pub gate_kind: u32,
-    pub g_stride_elems: u32,
+pod! {
+    pub struct AttnGateRowsParams {
+        pub n_words: u32,
+        pub head_dim: u32,
+        pub gate_kind: u32,
+        pub g_stride_elems: u32,
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_attn_layer_rows(
     b: &mut Builder,
     s: &Sources,
     shapes: &LagunaShapes,
     layer: &LayerShape,
     g: &AttnGpu,
-    x_rows_packed: &wgpu::Buffer,
-    out_rows_packed: &wgpu::Buffer,
+    x_rows_packed: &Buffer,
+    out_rows_packed: &Buffer,
     mp: &MRows,
     rope: &RopeTablesGpu,
 ) -> Result<()> {
@@ -486,7 +481,7 @@ pub fn build_attn_layer_rows(
     let q_rows = layer.q_rows;
     let kv_rows = layer.kv_rows;
     let words = hd / 2;
-    anyhow::ensure!(
+    ensure!(
         q_rows.is_multiple_of(2) && kv_rows.is_multiple_of(2),
         "layer {li}: rows prefill packs per-token bf16 words, q_rows {q_rows} and kv_rows \
          {kv_rows} must be even"
@@ -693,7 +688,6 @@ pub fn build_attn_layer_rows(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn ref_attn(
     shapes: &LagunaShapes,
     layer: &LayerShape,
@@ -709,7 +703,7 @@ pub fn ref_attn(
     let n_q = layer.num_q_heads;
     let n_kv = layer.num_kv_heads;
     let rot_half = layer.rotary_dim / 2;
-    anyhow::ensure!(
+    ensure!(
         rope_cos_row.len() >= rot_half && rope_sin_row.len() >= rot_half,
         "layer {li}: rope row has {} entries, need {rot_half}",
         rope_cos_row.len()
@@ -743,7 +737,7 @@ pub fn ref_attn(
     st.kc[li].extend_from_slice(&k);
     st.vc[li].extend_from_slice(&v);
     let total = st.kc[li].len() / layer.kv_rows;
-    anyhow::ensure!(
+    ensure!(
         total == pos_tokens + 1,
         "layer {li}: kv cache holds {total} tokens at position {pos_tokens}"
     );

@@ -44,10 +44,6 @@ impl GgufLoader {
         &self.path
     }
 
-    pub fn set_nvfp4_transcode(&self, on: bool) {
-        self.nvfp4_transcode.set(on);
-    }
-
     pub fn nvfp4_transcode(&self) -> bool {
         self.nvfp4_transcode.get()
     }
@@ -196,7 +192,7 @@ impl GgufLoader {
     }
 
     pub fn get_gguf(&self, gguf_name: &str, dtype: DType) -> Result<Tensor> {
-        let cuda_target = matches!(self.device, Device::Cuda(_));
+        let cuda_target = self.device.is_cuda();
         let read_device = if cuda_target {
             Device::Cpu
         } else {
@@ -228,7 +224,7 @@ impl GgufLoader {
                 .with_context(|| format!("nvfp4 transcode {gguf_name}"));
         }
 
-        if cuda_target && !matches!(t.device(), Device::Cuda(_)) {
+        if cuda_target && !t.device().is_cuda() {
             return t
                 .to_device(&self.device)
                 .map_err(|e| anyhow!("gguf to_device(cuda) {gguf_name}: {e}"));
@@ -711,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn dense_nvfp4_targets_exclude_experts_and_norms() {
+    fn dense_nvfp4_targets_exclude_experts_and_norms_and_only_stacked_experts_are_top_k_scaled() {
         for n in [
             "token_embd.weight",
             "blk.0.attn_q.weight",
@@ -736,10 +732,6 @@ mod tests {
         ] {
             assert!(!is_dense_nvfp4_target(n), "{n} must NOT be a dense target");
         }
-    }
-
-    #[test]
-    fn stacked_expert_names_are_the_only_top_k_scaled_tensors() {
         for n in [
             "blk.0.ffn_gate_up_exps.weight",
             "blk.29.ffn_down_exps.weight",
@@ -757,16 +749,6 @@ mod tests {
         ] {
             assert!(!is_stacked_expert(n), "{n} is read in full every token");
         }
-    }
-
-    #[test]
-    fn ggml_bytes_counts_block_scales() {
-        assert_eq!(ggml_bytes(32, GgmlDType::Q4_0), 18);
-        assert_eq!(ggml_bytes(1024, GgmlDType::Q4_0), 576);
-
-        assert_eq!(ggml_bytes(32, GgmlDType::Q8_0), 34);
-        assert_eq!(ggml_bytes(1024, GgmlDType::Q8_0), 1088);
-        assert_eq!(ggml_bytes(1024, GgmlDType::F32), 4096);
     }
 
     const QK4_0: usize = 32;
@@ -797,7 +779,12 @@ mod tests {
     }
 
     #[test]
-    fn q4_0_dequant_matches_candle_bit_exact() {
+    fn ggml_bytes_count_block_scales_and_q4_0_dequant_matches_candle() {
+        assert_eq!(ggml_bytes(32, GgmlDType::Q4_0), 18);
+        assert_eq!(ggml_bytes(1024, GgmlDType::Q4_0), 576);
+        assert_eq!(ggml_bytes(32, GgmlDType::Q8_0), 34);
+        assert_eq!(ggml_bytes(1024, GgmlDType::Q8_0), 1088);
+        assert_eq!(ggml_bytes(1024, GgmlDType::F32), 4096);
         use candle_core::quantized::{GgmlDType, QTensor};
         let device = Device::Cpu;
         let rows = 4usize;

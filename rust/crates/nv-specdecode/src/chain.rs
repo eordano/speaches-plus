@@ -271,7 +271,8 @@ mod tests {
     }
 
     #[test]
-    fn kv_cap_from_env_matches_drafter_cache_semantics() {
+    fn kv_cap_from_env_matches_drafter_cache_semantics_and_effective_rows_follow_max_seq_or_sink_window_slack(
+    ) {
         use crate::eagle3_loader::{DrafterKvCache, DRAFTER_KV_CAP_DEFAULT_SINK};
         assert_eq!(
             drafter_kv_cap_from_env(None, None, DRAFTER_KV_CAP_DEFAULT_SINK),
@@ -303,52 +304,42 @@ mod tests {
                 "w={w:?} s={s:?}"
             );
         }
-    }
+        {
+            assert_eq!(effective_drafter_kv_rows(32768, None, 256), 32768);
+            assert_eq!(effective_drafter_kv_rows(32768, Some((16, 0)), 256), 32768);
+            assert_eq!(effective_drafter_kv_rows(0, None, 256), 0);
 
-    #[test]
-    fn effective_rows_uncapped_is_max_seq() {
-        assert_eq!(effective_drafter_kv_rows(32768, None, 256), 32768);
-        assert_eq!(effective_drafter_kv_rows(32768, Some((16, 0)), 256), 32768);
-        assert_eq!(effective_drafter_kv_rows(0, None, 256), 0);
-    }
+            assert_eq!(
+                effective_drafter_kv_rows(32768, Some((16, 2048)), 256),
+                16 + 2048 + 256
+            );
+            assert_eq!(
+                effective_drafter_kv_rows(32768, Some((0, 1024)), 256),
+                1024 + 256
+            );
 
-    #[test]
-    fn effective_rows_capped_is_sink_window_slack() {
-        assert_eq!(
-            effective_drafter_kv_rows(32768, Some((16, 2048)), 256),
-            16 + 2048 + 256
-        );
-        assert_eq!(
-            effective_drafter_kv_rows(32768, Some((0, 1024)), 256),
-            1024 + 256
-        );
-    }
-
-    #[test]
-    fn effective_rows_never_exceeds_max_seq() {
-        assert_eq!(
-            effective_drafter_kv_rows(4096, Some((16, 32768)), 256),
-            4096
-        );
-        assert_eq!(
-            effective_drafter_kv_rows(4096, Some((16, usize::MAX)), 256),
-            4096
-        );
-        assert_eq!(
-            effective_drafter_kv_rows(4096, Some((usize::MAX, usize::MAX)), usize::MAX),
-            4096
-        );
-    }
-
-    #[test]
-    fn chain_graph_cap_matches_legacy_when_uncapped() {
-        for &(m, k) in &[(32768usize, 4usize), (8192, 3), (1, 1)] {
-            assert_eq!(chain_graph_cap(m, k, None, 256), m + k);
+            assert_eq!(
+                effective_drafter_kv_rows(4096, Some((16, 32768)), 256),
+                4096
+            );
+            assert_eq!(
+                effective_drafter_kv_rows(4096, Some((16, usize::MAX)), 256),
+                4096
+            );
+            assert_eq!(
+                effective_drafter_kv_rows(4096, Some((usize::MAX, usize::MAX)), usize::MAX),
+                4096
+            );
         }
     }
 
     #[test]
-    fn chain_graph_cap_covers_projected_phys_guard() {
+    fn chain_graph_cap_matches_legacy_uncapped_covers_the_projected_phys_guard_and_shrinks_when_capped(
+    ) {
+        for &(m, k) in &[(32768usize, 4usize), (8192, 3), (1, 1)] {
+            assert_eq!(chain_graph_cap(m, k, None, 256), m + k);
+        }
+
         let slack = crate::eagle3_loader::DRAFTER_KV_CAP_SLACK;
         for &(sink, window) in &[(16usize, 1024usize), (0, 4096), (16, 2048)] {
             for k in 1..=8usize {
@@ -361,37 +352,29 @@ mod tests {
                 );
             }
         }
-    }
 
-    #[test]
-    fn chain_graph_cap_capped_is_smaller_than_max_seq_sizing() {
         let cap = chain_graph_cap(32768, 4, Some((16, 2048)), 256);
         assert_eq!(cap, 16 + 2048 + 256 + 4);
         assert!(cap < 32768 + 4);
     }
 
     #[test]
-    fn accept_all_drafts_commits_k_and_carries_last_amax() {
+    fn accept_prefix_commits_all_k_on_full_accept_bonus_only_on_first_reject_and_the_prefix_plus_replacement_mid_round(
+    ) {
         let batch: Vec<u32> = vec![10, 11, 12, 13];
         let amax: Vec<u32> = vec![11, 12, 13, 99];
         let acc = accept_prefix_argmax(&batch, &amax).unwrap();
         assert_eq!(acc.commit_len, 4);
         assert_eq!(acc.draft_accepted, 3);
         assert_eq!(acc.next_bonus, 99);
-    }
 
-    #[test]
-    fn first_draft_reject_commits_bonus_only() {
         let batch: Vec<u32> = vec![10, 11, 12, 13];
         let amax: Vec<u32> = vec![77, 12, 13, 99];
         let acc = accept_prefix_argmax(&batch, &amax).unwrap();
         assert_eq!(acc.commit_len, 1);
         assert_eq!(acc.draft_accepted, 0);
         assert_eq!(acc.next_bonus, 77);
-    }
 
-    #[test]
-    fn mid_reject_commits_prefix_and_replacement_bonus() {
         for reject_at in 2..K {
             let batch: Vec<u32> = (0..K).map(|i| 100 + i as u32).collect();
             let mut amax: Vec<u32> = (0..K).map(|i| 101 + i as u32).collect();
@@ -404,27 +387,22 @@ mod tests {
     }
 
     #[test]
-    fn bonus_slot_never_judged() {
+    fn judge_slot_never_judges_the_bonus_slot_returns_none_out_of_range_and_matches_the_whole_round_walk(
+    ) {
         let batch: Vec<u32> = vec![5, 6, 7];
         let amax: Vec<u32> = vec![0, 0, 0];
         let acc = accept_prefix_argmax(&batch, &amax).unwrap();
         assert!(acc.commit_len >= 1);
         assert_eq!(acc.commit_len, 1);
         assert_eq!(judge_slot_argmax(&batch, &amax, 0), None);
-    }
 
-    #[test]
-    fn judge_slot_argmax_out_of_range_is_none_not_panic() {
         let batch: Vec<u32> = vec![5, 6, 7];
         assert_eq!(judge_slot_argmax(&batch, &[9, 9], 3), None);
         assert_eq!(judge_slot_argmax(&batch, &[9], 2), None);
         assert_eq!(judge_slot_argmax(&batch, &[], 1), None);
         assert_eq!(judge_slot_argmax(&[], &[], 1), None);
         assert_eq!(judge_slot_argmax(&batch, &[9, 9, 9], 2), Some(9));
-    }
 
-    #[test]
-    fn judge_slot_argmax_matches_whole_round_walk() {
         let mut rng: u64 = 0x9e3779b97f4a7c15;
         let mut next = move || {
             rng ^= rng << 13;
@@ -453,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn build_chain_batch_shift_and_bonus_modes() {
+    fn chain_batch_mask_positions_and_aux_rows_are_laid_out_as_the_verify_round_expects() {
         let draft: Vec<u32> = vec![20, 21, 22, 23];
         let shifted = build_chain_batch(9, &draft, 4, true).unwrap();
         assert_eq!(shifted, vec![9, 20, 21, 22]);
@@ -465,10 +443,7 @@ mod tests {
             build_chain_batch(9, &draft[..3], 4, true).unwrap(),
             vec![9, 20, 21, 22]
         );
-    }
 
-    #[test]
-    fn lower_tri_mask_matches_chain_tree_flatten() {
         for n in 1..=6 {
             let tree = DraftTree {
                 tokens: (0..n as u32).collect(),
@@ -480,47 +455,42 @@ mod tests {
             let (_, tree_mask) = flatten_with_mask(&tree);
             assert_eq!(lower_tri_mask(n), tree_mask, "n={n}");
         }
-    }
-
-    #[test]
-    fn chain_positions_are_contiguous_from_committed() {
-        for &(c, k) in &[(0usize, 1usize), (5, 4), (117, 8), (4096, 16)] {
-            let pos = chain_positions(c, k);
-            assert_eq!(pos.len(), k);
-            for (i, p) in pos.iter().enumerate() {
-                assert_eq!(*p, (c + i) as i32);
-            }
-        }
-    }
-
-    #[test]
-    fn aux_row_extract_concatenates_layer_blocks_in_order() {
-        let n_layers = 3;
-        let k = 4;
-        let hidden = 5;
-        let mut gaux = vec![0.0f32; n_layers * k * hidden];
-        for l in 0..n_layers {
-            for j in 0..k {
-                for h in 0..hidden {
-                    gaux[l * k * hidden + j * hidden + h] = (l * 1000 + j * 10 + h) as f32;
+        {
+            for &(c, k) in &[(0usize, 1usize), (5, 4), (117, 8), (4096, 16)] {
+                let pos = chain_positions(c, k);
+                assert_eq!(pos.len(), k);
+                for (i, p) in pos.iter().enumerate() {
+                    assert_eq!(*p, (c + i) as i32);
                 }
             }
-        }
-        for j in 0..k {
-            let row = aux_row_extract(&gaux, n_layers, k, hidden, j).unwrap();
-            assert_eq!(row.len(), n_layers * hidden);
+
+            let n_layers = 3;
+            let k = 4;
+            let hidden = 5;
+            let mut gaux = vec![0.0f32; n_layers * k * hidden];
             for l in 0..n_layers {
-                for h in 0..hidden {
-                    assert_eq!(row[l * hidden + h], (l * 1000 + j * 10 + h) as f32);
+                for j in 0..k {
+                    for h in 0..hidden {
+                        gaux[l * k * hidden + j * hidden + h] = (l * 1000 + j * 10 + h) as f32;
+                    }
                 }
             }
+            for j in 0..k {
+                let row = aux_row_extract(&gaux, n_layers, k, hidden, j).unwrap();
+                assert_eq!(row.len(), n_layers * hidden);
+                for l in 0..n_layers {
+                    for h in 0..hidden {
+                        assert_eq!(row[l * hidden + h], (l * 1000 + j * 10 + h) as f32);
+                    }
+                }
+            }
+            assert!(aux_row_extract(&gaux, n_layers, k, hidden, k).is_err());
+            assert!(aux_row_extract(&gaux[..gaux.len() - 1], n_layers, k, hidden, 0).is_err());
         }
-        assert!(aux_row_extract(&gaux, n_layers, k, hidden, k).is_err());
-        assert!(aux_row_extract(&gaux[..gaux.len() - 1], n_layers, k, hidden, 0).is_err());
     }
 
     #[test]
-    fn chain_state_lockstep_commit_and_reject_bookkeeping() {
+    fn chain_state_lockstep_bookkeeping_and_round_start_guard_reject_overflow_and_desync() {
         let fc_in = 6;
         let prompt: Vec<u32> = vec![1, 2, 3];
         let mut st = ChainState::new(&prompt, fc_in).unwrap();
@@ -544,10 +514,7 @@ mod tests {
 
         st.assert_round_start(4, 64).unwrap();
         assert!(st.commit_token(50, &aux_row[..fc_in - 1]).is_err());
-    }
 
-    #[test]
-    fn chain_state_round_start_guard_rejects_overflow_and_desync() {
         let fc_in = 4;
         let st = ChainState::new(&[1, 2, 3, 4, 5], fc_in).unwrap();
         st.assert_round_start(3, 8).unwrap();

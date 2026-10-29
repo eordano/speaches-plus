@@ -104,11 +104,7 @@ pub enum DotsOcrMode {
     PlainOcr,
 }
 
-impl DotsOcrMode {
-    pub fn emits_layout(self) -> bool {
-        !matches!(self, DotsOcrMode::PlainOcr)
-    }
-}
+impl DotsOcrMode {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DotsTierHint {

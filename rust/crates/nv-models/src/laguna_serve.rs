@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use std::collections::HashMap;
 use std::path::Path;
@@ -8,13 +8,16 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
 use crate::laguna::{Laguna, LagunaKvCache};
+use crate::laguna_batch_graph::LagunaBatchStepGraph;
+use crate::laguna_dflash::context_commit::DflashCtxCommitGraph;
 use crate::laguna_dflash::{
     accept_block_on_device_with_status, accept_block_on_host, adapt_truncate_len,
-    checked_target_argmax_row, dflash_adapt_enabled, dflash_adapt_thresh, dflash_window_mode,
-    resolve_tap_layers, tap_list_mode, vegas_enabled, AcceptSlots, DflashCtxCache,
-    DflashGraphProposer, DflashWindowMode, LagunaDflash, LagunaDflashConfig, LookupState,
+    checked_target_argmax_row, dflash_adapt_enabled, dflash_adapt_thresh, resolve_tap_layers,
+    tap_list_mode, vegas_enabled, AcceptSlots, DflashCtxCache, DflashGraphProposer, LagunaDflash,
+    LagunaDflashConfig, LookupState,
 };
 use crate::laguna_step_graph::{LagunaStepGraph, LagunaVerifyGraph, StepCache};
+use std::env;
 
 mod prefix;
 
@@ -55,7 +58,6 @@ pub enum SpecServeEvent {
 
 pub struct SpecServeJob {
     pub prompt_ids: Vec<u32>,
-    pub prompt_text: String,
     pub max_new: usize,
     pub eos_ids: Vec<u32>,
     pub emit: Box<dyn FnMut(SpecServeEvent) -> bool + Send>,
@@ -167,28 +169,28 @@ pub fn load_dflash_draft(dir: &Path, device: &Device) -> Result<LagunaDflash> {
 
 fn validate_draft(target: &Laguna, draft: &LagunaDflash, num_spec: usize) -> Result<()> {
     let dcfg = draft.config();
-    anyhow::ensure!(
+    ensure!(
         num_spec >= 1 && num_spec < dcfg.dflash_config.block_size,
         "num_speculative must be in 1..{}, got {num_spec}",
         dcfg.dflash_config.block_size
     );
     let n_target = target.config().num_hidden_layers;
-    anyhow::ensure!(
+    ensure!(
         dcfg.dflash_config.num_target_layers == n_target,
         "draft expects target with {} layers, got {n_target}",
         dcfg.dflash_config.num_target_layers
     );
     for &li in &dcfg.dflash_config.target_layer_ids {
-        anyhow::ensure!(
+        ensure!(
             li < n_target,
             "aux layer {li} out of range for target ({n_target})"
         );
     }
-    anyhow::ensure!(
+    ensure!(
         target.config().hidden_size == dcfg.hidden_size,
         "target/draft hidden size mismatch"
     );
-    anyhow::ensure!(
+    ensure!(
         target.config().vocab_size == dcfg.vocab_size,
         "target/draft vocab size mismatch"
     );
@@ -222,11 +224,11 @@ fn push_round(job: &mut SpecServeJob, toks: &[u32], total: &mut usize) -> Flow {
 }
 
 fn device_draft_transport_from_env() -> Result<bool> {
-    match std::env::var("NV_LAGUNA_DFLASH_DEVICE_TRANSPORT") {
+    match env::var("NV_LAGUNA_DFLASH_DEVICE_TRANSPORT") {
         Err(std::env::VarError::NotPresent) => Ok(false),
         Ok(v) if v == "0" => Ok(false),
         Ok(v) if v == "1" => Ok(true),
-        _ => anyhow::bail!("NV_LAGUNA_DFLASH_DEVICE_TRANSPORT must be 0 or 1"),
+        _ => bail!("NV_LAGUNA_DFLASH_DEVICE_TRANSPORT must be 0 or 1"),
     }
 }
 
@@ -256,17 +258,18 @@ pub fn bf16_prefill_handoff_opt_in() -> bool {
 
 fn validate_bf16_prefill_handoff_selection() -> Result<()> {
     if bf16_prefill_handoff_opt_in() {
-        anyhow::ensure!(!crate::laguna_prefix::prefix_reuse_enabled(),
+        ensure!(!crate::laguna_prefix::prefix_reuse_enabled(),
             "NV_LAGUNA_PREFILL_BF16_HANDOFF=1 requires NV_LAGUNA_PREFIX_REUSE=0; source-cache checkpoint reuse is not qualified");
-        anyhow::ensure!(
+        ensure!(
             batch_m2_graph_enabled_from_env()
                 || batch_m2_spec_enabled_from_env()
                 || (batch_lanes_from_env().is_none() && !batch_graph_enabled_from_env()?),
             "NV_LAGUNA_PREFILL_BF16_HANDOFF=1 requires solo serving or prepared m2/m2-spec lanes"
         );
-        anyhow::ensure!(std::env::var_os("NV_LAGUNA_HOST_KV").is_none()
-            && std::env::var_os("NV_LAGUNA_RING_ATTN").is_none(),
-            "BF16 prefill handoff requires compacting CUDA ring KV; unset NV_LAGUNA_HOST_KV and NV_LAGUNA_RING_ATTN");
+        ensure!(
+            !nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_RING_ATTN"),
+            "BF16 prefill handoff requires compacting CUDA ring KV; unset NV_LAGUNA_RING_ATTN"
+        );
     }
     Ok(())
 }
@@ -305,7 +308,7 @@ fn handoff_cache_bytes(
     chunk: usize,
 ) -> Result<(u64, u64)> {
     use crate::gemma4::LayerType;
-    anyhow::ensure!(
+    ensure!(
         (1..=262144).contains(&max_seq)
             && matches!(chunk, 256 | 512 | 1024 | 2048 | 4096 | 8192)
             && config.num_key_value_heads == 8
@@ -377,7 +380,7 @@ fn preflight_handoff_caches(
         "[laguna_vram_preflight] route=bf16-handoff source_bf16_gib={:.3} destination_e4m3_gib={:.3} reserve_gib={:.1} free_gib={:.3} cap={max_seq} chunk={chunk}",
         gib(source), gib(destination), gib(reserve), gib(free)
     );
-    anyhow::ensure!(
+    ensure!(
         free >= required,
         "laguna spec serving: refusing the explicitly selected BF16 handoff route before allocating: source {:.2} GiB + destination {:.2} GiB + reserve {:.1} GiB exceed the {:.2} GiB free after the target loaded; no silent fallback",
         gib(source), gib(destination), gib(reserve), gib(free)
@@ -394,8 +397,8 @@ impl<'m> SpecState<'m> {
     ) -> Result<Self> {
         let device_draft_transport = device_draft_transport_from_env()?;
         let device = target.device().clone();
-        anyhow::ensure!(
-            matches!(device, Device::Cuda(_)),
+        ensure!(
+            device.is_cuda(),
             "laguna spec serving requires a CUDA device"
         );
         validate_bf16_prefill_handoff_selection()?;
@@ -414,9 +417,9 @@ impl<'m> SpecState<'m> {
             )?;
         }
         let step = if handoff {
-            anyhow::ensure!(!nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_FP8_KV"),
+            ensure!(!nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_FP8_KV"),
                 "NV_LAGUNA_PREFILL_BF16_HANDOFF=1 builds its own typed FixedOne destination; unset NV_LAGUNA_FP8_KV");
-            anyhow::ensure!(std::env::var_os("NV_LAGUNA_FP8_UNIT_SCALE").is_none(),
+            ensure!(!nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_FP8_UNIT_SCALE"),
                 "NV_LAGUNA_PREFILL_BF16_HANDOFF=1 constructs the FixedOne destination explicitly and the BF16 source refuses NV_LAGUNA_FP8_UNIT_SCALE; unset it");
             let chunk = target.prefill_chunk_tokens();
             let destination = crate::laguna_fp8::LagunaKvCacheFp8::new_fixed_one_with_prefill_chunk(target.config(), max_seq, &device, chunk)
@@ -439,7 +442,7 @@ impl<'m> SpecState<'m> {
             )
             .context("laguna spec serving: BF16 source cache for the prefill handoff")?;
             eprintln!("[laguna_serve] bf16-handoff route: source=bf16-ring-cache chunk={chunk} cap={max_seq} destination=fixed-one-e4m3 (typed constructor, scale_policy={:?}) prefill_flashinfer={} (the request prefills the BF16 source with the packed target, converts once on the GPU into the reset destination, then decodes on the captured route; conversion is inside TTFT)",
-                match step.kv() { StepCache::Fp8(c) => c.scale_policy(), StepCache::Bf16(_) => anyhow::bail!("handoff destination is not FP8") },
+                match step.kv() { StepCache::Fp8(c) => c.scale_policy(), StepCache::Bf16(_) => bail!("handoff destination is not FP8") },
                 nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_PREFILL_FLASHINFER"));
             Some(source)
         } else {
@@ -516,20 +519,16 @@ impl<'m> SpecState<'m> {
     fn warmup(&mut self) -> Result<()> {
         let ids: Vec<u32> = (0..48u32).map(|i| 100 + i).collect();
         let max_new = 2 * (self.num_spec + 2);
-        let mut texts: Vec<&str> = vec!["Hello there, how are you doing today?"];
-        if self.draft.is_some() {
-            texts.push("```python\ndef square(x):\n    return x * x\n```");
-        }
-        for text in texts {
+        let runs = if self.draft.is_some() { 2 } else { 1 };
+        for run in 0..runs {
             let mut job = SpecServeJob {
                 prompt_ids: ids.clone(),
-                prompt_text: text.to_string(),
                 max_new,
                 eos_ids: Vec::new(),
                 emit: Box::new(|_| true),
             };
             self.serve_one(&mut job)
-                .with_context(|| format!("laguna spec serving warmup ({text:?})"))?;
+                .with_context(|| format!("laguna spec serving warmup run {run}"))?;
         }
         self.device.synchronize().ok();
         Ok(())
@@ -539,9 +538,9 @@ impl<'m> SpecState<'m> {
         if !job.client_is_live() {
             return Ok(());
         }
-        anyhow::ensure!(!job.prompt_ids.is_empty(), "spec serve: empty prompt");
+        ensure!(!job.prompt_ids.is_empty(), "spec serve: empty prompt");
         let n = job.prompt_ids.len();
-        anyhow::ensure!(
+        ensure!(
             n + 2 <= self.max_seq,
             "spec serve: prompt ({n}) exceeds KV capacity ({})",
             self.max_seq
@@ -555,18 +554,15 @@ impl<'m> SpecState<'m> {
 
     fn serve_validated_job(&mut self, job: &mut SpecServeJob) -> Result<()> {
         let n = job.prompt_ids.len();
-        if let Some(d) = self.draft {
-            d.select_for_prompt_ctx(&job.prompt_text, n);
-        }
         if self.handoff_source.is_some() {
-            anyhow::ensure!(
+            ensure!(
                 !crate::laguna_prefix::prefix_reuse_enabled(),
                 "engine busy: BF16 prefill handoff requires prefix reuse disabled; try later."
             );
         }
         let resume = self.prefix_prepare(job)?;
         if let Some(source) = self.handoff_source.as_mut() {
-            anyhow::ensure!(
+            ensure!(
                 resume == 0,
                 "BF16 prefill handoff cannot resume an FP8 checkpoint"
             );
@@ -636,7 +632,7 @@ impl<'m> SpecState<'m> {
                     .copy_from_bf16(src)
                     .context("bf16 prefill handoff into the FixedOne destination")?,
                 StepCache::Bf16(_) => {
-                    anyhow::bail!("bf16 prefill handoff needs the FixedOne destination")
+                    bail!("bf16 prefill handoff needs the FixedOne destination")
                 }
             }
             eprintln!("[laguna_serve] bf16-handoff prompt_tokens={n} converted_rows={} destination_len={} convert_ms={:.1}", crate::gemma4::Gemma4Cache::current_len(src), self.step.kv().current_len(), t_handoff.elapsed().as_secs_f64() * 1e3);
@@ -831,10 +827,10 @@ impl<'m> SpecState<'m> {
                     .get(&block.len())
                     .context("device verifier disappeared before acceptance")?;
                 let Device::Cuda(dev) = &self.device else {
-                    anyhow::bail!("device draft transport requires CUDA")
+                    bail!("device draft transport requires CUDA")
                 };
                 let (ptr, count) = graph.drafts_device_ptr(&dev.cuda_stream());
-                anyhow::ensure!(
+                ensure!(
                     count == drafts.len(),
                     "device draft count changed before acceptance"
                 );
@@ -917,7 +913,6 @@ impl<'m> SpecState<'m> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn propose_round(
     draft: &LagunaDflash,
     ctx: &DflashCtxCache,
@@ -929,9 +924,7 @@ fn propose_round(
     k: usize,
     device_transport: bool,
 ) -> Result<(Vec<u32>, Option<Vec<f32>>, bool, bool)> {
-    let graph_ok = ctx.has_ring()
-        && dflash_window_mode() == DflashWindowMode::Relaxed
-        && draft.check_rope_span(num_ctx, k + 1).is_ok();
+    let graph_ok = ctx.has_ring() && draft.check_rope_span(num_ctx, k + 1).is_ok();
     if graph_ok {
         let key = draft.active_rope_theta().to_bits();
         if let std::collections::hash_map::Entry::Vacant(entry) = proposers.entry(key) {
@@ -958,10 +951,7 @@ fn propose_round(
             let proposed = if device_transport {
                 p.propose_device(draft, ctx, anchor, num_ctx, target, target.lm_head())
                     .and_then(|n| {
-                        anyhow::ensure!(
-                            n == k,
-                            "device proposer returned {n} drafts, expected {k}"
-                        );
+                        ensure!(n == k, "device proposer returned {n} drafts, expected {k}");
                         Ok(vec![0u32; n])
                     })
             } else {
@@ -998,25 +988,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn batch_lane_spec_parsing() {
-        assert_eq!(batch_lanes_from_spec(None), None);
-        assert_eq!(batch_lanes_from_spec(Some("")), None);
-        assert_eq!(batch_lanes_from_spec(Some("0")), None);
-        assert_eq!(
-            batch_lanes_from_spec(Some("1")),
-            Some(LAGUNA_BATCH_DEFAULT_LANES)
-        );
-        assert_eq!(batch_lanes_from_spec(Some("2")), Some(2));
-        assert_eq!(batch_lanes_from_spec(Some(" 4 ")), Some(4));
-        assert_eq!(
-            batch_lanes_from_spec(Some("64")),
-            Some(LAGUNA_BATCH_MAX_LANES)
-        );
-        assert_eq!(batch_lanes_from_spec(Some("x")), None);
-    }
-
-    #[test]
-    fn proposer_init_budget_admits_the_cap_then_permanently_refuses() {
+    fn proposer_init_budget_admits_the_cap_then_permanently_refuses_counting_each_rope_theta_key_separately() {
         let cap =
             PROPOSER_INIT_ATTEMPTS_2_A_PERSISTENT_CAPTURE_FAILURE_MUST_NOT_FORK_A_STREAM_EVERY_ROUND;
         let mut b = ProposerInitBudget::new();
@@ -1036,10 +1008,6 @@ mod tests {
                  unbounded S1 retry this budget exists to stop"
             );
         }
-    }
-
-    #[test]
-    fn proposer_init_budget_counts_each_rope_theta_key_separately() {
         let mut b = ProposerInitBudget::new();
         assert_eq!(b.admit(1), Some(1));
         assert_eq!(b.admit(2), Some(1));
@@ -1047,7 +1015,9 @@ mod tests {
         assert_eq!(b.admit(1), None);
         assert_eq!(b.admit(2), Some(2));
         assert_eq!(b.admit(2), None);
+
     }
+
 }
 
 const VERIFY_FAILED_AFTER_CACHE_PREPARE_TERMINATES_THE_REQUEST_BECAUSE_AN_EAGER_RETRY_WOULD_RESERVE_THE_BLOCK_TWICE: &str =
@@ -1149,11 +1119,11 @@ pub fn batch_lanes_from_spec(spec: Option<&str>) -> Option<usize> {
 }
 
 pub fn batch_lanes_from_env() -> Option<usize> {
-    batch_lanes_from_spec(std::env::var(LAGUNA_BATCH_ENV).ok().as_deref())
+    batch_lanes_from_spec(env::var(LAGUNA_BATCH_ENV).ok().as_deref())
 }
 
 pub fn batch_graph_enabled_from_env() -> Result<bool> {
-    match std::env::var("NV_LAGUNA_BATCH_GRAPH") {
+    match env::var("NV_LAGUNA_BATCH_GRAPH") {
         Ok(value) => batch_graph_enabled_from_spec(Some(&value)),
         Err(std::env::VarError::NotPresent) => Ok(false),
         Err(e) => Err(e).context("NV_LAGUNA_BATCH_GRAPH must be 0, 1, m2 or m2-spec"),
@@ -1164,27 +1134,27 @@ fn batch_graph_enabled_from_spec(spec: Option<&str>) -> Result<bool> {
     match spec {
         None | Some("0") => Ok(false),
         Some("1") | Some("m2") | Some("m2-spec") => Ok(true),
-        _ => anyhow::bail!("NV_LAGUNA_BATCH_GRAPH must be 0, 1, m2 or m2-spec"),
+        _ => bail!("NV_LAGUNA_BATCH_GRAPH must be 0, 1, m2 or m2-spec"),
     }
 }
 
 pub fn batch_m2_graph_enabled_from_env() -> bool {
-    std::env::var("NV_LAGUNA_BATCH_GRAPH").as_deref() == Ok("m2")
+    env::var("NV_LAGUNA_BATCH_GRAPH").as_deref() == Ok("m2")
 }
 
 fn validate_b2_prefill_selection(selector: &str) -> Result<()> {
     for key in ["NV_LAGUNA_FP8_KV", "NV_LAGUNA_FP8_UNIT_SCALE"] {
         if bf16_prefill_handoff_opt_in() {
-            anyhow::ensure!(std::env::var_os(key).is_none(),
+            ensure!(env::var_os(key).is_none(),
                 "{selector} with BF16 prefill handoff constructs typed FixedOne destinations; unset {key}");
         } else {
-            anyhow::ensure!(
-                std::env::var(key).as_deref() == Ok("1"),
+            ensure!(
+                env::var(key).as_deref() == Ok("1"),
                 "{selector} with direct FP8 prefill requires {key}=1"
             );
         }
     }
-    anyhow::ensure!(
+    ensure!(
         !crate::laguna_prefix::prefix_reuse_enabled(),
         "{selector} requires prefix reuse disabled"
     );
@@ -1201,25 +1171,17 @@ pub fn validate_m2_graph_selection() -> Result<()> {
         ("NV_LAGUNA_XQA_FP8", "1"),
         ("NV_LAGUNA_PREFILL_FLASHINFER", "1"),
         ("NV_LAGUNA_BATCH_MOE_FUSED", "1"),
-        ("NV_MOE_FP4_DECODE_GEMV", "1"),
-        ("NV_LAGUNA_SERVE_SPEC", "1"),
         ("NV_LAGUNA_SERVE_DRAFT", "0"),
     ] {
-        anyhow::ensure!(
-            std::env::var(key).as_deref() == Ok(expected),
+        ensure!(
+            env::var(key).as_deref() == Ok(expected),
             "NV_LAGUNA_BATCH_GRAPH=m2 requires {key}={expected}"
         );
     }
     validate_b2_prefill_selection("NV_LAGUNA_BATCH_GRAPH=m2")?;
-    for key in [
-        "NV_LAGUNA_HOST_KV",
-        "NV_LAGUNA_RING_ATTN",
-        "NV_LAGUNA_FP8_BF16_FULL",
-        "NV_LAGUNA_HOST_MOE",
-        "NV_GRAPH_KEEP_EVENT_TRACKING",
-    ] {
-        anyhow::ensure!(
-            std::env::var_os(key).is_none(),
+    for key in ["NV_LAGUNA_RING_ATTN", "NV_LAGUNA_FP8_BF16_FULL"] {
+        ensure!(
+            env::var_os(key).is_none(),
             "NV_LAGUNA_BATCH_GRAPH=m2 requires {key} unset"
         );
     }
@@ -1227,7 +1189,7 @@ pub fn validate_m2_graph_selection() -> Result<()> {
 }
 
 pub fn batch_m2_spec_enabled_from_env() -> bool {
-    std::env::var("NV_LAGUNA_BATCH_GRAPH").as_deref() == Ok("m2-spec")
+    env::var("NV_LAGUNA_BATCH_GRAPH").as_deref() == Ok("m2-spec")
 }
 
 pub fn validate_m2_spec_selection() -> Result<()> {
@@ -1240,43 +1202,29 @@ pub fn validate_m2_spec_selection() -> Result<()> {
         ("NV_LAGUNA_XQA_FP8", "1"),
         ("NV_LAGUNA_PREFILL_FLASHINFER", "1"),
         ("NV_LAGUNA_BATCH_MOE_FUSED", "1"),
-        ("NV_MOE_FP4_DECODE_GEMV", "1"),
-        ("NV_LAGUNA_SERVE_SPEC", "1"),
         ("NV_LAGUNA_SERVE_DRAFT", "1"),
         ("NV_LAGUNA_DFLASH_NVFP4", "1"),
         ("NV_DFLASH_K", "2"),
     ] {
-        anyhow::ensure!(
-            std::env::var(key).as_deref() == Ok(expected),
+        ensure!(
+            env::var(key).as_deref() == Ok(expected),
             "NV_LAGUNA_BATCH_GRAPH=m2-spec requires {key}={expected}"
         );
     }
     validate_b2_prefill_selection("NV_LAGUNA_BATCH_GRAPH=m2-spec")?;
-    anyhow::ensure!(
-        crate::laguna_dflash::rope_theta_policy() == crate::laguna_dflash::RopeThetaPolicy::Fixed
-            && dflash_window_mode() == DflashWindowMode::Relaxed
-            && !dflash_adapt_enabled()
+    ensure!(
+        !dflash_adapt_enabled()
             && !vegas_enabled()
             && !crate::laguna_dflash::lookup_draft_enabled()
             && crate::laguna_dflash::dflash_graph_enabled(),
-        "m2-spec requires fixed theta, relaxed graph drafting, no adaptive K, lookup or Vegas"
+        "m2-spec requires graph drafting, no adaptive K, lookup or Vegas"
     );
-    anyhow::ensure!(
+    ensure!(
         !device_draft_transport_from_env()?,
         "m2-spec uses host draft IDs; device transport is not composed"
     );
-    for key in [
-        "NV_LAGUNA_HOST_KV",
-        "NV_LAGUNA_RING_ATTN",
-        "NV_LAGUNA_FP8_BF16_FULL",
-        "NV_LAGUNA_HOST_MOE",
-        "NV_GRAPH_KEEP_EVENT_TRACKING",
-        "NV_DFLASH_HOST_CTX",
-    ] {
-        anyhow::ensure!(
-            std::env::var_os(key).is_none(),
-            "m2-spec requires {key} unset"
-        );
+    for key in ["NV_LAGUNA_RING_ATTN", "NV_LAGUNA_FP8_BF16_FULL"] {
+        ensure!(env::var_os(key).is_none(), "m2-spec requires {key} unset");
     }
     Ok(())
 }
@@ -1285,7 +1233,7 @@ fn batch_spec_rows(position: usize, capacity: usize) -> Result<usize> {
     let remaining = capacity
         .checked_sub(position)
         .context("B2 position exceeds capacity")?;
-    anyhow::ensure!(remaining > 0, "B2 cache has no remaining slot");
+    ensure!(remaining > 0, "B2 cache has no remaining slot");
     Ok(if remaining >= 3 { 3 } else { 1 })
 }
 
@@ -1307,7 +1255,7 @@ fn b2_draft_context_bytes(cfg: &LagunaDflashConfig) -> Result<u64> {
 }
 
 struct BatchSpecLane {
-    commit: crate::laguna_dflash::context_commit::DflashCtxCommitGraph,
+    commit: DflashCtxCommitGraph,
     proposer: DflashGraphProposer,
     ctx: DflashCtxCache,
     accept: HashMap<usize, AcceptSlots>,
@@ -1332,12 +1280,12 @@ impl BatchM1State {
         validate_bf16_prefill_handoff_selection()?;
         validate_m2_spec_selection()?;
         validate_draft(target, &draft, k)?;
-        anyhow::ensure!(
+        ensure!(
             k == 2 && max_seq > 0 && max_seq <= draft.rope_max_seq_len(),
             "m2-spec requires K2 and draft rotary tables covering target capacity"
         );
         let packed = draft.quantization_summary();
-        anyhow::ensure!(
+        ensure!(
             packed.weight_format == "nvfp4-derived"
                 && packed.packed_linears == 36
                 && packed.excluded_linears == 5
@@ -1345,7 +1293,7 @@ impl BatchM1State {
             "m2-spec requires packed target-trained draft 36/5/0: {packed:?}"
         );
         let cfg = draft.config();
-        anyhow::ensure!(
+        ensure!(
             cfg.hidden_size == target.config().hidden_size
                 && cfg.vocab_size == target.config().vocab_size
                 && cfg.num_hidden_layers == 5
@@ -1375,10 +1323,7 @@ impl BatchM1State {
                 n.checked_add((target.config().hidden_size as u64).checked_mul(6 * 5 * 2)?)
             })
             .context("B2 spec output bytes overflow")?;
-        let commit_staging =
-            crate::laguna_dflash::context_commit::DflashCtxCommitGraph::retained_bytes(
-                cfg.hidden_size,
-            )?
+        let commit_staging = DflashCtxCommitGraph::retained_bytes(cfg.hidden_size)?
             .checked_mul(2)
             .context("B2 spec commit staging bytes overflow")?;
         let reserve = 2u64 << 30;
@@ -1393,21 +1338,16 @@ impl BatchM1State {
         let (free, _) = device_free_total_bytes(target.device())
             .context("B2 spec preflight requires a bound CUDA context")?;
         eprintln!("[laguna_vram_preflight] route=prepared-b2-spec-k2 physical_lanes=2 destination_bytes={destinations} draft_ring_bytes={rings} output_bytes={outputs} reserve_bytes={reserve} reserve_is_estimate=true free_bytes={free} capacity_per_lane={max_seq} source_bf16_bytes={source} context_commit_staging_bytes={commit_staging} draft_weights_already_loaded=true");
-        anyhow::ensure!(free >= needed, "engine busy: B2 spec allocation estimate {needed} exceeds free CUDA memory {free}; try later.");
-        let batched = crate::laguna_batch_graph::LagunaBatchStepGraph::new_spec(
-            target.clone(),
-            max_seq,
-            &aux_layers,
-        )?;
+        ensure!(free >= needed, "engine busy: B2 spec allocation estimate {needed} exceeds free CUDA memory {free}; try later.");
+        let batched = LagunaBatchStepGraph::new_spec(target.clone(), max_seq, &aux_layers)?;
         let handoff_source = BatchPrefillSource::new(target, max_seq)?;
         let make = || -> Result<BatchSpecLane> {
             let ctx = draft.new_ctx_cache();
-            anyhow::ensure!(
+            ensure!(
                 ctx.has_ring(),
                 "required B2 draft ring allocation failed; refusing legacy context growth"
             );
-            let commit =
-                crate::laguna_dflash::context_commit::DflashCtxCommitGraph::new(&draft, &ctx)?;
+            let commit = DflashCtxCommitGraph::new(&draft, &ctx)?;
             Ok(BatchSpecLane {
                 commit,
                 proposer: DflashGraphProposer::new(&draft, 2)?,
@@ -1444,7 +1384,6 @@ impl BatchM1State {
             self.reset_lane(lane)?;
             let job = SpecServeJob {
                 prompt_ids: ids.clone(),
-                prompt_text: String::new(),
                 max_new: 32,
                 eos_ids: Vec::new(),
                 emit: Box::new(|_| true),
@@ -1507,7 +1446,7 @@ impl BatchM1State {
                 continue;
             }
             let spec = self.spec.as_mut().context("B2 draft state disappeared")?;
-            anyhow::ensure!(
+            ensure!(
                 spec.theta == spec.draft.active_rope_theta().to_bits(),
                 "B2 draft theta changed after capture"
             );
@@ -1520,7 +1459,7 @@ impl BatchM1State {
             for &lane in &active {
                 let r = slots[lane].as_ref().context("B2 active lane disappeared")?;
                 let state = &mut spec.lanes[lane];
-                anyhow::ensure!(
+                ensure!(
                     state.ctx.len() == r.pos,
                     "B2 lane {lane} draft/target frontier differs"
                 );
@@ -1536,7 +1475,7 @@ impl BatchM1State {
                 } else {
                     Vec::new()
                 };
-                anyhow::ensure!(
+                ensure!(
                     draft_ids.len() + 1 == rows,
                     "B2 proposer returned a different K"
                 );
@@ -1568,7 +1507,7 @@ impl BatchM1State {
                         vec![checked_target_argmax_row(&values).context("invalid B2 tail logits")?],
                     )
                 };
-                anyhow::ensure!(
+                ensure!(
                     answer.0 < rows && answer.1.len() == answer.0 + 1,
                     "B2 acceptance output shape is invalid"
                 );
@@ -1598,7 +1537,7 @@ impl BatchM1State {
             for &lane in &active {
                 let state = &mut spec.lanes[lane];
                 state.commit.finish_after_sync(&mut state.ctx)?;
-                anyhow::ensure!(
+                ensure!(
                     state.ctx.len() == graph.current_lengths()[lane],
                     "B2 lane {lane} committed draft/target frontier differs"
                 );
@@ -1651,21 +1590,21 @@ fn preflight_b2_caches(target: &Laguna, max_seq: usize) -> Result<()> {
     let (free, _) = device_free_total_bytes(target.device())
         .context("B2 preflight needs bound worker CUDA context")?;
     eprintln!("[laguna_vram_preflight] route=prepared-b2-fixed-one physical_lanes=2 destination_bytes={destinations} reserve_bytes={reserve} free_bytes={free} capacity_per_lane={max_seq} source_bf16_bytes={source} draft_bytes=0 reserve_is_estimate=true");
-    anyhow::ensure!(free >= needed,
+    ensure!(free >= needed,
         "engine busy: required B2 destinations ({destinations} bytes), shared BF16 source ({source} bytes) and reserve ({reserve}) exceed free CUDA memory ({free}); try later.");
     Ok(())
 }
 
 fn validate_graph_lanes(lanes: usize, interleave: bool, fp8_kv: bool) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         lanes == 2,
         "NV_LAGUNA_BATCH_GRAPH=1 requires NV_LAGUNA_BATCH=2"
     );
-    anyhow::ensure!(
+    ensure!(
         interleave,
         "NV_LAGUNA_BATCH_GRAPH=1 requires NV_LAGUNA_BATCH_INTERLEAVE_PREFILL=1"
     );
-    anyhow::ensure!(
+    ensure!(
         !fp8_kv,
         "NV_LAGUNA_BATCH_GRAPH=1 requires NV_LAGUNA_FP8_KV unset"
     );
@@ -1723,7 +1662,7 @@ fn select_prefill_lane(
     owner: Option<usize>,
 ) -> Result<Option<usize>> {
     if let Some(lane) = owner {
-        anyhow::ensure!(
+        ensure!(
             prefills.get(lane).is_some_and(Option::is_some),
             "engine busy: shared BF16 prefill owner has no pending request; try later."
         );
@@ -1742,36 +1681,35 @@ pub struct BatchM1State {
     device: Device,
     max_seq: usize,
     lanes: Vec<BatchLane>,
-    batched: Option<crate::laguna_batch_graph::LagunaBatchStepGraph>,
+    batched: Option<LagunaBatchStepGraph>,
     handoff_source: Option<BatchPrefillSource>,
     interleave_prefill: bool,
 }
 
 impl BatchM1State {
     pub fn new(target: &Arc<Laguna>, lanes: usize, max_seq: usize) -> Result<Self> {
-        anyhow::ensure!(
-            matches!(target.device(), Device::Cuda(_)),
+        ensure!(
+            target.device().is_cuda(),
             "laguna batched serving requires a CUDA device"
         );
-        anyhow::ensure!(lanes >= 2, "a 1-lane batch loop is just the M=1 loop");
-        let interleave_prefill = match std::env::var("NV_LAGUNA_BATCH_INTERLEAVE_PREFILL") {
+        ensure!(lanes >= 2, "a 1-lane batch loop is just the M=1 loop");
+        let interleave_prefill = match env::var("NV_LAGUNA_BATCH_INTERLEAVE_PREFILL") {
             Ok(v) if v == "1" => true,
             Ok(v) if v == "0" => false,
             Err(std::env::VarError::NotPresent) => false,
-            _ => anyhow::bail!("NV_LAGUNA_BATCH_INTERLEAVE_PREFILL must be 0 or 1"),
+            _ => bail!("NV_LAGUNA_BATCH_INTERLEAVE_PREFILL must be 0 or 1"),
         };
         let graph_lanes = batch_graph_enabled_from_env()?;
         let m2_graph = batch_m2_graph_enabled_from_env();
         validate_bf16_prefill_handoff_selection()?;
         validate_m2_graph_selection()?;
         if m2_graph {
-            anyhow::ensure!(
+            ensure!(
                 lanes == 2 && interleave_prefill,
                 "prepared B2 graph requires two interleaved slots"
             );
             preflight_b2_caches(target, max_seq)?;
-            let batched =
-                crate::laguna_batch_graph::LagunaBatchStepGraph::new(target.clone(), max_seq)?;
+            let batched = LagunaBatchStepGraph::new(target.clone(), max_seq)?;
             let handoff_source = BatchPrefillSource::new(target, max_seq)?;
             return Ok(Self {
                 spec: None,
@@ -1790,7 +1728,7 @@ impl BatchM1State {
             validate_graph_lanes(
                 lanes,
                 interleave_prefill,
-                std::env::var_os("NV_LAGUNA_FP8_KV").is_some(),
+                nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_FP8_KV"),
             )?;
         }
         let mut v = Vec::with_capacity(lanes);
@@ -1864,9 +1802,9 @@ impl BatchM1State {
     }
 
     fn prefill_lane(&mut self, lane: usize, job: &mut SpecServeJob) -> Result<u32> {
-        anyhow::ensure!(!job.prompt_ids.is_empty(), "batch serve: empty prompt");
+        ensure!(!job.prompt_ids.is_empty(), "batch serve: empty prompt");
         let n = job.prompt_ids.len();
-        anyhow::ensure!(
+        ensure!(
             n + 2 <= self.max_seq,
             "batch serve: prompt ({n}) exceeds KV capacity ({})",
             self.max_seq
@@ -1874,7 +1812,7 @@ impl BatchM1State {
         self.reset_lane(lane)?;
         let mut offset = 0usize;
         while offset < n {
-            anyhow::ensure!(
+            ensure!(
                 job.client_is_live(),
                 "batch serve: client disconnected before prefill completed"
             );
@@ -1882,7 +1820,7 @@ impl BatchM1State {
                 return Ok(anchor);
             }
         }
-        anyhow::bail!("batch serve: prefill completed without logits")
+        bail!("batch serve: prefill completed without logits")
     }
 
     fn prefill_lane_chunk(
@@ -1908,7 +1846,7 @@ impl BatchM1State {
         let spec_tier = self.spec.is_some();
         let (logits, aux) = if let Some(source) = self.handoff_source.as_mut() {
             if source.owner.is_none() {
-                anyhow::ensure!(
+                ensure!(
                     *offset == 0,
                     "B2 shared BF16 prefill cannot resume an unowned prompt"
                 );
@@ -1916,7 +1854,7 @@ impl BatchM1State {
                 source.owner = Some(lane);
                 eprintln!("[laguna_b2_handoff] acquired lane={lane} prompt_tokens={n}");
             }
-            anyhow::ensure!(
+            ensure!(
                 source.owner == Some(lane)
                     && crate::gemma4::Gemma4Cache::current_len(&source.cache) == *offset,
                 "B2 shared BF16 prefill owner or frontier mismatch"
@@ -1949,7 +1887,7 @@ impl BatchM1State {
             )?
         };
         if let Some(spec) = self.spec.as_mut() {
-            anyhow::ensure!(
+            ensure!(
                 spec.theta == spec.draft.active_rope_theta().to_bits()
                     && spec.lanes[lane].ctx.len() == *offset,
                 "B2 draft prefill frontier/theta mismatch"
@@ -1960,7 +1898,7 @@ impl BatchM1State {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             spec.draft
                 .append_context(&mut spec.lanes[lane].ctx, &combined, &positions)?;
-            anyhow::ensure!(
+            ensure!(
                 spec.lanes[lane].ctx.len() == *offset + m,
                 "B2 draft context did not commit the complete prefill chunk"
             );
@@ -1984,14 +1922,14 @@ impl BatchM1State {
                 .as_mut()
                 .context("B2 BF16 handoff requires the prepared graph")?;
             let destination = graph.cache_mut(lane)?;
-            anyhow::ensure!(
+            ensure!(
                 crate::gemma4::Gemma4Cache::current_len(&source.cache) == n,
                 "B2 BF16 handoff requires the entire prompt in its source"
             );
             destination
                 .copy_from_bf16(&mut source.cache)
                 .context("B2 shared BF16 prefill handoff")?;
-            anyhow::ensure!(
+            ensure!(
                 destination.current_len() == n
                     && destination.direct_fp8_prefill_enqueued_calls() == 0,
                 "B2 BF16 handoff destination frontier or prefill route mismatch"
@@ -2184,9 +2122,9 @@ impl BatchM1State {
             let mut next = Vec::with_capacity(active.len());
             for (row, &i) in active.iter().enumerate() {
                 let BatchLane::Graph { step, replays } = &mut self.lanes[i] else {
-                    anyhow::bail!("graph batch lane unexpectedly contains an eager cache");
+                    bail!("graph batch lane unexpectedly contains an eager cache");
                 };
-                anyhow::ensure!(
+                ensure!(
                     step.current_len() == positions[row],
                     "graph lane {i} cache position mismatch"
                 );
@@ -2197,7 +2135,7 @@ impl BatchM1State {
                     step.argmax_device()
                         .with_context(|| format!("graph lane {i} argmax"))?,
                 );
-                anyhow::ensure!(
+                ensure!(
                     step.captured_node_count() > 0,
                     "graph lane {i} step returned without a captured graph"
                 );
@@ -2239,9 +2177,9 @@ impl BatchM1State {
 
     pub fn serve_batch(&mut self, jobs: Vec<SpecServeJob>) -> Result<()> {
         if let Some(fault) = self.pending_retirement.as_ref() {
-            anyhow::bail!("{fault:#}");
+            bail!("{fault:#}");
         }
-        anyhow::ensure!(
+        ensure!(
             jobs.len() <= self.lane_count(),
             "serve_batch: {} jobs > {} lanes",
             jobs.len(),
@@ -2264,7 +2202,7 @@ impl BatchM1State {
             slots[i] = self.admit(i, job);
             if let Some(fault) = self.pending_retirement.as_ref() {
                 retire_active_jobs_before_the_worker_exits(&mut slots);
-                anyhow::bail!("{fault:#}");
+                bail!("{fault:#}");
             }
         }
         while slots.iter().any(|s| s.is_some()) {
@@ -2279,7 +2217,6 @@ impl BatchM1State {
         let batch: Vec<SpecServeJob> = (0..n_jobs)
             .map(|_| SpecServeJob {
                 prompt_ids: ids.clone(),
-                prompt_text: "Hello there, how are you doing today?".to_string(),
                 max_new: 4,
                 eos_ids: Vec::new(),
                 emit: Box::new(|_| true),
@@ -2290,7 +2227,7 @@ impl BatchM1State {
         for (lane, storage) in self.lanes.iter().enumerate() {
             if let BatchLane::Graph { step, replays } = storage {
                 step.synchronize()?;
-                anyhow::ensure!(
+                ensure!(
                     step.captured_node_count() > 0 && *replays > 0,
                     "graph lane {lane} warmup did not capture and replay"
                 );
@@ -2322,7 +2259,7 @@ fn finish_batch_prefill<T>(
 }
 
 fn checked_batch_target_tokens(logits: &[f32], rows: usize) -> Result<Vec<u32>> {
-    anyhow::ensure!(
+    ensure!(
         rows > 0 && !logits.is_empty() && logits.len().is_multiple_of(rows),
         "engine busy: Laguna batch target logits have an invalid row shape; try later."
     );
@@ -2515,11 +2452,11 @@ pub fn spec_serve_loop(
     let target = target;
     let draft = draft;
     if batch_graph_enabled_from_env()? {
-        anyhow::ensure!(
+        ensure!(
             draft.is_none(),
             "NV_LAGUNA_BATCH_GRAPH=1 requires draft-free serving"
         );
-        anyhow::ensure!(
+        ensure!(
             batch_lanes_from_env() == Some(2),
             "NV_LAGUNA_BATCH_GRAPH=1 requires NV_LAGUNA_BATCH=2"
         );
@@ -2584,7 +2521,7 @@ mod host_target_logits_tests {
     use super::{checked_batch_target_tokens, checked_target_argmax_row};
 
     #[test]
-    fn target_rows_preserve_token_zero_masks_and_first_index_ties_and_reject_invalid_tails() {
+    fn target_rows_preserve_token_zero_masks_and_first_index_ties_and_a_batch_rejects_any_invalid_row_before_emission() {
         for (row, expected) in [
             (vec![9.0, 1.0, f32::NEG_INFINITY], 0),
             (vec![f32::NEG_INFINITY, -4.0, -4.0], 1),
@@ -2612,10 +2549,6 @@ mod host_target_logits_tests {
                 "invalid values anywhere in a target row must reject it: {row:?}"
             );
         }
-    }
-
-    #[test]
-    fn batch_rejects_a_later_invalid_row_before_any_tokens_reach_emission() {
         let mut emissions = Vec::new();
         for bad_tail in [f32::NAN, f32::INFINITY] {
             let logits = [5.0, 1.0, -1.0, 9.0, 0.0, bad_tail, 0.0, 7.0, 2.0];
@@ -2655,7 +2588,7 @@ mod retirement_producer_tests {
     use std::sync::{mpsc, Mutex};
 
     #[test]
-    fn prepared_prefill_error_reaches_retirement_without_entering_a_cleanup_barrier() {
+    fn prepared_prefill_error_reaches_retirement_without_a_cleanup_barrier_and_a_successful_prefill_waits_before_its_anchor() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut active = vec![Some(LaneRun {
             job: closed_client_job(0, &log),
@@ -2679,10 +2612,6 @@ mod retirement_producer_tests {
                 "0:released",
             ]
         );
-    }
-
-    #[test]
-    fn successful_prefill_waits_before_exposing_its_anchor_and_eager_error_order_is_preserved() {
         for prepared in [false, true] {
             let synchronized = std::cell::Cell::new(false);
             let anchor = finish_batch_prefill(Ok(Some(42u32)), prepared, || {
@@ -2713,57 +2642,7 @@ mod retirement_producer_tests {
     }
 
     #[test]
-    fn successful_probe_preserves_request_errors_without_text_classification() {
-        for cause in [
-            "invalid prompt",
-            "CUDA_ERROR_OUT_OF_MEMORY",
-            "cuda error: an illegal memory access was encountered",
-            "engine busy: invalid verification logits; try later.",
-        ] {
-            let request = anyhow::anyhow!(cause.to_string()).context("request boundary");
-            let expected = format!("{request:#}");
-            let (message, retirement) =
-                request_error_or_worker_retirement_from_probe(Ok(()), request);
-            assert_eq!(message, expected);
-            assert!(
-                retirement.is_none(),
-                "a successful probe cannot be replaced by a string classifier"
-            );
-        }
-    }
-
-    #[test]
-    fn execution_error_keeps_callback_reserved_and_delivers_later_retirement() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut job = closed_client_job(0, &log);
-        assert!(job.report_execution_result(Ok(())).is_ok());
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "successful or cancelled execution must not produce Error"
-        );
-        let error = job
-            .report_execution_result(Err(anyhow::anyhow!("fixture execution failure")))
-            .unwrap_err();
-        assert!(error.is::<LagunaRequestExecutionFailure>());
-        assert_eq!(log.lock().unwrap().as_slice(), [
-            "0:event:engine busy: Laguna request execution failed; try later: fixture execution failure",
-        ]);
-        let (message, retirement) = request_error_or_worker_retirement_from_probe(
-            Err(anyhow::anyhow!("fixture probe fault")),
-            error,
-        );
-        assert!(retirement.is_some());
-        assert!(!(job.emit)(SpecServeEvent::Error(message)));
-        drop(job);
-        assert_eq!(log.lock().unwrap().as_slice(), [
-            "0:event:engine busy: Laguna request execution failed; try later: fixture execution failure",
-            "0:event:engine busy: Laguna worker retired; try later.",
-            "0:released",
-        ]);
-    }
-
-    #[test]
-    fn typed_execution_failure_preserves_cause_and_probe_controls_retirement() {
+    fn typed_execution_failure_preserves_cause_probe_controls_retirement_and_a_successful_probe_never_classifies_text() {
         for failed_probe in [false, true] {
             let error = anyhow::anyhow!("Laguna FMHAv2 FP8 requires an explicit CUDA stream")
                 .context(LagunaRequestExecutionFailure);
@@ -2787,21 +2666,23 @@ mod retirement_producer_tests {
                 assert!(retirement.is_none());
             }
         }
-    }
+        for cause in [
+            "invalid prompt",
+            "CUDA_ERROR_OUT_OF_MEMORY",
+            "cuda error: an illegal memory access was encountered",
+            "engine busy: invalid verification logits; try later.",
+        ] {
+            let request = anyhow::anyhow!(cause.to_string()).context("request boundary");
+            let expected = format!("{request:#}");
+            let (message, retirement) =
+                request_error_or_worker_retirement_from_probe(Ok(()), request);
+            assert_eq!(message, expected);
+            assert!(
+                retirement.is_none(),
+                "a successful probe cannot be replaced by a string classifier"
+            );
+        }
 
-    #[test]
-    fn failed_probe_emits_only_the_exact_marker_and_retains_both_causes() {
-        let (message, retirement) = request_error_or_worker_retirement_from_probe(
-            Err(anyhow::anyhow!("fixture probe failure")),
-            anyhow::anyhow!("original request failure").context("request phase"),
-        );
-        assert_eq!(message, "engine busy: Laguna worker retired; try later.");
-        let retained = format!("{:#}", retirement.expect("failed probe must retire"));
-        assert!(retained.contains("fixture probe failure"), "{retained}");
-        assert!(
-            retained.contains("request phase: original request failure"),
-            "{retained}"
-        );
     }
 
     struct CallbackReservation {
@@ -2841,7 +2722,6 @@ mod retirement_producer_tests {
         };
         SpecServeJob {
             prompt_ids: vec![1],
-            prompt_text: String::new(),
             max_new: 1,
             eos_ids: Vec::new(),
             emit: Box::new(move |event| reservation.event(event)),
@@ -2849,7 +2729,7 @@ mod retirement_producer_tests {
     }
 
     #[test]
-    fn retirement_drains_active_and_queued_jobs_even_when_delivery_returns_false() {
+    fn retirement_drains_active_and_queued_jobs_even_when_delivery_returns_false_and_an_execution_error_keeps_its_callback_reserved() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut active = vec![
             Some(LaneRun {
@@ -2893,15 +2773,74 @@ mod retirement_producer_tests {
             expected,
             "empty drains must not manufacture events"
         );
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut job = closed_client_job(0, &log);
+        assert!(job.report_execution_result(Ok(())).is_ok());
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "successful or cancelled execution must not produce Error"
+        );
+        let error = job
+            .report_execution_result(Err(anyhow::anyhow!("fixture execution failure")))
+            .unwrap_err();
+        assert!(error.is::<LagunaRequestExecutionFailure>());
+        assert_eq!(log.lock().unwrap().as_slice(), [
+            "0:event:engine busy: Laguna request execution failed; try later: fixture execution failure",
+        ]);
+        let (message, retirement) = request_error_or_worker_retirement_from_probe(
+            Err(anyhow::anyhow!("fixture probe fault")),
+            error,
+        );
+        assert!(retirement.is_some());
+        assert!(!(job.emit)(SpecServeEvent::Error(message)));
+        drop(job);
+        assert_eq!(log.lock().unwrap().as_slice(), [
+            "0:event:engine busy: Laguna request execution failed; try later: fixture execution failure",
+            "0:event:engine busy: Laguna worker retired; try later.",
+            "0:released",
+        ]);
+
     }
 }
 
 #[cfg(test)]
 mod graph_lane_policy_tests {
-    use super::{batch_graph_enabled_from_spec, validate_graph_lanes};
+    use super::{
+        batch_graph_enabled_from_spec, batch_lanes_from_spec, select_prefill_lane,
+        validate_graph_lanes, LanePrefill, SpecServeJob, LAGUNA_BATCH_DEFAULT_LANES,
+        LAGUNA_BATCH_MAX_LANES,
+    };
+
+    fn pending() -> Option<LanePrefill> {
+        Some(LanePrefill {
+            job: SpecServeJob {
+                prompt_ids: vec![1, 2, 3],
+                max_new: 4,
+                eos_ids: Vec::new(),
+                emit: Box::new(|_| true),
+            },
+            offset: 0,
+        })
+    }
 
     #[test]
-    fn graph_lane_selection_is_explicit_and_rejects_unsupported_modes() {
+    fn batch_lane_graph_lane_and_shared_prefill_owner_selection_are_explicit_and_refuse_bad_specs_or_lost_owners() {
+        assert_eq!(batch_lanes_from_spec(None), None);
+        assert_eq!(batch_lanes_from_spec(Some("")), None);
+        assert_eq!(batch_lanes_from_spec(Some("0")), None);
+        assert_eq!(
+            batch_lanes_from_spec(Some("1")),
+            Some(LAGUNA_BATCH_DEFAULT_LANES)
+        );
+        assert_eq!(batch_lanes_from_spec(Some("2")), Some(2));
+        assert_eq!(batch_lanes_from_spec(Some(" 4 ")), Some(4));
+        assert_eq!(
+            batch_lanes_from_spec(Some("64")),
+            Some(LAGUNA_BATCH_MAX_LANES)
+        );
+        assert_eq!(batch_lanes_from_spec(Some("x")), None);
+
         assert!(!batch_graph_enabled_from_spec(None).unwrap());
         assert!(!batch_graph_enabled_from_spec(Some("0")).unwrap());
         assert!(batch_graph_enabled_from_spec(Some("1")).unwrap());
@@ -2919,28 +2858,7 @@ mod graph_lane_policy_tests {
         ] {
             assert!(validate_graph_lanes(lanes, interleave, fp8).is_err());
         }
-    }
-}
 
-#[cfg(test)]
-mod shared_prefill_owner_tests {
-    use super::*;
-
-    fn pending() -> Option<LanePrefill> {
-        Some(LanePrefill {
-            job: SpecServeJob {
-                prompt_ids: vec![1, 2, 3],
-                prompt_text: String::new(),
-                max_new: 4,
-                eos_ids: Vec::new(),
-                emit: Box::new(|_| true),
-            },
-            offset: 0,
-        })
-    }
-
-    #[test]
-    fn shared_prefill_owner_overrides_the_cursor_and_refuses_a_lost_owner() {
         let mut prefills = [pending(), pending()];
         for cursor in [0, 1, 4] {
             assert_eq!(
@@ -2961,6 +2879,7 @@ mod shared_prefill_owner_tests {
         assert_eq!(select_prefill_lane(&prefills, 0, None).unwrap(), Some(0));
         assert_eq!(select_prefill_lane(&prefills, 1, None).unwrap(), Some(1));
         assert_eq!(select_prefill_lane(&[None, None], 0, None).unwrap(), None);
+
     }
 }
 
@@ -3015,7 +2934,6 @@ mod shared_prefill_handoff_cuda_tests {
         (
             SpecServeJob {
                 prompt_ids: ids.to_vec(),
-                prompt_text: String::new(),
                 max_new,
                 eos_ids: Vec::new(),
                 emit: Box::new(move |event| {
@@ -3049,9 +2967,8 @@ mod shared_prefill_handoff_cuda_tests {
     fn source_pointers(st: &BatchM1State) -> Vec<u64> {
         let cache = &st.handoff_source.as_ref().unwrap().cache;
         let state = cache.checked_bf16_handoff().unwrap();
-        let dev = match &st.device {
-            Device::Cuda(dev) => dev,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = &st.device else {
+            unreachable!()
         };
         let stream = dev.cuda_stream();
         state

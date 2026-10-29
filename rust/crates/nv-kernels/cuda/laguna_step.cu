@@ -514,14 +514,6 @@ inline int laguna_m1_splits_env() {
     return v;
 }
 
-inline int laguna_m1_depthgate_env_default_on_since_round_82_set_it_to_0_for_the_shallow_pinned_split_count() {
-    static int v = [] {
-        const char* e = getenv("NV_LAGUNA_M1_DEPTHGATE");
-        return (e != nullptr && e[0] == '0') ? 0 : 1;
-    }();
-    return v;
-}
-
 inline int laguna_m1_depthgate_deep_splits_env() {
     static int v = [] {
         const char* e = getenv("NV_LAGUNA_M1_DEPTHGATE_SPLITS");
@@ -543,8 +535,6 @@ inline int laguna_m1_depthgate_knee_env() {
 }
 
 inline int laguna_m1_launch_splits() {
-    if (!laguna_m1_depthgate_env_default_on_since_round_82_set_it_to_0_for_the_shallow_pinned_split_count())
-        return laguna_m1_splits_env();
     int deep = laguna_m1_depthgate_deep_splits_env();
     if (deep == 0)
         deep = kLagunaM1DepthgateDeepSplits47Is376WorkgroupsTwoPerSmAt8KvHeadsOn188Sms;
@@ -757,10 +747,7 @@ extern "C" int nv_kernels_laguna_flash_decode_gqa(
     if (group != 1 && group != 6 && group != 8) return -1;
     cudaStream_t s = static_cast<cudaStream_t>(stream);
     const int sp = laguna_m1_launch_splits();
-    const int mid_band_splits =
-        laguna_m1_depthgate_env_default_on_since_round_82_set_it_to_0_for_the_shallow_pinned_split_count()
-            ? laguna_m1_splits_env()
-            : 0;
+    const int mid_band_splits = laguna_m1_splits_env();
     const int mid_band_hi_total =
         (laguna_m1_depthgate_knee_env() > 0)
             ? laguna_m1_depthgate_knee_env()
@@ -828,10 +815,7 @@ extern "C" int nv_kernels_laguna_flash_decode_gqa_rows(
     if (group != 8) return -1;
     cudaStream_t s = static_cast<cudaStream_t>(stream);
     const int sp = laguna_m1_launch_splits();
-    const int mid_band_splits =
-        laguna_m1_depthgate_env_default_on_since_round_82_set_it_to_0_for_the_shallow_pinned_split_count()
-            ? laguna_m1_splits_env()
-            : 0;
+    const int mid_band_splits = laguna_m1_splits_env();
     const int mid_band_hi_total =
         (laguna_m1_depthgate_knee_env() > 0)
             ? laguna_m1_depthgate_knee_env()

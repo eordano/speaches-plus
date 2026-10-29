@@ -345,53 +345,31 @@ mod tests {
     }
 
     #[test]
-    fn yields_chunks_of_expected_size() {
-        let talker = Arc::new(StubTalker {
-            eos_id: 999,
-            eos_at: 12,
-            calls: AtomicUsize::new(0),
-        });
-        let tk = tokenizer_for_stream();
-        let stream = TtsStream::new(talker, tk, dummy_text_hidden()).with_eos_id(999);
-        let mut chunks: Vec<Vec<u32>> = Vec::new();
-        for c in stream {
-            chunks.push(c.expect("chunk"));
+    fn token_chunks_follow_the_chunk_size_and_stop_at_eos() {
+        let cases: [(u32, usize, Option<usize>, bool, Vec<Vec<u32>>); 4] = [
+            (999, 12, None, false, vec![vec![0; 4], vec![0; 4], vec![0; 4], vec![999]]),
+            (5, 2, None, false, vec![vec![0, 0, 5]]),
+            (999, 5, Some(2), false, vec![vec![0, 0], vec![0, 0], vec![0, 999]]),
+            (999, 1, Some(2), true, vec![vec![0, 999]]),
+        ];
+        for (eos_id, eos_at, chunk, via_tokens_stream, want) in cases {
+            let talker = Arc::new(StubTalker {
+                eos_id,
+                eos_at,
+                calls: AtomicUsize::new(0),
+            });
+            let mut stream =
+                TtsStream::new(talker, tokenizer_for_stream(), dummy_text_hidden()).with_eos_id(eos_id);
+            if let Some(frames) = chunk {
+                stream = stream.with_chunk_frames(frames);
+            }
+            let chunks: Vec<Vec<u32>> = if via_tokens_stream {
+                stream.tokens_stream().map(|r| r.unwrap()).collect()
+            } else {
+                stream.map(|r| r.unwrap()).collect()
+            };
+            assert_eq!(chunks, want, "eos {eos_id} at {eos_at}, chunk {chunk:?}");
         }
-
-        assert_eq!(chunks.len(), 4, "got chunks: {chunks:?}");
-        assert_eq!(chunks[0], vec![0, 0, 0, 0]);
-        assert_eq!(chunks[1], vec![0, 0, 0, 0]);
-        assert_eq!(chunks[2], vec![0, 0, 0, 0]);
-        assert_eq!(chunks[3], vec![999]);
-    }
-
-    #[test]
-    fn stops_on_eos_within_first_chunk() {
-        let talker = Arc::new(StubTalker {
-            eos_id: 5,
-            eos_at: 2,
-            calls: AtomicUsize::new(0),
-        });
-        let tk = tokenizer_for_stream();
-        let stream = TtsStream::new(talker, tk, dummy_text_hidden()).with_eos_id(5);
-        let chunks: Vec<Vec<u32>> = stream.map(|r| r.unwrap()).collect();
-        assert_eq!(chunks, vec![vec![0u32, 0, 5]]);
-    }
-
-    #[test]
-    fn custom_chunk_size() {
-        let talker = Arc::new(StubTalker {
-            eos_id: 999,
-            eos_at: 5,
-            calls: AtomicUsize::new(0),
-        });
-        let tk = tokenizer_for_stream();
-        let stream = TtsStream::new(talker, tk, dummy_text_hidden())
-            .with_chunk_frames(2)
-            .with_eos_id(999);
-        let chunks: Vec<Vec<u32>> = stream.map(|r| r.unwrap()).collect();
-
-        assert_eq!(chunks, vec![vec![0u32, 0], vec![0, 0], vec![0, 999]]);
     }
 
     struct SpkAwareStubTalker;
@@ -458,54 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_stream_emits_pcm_chunks_with_zero_init_vocoder() {
-        use nv_omni::vocoder::{Vocoder, VocoderConfig, NUM_CODEBOOKS as NCB};
-
-        let talker = Arc::new(StubTalker {
-            eos_id: 999,
-            eos_at: 6,
-            calls: AtomicUsize::new(0),
-        });
-        let tk = tokenizer_for_stream();
-        let token_stream = TtsStream::new(talker, tk, dummy_text_hidden())
-            .with_chunk_frames(3)
-            .with_eos_id(999);
-
-        let cfg = VocoderConfig {
-            codebook_size: 16,
-            num_codebooks: NCB,
-            codebook_dim: 4,
-            quant_proj_dim: 8,
-            latent_dim: 16,
-            pre_upsample_dim: 16,
-            decoder_dim: 32,
-            ..VocoderConfig::default()
-        };
-        let voc = Arc::new(Vocoder::new(cfg.clone(), &Device::Cpu).unwrap());
-        let upsample = cfg.upsample_factor();
-
-        let audio = token_stream.into_audio_stream(voc);
-        let mut total = 0usize;
-        for c in audio {
-            let pcm = c.expect("audio chunk");
-            total += pcm.len();
-
-            assert!(
-                pcm.iter().all(|s| *s == 0.0),
-                "non-zero sample from zero-init vocoder"
-            );
-        }
-
-        assert_eq!(
-            total,
-            6 * upsample,
-            "expected {} samples, got {total}",
-            6 * upsample
-        );
-    }
-
-    #[test]
-    fn audio_stream_uses_full_frame_callback_when_set() {
+    fn audio_stream_uses_the_full_frame_callback_and_matches_batch_decode_at_every_chunk_size() {
         use nv_omni::vocoder::{Vocoder, VocoderConfig, NUM_CODEBOOKS as NCB};
         use std::sync::Mutex;
 
@@ -556,43 +487,13 @@ mod tests {
             "callback should fire once per non-EOS token, got {:?}",
             *calls
         );
-    }
-
-    #[test]
-    fn tokens_stream_method_is_identity() {
-        let talker = Arc::new(StubTalker {
-            eos_id: 999,
-            eos_at: 1,
-            calls: AtomicUsize::new(0),
-        });
-        let tk = tokenizer_for_stream();
-        let stream = TtsStream::new(talker, tk, dummy_text_hidden())
-            .with_chunk_frames(2)
-            .with_eos_id(999)
-            .tokens_stream();
-        let chunks: Vec<Vec<u32>> = stream.map(|r| r.unwrap()).collect();
-        assert_eq!(chunks, vec![vec![0u32, 999]]);
-    }
-
-    #[test]
-    fn streaming_vs_batch_decode_matches_for_zero_init_vocoder() {
-        use nv_omni::vocoder::{Vocoder, VocoderConfig, NUM_CODEBOOKS as NCB};
 
         let total_frames = 12usize;
-        let chunk_sizes = [2usize, 3, 4, 6, 12];
-
         let cfg = VocoderConfig {
             codebook_size: 16,
-            num_codebooks: NCB,
-            codebook_dim: 4,
-            quant_proj_dim: 8,
-            latent_dim: 16,
-            pre_upsample_dim: 16,
-            decoder_dim: 32,
-            ..VocoderConfig::default()
+            ..cfg
         };
         let voc = Arc::new(Vocoder::new(cfg.clone(), &Device::Cpu).unwrap());
-
         let frames: Vec<[u32; NCB]> = (0..total_frames)
             .map(|i| {
                 let mut row = [0u32; NCB];
@@ -600,22 +501,24 @@ mod tests {
                 row
             })
             .collect();
-
         let batch_pcm = voc.decode(&frames).unwrap();
-
-        for &cs in &chunk_sizes {
+        assert!(
+            batch_pcm.iter().all(|s| *s == 0.0),
+            "non-zero sample from zero-init vocoder"
+        );
+        for cs in [2usize, 3, 4, 6, 12] {
             let talker = Arc::new(StubTalker {
                 eos_id: 999,
                 eos_at: total_frames,
                 calls: AtomicUsize::new(0),
             });
-            let tk = tokenizer_for_stream();
-            let stream = TtsStream::new(talker, tk, dummy_text_hidden())
+            let stream = TtsStream::new(talker, tokenizer_for_stream(), dummy_text_hidden())
                 .with_chunk_frames(cs)
                 .with_eos_id(999);
-            let audio = stream.into_audio_stream(voc.clone());
-            let streamed: Vec<f32> = audio.flat_map(|r| r.unwrap()).collect();
-
+            let streamed: Vec<f32> = stream
+                .into_audio_stream(voc.clone())
+                .flat_map(|r| r.unwrap())
+                .collect();
             assert_eq!(
                 streamed.len(),
                 batch_pcm.len(),

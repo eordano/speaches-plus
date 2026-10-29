@@ -32,7 +32,7 @@ def _select_backend() -> tuple[str, Any, str | None]:
         "and whisper.cpp has no canonical PyPI wheel to fall back to.\n"
         f"  whisper_bindings._whisper import error: {native_err}\n"
         "Build the local extension (see whisper_bindings/README.md): "
-        "`cd whisper_bindings && pip install .` once libwhisper + whisper.h "
+        "`cd whisper_bindings && uv pip install .` once libwhisper + whisper.h "
         "are on the include/library search path (or set WHISPER_INCLUDE_DIR "
         "and WHISPER_LIBRARY_DIR)."
     )

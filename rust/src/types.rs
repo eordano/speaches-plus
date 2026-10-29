@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::fmt;
 
@@ -194,7 +193,6 @@ pub struct StereoS16At48k(pub Vec<i16>);
 
 impl StereoS16At48k {
     pub const SAMPLE_RATE: u32 = 48_000;
-    pub const CHANNELS: u32 = 2;
 
     pub fn new(samples: Vec<i16>) -> Self {
         Self(samples)
@@ -222,49 +220,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ids_distinct_at_compile_time() {
-        let item: ItemId = ItemId::new("item_x");
-        let resp: ResponseId = ResponseId::new("resp_y");
-        assert_ne!(item.as_str(), resp.as_str());
-    }
-
-    #[test]
-    fn epoch_next_monotonic() {
+    fn epochs_millis_and_audio_buffers_do_their_arithmetic() {
         let e = Epoch::zero();
         assert_eq!(e.next().raw(), 1);
         assert_eq!(e.next().next().raw(), 2);
+        {
+            let m = Millis(1000);
+            let d = DurationMs(300);
+            assert_eq!(m.saturating_sub_dur(d), Millis(700));
+            assert_eq!(Millis(100).saturating_sub_dur(DurationMs(500)), Millis(0));
+        }
+        {
+            let d = DurationMs(123);
+            let m = Millis::from_session_start(d);
+            assert_eq!(m.raw(), 123);
+        }
+        {
+            let b16 = MonoF32At16k::new(vec![0.0; 16_000]);
+            assert_eq!(b16.duration_ms().raw(), 1000);
+            let b24 = MonoF32At24k::new(vec![0.0; 12_000]);
+            assert_eq!(b24.duration_ms().raw(), 500);
+            let b48 = MonoF32At48k::new(vec![0.0; 48_000]);
+            assert_eq!(b48.duration_ms().raw(), 1000);
+        }
     }
 
-    #[test]
-    fn millis_dur_sub() {
-        let m = Millis(1000);
-        let d = DurationMs(300);
-        assert_eq!(m.saturating_sub_dur(d), Millis(700));
-        assert_eq!(Millis(100).saturating_sub_dur(DurationMs(500)), Millis(0));
-    }
-
-    #[test]
-    fn millis_from_session_start() {
-        let d = DurationMs(123);
-        let m = Millis::from_session_start(d);
-        assert_eq!(m.raw(), 123);
-    }
-
-    #[test]
-    fn audio_buffer_duration_matches_rate() {
-        let b16 = MonoF32At16k::new(vec![0.0; 16_000]);
-        assert_eq!(b16.duration_ms().raw(), 1000);
-        let b24 = MonoF32At24k::new(vec![0.0; 12_000]);
-        assert_eq!(b24.duration_ms().raw(), 500);
-        let b48 = MonoF32At48k::new(vec![0.0; 48_000]);
-        assert_eq!(b48.duration_ms().raw(), 1000);
-    }
-
-    #[test]
-    fn audio_types_distinct() {
-        let _b16 = MonoF32At16k::default();
-        let _b24 = MonoF32At24k::default();
-        let _b48 = MonoF32At48k::default();
-        let _s = StereoS16At48k::default();
-    }
 }

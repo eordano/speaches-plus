@@ -1,0 +1,34 @@
+{
+  "name": "020-chat-forced-tool-required",
+  "family": "020-chat-completions",
+  "description": "tool_choice=required with two tools is grammar-forced: the model must write one or more <tool_call>{\"name\", \"arguments\"}</tool_call> blocks whose name is one of the tools and whose arguments validate against that tool's own parameters (optional parameters stay optional, enum and integer bounds hold). Asserts finish_reason=tool_calls and schema-valid arguments.",
+  "endpoint": {"method": "POST", "path": "/v1/chat/completions"},
+  "request_body": {
+    "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    "messages": [{"role": "user", "content": "Book a table for twenty people at half past seven tonight."}],
+    "temperature": 0.0,
+    "max_tokens": 300,
+    "chat_template_kwargs": {"enable_thinking": false},
+    "tools": [
+      {"type": "function", "function": {"name": "get_weather", "description": "Get the weather for a city",
+        "parameters": {"type": "object", "properties": {"location": {"type": "string"}, "unit": {"type": "string", "enum": ["c", "f"]}}, "required": ["location"], "additionalProperties": false}}},
+      {"type": "function", "function": {"name": "book_table", "description": "Book a restaurant table",
+        "parameters": {"type": "object", "properties": {"people": {"type": "integer", "minimum": 1, "maximum": 12}, "time": {"type": "string", "pattern": "^[0-2][0-9]:[0-5][0-9]$"}, "note": {"anyOf": [{"type": "string"}, {"type": "null"}]}}, "required": ["people", "time"], "additionalProperties": false}}}
+    ],
+    "tool_choice": "required",
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "choices": [{
+      "index": 0,
+      "finish_reason": "tool_calls",
+      "message": {
+        "tool_calls_min": 1,
+        "each_tool_call": {"name_in": ["get_weather", "book_table"], "arguments_matches_schema_of_named_tool": "#/request_body/tools"}
+      }
+    }]
+  },
+  "comparison_strategy": "structural+jsonschema",
+  "skip_when_no_model": true
+}

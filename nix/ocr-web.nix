@@ -7,18 +7,18 @@
 }:
 let
   wasm-bindgen-cli = pkgs.buildWasmBindgenCli rec {
-    version = "0.2.127";
+    version = "0.2.129";
     src = pkgs.fetchzip {
       urls = [
         "https://git.decent.foundation/api/packages/mirrors/generic/wasm-bindgen-cli/${version}/wasm-bindgen-cli-${version}.crate"
         "https://static.crates.io/crates/wasm-bindgen-cli/wasm-bindgen-cli-${version}.crate"
       ];
       extension = "tar.gz";
-      hash = "sha256-di+qBAdd7pENLiIB9CoZoab+W5xeDoByMREcCGTSzWo=";
+      hash = "sha256-pcecKQd7E8Opw6bkFoE569epUi7gh5qpQF1e5PJY6V8=";
     };
     cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
       inherit src;
-      hash = "sha256-FTv2GZIAQs0ePdIZXIXil7JbZ6kIT05VG6vqC1qNFxQ=";
+      hash = "sha256-vmUrWVU7kPJJxO5qIVeAkwQyWDELO1Z4Z5gitz2kco8=";
     };
   };
 

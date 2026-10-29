@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 #[cfg(test)]
 use crate::wgpu_backend::WgpuError;
@@ -202,20 +200,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn odd_length_packs_and_unpacks() {
-        let src: Vec<u16> = vec![1, 2, 3, 4, 5];
-        let words = word_count(src.len());
-        assert_eq!(words, 3);
-        let packed = pack_u16(&src, words);
-        assert_eq!(packed[2], 5);
-        let mut back = vec![0u16; src.len()];
-        unpack_u16(&packed, &mut back);
-        assert_eq!(back, src);
-    }
-
-    #[test]
-    fn shape_mismatch_is_reported() {
-        let e = dispatch::check_len("scale_out_bf16 x", 3, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+    fn odd_length_packing_round_trips_and_shape_mismatch_is_reported() {
+        {
+            let src: Vec<u16> = vec![1, 2, 3, 4, 5];
+            let words = word_count(src.len());
+            assert_eq!(words, 3);
+            let packed = pack_u16(&src, words);
+            assert_eq!(packed[2], 5);
+            let mut back = vec![0u16; src.len()];
+            unpack_u16(&packed, &mut back);
+            assert_eq!(back, src);
+        }
+        {
+            let e = dispatch::check_len("scale_out_bf16 x", 3, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
     }
 }

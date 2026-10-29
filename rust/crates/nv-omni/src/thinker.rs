@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
 
+use crate::weights::{load_1d, load_2d};
 use nv_layers::attn::{sdpa, AttnConfig};
 use nv_layers::linear::Linear;
 use nv_layers::mlp::Mlp;
@@ -959,38 +960,6 @@ fn splice_into(x: &Tensor, position: usize, splice: &Tensor) -> Result<Tensor> {
     Ok(Tensor::cat(&refs, 0)?)
 }
 
-fn load_1d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    dim: usize,
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("{name}: expected [{}], got {:?}", dim, d);
-    }
-    Ok(w)
-}
-
-fn load_2d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    shape: (usize, usize),
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != shape.0 || d[1] != shape.1 {
-        anyhow::bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
-    }
-    Ok(w)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,23 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_and_forward_step_runs() {
-        let cfg = tiny_cfg();
-        let t = OmniThinker::new(cfg.clone(), &Device::Cpu).unwrap();
-        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
-        let x = t.embed_with_splices(&tokens, &[]).unwrap();
-        let x = x.unsqueeze(0).unwrap();
-        let mut cache = OmniKvCache::new(cfg.num_hidden_layers);
-        let pos = OmniPositions::uniform(&[0, 1, 2, 3, 4]);
-        let logits = t.forward_step(&x, &pos, &mut cache, None).unwrap();
-        assert_eq!(logits.dims(), &[cfg.vocab_size]);
-        assert_eq!(cache.len(), 5);
-        let v: Vec<f32> = logits.to_vec1().unwrap();
-        assert!(v.iter().all(|x| x.is_finite()));
-    }
-
-    #[test]
-    fn kv_cache_decode_matches_full_prefill() {
+    fn forward_step_runs_and_kv_cache_decode_matches_full_prefill() {
         let cfg = tiny_cfg();
         let mut t = OmniThinker::new(cfg.clone(), &Device::Cpu).unwrap();
         let vocab = cfg.vocab_size;
@@ -1050,6 +1003,9 @@ mod tests {
         let mut cache = OmniKvCache::new(cfg.num_hidden_layers);
         let pos = OmniPositions::uniform(&[0, 1, 2, 3, 4]);
         let full = t.forward_step(&x, &pos, &mut cache, None).unwrap();
+        assert_eq!(full.dims(), &[cfg.vocab_size]);
+        assert_eq!(cache.len(), 5);
+        assert!(full.to_vec1::<f32>().unwrap().iter().all(|x| x.is_finite()));
 
         let mut cache2 = OmniKvCache::new(cfg.num_hidden_layers);
         let mut last = None;
@@ -1076,44 +1032,15 @@ mod tests {
     }
 
     #[test]
-    fn moe_topk_softmax_equals_softmax_all_then_renorm() {
-        let device = Device::Cpu;
-        let n_exp = 6usize;
-        let k = 3usize;
-        let logits_host: Vec<f32> = (0..2 * n_exp).map(|i| ((i as f32) * 0.531).sin()).collect();
-        let logits = Tensor::from_vec(logits_host.clone(), (2, n_exp), &device).unwrap();
-        let (sorted, idx) = logits.sort_last_dim(false).unwrap();
-        let top = sorted.narrow(1, 0, k).unwrap().contiguous().unwrap();
-        let top_idx: Vec<u32> = idx
-            .narrow(1, 0, k)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1()
-            .unwrap();
-        let w = candle_nn::ops::softmax_last_dim(&top).unwrap();
-        let w_host: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
-        for row in 0..2 {
-            let r = &logits_host[row * n_exp..(row + 1) * n_exp];
-            let max = r.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = r.iter().map(|l| (l - max).exp()).collect();
-            let z: f32 = exps.iter().sum();
-            let probs: Vec<f32> = exps.iter().map(|e| e / z).collect();
-            let sel: Vec<usize> = (0..k).map(|j| top_idx[row * k + j] as usize).collect();
-            let sel_sum: f32 = sel.iter().map(|&e| probs[e]).sum();
-            for j in 0..k {
-                let want = probs[sel[j]] / sel_sum;
-                assert!(
-                    (w_host[row * k + j] - want).abs() < 1e-5,
-                    "row {row} slot {j}: {} vs renorm {want}",
-                    w_host[row * k + j]
-                );
-            }
+    fn interleaved_mrope_matches_the_hf_axis_map_a_scalar_rotation_and_standard_rope_at_equal_positions(
+    ) {
+        let sections = [24usize, 20, 20];
+        for i in 0..64usize {
+            let axis = axis_for_freq(i, sections);
+            let want = if i >= 60 { 0 } else { i % 3 };
+            assert_eq!(axis, want, "freq {i}");
         }
-    }
 
-    #[test]
-    fn interleaved_mrope_equal_positions_is_standard_rope() {
         let cfg = tiny_cfg();
         let rope = Rope::new(
             RopeConfig {
@@ -1136,30 +1063,9 @@ mod tests {
         let a: Vec<f32> = q1.flatten_all().unwrap().to_vec1().unwrap();
         let b: Vec<f32> = q2.flatten_all().unwrap().to_vec1().unwrap();
         for (x, y) in a.iter().zip(b.iter()) {
-            assert!((x - y).abs() < 1e-5, "{x} vs {y}");
+            assert!((x - y).abs() < 1e-5, "equal positions must be standard rope: {x} vs {y}");
         }
-    }
 
-    #[test]
-    fn interleaved_mrope_axis_map_matches_hf_overwrite_semantics() {
-        let sections = [24usize, 20, 20];
-        for i in 0..64usize {
-            let axis = axis_for_freq(i, sections);
-            let want = if i >= 60 {
-                0
-            } else {
-                match i % 3 {
-                    0 => 0,
-                    1 => 1,
-                    _ => 2,
-                }
-            };
-            assert_eq!(axis, want, "freq {i}");
-        }
-    }
-
-    #[test]
-    fn interleaved_mrope_rotation_matches_scalar_reference() {
         let head_dim = 8usize;
         let sections = [2usize, 1, 1];
         let base = 10_000f32;
@@ -1209,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn build_mrope_positions_golden_image_example() {
+    fn build_mrope_positions_matches_the_text_image_and_image_audio_goldens() {
         let ids = OmniSpecialIds::default();
         let vs = ids.vision_start;
         let ve = ids.vision_end;
@@ -1220,23 +1126,13 @@ mod tests {
         assert_eq!(pos.h, vec![0, 1, 2, 3, 3, 4, 4, 5, 6, 7, 8]);
         assert_eq!(pos.w, vec![0, 1, 2, 3, 4, 3, 4, 5, 6, 7, 8]);
         assert_eq!(next, 9);
-    }
 
-    #[test]
-    fn build_mrope_positions_text_only_is_sequential() {
-        let ids = OmniSpecialIds::default();
-        let tokens: Vec<u32> = vec![1, 2, 3, 4];
-        let (pos, next) = build_mrope_positions(&tokens, &ids, &[], &[]).unwrap();
-        assert_eq!(pos.t, vec![0, 1, 2, 3]);
+        let (pos, next) = build_mrope_positions(&[1, 2, 3, 4], &ids, &[], &[]).unwrap();
+        assert_eq!(pos.t, vec![0, 1, 2, 3], "text only is sequential");
         assert_eq!(pos.h, pos.t);
         assert_eq!(pos.w, pos.t);
         assert_eq!(next, 4);
-    }
 
-    #[test]
-    fn build_mrope_positions_golden_image_audio() {
-        let ids = OmniSpecialIds::default();
-        let (vs, ve, ip) = (ids.vision_start, ids.vision_end, ids.image_pad);
         let (as_, ae, ap) = (ids.audio_start, ids.audio_end, ids.audio_pad);
         let mut tokens = vec![10, vs];
         tokens.extend([ip; 4]);
@@ -1264,14 +1160,13 @@ mod tests {
     }
 
     #[test]
-    fn splice_overwrites_position_range() {
+    fn splices_overwrite_their_position_range_are_bounded_and_deepstack_injection_changes_the_logits() {
         let cfg = tiny_cfg();
         let t = OmniThinker::new(cfg.clone(), &Device::Cpu).unwrap();
-        let tokens: Vec<u32> = vec![0, 0, 0, 0, 0];
         let ones = Tensor::ones((2, cfg.hidden_size), DType::F32, &Device::Cpu).unwrap();
         let out = t
             .embed_with_splices(
-                &tokens,
+                &[0, 0, 0, 0, 0],
                 &[ModalitySplice {
                     position: 1,
                     embedding: ones,
@@ -1285,17 +1180,10 @@ mod tests {
         assert!(row2.iter().all(|x| (*x - 1.0).abs() < 1e-6));
         assert!(row3.iter().all(|x| *x == 0.0));
         assert_eq!(out.dims(), &[5, cfg.hidden_size]);
-    }
-
-    #[test]
-    fn rejects_oversized_splice() {
-        let cfg = tiny_cfg();
-        let t = OmniThinker::new(cfg.clone(), &Device::Cpu).unwrap();
-        let tokens: Vec<u32> = vec![0, 0, 0];
         let big = Tensor::zeros((5, cfg.hidden_size), DType::F32, &Device::Cpu).unwrap();
         let err = t
             .embed_with_splices(
-                &tokens,
+                &[0, 0, 0],
                 &[ModalitySplice {
                     position: 1,
                     embedding: big,
@@ -1303,12 +1191,8 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("exceeds seq len"));
-    }
 
-    #[test]
-    fn deepstack_injection_changes_hidden_state() {
-        let cfg = tiny_cfg();
-        let mut t = OmniThinker::new(cfg.clone(), &Device::Cpu).unwrap();
+        let mut t = t;
         let vocab = cfg.vocab_size;
         let h = cfg.hidden_size;
         let embed: Vec<f32> = (0..vocab * h).map(|i| ((i % 7) as f32) * 0.1).collect();

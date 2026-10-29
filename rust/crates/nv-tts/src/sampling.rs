@@ -153,7 +153,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn greedy_ignores_rng_and_respects_mask() {
+    fn greedy_respects_the_mask_and_the_repetition_penalty() {
         let mut s = Sampler::new(SamplerConfig {
             do_sample: false,
             ..Default::default()
@@ -161,34 +161,24 @@ mod tests {
         let logits = vec![0.1, 5.0, 3.0, 4.0];
         let tok = s.sample(&logits, &[], |i| i != 1).unwrap();
         assert_eq!(tok, 3);
-    }
-
-    #[test]
-    fn repetition_penalty_can_flip_argmax() {
         let mut s = Sampler::new(SamplerConfig {
             do_sample: false,
             repetition_penalty: 2.0,
             ..Default::default()
         });
-        let logits = vec![1.0, 1.5];
-        let tok = s.sample(&logits, &[1], |_| true).unwrap();
-        assert_eq!(tok, 0);
+        let tok = s.sample(&[1.0, 1.5], &[1], |_| true).unwrap();
+        assert_eq!(tok, 0, "the repetition penalty flips the argmax");
     }
 
     #[test]
-    fn sampling_stays_in_allowed_set() {
+    fn sampling_stays_in_the_allowed_set_and_an_empty_set_is_an_error() {
         let mut s = Sampler::new(SamplerConfig::default());
         let logits: Vec<f32> = (0..100).map(|i| (i % 7) as f32 * 0.3).collect();
         for _ in 0..200 {
             let tok = s.sample(&logits, &[], |i| i < 50).unwrap();
             assert!(tok < 50);
         }
+        assert!(s.sample(&[1.0, 2.0], &[], |_| false).is_err(), "all suppressed");
     }
 
-    #[test]
-    fn all_suppressed_is_an_error() {
-        let mut s = Sampler::new(SamplerConfig::default());
-        let logits = vec![1.0, 2.0];
-        assert!(s.sample(&logits, &[], |_| false).is_err());
-    }
 }

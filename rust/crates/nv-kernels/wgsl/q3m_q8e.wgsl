@@ -25,6 +25,7 @@ var<workgroup> q8e_pk_bits: array<u32, 8>;
 
 @compute @workgroup_size(256)
 fn q3w_gemv_i8g_experts(
+    #def b2
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
@@ -38,6 +39,7 @@ fn q3w_gemv_i8g_experts(
     let live = row < q8e_p.n_rows;
     let words = select(0u, q8e_p.k_elems >> 2u, live);
     let wbase = select(0u, e * q8e_p.w_e_stride_words + row * (q8e_p.k_elems >> 2u), live);
+    #end
     let sbase = select(0u, (e * q8e_p.n_rows + row) * q8e_p.groups_per_row, live);
     let gshift = q8e_p.group_shift;
     let xw_base = (slot * q8e_p.x_slot_stride_elems) >> 1u;
@@ -46,6 +48,7 @@ fn q3w_gemv_i8g_experts(
         let w = q8e_w[wbase + i];
         let x0 = q8e_x[xw_base + 2u * i];
         let x1 = q8e_x[xw_base + 2u * i + 1u];
+        #def b1
         var d = 0.0;
         d = fma(int8_decode(w, 0u), bf16_lo(x0), d);
         d = fma(int8_decode(w, 1u), bf16_hi(x0), d);
@@ -58,8 +61,10 @@ fn q3w_gemv_i8g_experts(
     acc = acc + subgroupShuffleXor(acc, 4u);
     acc = acc + subgroupShuffleXor(acc, 2u);
     acc = acc + subgroupShuffleXor(acc, 1u);
+        #end
     if (lane == 0u) {
         q8e_pk_bits[sgid] = bf16_encode(acc) & 0xffffu;
+    #def b3
     }
     workgroupBarrier();
     if ((sgid & 1u) == 0u && lane == 0u && live) {
@@ -70,22 +75,11 @@ fn q3w_gemv_i8g_experts(
         q8e_y[slot * q8e_p.y_slot_stride_words + (row >> 1u)] = word;
     }
 }
+    #end
 
 @compute @workgroup_size(256)
 fn q3w_gemv_i8_experts(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let slot = wid.z;
-    var e = slot;
-    if (q8e_p.use_sel == 1u) {
-        e = q8e_sel[slot];
-    }
-    let row = (wid.x + wid.y * q8e_p.groups_x) * 8u + sgid;
-    let live = row < q8e_p.n_rows;
-    let words = select(0u, q8e_p.k_elems >> 2u, live);
-    let wbase = select(0u, e * q8e_p.w_e_stride_words + row * (q8e_p.k_elems >> 2u), live);
+    #use b2
     let xw_base = (slot * q8e_p.x_slot_stride_elems) >> 1u;
     var acc = 0.0;
     for (var i = lane; i < words; i = i + 32u) {
@@ -105,16 +99,7 @@ fn q3w_gemv_i8_experts(
     if (lane == 0u) {
         let sr = q8e_s[e * q8e_p.n_rows + select(0u, row, live)];
         q8e_pk_bits[sgid] = bf16_encode(acc * sr) & 0xffffu;
-    }
-    workgroupBarrier();
-    if ((sgid & 1u) == 0u && lane == 0u && live) {
-        var word = q8e_pk_bits[sgid];
-        if (row + 1u < q8e_p.n_rows) {
-            word = word | (q8e_pk_bits[sgid + 1u] << 16u);
-        }
-        q8e_y[slot * q8e_p.y_slot_stride_words + (row >> 1u)] = word;
-    }
-}
+    #use b3
 
 @compute @workgroup_size(256)
 fn q3w_gemv_i8g_f32(
@@ -133,18 +118,7 @@ fn q3w_gemv_i8g_f32(
         let w = q8e_w[wbase + i];
         let x0 = q8e_x[2u * i];
         let x1 = q8e_x[2u * i + 1u];
-        var d = 0.0;
-        d = fma(int8_decode(w, 0u), bf16_lo(x0), d);
-        d = fma(int8_decode(w, 1u), bf16_hi(x0), d);
-        d = fma(int8_decode(w, 2u), bf16_lo(x1), d);
-        d = fma(int8_decode(w, 3u), bf16_hi(x1), d);
-        acc = fma(q8e_s[sbase + (i >> gshift)], d, acc);
-    }
-    acc = acc + subgroupShuffleXor(acc, 16u);
-    acc = acc + subgroupShuffleXor(acc, 8u);
-    acc = acc + subgroupShuffleXor(acc, 4u);
-    acc = acc + subgroupShuffleXor(acc, 2u);
-    acc = acc + subgroupShuffleXor(acc, 1u);
+        #use b1
     if (lane == 0u && live) {
         q8e_y[q8e_p.y_off_words + row] = bitcast<u32>(acc);
     }

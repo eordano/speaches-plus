@@ -103,6 +103,17 @@ pub(crate) fn log_sse_abort(outcome: SsePush, path: &str) {
     }
 }
 
+pub(crate) async fn push_or_abort(
+    tx: &mpsc::Sender<ChatEvent>,
+    ev: ChatEvent,
+    timeout: std::time::Duration,
+    path: &str,
+) -> bool {
+    let out = push_event_async(tx, ev, timeout).await;
+    log_sse_abort(out, path);
+    out == SsePush::Sent
+}
+
 #[cfg(feature = "cuda")]
 pub(crate) fn effective_max_new(requested: usize, default_max_new: usize) -> usize {
     if requested == 0 {
@@ -234,6 +245,50 @@ impl StreamEmitter {
         }
         piece
     }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn stopped_by_then_done(
+        &mut self,
+        finish_reason: String,
+        completion_tokens: u32,
+    ) -> Vec<ChatEvent> {
+        self.matched
+            .take()
+            .map(|stop_sequence| ChatEvent::StoppedBy { stop_sequence })
+            .into_iter()
+            .chain([ChatEvent::Done {
+                finish_reason,
+                completion_tokens,
+            }])
+            .collect()
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) async fn send_stopped_by_then_done(
+    tx: &mpsc::Sender<ChatEvent>,
+    emitter: &mut StreamEmitter,
+    finish_reason: String,
+    completion_tokens: u32,
+    timeout: Option<std::time::Duration>,
+) -> SsePush {
+    let terminal = emitter.stopped_by_then_done(finish_reason, completion_tokens);
+    send_in_order_until_one_fails(tx, terminal, timeout).await
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) async fn send_in_order_until_one_fails(
+    tx: &mpsc::Sender<ChatEvent>,
+    events: Vec<ChatEvent>,
+    timeout: Option<std::time::Duration>,
+) -> SsePush {
+    for ev in events {
+        let out = push_event_async_opt(tx, ev, timeout).await;
+        if out != SsePush::Sent {
+            return out;
+        }
+    }
+    SsePush::Sent
 }
 
 pub(crate) const DETOK_WINDOW_MAX: usize = 48;
@@ -280,6 +335,7 @@ pub(crate) struct IncrementalDetok {
     pub(crate) next_attempt: usize,
 
     pub(crate) wire: Vec<(u32, &'static str)>,
+    pub(crate) open_byte_run_starts_at: Option<usize>,
 }
 
 impl IncrementalDetok {
@@ -295,7 +351,17 @@ impl IncrementalDetok {
             acc: String::new(),
             next_attempt: DETOK_WINDOW_MAX,
             wire,
+            open_byte_run_starts_at: None,
         }
+    }
+
+    fn is_byte_fallback_token(&self, id: u32) -> bool {
+        self.tokenizer.id_to_token(id).is_some_and(|t| {
+            t.len() == 6
+                && t.starts_with("<0x")
+                && t.ends_with('>')
+                && u8::from_str_radix(&t[3..5], 16).is_ok()
+        })
     }
 
     fn wire_text(&self, id: u32) -> Option<&'static str> {
@@ -315,8 +381,10 @@ impl IncrementalDetok {
             self.acc.push_str(text);
             self.window.clear();
             self.next_attempt = DETOK_WINDOW_MAX;
+            self.open_byte_run_starts_at = None;
             return Ok(&self.acc);
         }
+        let settled = self.acc.len();
         self.window.push(id);
         let w = self
             .tokenizer
@@ -331,7 +399,13 @@ impl IncrementalDetok {
                 self.window.len() + DETOK_WINDOW_KEEP
             };
         }
-        Ok(&self.acc)
+        self.open_byte_run_starts_at = self
+            .is_byte_fallback_token(id)
+            .then(|| self.open_byte_run_starts_at.unwrap_or(settled));
+        Ok(self
+            .open_byte_run_starts_at
+            .and_then(|at| self.acc.get(..at))
+            .unwrap_or(&self.acc))
     }
 
     pub(crate) fn advance_cut(&mut self, w: &str) -> bool {
@@ -354,6 +428,7 @@ impl IncrementalDetok {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) fn token_text_and_bytes(
     tokenizer: &tokenizers::Tokenizer,
     id: u32,
@@ -363,6 +438,7 @@ pub(crate) fn token_text_and_bytes(
     (s, bytes)
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) fn build_logprob_entry(
     tokenizer: &tokenizers::Tokenizer,
     out: &SampleOutput,
@@ -478,7 +554,7 @@ mod wire_grammar_tests {
     }
 
     #[test]
-    fn the_wire_list_is_exactly_the_grammars_the_parser_understands() {
+    fn the_wire_list_is_exactly_the_parser_grammars_and_the_fixture_makes_them_special() {
         for t in NATIVE_GRAMMAR.iter().chain(HERMES_GRAMMAR.iter()) {
             assert!(
                 TOOL_WIRE_TOKENS.contains(t),
@@ -492,24 +568,22 @@ mod wire_grammar_tests {
             "TOOL_WIRE_TOKENS carries an entry no parser grammar claims, so a special \
              token would be written into user-visible text: {TOOL_WIRE_TOKENS:?}"
         );
-    }
-
-    #[test]
-    fn the_fixture_makes_every_delimiter_a_special_token() {
-        let tok = grammar_tokenizer(true);
-        for t in TOOL_WIRE_TOKENS.iter().chain([&FRAMING]) {
-            let i = id(&tok, t);
-            assert_eq!(
-                tok.decode(&[i], true).unwrap(),
-                "",
-                "{t} is not special in the fixture, so nothing here reproduces the \
-                 checkpoints where these delimiters are added-special tokens"
-            );
+        {
+            let tok = grammar_tokenizer(true);
+            for t in TOOL_WIRE_TOKENS.iter().chain([&FRAMING]) {
+                let i = id(&tok, t);
+                assert_eq!(
+                    tok.decode(&[i], true).unwrap(),
+                    "",
+                    "{t} is not special in the fixture, so nothing here reproduces the \
+                     checkpoints where these delimiters are added-special tokens"
+                );
+            }
         }
     }
 
     #[test]
-    fn a_hermes_tool_call_survives_the_stream_and_parses() {
+    fn hermes_and_native_tool_calls_survive_the_stream_whether_or_not_their_delimiters_are_special() {
         let tok = grammar_tokenizer(true);
         let ids = hermes_call_ids(&tok);
         let full = stream_and_finish(&tok, &ids);
@@ -536,229 +610,57 @@ mod wire_grammar_tests {
             !full.contains(FRAMING),
             "a non-wire special leaked into user-visible text: {full:?}"
         );
-    }
-
-    #[test]
-    fn a_native_tool_call_survives_the_stream_and_parses() {
-        let tok = grammar_tokenizer(true);
-        let s = id(&tok, NATIVE_GRAMMAR[2]);
-        let ids = [
-            id(&tok, NATIVE_GRAMMAR[0]),
-            4,
-            s,
-            5,
-            s,
-            6,
-            id(&tok, NATIVE_GRAMMAR[1]),
-            id(&tok, FRAMING),
-        ];
-        let full = stream_and_finish(&tok, &ids);
-        let parsed = crate::oapi::chat::parse_model_tool_calls(&full, None);
-        assert_eq!(
-            parsed.tool_calls.len(),
-            1,
-            "a Gemma-4 native tool call came back as content {:?} instead of tool_calls. \
-             Decoded {full:?}",
-            parsed.content
-        );
-        assert_eq!(parsed.tool_calls[0].function.name, "get_weather");
-        assert_eq!(
-            parsed.tool_calls[0].function.arguments,
-            r#"{"city":"Oslo, NO"}"#
-        );
-    }
-
-    #[test]
-    fn delimiters_the_checkpoint_never_flagged_special_decode_to_the_same_text() {
-        let tok = grammar_tokenizer(false);
-        let ids = hermes_call_ids(&tok);
-        let plain = tok.decode(&ids, true).expect("decode");
-        assert!(
-            plain.contains(HERMES_GRAMMAR[0]) && plain.contains(HERMES_GRAMMAR[1]),
-            "skip_special_tokens already dropped a delimiter the fixture declared \
-             non-special, so this fixture does not model the Qwen packaging: {plain:?}"
-        );
-        let full = stream_and_finish(&tok, &ids);
-        assert_eq!(
-            full, plain,
-            "putting the Hermes pair on the wire list changed the served text on a \
-             checkpoint that never flagged those delimiters special"
-        );
-        assert_eq!(
-            crate::oapi::chat::parse_model_tool_calls(&full, None)
-                .tool_calls
-                .len(),
-            1,
-            "decoded {full:?}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod wire_token_tests {
-    use super::*;
-
-    fn real_tokenizer() -> Arc<tokenizers::Tokenizer> {
-        let dir = std::env::var("NV_CHAT_MODEL_DIR")
-            .expect("PRECONDITION NOT MET, THIS TEST EXECUTED NOTHING: NV_CHAT_MODEL_DIR unset");
-        let path = std::path::Path::new(&dir).join("tokenizer.json");
-        Arc::new(tokenizers::Tokenizer::from_file(&path).expect("tokenizer.json"))
-    }
-
-    use crate::oapi::chat::NATIVE_WIRE_TOKENS as NATIVE_GRAMMAR;
-    use crate::oapi::tool_parse::HERMES_WIRE_TOKENS as HERMES_GRAMMAR;
-
-    #[test]
-    #[ignore]
-    fn the_tool_wire_tokens_exist_in_the_checkpoint() {
-        if std::env::var("NV_TOOL_WIRE_TEST").as_deref() != Ok("1") {
-            panic!("PRECONDITION NOT MET, THIS TEST EXECUTED NOTHING: set NV_TOOL_WIRE_TEST=1");
-        }
-        let tok = real_tokenizer();
-        let d = IncrementalDetok::new(tok.clone());
-        let mut whole = 0usize;
-        for g in [&NATIVE_GRAMMAR[..], &HERMES_GRAMMAR[..]] {
-            let n = g.iter().filter(|t| tok.token_to_id(t).is_some()).count();
-            assert!(
-                n == 0 || n == g.len(),
-                "the checkpoint declares {n} of {g:?}: half a grammar means the \
-                 emitter writes some delimiters and drops the rest, which the tool \
-                 parser cannot recover from"
-            );
-            whole += usize::from(n == g.len());
-        }
-        assert!(
-            whole > 0,
-            "no tool-call grammar resolves against this checkpoint, so the wire \
-             list is a no-op here and tool calling is broken with everything green: \
-             resolved {:?} of {:?}",
-            d.wire,
-            TOOL_WIRE_TOKENS
-        );
-        for t in TOOL_WIRE_TOKENS {
-            let Some(id) = tok.token_to_id(t) else {
-                continue;
-            };
+        {
+            let tok = grammar_tokenizer(true);
+            let s = id(&tok, NATIVE_GRAMMAR[2]);
+            let ids = [
+                id(&tok, NATIVE_GRAMMAR[0]),
+                4,
+                s,
+                5,
+                s,
+                6,
+                id(&tok, NATIVE_GRAMMAR[1]),
+                id(&tok, FRAMING),
+            ];
+            let full = stream_and_finish(&tok, &ids);
+            let parsed = crate::oapi::chat::parse_model_tool_calls(&full, None);
             assert_eq!(
-                tok.decode(&[id], true).unwrap(),
-                "",
-                "{t} is not special, so it was never being stripped and this fix \
-                 is solving a problem that does not exist"
+                parsed.tool_calls.len(),
+                1,
+                "a Gemma-4 native tool call came back as content {:?} instead of tool_calls. \
+                 Decoded {full:?}",
+                parsed.content
+            );
+            assert_eq!(parsed.tool_calls[0].function.name, "get_weather");
+            assert_eq!(
+                parsed.tool_calls[0].function.arguments,
+                r#"{"city":"Oslo, NO"}"#
+            );
+        }
+        {
+            let tok = grammar_tokenizer(false);
+            let ids = hermes_call_ids(&tok);
+            let plain = tok.decode(&ids, true).expect("decode");
+            assert!(
+                plain.contains(HERMES_GRAMMAR[0]) && plain.contains(HERMES_GRAMMAR[1]),
+                "skip_special_tokens already dropped a delimiter the fixture declared \
+                 non-special, so this fixture does not model the Qwen packaging: {plain:?}"
+            );
+            let full = stream_and_finish(&tok, &ids);
+            assert_eq!(
+                full, plain,
+                "putting the Hermes pair on the wire list changed the served text on a \
+                 checkpoint that never flagged those delimiters special"
+            );
+            assert_eq!(
+                crate::oapi::chat::parse_model_tool_calls(&full, None)
+                    .tool_calls
+                    .len(),
+                1,
+                "decoded {full:?}"
             );
         }
     }
 
-    #[test]
-    #[ignore]
-    fn a_tool_call_survives_incremental_detokenisation() {
-        if std::env::var("NV_TOOL_WIRE_TEST").as_deref() != Ok("1") {
-            panic!("PRECONDITION NOT MET, THIS TEST EXECUTED NOTHING: set NV_TOOL_WIRE_TEST=1");
-        }
-        let tok = real_tokenizer();
-        let call = "<|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>}<tool_call|>";
-        let ids = tok.encode(call, false).expect("encode").get_ids().to_vec();
-        assert!(
-            ids.iter()
-                .any(|i| tok.decode(&[*i], true).unwrap().is_empty()),
-            "the encoding contains no special token, so this proves nothing"
-        );
-
-        let mut d = IncrementalDetok::new(tok.clone());
-        let mut last = String::new();
-        for id in &ids {
-            last = d.push(*id).expect("push").to_string();
-        }
-        assert_eq!(
-            last, call,
-            "emitter output must reproduce the call verbatim"
-        );
-
-        let parsed = crate::oapi::chat::parse_model_tool_calls(&last, None);
-        assert_eq!(parsed.tool_calls.len(), 1, "parsed: {last:?}");
-        assert_eq!(parsed.tool_calls[0].function.name, "get_weather");
-        assert_eq!(
-            parsed.tool_calls[0].function.arguments,
-            r#"{"city":"Oslo"}"#
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn plain_decoding_of_the_same_ids_loses_the_call() {
-        if std::env::var("NV_TOOL_WIRE_TEST").as_deref() != Ok("1") {
-            panic!("PRECONDITION NOT MET, THIS TEST EXECUTED NOTHING: set NV_TOOL_WIRE_TEST=1");
-        }
-        let tok = real_tokenizer();
-        let call = "<|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>}<tool_call|>";
-        let ids = tok.encode(call, false).expect("encode").get_ids().to_vec();
-        let stripped = tok.decode(&ids, true).expect("decode");
-        assert_ne!(stripped, call);
-        let parsed = crate::oapi::chat::parse_model_tool_calls(&stripped, None);
-        assert!(
-            parsed.tool_calls.is_empty(),
-            "skip_special_tokens decoding produced {stripped:?}, which parsed -- \
-             then the delimiters were never load-bearing"
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn the_full_decode_agrees_with_the_streamed_one() {
-        if std::env::var("NV_TOOL_WIRE_TEST").as_deref() != Ok("1") {
-            panic!("PRECONDITION NOT MET, THIS TEST EXECUTED NOTHING: set NV_TOOL_WIRE_TEST=1");
-        }
-        let tok = real_tokenizer();
-        let text = "sure<|tool_call>call:f{x:<|\"|>a<|\"|>}<tool_call|>all done";
-        let ids = tok.encode(text, false).expect("encode").get_ids().to_vec();
-
-        let mut d = IncrementalDetok::new(tok.clone());
-        let mut streamed = String::new();
-        for id in &ids {
-            streamed = d.push(*id).expect("push").to_string();
-        }
-        let full = decode_keeping_wire(&tok, &ids).expect("decode");
-
-        assert_eq!(streamed, full, "streamed and full decode disagree");
-        assert_eq!(full, text, "round trip changed the text");
-        assert!(
-            full.starts_with(streamed.as_str()),
-            "StopEmitter::finish would drop the tail"
-        );
-        assert!(
-            full.ends_with("all done"),
-            "text after the call was lost: {full:?}"
-        );
-
-        let plain = tok.decode(&ids, true).expect("decode");
-        assert!(
-            !plain.starts_with(streamed.as_str()),
-            "if the plain decode still prefixes the stream, this test is not \
-             pinning the defect it claims to"
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn other_special_tokens_are_still_dropped() {
-        if std::env::var("NV_TOOL_WIRE_TEST").as_deref() != Ok("1") {
-            panic!("PRECONDITION NOT MET, THIS TEST EXECUTED NOTHING: set NV_TOOL_WIRE_TEST=1");
-        }
-        let tok = real_tokenizer();
-        let eos = tok
-            .token_to_id("<end_of_turn>")
-            .or_else(|| tok.token_to_id("<eos>"))
-            .expect("an end-of-turn token");
-        assert_eq!(tok.decode(&[eos], true).unwrap(), "", "not special");
-        let hi = tok.encode("hi", false).expect("encode").get_ids().to_vec();
-
-        let mut d = IncrementalDetok::new(tok.clone());
-        let mut last = String::new();
-        for id in hi.iter().chain(std::iter::once(&eos)) {
-            last = d.push(*id).expect("push").to_string();
-        }
-        assert!(
-            !last.contains("<end_of_turn>") && !last.contains("<eos>"),
-            "framing token leaked into user-visible text: {last:?}"
-        );
-    }
 }

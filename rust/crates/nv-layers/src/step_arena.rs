@@ -1,11 +1,13 @@
+#[cfg(feature = "cuda")]
 use anyhow::Result;
+#[cfg(feature = "cuda")]
 use candle_core::{DType, Device, Tensor};
 use std::cell::RefCell;
 
 pub struct StepArena {
+    #[cfg(feature = "cuda")]
     slots: Vec<Tensor>,
     cursor: usize,
-    misses_after_warm: usize,
 }
 
 thread_local! {
@@ -15,9 +17,9 @@ thread_local! {
 impl StepArena {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "cuda")]
             slots: Vec::new(),
             cursor: 0,
-            misses_after_warm: 0,
         }
     }
 }
@@ -42,15 +44,6 @@ pub fn begin_step() {
             ar.cursor = 0;
         }
     });
-}
-
-pub fn is_installed() -> bool {
-    INSTALLED_ARENA_FOR_THE_GRAPHED_STEP_ON_THIS_THREAD.with(|a| a.borrow().is_some())
-}
-
-pub fn slots_in_use() -> usize {
-    INSTALLED_ARENA_FOR_THE_GRAPHED_STEP_ON_THIS_THREAD
-        .with(|a| a.borrow().as_ref().map(|ar| ar.slots.len()).unwrap_or(0))
 }
 
 #[cfg(feature = "cuda")]
@@ -111,9 +104,6 @@ pub fn output_tensor_uninitialised_for_a_kernel_to_fill(
                 slot.elem_count()
             );
         }
-        if idx > 0 && ar.slots.len() == idx && ar.misses_after_warm > 0 {
-            ar.misses_after_warm += 1;
-        }
         let t = fresh_uninitialised(dev, dtype, elems)?;
         ar.slots.push(t.clone());
         Ok(Some(t))
@@ -143,15 +133,15 @@ pub fn device_ptr_for_a_kernel_to_write(t: &Tensor) -> Result<u64> {
     Ok(match t.dtype() {
         DType::BF16 => {
             let (p, _g) = cuda.as_cuda_slice::<half::bf16>()?.device_ptr(&stream);
-            p as u64 + (off * 2) as u64
+            p + (off * 2) as u64
         }
         DType::F32 => {
             let (p, _g) = cuda.as_cuda_slice::<f32>()?.device_ptr(&stream);
-            p as u64 + (off * 4) as u64
+            p + (off * 4) as u64
         }
         DType::U32 => {
             let (p, _g) = cuda.as_cuda_slice::<u32>()?.device_ptr(&stream);
-            p as u64 + (off * 4) as u64
+            p + (off * 4) as u64
         }
         other => anyhow::bail!("step arena: unsupported dtype {other:?}"),
     })

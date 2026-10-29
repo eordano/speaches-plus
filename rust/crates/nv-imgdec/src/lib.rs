@@ -96,7 +96,7 @@ mod tests {
     }
 
     #[test]
-    fn grayscale_and_sixteen_bit_sources_decode() {
+    fn grayscale_sixteen_bit_and_transparent_sources_decode_onto_white_paper() {
         let l8 = image::GrayImage::from_fn(5, 3, |x, _| image::Luma([(x * 50) as u8]));
         let bytes = encode(image::DynamicImage::ImageLuma8(l8), image::ImageFormat::Png);
         let got = decode_rgb8(&bytes).expect("L8 png");
@@ -117,10 +117,6 @@ mod tests {
             255,
             "16-bit full-scale blue must map to 255"
         );
-    }
-
-    #[test]
-    fn transparent_pixels_flatten_to_white_not_black() {
         let rgba = image::RgbaImage::from_fn(2, 1, |x, _| {
             if x == 0 {
                 image::Rgba([0, 0, 0, 0])
@@ -204,15 +200,11 @@ mod tests {
     }
 
     #[test]
-    fn decompression_bombs_fail_before_allocating() {
+    fn bombs_junk_and_truncated_files_error_cleanly_before_allocating() {
         let err = decode_rgb8(&bmp_header_claiming(20_000, 20_000))
             .expect_err("400-megapixel claim must be rejected")
             .to_string();
         assert!(err.contains("decode cap"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn junk_bytes_name_the_supported_formats() {
         let err = decode_rgb8(b"definitely not an image")
             .expect_err("junk must not decode")
             .to_string();
@@ -220,6 +212,16 @@ mod tests {
             err.contains("supported: png, jpeg"),
             "unexpected error: {err}"
         );
+        let full = encode(
+            image::DynamicImage::ImageRgb8(gradient_rgb(32, 32)),
+            image::ImageFormat::Png,
+        );
+        for cut in [8, 24, full.len() / 2] {
+            assert!(
+                decode_rgb8(&full[..cut]).is_err(),
+                "truncated png at {cut} bytes must error cleanly"
+            );
+        }
     }
 
     #[test]
@@ -264,17 +266,4 @@ mod tests {
         eprintln!("corpus sweep: {ok} decoded, {rejected} rejected as expected");
     }
 
-    #[test]
-    fn truncated_files_error_instead_of_panicking() {
-        let full = encode(
-            image::DynamicImage::ImageRgb8(gradient_rgb(32, 32)),
-            image::ImageFormat::Png,
-        );
-        for cut in [8, 24, full.len() / 2] {
-            assert!(
-                decode_rgb8(&full[..cut]).is_err(),
-                "truncated png at {cut} bytes must error cleanly"
-            );
-        }
-    }
 }

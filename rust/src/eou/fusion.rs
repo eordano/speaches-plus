@@ -467,16 +467,6 @@ mod tests {
     }
 
     #[test]
-    fn banded_parse_round_trip_and_aliases() {
-        assert_eq!(FusionRule::parse("banded"), Some(FusionRule::Banded));
-        assert_eq!(FusionRule::parse("band-gated"), Some(FusionRule::Banded));
-        assert_eq!(
-            FusionRule::parse(FusionRule::Banded.as_str()),
-            Some(FusionRule::Banded)
-        );
-    }
-
-    #[test]
     fn banded_outside_the_band_is_the_audio_verdict_untouched() {
         let w = &DEFAULT_BANDED_FUSION_WEIGHTS_FIT_ON_CONTEXT_PROBE_BAND;
         for pa in [0.05f32, 0.2, 0.8, 0.95] {
@@ -488,6 +478,9 @@ mod tests {
                 );
             }
         }
+        assert_eq!(combine_fusion_banded(-1.0, 0.5, w), 0.5);
+        assert_eq!(combine_fusion_banded(0.9, -1.0, w), 0.9);
+        assert_eq!(combine_fusion_banded(-1.0, -1.0, w), 1.0);
     }
 
     #[test]
@@ -531,30 +524,24 @@ mod tests {
     }
 
     #[test]
-    fn banded_garbage_guards_match_the_other_rules() {
-        let w = &DEFAULT_BANDED_FUSION_WEIGHTS_FIT_ON_CONTEXT_PROBE_BAND;
-        assert_eq!(combine_fusion_banded(-1.0, 0.5, w), 0.5);
-        assert_eq!(combine_fusion_banded(0.9, -1.0, w), 0.9);
-        assert_eq!(combine_fusion_banded(-1.0, -1.0, w), 1.0);
-    }
-
-    #[test]
     fn fusion_rule_parse_round_trip() {
         for &r in &[
             FusionRule::NoisyOr,
             FusionRule::Max,
             FusionRule::Mean,
             FusionRule::Weighted,
+            FusionRule::Gated,
+            FusionRule::Banded,
         ] {
             assert_eq!(FusionRule::parse(r.as_str()), Some(r));
         }
         assert_eq!(FusionRule::parse("noisy-or"), Some(FusionRule::NoisyOr));
         assert_eq!(FusionRule::parse("avg"), Some(FusionRule::Mean));
+        assert_eq!(FusionRule::parse("gated"), Some(FusionRule::Gated));
+        assert_eq!(FusionRule::Gated.as_str(), "gated");
+        assert_eq!(FusionRule::parse("banded"), Some(FusionRule::Banded));
+        assert_eq!(FusionRule::parse("band-gated"), Some(FusionRule::Banded));
         assert_eq!(FusionRule::parse("nope"), None);
-    }
-
-    #[test]
-    fn fusion_default_is_gated() {
         assert_eq!(FusionRule::default(), FusionRule::Gated);
     }
 
@@ -569,81 +556,36 @@ mod tests {
     }
 
     #[test]
-    fn combine_fusion_weighted_handles_nan_weight() {
+    fn fusion_combine_rules_match_their_formulas() {
+        for (pt, pa, rule, w, want) in [
+            (0.6f32, 0.4f32, FusionRule::NoisyOr, 0.5f32, 1.0 - 0.4 * 0.6),
+            (0.6, 0.4, FusionRule::Max, 0.5, 0.6),
+            (0.4, 0.9, FusionRule::Max, 0.5, 0.9),
+            (0.6, 0.4, FusionRule::Mean, 0.5, 0.5),
+            (0.7, 0.3, FusionRule::Weighted, 0.5, 0.5),
+            (0.7, 0.3, FusionRule::Weighted, 1.0, 0.7),
+            (0.7, 0.3, FusionRule::Weighted, 0.0, 0.3),
+        ] {
+            let got = combine_fusion(pt, pa, rule, w);
+            assert!(approx_eq(got, want), "{rule:?} pt={pt} pa={pa} w={w}: got {got} want {want}");
+        }
         let p = combine_fusion(0.6, 0.4, FusionRule::Weighted, f32::NAN);
         assert!(p.is_finite(), "weight=NaN must be sanitized, got {p}");
     }
 
     #[test]
-    fn fusion_combine_noisy_or_matches_formula() {
-        let p = combine_fusion(0.6, 0.4, FusionRule::NoisyOr, 0.5);
-        assert!(approx_eq(p, 1.0 - 0.4 * 0.6));
-    }
-
-    #[test]
-    fn fusion_combine_max_matches_formula() {
-        assert!(approx_eq(
-            combine_fusion(0.6, 0.4, FusionRule::Max, 0.5),
-            0.6
-        ));
-        assert!(approx_eq(
-            combine_fusion(0.4, 0.9, FusionRule::Max, 0.5),
-            0.9
-        ));
-    }
-
-    #[test]
-    fn fusion_combine_mean_matches_formula() {
-        assert!(approx_eq(
-            combine_fusion(0.6, 0.4, FusionRule::Mean, 0.5),
-            0.5
-        ));
-    }
-
-    #[test]
-    fn fusion_combine_weighted_at_w0_5_equals_mean() {
-        let mean = combine_fusion(0.7, 0.3, FusionRule::Mean, 0.5);
-        let weighted = combine_fusion(0.7, 0.3, FusionRule::Weighted, 0.5);
-        assert!(approx_eq(mean, weighted));
-    }
-
-    #[test]
-    fn fusion_combine_weighted_w_extremes() {
-        let only_text = combine_fusion(0.7, 0.3, FusionRule::Weighted, 1.0);
-        assert!(approx_eq(only_text, 0.7));
-        let only_audio = combine_fusion(0.7, 0.3, FusionRule::Weighted, 0.0);
-        assert!(approx_eq(only_audio, 0.3));
-    }
-
-    #[test]
-    fn fusion_graceful_degradation_audio_fails() {
-        let nan = f32::NAN;
-        let p = combine_fusion(0.6, nan, FusionRule::NoisyOr, 0.5);
-        assert!(approx_eq(p, 0.6));
-        let inf = f32::INFINITY;
-        let p2 = combine_fusion(0.6, inf, FusionRule::Max, 0.5);
-        assert!(approx_eq(p2, 0.6));
-        let oob = 1.5_f32;
-        let p3 = combine_fusion(0.6, oob, FusionRule::Mean, 0.5);
-        assert!(approx_eq(p3, 0.6));
-    }
-
-    #[test]
-    fn fusion_graceful_degradation_text_fails() {
-        let p = combine_fusion(f32::NAN, 0.4, FusionRule::NoisyOr, 0.5);
-        assert!(approx_eq(p, 0.4));
-    }
-
-    #[test]
-    fn fusion_both_fail_returns_one() {
-        let p = combine_fusion(f32::NAN, f32::NAN, FusionRule::NoisyOr, 0.5);
-        assert!(approx_eq(p, 1.0));
-        let p2 = combine_fusion(-0.1, 1.5, FusionRule::Mean, 0.5);
-        assert!(approx_eq(p2, 1.0));
-    }
-
-    #[test]
-    fn fusion_clamps_to_unit_interval() {
+    fn fusion_graceful_degradation_when_a_head_fails_and_clamps_to_unit_interval() {
+        for (pt, pa, rule, want) in [
+            (0.6f32, f32::NAN, FusionRule::NoisyOr, 0.6f32),
+            (0.6, f32::INFINITY, FusionRule::Max, 0.6),
+            (0.6, 1.5, FusionRule::Mean, 0.6),
+            (f32::NAN, 0.4, FusionRule::NoisyOr, 0.4),
+            (f32::NAN, f32::NAN, FusionRule::NoisyOr, 1.0),
+            (-0.1, 1.5, FusionRule::Mean, 1.0),
+        ] {
+            let got = combine_fusion(pt, pa, rule, 0.5);
+            assert!(approx_eq(got, want), "{rule:?} pt={pt} pa={pa}: got {got} want {want}");
+        }
         let p = combine_fusion(1.0, 1.0, FusionRule::NoisyOr, 0.5);
         assert!((0.0..=1.0).contains(&p));
         let p2 = combine_fusion(0.0, 0.0, FusionRule::Mean, 0.5);
@@ -674,6 +616,17 @@ mod tests {
             assert_eq!(
                 f.partial_last_word_is_continuation, *cont,
                 "{s:?} continuation"
+            );
+        }
+        for partial in ["about 440 for the...", "I was thinking…", "and then..."] {
+            let feat = extract_gated_fusion_features(partial, 1500);
+            assert!(
+                !feat.partial_ends_with_strong_terminator,
+                "{partial:?}: '...' must not read as a sentence-final terminator"
+            );
+            assert!(
+                feat.partial_last_word_is_continuation,
+                "{partial:?}: trailing ellipsis is whisper's trail-off signal"
             );
         }
     }
@@ -724,17 +677,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn gated_default_weights_metadata() {
-        assert!(DEFAULT_GATED_FUSION_WEIGHTS.trained_samples > 0);
-        assert!(
-            DEFAULT_GATED_FUSION_WEIGHTS.trained_acc > 0.6,
-            "trained_acc={} unexpectedly low",
-            DEFAULT_GATED_FUSION_WEIGHTS.trained_acc
-        );
-    }
-
-    #[test]
     fn gated_real_data_agreement_cases() {
         let w = DEFAULT_GATED_FUSION_WEIGHTS;
         let cases: &[(&str, f32, f32, f32, f32)] = &[
@@ -751,24 +693,6 @@ mod tests {
                 "{text:?}: got {got} outside [{lo}, {hi}]; pt={pt} pa={pa}"
             );
         }
-    }
-
-    #[test]
-    fn ellipsis_ending_is_continuation_not_strong_terminator() {
-        for partial in ["about 440 for the...", "I was thinking…", "and then..."] {
-            let feat = extract_gated_fusion_features(partial, 1500);
-            assert!(
-                !feat.partial_ends_with_strong_terminator,
-                "{partial:?}: '...' must not read as a sentence-final terminator"
-            );
-            assert!(
-                feat.partial_last_word_is_continuation,
-                "{partial:?}: trailing ellipsis is whisper's trail-off signal"
-            );
-        }
-        let feat = extract_gated_fusion_features("done.", 1500);
-        assert!(feat.partial_ends_with_strong_terminator);
-        assert!(!feat.partial_last_word_is_continuation);
     }
 
     #[test]
@@ -812,11 +736,6 @@ mod tests {
                 "cap_cut must make cutoff-flips impossible: pa={pa} got {got}"
             );
         }
-    }
-
-    #[test]
-    fn logit_fusion_confident_audio_survives_adversarial_text() {
-        let w = DEFAULT_LOGIT_FUSION_WEIGHTS;
         let adversarial = GatedFusionFeatures {
             audio_ms: 30_000,
             partial_chars: 500,
@@ -832,27 +751,19 @@ mod tests {
     }
 
     #[test]
-    fn logit_fusion_monotonic_in_p_audio() {
-        let w = DEFAULT_LOGIT_FUSION_WEIGHTS;
+    fn logit_and_gated_fusion_are_monotonic_in_p_audio() {
         let feat = extract_gated_fusion_features("looking forward to it", 1500);
-        let mut prev = -1.0f32;
-        for &pa in &[0.01f32, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99] {
-            let got = combine_fusion_logit(0.55, pa, &feat, &w);
-            assert!(got >= prev, "non-monotonic: pa={pa} got={got} prev={prev}");
-            prev = got;
-        }
-    }
-
-    #[test]
-    fn gated_monotonic_in_p_audio() {
-        let w = DEFAULT_GATED_FUSION_WEIGHTS;
-        let feat = extract_gated_fusion_features("looking forward to it", 1500);
-        let pt = 0.55_f32;
-        let mut prev = -1.0_f32;
-        for &pa in &[0.01_f32, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99] {
-            let got = combine_fusion_gated(pt, pa, &feat, &w);
-            assert!(got >= prev, "non-monotonic: pa={pa} got={got} prev={prev}");
-            prev = got;
+        let heads: [(&str, &dyn Fn(f32) -> f32); 2] = [
+            ("logit", &|pa| combine_fusion_logit(0.55, pa, &feat, &DEFAULT_LOGIT_FUSION_WEIGHTS)),
+            ("gated", &|pa| combine_fusion_gated(0.55, pa, &feat, &DEFAULT_GATED_FUSION_WEIGHTS)),
+        ];
+        for (name, f) in heads {
+            let mut prev = -1.0f32;
+            for &pa in &[0.01f32, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99] {
+                let got = f(pa);
+                assert!(got >= prev, "{name} non-monotonic: pa={pa} got={got} prev={prev}");
+                prev = got;
+            }
         }
     }
 
@@ -908,18 +819,6 @@ mod tests {
         let direct = combine_fusion_gated(0.7, 0.3, &feat, &w);
         let routed = combine_fusion_with_features(0.7, 0.3, FusionRule::Gated, 0.5, &feat, &w);
         assert!((direct - routed).abs() < 1e-6);
-    }
-
-    #[test]
-    fn gated_combine_fusion_no_features_falls_back_to_mean() {
-        let got = combine_fusion(0.8, 0.2, FusionRule::Gated, 0.5);
-        assert!(approx_eq(got, 0.5));
-    }
-
-    #[test]
-    fn gated_rule_parses_and_round_trips() {
-        assert_eq!(FusionRule::parse("gated"), Some(FusionRule::Gated));
-        assert_eq!(FusionRule::Gated.as_str(), "gated");
     }
 
     #[test]

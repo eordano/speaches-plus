@@ -519,8 +519,8 @@ def main(argv=None):
         return 3
     if not train:
         print(
-            f"UNRESOLVED: every kept row shares one merged prompt group, so no "
-            f"leakage-free train/holdout split exists; no training run, no promote, no roll-over",
+            "UNRESOLVED: every kept row shares one merged prompt group, so no "
+            "leakage-free train/holdout split exists; no training run, no promote, no roll-over",
             file=sys.stderr,
         )
         return 3

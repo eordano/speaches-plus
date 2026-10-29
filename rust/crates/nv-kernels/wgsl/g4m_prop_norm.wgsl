@@ -41,6 +41,7 @@ fn pn_reduce(lid: u32, local: f32) -> f32 {
 
 @compute @workgroup_size(256)
 fn g4m_norm(@builtin(local_invocation_id) lid3: vec3<u32>) {
+    #def b2
     let lid = lid3.x;
     var local = 0.0;
     for (var w = lid; w < pn_p.words; w = w + 256u) {
@@ -53,6 +54,7 @@ fn g4m_norm(@builtin(local_invocation_id) lid3: vec3<u32>) {
     for (var w = lid; w < pn_p.words; w = w + 256u) {
         let xw = pn_x[w];
         let ww = pn_w[w];
+    #end
         pn_y[w] = bf16_pack(bf16_lo(xw) * s * bf16_lo(ww), bf16_hi(xw) * s * bf16_hi(ww));
     }
 }
@@ -82,18 +84,7 @@ fn g4m_norm_residual(@builtin(local_invocation_id) lid3: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn g4m_norm_mul(@builtin(local_invocation_id) lid3: vec3<u32>) {
-    let lid = lid3.x;
-    var local = 0.0;
-    for (var w = lid; w < pn_p.words; w = w + 256u) {
-        let xw = pn_x[w];
-        let x0 = bf16_lo(xw);
-        let x1 = bf16_hi(xw);
-        local = local + x0 * x0 + x1 * x1;
-    }
-    let s = pn_reduce(lid, local);
-    for (var w = lid; w < pn_p.words; w = w + 256u) {
-        let xw = pn_x[w];
-        let ww = pn_w[w];
+    #use b2
         let t = bf16_pack(bf16_lo(xw) * s, bf16_hi(xw) * s);
         pn_y[w] = bf16_pack(bf16_lo(t) * bf16_lo(ww), bf16_hi(t) * bf16_hi(ww));
     }
@@ -101,6 +92,7 @@ fn g4m_norm_mul(@builtin(local_invocation_id) lid3: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn g4m_norm_norm_residual(@builtin(local_invocation_id) lid3: vec3<u32>) {
+    #def b3
     let lid = lid3.x;
     var local = 0.0;
     for (var w = lid; w < pn_p.words; w = w + 256u) {
@@ -113,6 +105,7 @@ fn g4m_norm_norm_residual(@builtin(local_invocation_id) lid3: vec3<u32>) {
     var local2 = 0.0;
     for (var w = lid; w < pn_p.words; w = w + 256u) {
         let xw = pn_x[w];
+    #end
         let w1 = pn_w[w];
         let t = bf16_pack(bf16_lo(xw) * s1 * bf16_lo(w1), bf16_hi(xw) * s1 * bf16_hi(w1));
         let rw = pn_res[w];
@@ -166,18 +159,8 @@ fn g4m_norm_x2(
 
 @compute @workgroup_size(256)
 fn g4m_norm_add_norm_resout(@builtin(local_invocation_id) lid3: vec3<u32>) {
-    let lid = lid3.x;
-    var local = 0.0;
-    for (var w = lid; w < pn_p.words; w = w + 256u) {
-        let xw = pn_x[w];
-        let x0 = bf16_lo(xw);
-        let x1 = bf16_hi(xw);
-        local = local + x0 * x0 + x1 * x1;
-    }
-    let s1 = pn_reduce(lid, local);
-    var local2 = 0.0;
-    for (var w = lid; w < pn_p.words; w = w + 256u) {
-        let xw = pn_x[w];
+    #def b1
+    #use b3
         let ww = pn_w[w];
         let h2 = bf16_pack(bf16_lo(xw) * s1 * bf16_lo(ww), bf16_hi(xw) * s1 * bf16_hi(ww));
         let h1w = pn_h1[w];
@@ -191,6 +174,7 @@ fn g4m_norm_add_norm_resout(@builtin(local_invocation_id) lid3: vec3<u32>) {
         local2 = local2 + r0 * r0 + r1 * r1;
     }
     let s2 = pn_reduce(lid, local2);
+    #end
     for (var w = lid; w < pn_p.words; w = w + 256u) {
         let sum = pn_buf[w];
         let w3 = pn_w2[w];
@@ -205,31 +189,7 @@ fn g4m_norm_add_norm_resout(@builtin(local_invocation_id) lid3: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn g4m_norm_add_norm_resout_normnext(@builtin(local_invocation_id) lid3: vec3<u32>) {
-    let lid = lid3.x;
-    var local = 0.0;
-    for (var w = lid; w < pn_p.words; w = w + 256u) {
-        let xw = pn_x[w];
-        let x0 = bf16_lo(xw);
-        let x1 = bf16_hi(xw);
-        local = local + x0 * x0 + x1 * x1;
-    }
-    let s1 = pn_reduce(lid, local);
-    var local2 = 0.0;
-    for (var w = lid; w < pn_p.words; w = w + 256u) {
-        let xw = pn_x[w];
-        let ww = pn_w[w];
-        let h2 = bf16_pack(bf16_lo(xw) * s1 * bf16_lo(ww), bf16_hi(xw) * s1 * bf16_hi(ww));
-        let h1w = pn_h1[w];
-        let sum = bf16_pack(
-            (bf16_lo(h1w) + bf16_lo(h2)) * 1.0,
-            (bf16_hi(h1w) + bf16_hi(h2)) * 1.0
-        );
-        pn_buf[w] = sum;
-        let r0 = bf16_lo(sum);
-        let r1 = bf16_hi(sum);
-        local2 = local2 + r0 * r0 + r1 * r1;
-    }
-    let s2 = pn_reduce(lid, local2);
+    #use b1
     var local3 = 0.0;
     for (var w = lid; w < pn_p.words; w = w + 256u) {
         let sum = pn_buf[w];

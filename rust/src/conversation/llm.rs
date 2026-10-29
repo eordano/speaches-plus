@@ -1,63 +1,9 @@
-use std::collections::VecDeque;
-
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::debug;
-
-#[allow(dead_code)]
-pub struct PredictedTokenBuffer {
-    cap: usize,
-    inner: VecDeque<String>,
-    dropped: u32,
-    chars_seen: u32,
-}
-
-#[allow(dead_code)]
-impl PredictedTokenBuffer {
-    pub fn new(cap: usize) -> Self {
-        Self {
-            cap: cap.max(1),
-            inner: VecDeque::with_capacity(cap.max(1)),
-            dropped: 0,
-            chars_seen: 0,
-        }
-    }
-
-    pub fn push(&mut self, token: String) -> bool {
-        self.chars_seen = self.chars_seen.saturating_add(token.chars().count() as u32);
-        let mut overflowed = false;
-        while self.inner.len() >= self.cap {
-            self.inner.pop_front();
-            self.dropped = self.dropped.saturating_add(1);
-            overflowed = true;
-        }
-        self.inner.push_back(token);
-        overflowed
-    }
-
-    pub fn drain(&mut self) -> Vec<String> {
-        self.inner.drain(..).collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    pub fn dropped_count(&self) -> u32 {
-        self.dropped
-    }
-
-    pub fn chars_seen(&self) -> u32 {
-        self.chars_seen
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct LlmConfig {
@@ -309,38 +255,6 @@ struct SseMessage {
 }
 
 #[cfg(test)]
-mod predicted_buffer_tests {
-    use super::*;
-
-    #[test]
-    fn buffer_drops_oldest_at_cap() {
-        let mut b = PredictedTokenBuffer::new(2);
-        assert!(!b.push("a".into()));
-        assert!(!b.push("b".into()));
-        assert!(b.push("c".into()));
-        let v = b.drain();
-        assert_eq!(v, vec!["b", "c"]);
-        assert_eq!(b.dropped_count(), 1);
-    }
-
-    #[test]
-    fn buffer_chars_seen_is_cumulative() {
-        let mut b = PredictedTokenBuffer::new(8);
-        b.push("hi ".into());
-        b.push("there".into());
-        assert_eq!(b.chars_seen(), 8);
-    }
-
-    #[test]
-    fn buffer_drain_clears() {
-        let mut b = PredictedTokenBuffer::new(4);
-        b.push("x".into());
-        let _ = b.drain();
-        assert!(b.is_empty());
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
@@ -456,27 +370,23 @@ mod tests {
     }
 
     #[test]
-    fn sentence_chunker_splits_on_terminators() {
+    fn sentence_chunker_splits_on_terminators_and_newlines_and_flushes_the_rest() {
         let mut c = SentenceChunker::new();
         assert!(c.feed("Hello").is_empty());
         let out = c.feed(" world. How are you?");
         assert_eq!(out, vec!["Hello world.", "How are you?"]);
         assert_eq!(c.flush(), None);
-    }
-
-    #[test]
-    fn sentence_chunker_flushes_unterminated() {
-        let mut c = SentenceChunker::new();
-        c.feed("incomplete");
-        assert_eq!(c.flush(), Some("incomplete".to_string()));
-    }
-
-    #[test]
-    fn sentence_chunker_handles_newline() {
-        let mut c = SentenceChunker::new();
-        let out = c.feed("line one\nline two");
-        assert_eq!(out, vec!["line one"]);
-        assert_eq!(c.flush(), Some("line two".to_string()));
+        {
+            let mut c = SentenceChunker::new();
+            c.feed("incomplete");
+            assert_eq!(c.flush(), Some("incomplete".to_string()));
+        }
+        {
+            let mut c = SentenceChunker::new();
+            let out = c.feed("line one\nline two");
+            assert_eq!(out, vec!["line one"]);
+            assert_eq!(c.flush(), Some("line two".to_string()));
+        }
     }
 
     #[tokio::test]

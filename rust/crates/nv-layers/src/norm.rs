@@ -143,17 +143,12 @@ impl RmsNorm {
         if let (Device::Cuda(_), DType::BF16 | DType::F32, Some(w)) =
             (x.device(), x.dtype(), self.weight_f32.as_ref())
         {
-            if std::env::var(NV_TRAIN_RMSNORM_FUSED_DEFAULT_ON_0_RESTORES_THE_CANDLE_SQR_MEAN_SQRT_DIV_MUL_CHAIN)
-                .as_deref()
-                != Ok("0")
-            {
-                let op = RmsNormTrainOp {
-                    w: w.contiguous()?,
-                    eps: self.eps as f32,
-                    rstd: std::sync::Mutex::new(None),
-                };
-                return Ok(x.contiguous()?.apply_op1(op)?);
-            }
+            let op = RmsNormTrainOp {
+                w: w.contiguous()?,
+                eps: self.eps as f32,
+                rstd: std::sync::Mutex::new(None),
+            };
+            return Ok(x.contiguous()?.apply_op1(op)?);
         }
         self.forward_candle_chain(x)
     }
@@ -187,9 +182,8 @@ impl RmsNorm {
         let hidden = *dims.last().unwrap();
         let batch: usize = dims[..dims.len() - 1].iter().product();
 
-        let dev = match x_c.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = x_c.device().clone() else {
+            unreachable!()
         };
         let stream = crate::cuda_stream::current_stream(&dev);
 
@@ -282,9 +276,8 @@ impl RmsNorm {
         let hidden = *dims.last().unwrap();
         let batch: usize = dims[..dims.len() - 1].iter().product();
 
-        let dev = match x_c.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = x_c.device().clone() else {
+            unreachable!()
         };
         let stream = crate::cuda_stream::current_stream(&dev);
 
@@ -363,9 +356,8 @@ impl RmsNorm {
         let hidden = *dims.last().unwrap();
         let batch: usize = dims[..dims.len() - 1].iter().product();
 
-        let dev = match x_c.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = x_c.device().clone() else {
+            unreachable!()
         };
         let stream = crate::cuda_stream::current_stream(&dev);
 
@@ -494,9 +486,8 @@ impl RmsNorm {
         let hidden = *dims.last().unwrap();
         let batch: usize = dims[..dims.len() - 1].iter().product();
 
-        let dev = match x_c.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = x_c.device().clone() else {
+            unreachable!()
         };
         let stream = crate::cuda_stream::current_stream(&dev);
 
@@ -589,19 +580,23 @@ mod paper_validation {
         Tensor::from_vec(vals.to_vec(), shape, &Device::Cpu).unwrap()
     }
 
+    fn forward(vals: &[f32], hidden: usize, w: &[f32], eps: f64) -> Vec<f32> {
+        let x = tensor(vals, (vals.len() / hidden, hidden));
+        let w = Tensor::from_vec(w.to_vec(), hidden, &Device::Cpu).unwrap();
+        let y = RmsNorm::new(w, eps).forward(&x).unwrap();
+        y.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
     #[test]
-    fn rmsnorm_matches_reference_formula() {
+    fn rmsnorm_matches_reference_formula_with_eps_inside_the_sqrt_a_plain_weight_multiplier_and_an_exact_zero_row(
+    ) {
         let hidden = 8usize;
         let x_host: Vec<f32> = (0..2 * hidden)
             .map(|i| ((i as f32) * 0.37).sin() * 3.0)
             .collect();
         let w_host: Vec<f32> = (0..hidden).map(|i| 0.5 + 0.1 * i as f32).collect();
         let eps = 1e-6f64;
-        let x = tensor(&x_host, (2, hidden));
-        let w = Tensor::from_vec(w_host.clone(), hidden, &Device::Cpu).unwrap();
-        let norm = RmsNorm::new(w, eps);
-        let y = norm.forward(&x).unwrap();
-        let y_host = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let y_host = forward(&x_host, hidden, &w_host, eps);
         for r in 0..2 {
             let row = &x_host[r * hidden..(r + 1) * hidden];
             let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
@@ -615,18 +610,9 @@ mod paper_validation {
                 );
             }
         }
-    }
 
-    #[test]
-    fn rmsnorm_eps_is_inside_the_sqrt() {
         let hidden = 4usize;
-        let x_host = vec![1e-4f32; hidden];
-        let eps = 1e-6f64;
-        let x = tensor(&x_host, (1, hidden));
-        let w = Tensor::from_vec(vec![1.0f32; hidden], hidden, &Device::Cpu).unwrap();
-        let norm = RmsNorm::new(w, eps);
-        let y = norm.forward(&x).unwrap();
-        let y_host = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let y_host = forward(&[1e-4f32; 4], hidden, &[1.0f32; 4], 1e-6);
         let inside = 1e-4f32 / (1e-8f32 + 1e-6).sqrt();
         let outside = 1e-4f32 / (1e-8f32.sqrt() + 1e-6);
         for &got in &y_host {
@@ -639,38 +625,21 @@ mod paper_validation {
                 "output {got} suspiciously matches the eps-outside variant {outside}"
             );
         }
-    }
 
-    #[test]
-    fn rmsnorm_zero_row_is_finite_and_zero() {
-        let hidden = 4usize;
-        let x = tensor(&vec![0.0f32; hidden], (1, hidden));
-        let w = Tensor::from_vec(vec![2.0f32; hidden], hidden, &Device::Cpu).unwrap();
-        let norm = RmsNorm::new(w, 1e-6);
-        let y = norm.forward(&x).unwrap();
-        for v in y.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
+        for v in forward(&[0.0f32; 4], hidden, &[2.0f32; 4], 1e-6) {
             assert_eq!(
                 v, 0.0,
                 "zero input must stay exactly zero (eps guards the div)"
             );
         }
-    }
 
-    #[test]
-    fn rmsnorm_weight_is_a_plain_multiplier_not_one_plus_w() {
-        let hidden = 4usize;
-        let x = tensor(&[2.0, -2.0, 2.0, -2.0], (1, hidden));
-        let w = Tensor::from_vec(vec![1.0f32; hidden], hidden, &Device::Cpu).unwrap();
-        let norm = RmsNorm::new(w, 0.0);
-        let y = norm.forward(&x).unwrap();
-        let y_host = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-
-        assert_eq!(y_host, vec![1.0, -1.0, 1.0, -1.0]);
+        assert_eq!(
+            forward(&[2.0, -2.0, 2.0, -2.0], hidden, &[1.0f32; 4], 0.0),
+            vec![1.0, -1.0, 1.0, -1.0],
+            "the weight is a plain multiplier, not one plus w"
+        );
     }
 }
-
-pub const NV_TRAIN_RMSNORM_FUSED_DEFAULT_ON_0_RESTORES_THE_CANDLE_SQR_MEAN_SQRT_DIV_MUL_CHAIN: &str =
-    "NV_TRAIN_RMSNORM_FUSED";
 
 #[cfg(feature = "cuda")]
 pub struct RmsNormTrainOp {
@@ -680,11 +649,16 @@ pub struct RmsNormTrainOp {
 }
 
 #[cfg(feature = "cuda")]
-fn train_op_ptr(t: &Tensor, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> candle_core::Result<u64> {
+fn train_op_ptr(
+    t: &Tensor,
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+) -> candle_core::Result<u64> {
     use cudarc::driver::DevicePtr;
     let (st, l) = t.storage_and_layout();
     let candle_core::Storage::Cuda(c) = &*st else {
-        return Err(candle_core::Error::Msg("rmsnorm train op: operand not cuda".into()));
+        return Err(candle_core::Error::Msg(
+            "rmsnorm train op: operand not cuda".into(),
+        ));
     };
     Ok(match t.dtype() {
         DType::F32 => {
@@ -695,7 +669,11 @@ fn train_op_ptr(t: &Tensor, stream: &std::sync::Arc<cudarc::driver::CudaStream>)
             let (p, _g) = c.as_cuda_slice::<half::bf16>()?.device_ptr(stream);
             p + (l.start_offset() * 2) as u64
         }
-        other => return Err(candle_core::Error::Msg(format!("rmsnorm train op: dtype {other:?}"))),
+        other => {
+            return Err(candle_core::Error::Msg(format!(
+                "rmsnorm train op: dtype {other:?}"
+            )))
+        }
     })
 }
 
@@ -726,7 +704,9 @@ impl candle_core::CustomOp1 for RmsNormTrainOp {
         let dim = *dims.last().unwrap();
         let rows: usize = dims.iter().product::<usize>() / dim;
         let Some((start, _end)) = l.contiguous_offsets() else {
-            return Err(candle_core::Error::Msg("rmsnorm train op: input must be contiguous".into()));
+            return Err(candle_core::Error::Msg(
+                "rmsnorm train op: input must be contiguous".into(),
+            ));
         };
         if self.w.elem_count() != dim {
             return Err(candle_core::Error::Msg(format!(
@@ -746,9 +726,10 @@ impl candle_core::CustomOp1 for RmsNormTrainOp {
                 let x = s.as_cuda_slice::<half::bf16>()?;
                 let xv = x.slice(start..);
                 let (xp, _g1) = xv.device_ptr(&stream);
-                let mut y: cudarc::driver::CudaSlice<half::bf16> =
-                    unsafe { stream.alloc::<half::bf16>(rows * dim) }
-                        .map_err(|e| candle_core::Error::Msg(format!("rmsnorm train op alloc: {e:?}")))?;
+                let mut y: cudarc::driver::CudaSlice<half::bf16> = unsafe {
+                    stream.alloc::<half::bf16>(rows * dim)
+                }
+                .map_err(|e| candle_core::Error::Msg(format!("rmsnorm train op alloc: {e:?}")))?;
                 let rc = unsafe {
                     let (yp, _g2) = y.device_ptr_mut(&stream);
                     nv_kernels::cuda::rmsnorm_train_fwd(
@@ -763,14 +744,19 @@ impl candle_core::CustomOp1 for RmsNormTrainOp {
                         1,
                     )
                 };
-                (candle_core::CudaStorage::wrap_cuda_slice(y, dev.clone()), rc)
+                (
+                    candle_core::CudaStorage::wrap_cuda_slice(y, dev.clone()),
+                    rc,
+                )
             }
             DType::F32 => {
                 let x = s.as_cuda_slice::<f32>()?;
                 let xv = x.slice(start..);
                 let (xp, _g1) = xv.device_ptr(&stream);
-                let mut y: cudarc::driver::CudaSlice<f32> = unsafe { stream.alloc::<f32>(rows * dim) }
-                    .map_err(|e| candle_core::Error::Msg(format!("rmsnorm train op alloc: {e:?}")))?;
+                let mut y: cudarc::driver::CudaSlice<f32> = unsafe {
+                    stream.alloc::<f32>(rows * dim)
+                }
+                .map_err(|e| candle_core::Error::Msg(format!("rmsnorm train op alloc: {e:?}")))?;
                 let rc = unsafe {
                     let (yp, _g2) = y.device_ptr_mut(&stream);
                     nv_kernels::cuda::rmsnorm_train_fwd(
@@ -785,12 +771,21 @@ impl candle_core::CustomOp1 for RmsNormTrainOp {
                         0,
                     )
                 };
-                (candle_core::CudaStorage::wrap_cuda_slice(y, dev.clone()), rc)
+                (
+                    candle_core::CudaStorage::wrap_cuda_slice(y, dev.clone()),
+                    rc,
+                )
             }
-            other => return Err(candle_core::Error::Msg(format!("rmsnorm train op: dtype {other:?}"))),
+            other => {
+                return Err(candle_core::Error::Msg(format!(
+                    "rmsnorm train op: dtype {other:?}"
+                )))
+            }
         };
         if rc != 0 {
-            return Err(candle_core::Error::Msg(format!("rmsnorm_train_fwd rc={rc}")));
+            return Err(candle_core::Error::Msg(format!(
+                "rmsnorm_train_fwd rc={rc}"
+            )));
         }
         let rstd_t = Tensor::from_storage(
             candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(rstd, dev)),
@@ -809,7 +804,9 @@ impl candle_core::CustomOp1 for RmsNormTrainOp {
         grad_res: &Tensor,
     ) -> candle_core::Result<Option<Tensor>> {
         let candle_core::Device::Cuda(dev) = arg.device() else {
-            return Err(candle_core::Error::Msg("rmsnorm train op bwd: not cuda".into()));
+            return Err(candle_core::Error::Msg(
+                "rmsnorm train op bwd: not cuda".into(),
+            ));
         };
         let stream = crate::cuda_stream::current_stream(dev);
         let x = arg.detach().contiguous()?;
@@ -817,14 +814,16 @@ impl candle_core::CustomOp1 for RmsNormTrainOp {
         let dim = *dims.last().unwrap();
         let rows = x.elem_count() / dim;
         let g = grad_res.detach().to_dtype(x.dtype())?.contiguous()?;
-        let rstd = self
-            .rstd
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| candle_core::Error::Msg("rmsnorm train op bwd: no saved rstd".into()))?;
-        let dx = crate::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(arg.device(), x.dtype(), &dims)
-            .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+        let rstd =
+            self.rstd.lock().unwrap().clone().ok_or_else(|| {
+                candle_core::Error::Msg("rmsnorm train op bwd: no saved rstd".into())
+            })?;
+        let dx = crate::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
+            arg.device(),
+            x.dtype(),
+            &dims,
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
         let rc = unsafe {
             nv_kernels::cuda::rmsnorm_train_bwd(
                 stream.cu_stream() as *mut _,
@@ -833,14 +832,17 @@ impl candle_core::CustomOp1 for RmsNormTrainOp {
                 train_op_ptr(&rstd, &stream)? as *const f32,
                 train_op_ptr(&g, &stream)? as *const std::ffi::c_void,
                 crate::step_arena::device_ptr_for_a_kernel_to_write(&dx)
-                    .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))? as *mut std::ffi::c_void,
+                    .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?
+                    as *mut std::ffi::c_void,
                 rows as i64,
                 dim as i32,
                 if x.dtype() == DType::BF16 { 1 } else { 0 },
             )
         };
         if rc != 0 {
-            return Err(candle_core::Error::Msg(format!("rmsnorm_train_bwd rc={rc}")));
+            return Err(candle_core::Error::Msg(format!(
+                "rmsnorm_train_bwd rc={rc}"
+            )));
         }
         Ok(Some(dx))
     }

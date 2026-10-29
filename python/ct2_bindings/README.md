@@ -26,7 +26,7 @@ headers, and a C++17 compiler.
 
 ```sh
 cd ct2_bindings
-pip install .                         # installs as a separate package
+uv pip install .                      # installs as a separate package
 # -- or --
 python setup.py build_ext --inplace   # produces _ct2.cpython-*.so here
 ```
@@ -48,7 +48,7 @@ paths. Build with `nix develop` then `bash scripts/build_bindings.sh`
 `cd ct2_bindings && python setup.py build_ext --inplace`.
 
 If `pkgs.ctranslate2` isn't reachable (building outside `nix develop`),
-fall back to `pip install ctranslate2` in the venv and the PyPI path in
+fall back to `uv pip install ctranslate2` in the venv and the PyPI path in
 `stt/ct2.py` (below).
 
 ## Fallback
@@ -60,15 +60,15 @@ The sibling `stt/ct2.py` `Ct2WhisperBackend` checks in this order:
 3. Otherwise raises an informative `RuntimeError` pointing back here.
 
 So casual users on a dev shell without `libctranslate2` can still satisfy
-the dep with `pip install '.[ct2]'` from the repo root (see the `[ct2]`
+the dep with `uv pip install '.[ct2]'` from the repo root (see the `[ct2]`
 extra in the top-level `pyproject.toml`).
 
 ## Why a separate buildable
 
-`ct2_bindings/` is intentionally a *sibling* project, not part of the main
+`ct2_bindings/` is intentionally a sibling project, not part of the main
 `speaches-plus-python` package's `[tool.setuptools.packages.find]`. Two
 reasons: the main package must install cleanly on machines without
 `libctranslate2` headers (most dev shells today), and a C++ extension
 forces PEP 517 `build_ext` territory -- isolating it means a broken
-`ct2_bindings` build can never break a `pip install .` of
+`ct2_bindings` build can never break a `uv pip install .` of
 `speaches-plus-python`.

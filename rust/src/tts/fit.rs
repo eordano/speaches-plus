@@ -297,7 +297,8 @@ impl Fitter {
             return Err(anyhow!("no usable reference clip (need >= 1 s of audio)"));
         }
         let target = unit(&target);
-        let language = super::http::espeak_voice_for(&req.language).map_err(|e| anyhow!("language: {e}"))?;
+        let language =
+            super::http::espeak_voice_for(&req.language).map_err(|e| anyhow!("language: {e}"))?;
         let (train_corpus, default_sentences) = corpus_for(language);
         let sentences: Vec<String> = if req.sentences.is_empty() {
             default_sentences.iter().map(|s| s.to_string()).collect()
@@ -585,13 +586,25 @@ mod tests {
     use nv_tts::kokoro::Rng;
 
     #[test]
-    fn voices_fit_form_needs_no_explicit_refs() {
+    fn voices_fit_form_needs_no_refs_defaults_to_english_and_es_selects_the_spanish_corpus() {
         let req: FitRequest = serde_json::from_value(serde_json::json!({
             "speaker": "spk-0001", "name": "example", "tier": "adapter", "steps": 2
         }))
         .unwrap();
         assert!(req.refs.is_empty());
         assert_eq!(req.speaker.as_deref(), Some("spk-0001"));
+        {
+            let req: FitRequest =
+                serde_json::from_value(serde_json::json!({"name": "v", "refs": ["a.wav"]})).unwrap();
+            assert_eq!(req.language, "en-us");
+            let (train, heldout) = corpus_for("es");
+            assert_eq!(train.len(), TRAIN_SENTENCES_ES.len());
+            assert_eq!(heldout, &DEFAULT_SENTENCES_ES);
+            assert!(train.iter().all(|s| !TRAIN_SENTENCES.contains(s)));
+            assert_eq!(corpus_for("en-gb").0, &TRAIN_SENTENCES);
+            assert_eq!(super::super::http::espeak_voice_for("es-AR"), Ok("es-419"));
+            assert!(super::super::http::espeak_voice_for("pt-BR").is_err());
+        }
     }
 
     #[test]
@@ -608,20 +621,6 @@ mod tests {
             &TRAIN_SENTENCES
         )
         .is_err());
-    }
-
-    #[test]
-    fn voices_fit_language_defaults_to_english_and_es_selects_the_spanish_corpus() {
-        let req: FitRequest =
-            serde_json::from_value(serde_json::json!({"name": "v", "refs": ["a.wav"]})).unwrap();
-        assert_eq!(req.language, "en-us");
-        let (train, heldout) = corpus_for("es");
-        assert_eq!(train.len(), TRAIN_SENTENCES_ES.len());
-        assert_eq!(heldout, &DEFAULT_SENTENCES_ES);
-        assert!(train.iter().all(|s| !TRAIN_SENTENCES.contains(s)));
-        assert_eq!(corpus_for("en-gb").0, &TRAIN_SENTENCES);
-        assert_eq!(super::super::http::espeak_voice_for("es-AR"), Ok("es-419"));
-        assert!(super::super::http::espeak_voice_for("pt-BR").is_err());
     }
 
     #[test]
@@ -686,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn npy_header_is_valid_and_data_round_trips() {
+    fn npy_round_trips_resample_keeps_duration_rng_is_deterministic_and_timestamps_are_iso() {
         let data: Vec<f32> = (0..256).map(|i| i as f32 * 0.5).collect();
         let bytes = npy_f32(&[1, 1, 256], &data);
         let voice = super::super::npz::parse_npy(&bytes).unwrap();
@@ -697,24 +696,21 @@ mod tests {
             0,
             "header padded to 64 bytes"
         );
+        {
+            let x: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.01).sin()).collect();
+            let y = resample_linear(&x, 24_000, 16_000);
+            assert_eq!(y.len(), 16_000);
+            let mut a = Rng(7);
+            let mut b = Rng(7);
+            assert_eq!(a.normal(), b.normal());
+            let m: f32 = (0..20_000).map(|_| a.normal()).sum::<f32>() / 20_000.0;
+            assert!(m.abs() < 0.05, "mean {m}");
+        }
+        {
+            let t = chrono_like_now();
+            assert_eq!(t.len(), 20);
+            assert!(t.starts_with("20") && t.ends_with('Z'), "{t}");
+        }
     }
 
-    #[test]
-    fn resample_keeps_duration_and_normal_rng_is_deterministic() {
-        let x: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.01).sin()).collect();
-        let y = resample_linear(&x, 24_000, 16_000);
-        assert_eq!(y.len(), 16_000);
-        let mut a = Rng(7);
-        let mut b = Rng(7);
-        assert_eq!(a.normal(), b.normal());
-        let m: f32 = (0..20_000).map(|_| a.normal()).sum::<f32>() / 20_000.0;
-        assert!(m.abs() < 0.05, "mean {m}");
-    }
-
-    #[test]
-    fn timestamp_is_iso_utc() {
-        let t = chrono_like_now();
-        assert_eq!(t.len(), 20);
-        assert!(t.starts_with("20") && t.ends_with('Z'), "{t}");
-    }
 }

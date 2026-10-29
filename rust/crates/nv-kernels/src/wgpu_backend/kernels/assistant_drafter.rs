@@ -104,34 +104,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wgsl_declares_every_entry_point() {
-        for entry in [
-            ENTRY_EMBED_CONCAT,
-            ENTRY_GEMV,
-            ENTRY_RMSNORM,
-            ENTRY_ROPE,
-            ENTRY_ATTN_SCORES,
-            ENTRY_ATTN_SOFTMAX,
-            ENTRY_ATTN_CTX,
-            ENTRY_ADD_SCALE,
-            ENTRY_TOPK,
-            ENTRY_CAND_LOGITS,
-            ENTRY_PICK,
-        ] {
-            assert!(WGSL.contains(&format!("fn {entry}(")));
+    fn wgsl_declares_every_entry_point_and_params_are_uniform_sized() {
+        {
+            for entry in [
+                ENTRY_EMBED_CONCAT,
+                ENTRY_GEMV,
+                ENTRY_RMSNORM,
+                ENTRY_ROPE,
+                ENTRY_ATTN_SCORES,
+                ENTRY_ATTN_SOFTMAX,
+                ENTRY_ATTN_CTX,
+                ENTRY_ADD_SCALE,
+                ENTRY_TOPK,
+                ENTRY_CAND_LOGITS,
+                ENTRY_PICK,
+            ] {
+                assert!(WGSL.contains(&format!("fn {entry}(")));
+            }
         }
-    }
-
-    #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert!(std::mem::size_of::<AdEmbedParams>().is_multiple_of(16));
-        assert!(std::mem::size_of::<AdGemvParams>().is_multiple_of(16));
-        assert!(std::mem::size_of::<AdRmsParams>().is_multiple_of(16));
-        assert!(std::mem::size_of::<AdRopeParams>().is_multiple_of(16));
-        assert!(std::mem::size_of::<AdAttnParams>().is_multiple_of(16));
-        assert!(std::mem::size_of::<AdAddParams>().is_multiple_of(16));
-        assert!(std::mem::size_of::<AdTopkParams>().is_multiple_of(16));
-        assert!(std::mem::size_of::<AdCandParams>().is_multiple_of(16));
-        assert!(std::mem::size_of::<AdPickParams>().is_multiple_of(16));
+        {
+            assert!(std::mem::size_of::<AdEmbedParams>().is_multiple_of(16));
+            assert!(std::mem::size_of::<AdGemvParams>().is_multiple_of(16));
+            assert!(std::mem::size_of::<AdRmsParams>().is_multiple_of(16));
+            assert!(std::mem::size_of::<AdRopeParams>().is_multiple_of(16));
+            assert!(std::mem::size_of::<AdAttnParams>().is_multiple_of(16));
+            assert!(std::mem::size_of::<AdAddParams>().is_multiple_of(16));
+            assert!(std::mem::size_of::<AdTopkParams>().is_multiple_of(16));
+            assert!(std::mem::size_of::<AdCandParams>().is_multiple_of(16));
+            assert!(std::mem::size_of::<AdPickParams>().is_multiple_of(16));
+        }
     }
 }

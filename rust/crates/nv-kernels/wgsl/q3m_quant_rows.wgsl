@@ -72,6 +72,7 @@ fn q3w_qz_block(x_base: u32, out_base: u32, kb: u32, stored: f32) -> u32 {
 
 @compute @workgroup_size(256)
 fn q3w_quant_rows(
+    #def b1
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -87,6 +88,7 @@ fn q3w_quant_rows(
     if (bad) {
         stored = 1.0;
     }
+    #end
     let x_base = slot * q3q_p.x_slot_stride_elems;
     let out_base = slot * (q3q_p.k_blocks * 2u);
     let sf_base_words = slot * (q3q_p.k_blocks >> 2u);
@@ -95,6 +97,7 @@ fn q3w_quant_rows(
     var sb = 0u;
     if (kb < q3q_p.k_blocks) {
         sb = q3w_qz_block(x_base, out_base, kb, stored);
+    #def b2
     }
     q3q_sbytes[lid.x] = sb;
     workgroupBarrier();
@@ -105,24 +108,11 @@ fn q3w_quant_rows(
             | (q3q_sbytes[lid.x + 3u] << 24u);
     }
 }
+    #end
 
 @compute @workgroup_size(256)
 fn q3w_silu_mul_quant(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let slot = wid.y;
-    var gi = slot;
-    if (q3q_p.use_sel == 1u) {
-        gi = q3q_sel[slot];
-    }
-    let g = q3q_glob[gi];
-    let g_mag = bitcast<u32>(g) & 0x7fffffffu;
-    let bad = (g_mag == 0u) || (g_mag >= F32_INF);
-    var stored = g;
-    if (bad) {
-        stored = 1.0;
-    }
+    #use b1
     let out_base = slot * (q3q_p.k_blocks * 2u);
     let sf_base_words = slot * (q3q_p.k_blocks >> 2u);
 
@@ -142,13 +132,4 @@ fn q3w_silu_mul_quant(
             vbits[2u * i + 1u] = bf16_encode(a1) & 0xffffu;
         }
         sb = q3w_qz_core(&vbits, out_base, kb, stored);
-    }
-    q3q_sbytes[lid.x] = sb;
-    workgroupBarrier();
-    if ((lid.x & 3u) == 0u && kb < q3q_p.k_blocks) {
-        q3q_scales[sf_base_words + (kb >> 2u)] = q3q_sbytes[lid.x]
-            | (q3q_sbytes[lid.x + 1u] << 8u)
-            | (q3q_sbytes[lid.x + 2u] << 16u)
-            | (q3q_sbytes[lid.x + 3u] << 24u);
-    }
-}
+    #use b2

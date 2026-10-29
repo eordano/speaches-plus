@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
@@ -29,8 +27,6 @@ struct SamplerParams {
 pub const EXACT_MAX_TOP_K: u32 = 256;
 
 pub const EXACT_SCRATCH_BYTES: u32 = EXACT_MAX_TOP_K * 4 * 4 + WORKGROUP_SIZE * 4 * 2 + 32;
-
-pub const EXACT_SENTINEL: u32 = 0xFFFF_FFFF;
 
 const EXACT_FLAG_HOST_U01: u32 = 1;
 
@@ -267,76 +263,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seed_split_is_little_endian_pairs() {
-        let words = split_seeds(&[0x0123_4567_89ab_cdef, 1]);
-        assert_eq!(words, vec![0x89ab_cdef, 0x0123_4567, 1, 0]);
+    fn seed_split_params_and_shape_check_follow_the_shader_layout() {
+        {
+            let words = split_seeds(&[0x0123_4567_89ab_cdef, 1]);
+            assert_eq!(words, vec![0x89ab_cdef, 0x0123_4567, 1, 0]);
+        }
+        {
+            let e = dispatch::check_len("sampler logits", 10, 12).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            assert_eq!(std::mem::size_of::<SamplerParams>(), 48);
+            assert_eq!(std::mem::size_of::<SamplerParams>() % 16, 0);
+        }
     }
 
     #[test]
-    fn shape_mismatch_is_reported() {
-        let e = dispatch::check_len("sampler logits", 10, 12).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn params_are_forty_eight_bytes() {
-        assert_eq!(std::mem::size_of::<SamplerParams>(), 48);
-        assert_eq!(std::mem::size_of::<SamplerParams>() % 16, 0);
-    }
-
-    #[test]
-    fn exact_support_window_is_advertised_honestly() {
-        let p = ExactSampling {
-            temperature: 0.8,
-            top_k: 40,
-            ..Default::default()
-        };
-        assert!(p.supported(262144));
-        assert!(!p.supported(8), "top_k must not exceed the vocab");
-        let no_k = ExactSampling {
-            temperature: 0.8,
-            top_k: 0,
-            ..Default::default()
-        };
-        assert!(
-            !no_k.supported(262144),
-            "top_k is mandatory off the greedy path"
-        );
-        let too_big = ExactSampling {
-            temperature: 0.8,
-            top_k: 257,
-            ..Default::default()
-        };
-        assert!(!too_big.supported(262144));
-        let greedy = ExactSampling {
-            temperature: 0.0,
-            top_k: 0,
-            ..Default::default()
-        };
-        assert!(greedy.supported(262144));
-    }
-
-    #[test]
-    fn host_u01_is_clamped_the_same_way_the_host_sampler_clamps() {
-        let p = ExactSampling {
-            u01: Some(1.5),
-            ..Default::default()
-        };
-        let got = f32::from_bits(exact_params(1, 8, &p).u01_bits);
-        assert_eq!(got, 1.0f32 - f32::EPSILON);
-        let p = ExactSampling {
-            u01: Some(-3.0),
-            ..Default::default()
-        };
-        assert_eq!(f32::from_bits(exact_params(1, 8, &p).u01_bits), 0.0);
-    }
-
-    #[test]
-    fn unit_from_seed_is_in_the_unit_interval() {
-        for s in [0u64, 1, 0x9e37_79b9_7f4a_7c15, u64::MAX] {
-            for row in 0..4u32 {
-                let u = unit_from_seed(s, row);
-                assert!((0.0..1.0).contains(&u), "seed={s} row={row} u={u}");
+    fn exact_support_is_advertised_honestly_and_u01_is_clamped_like_the_host_sampler() {
+        {
+            let p = ExactSampling {
+                temperature: 0.8,
+                top_k: 40,
+                ..Default::default()
+            };
+            assert!(p.supported(262144));
+            assert!(!p.supported(8), "top_k must not exceed the vocab");
+            let no_k = ExactSampling {
+                temperature: 0.8,
+                top_k: 0,
+                ..Default::default()
+            };
+            assert!(
+                !no_k.supported(262144),
+                "top_k is mandatory off the greedy path"
+            );
+            let too_big = ExactSampling {
+                temperature: 0.8,
+                top_k: 257,
+                ..Default::default()
+            };
+            assert!(!too_big.supported(262144));
+            let greedy = ExactSampling {
+                temperature: 0.0,
+                top_k: 0,
+                ..Default::default()
+            };
+            assert!(greedy.supported(262144));
+        }
+        {
+            let p = ExactSampling {
+                u01: Some(1.5),
+                ..Default::default()
+            };
+            let got = f32::from_bits(exact_params(1, 8, &p).u01_bits);
+            assert_eq!(got, 1.0f32 - f32::EPSILON);
+            let p = ExactSampling {
+                u01: Some(-3.0),
+                ..Default::default()
+            };
+            assert_eq!(f32::from_bits(exact_params(1, 8, &p).u01_bits), 0.0);
+        }
+        {
+            for s in [0u64, 1, 0x9e37_79b9_7f4a_7c15, u64::MAX] {
+                for row in 0..4u32 {
+                    let u = unit_from_seed(s, row);
+                    assert!((0.0..1.0).contains(&u), "seed={s} row={row} u={u}");
+                }
             }
         }
     }

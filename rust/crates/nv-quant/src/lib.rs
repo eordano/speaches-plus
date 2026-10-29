@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 pub mod algo_pin;
+pub use nv_kernels::capture_exclusion;
+#[cfg(feature = "cuda")]
+pub mod capture_stream;
 pub mod fp8;
+#[cfg(feature = "cuda")]
+pub mod graph_teardown;
 pub mod marlin_fp8;
 pub mod marlin_nvfp4;
 pub mod matmul;
@@ -11,6 +16,7 @@ pub mod nvfp4;
 
 #[cfg(feature = "cuda")]
 pub fn release_stream_resources(cu_stream_key: usize) {
+    let _no_capture_in_flight = capture_exclusion::no_capture_in_flight();
     matmul::release_stream_state(cu_stream_key);
     nvfp4::release_stream_workspace(cu_stream_key);
     bump_stream_epoch(cu_stream_key);

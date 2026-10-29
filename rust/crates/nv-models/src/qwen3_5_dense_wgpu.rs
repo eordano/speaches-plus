@@ -1,18 +1,33 @@
-use anyhow::{Context, Result};
+use crate::{dispatch_pass, submit_passes};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use bytemuck::{bytes_of, cast_slice};
+use half::bf16;
+use nv_config::env_arm_opt_in_eq_some_1_reread_every_call;
+use nv_weights::WeightLoader;
+use std::env;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+use wgpu::{BindGroup, Buffer, BufferUsages, CommandBuffer, ComputePipeline, ErrorFilter};
 
 use nv_kernels::wgpu_backend::dispatch;
 use nv_kernels::wgpu_backend::kernels as wk;
 use nv_kernels::wgpu_backend::{compose, compose_enabled, strip_subgroup_fns, WgpuContext};
 
-use crate::gemma4_wgpu_shared::err;
+use crate::gemma4_wgpu_shared::{bf16_bits, bf16_val, err};
+use crate::pod;
 use crate::qwen3_5_moe::LayerType;
 pub use crate::qwen3_5_moe::Qwen3_5DenseConfig;
+pub use crate::qwen3_5_moe_wgpu::RefState;
 use crate::qwen3_5_moe_wgpu::{
-    bytes_to_words, delta_recurrent_kernel, delta_recurrent_variants_source, load_nvfp4,
-    nvfp4_gemv_source, nvfp4_quant_source, nvfp4_v2_route, nvfp4_v2_route_slotshared,
-    quant_lane_entry, staging_flush_enabled, GemvNvfp4Params, HostBf16Lin, HostDeltaNet,
-    HostNvfp4Lin, QuantRowsParams, SiluPairParams, VramReport, NVFP4_BLOCK,
+    bytes_to_words, delta_recurrent_variants_source, load_f32_vec, DELTA_RECURRENT_ENTRY,
+    DELTA_RECURRENT_LANES_PER_WORKGROUP,
+    load_nvfp4, nvfp4_gemv_source, nvfp4_quant_source, nvfp4_v2_route, nvfp4_v2_route_slotshared,
+    quant_lane_entry, rbf, ref_delta, ref_gemv_bf16, ref_rmsnorm, sigmoid, silu,
+    GemvNvfp4Params, HostBf16Lin, HostDeltaNet, HostNvfp4Lin,
+    QuantRowsParams, SiluPairParams, VramReport, NVFP4_BLOCK,
 };
+use crate::wgpu_ledger::env_on;
+use crate::wgpu_ledger::{spliced_chunk, ChunkRowSplice};
 use crate::wgpu_lora::{
     build_lora_pipelines, build_lora_site, emit_lora_site_pk, emit_lora_site_pk_shrink_only,
     upload_lora_site, LoraPipelines, LoraShrinkFold, LoraSite, LoraSiteGpu,
@@ -24,7 +39,7 @@ const ARGMAX_GROUPS: usize = 256;
 
 const STAGING_FLUSH_BYTES: u64 = 256 << 20;
 
-const GEMV_BF16_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3d_gemv_bf16.wgsl");
+const GEMV_BF16_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/q3d_gemv_bf16.wgsl");
 
 const GEMV_I8_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3d_gemv_i8.wgsl");
 
@@ -39,9 +54,10 @@ const MISC_WGSL: &str = concat!(
 
 const PREFILL_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3d_prefill.wgsl");
 
-const GEMV_W4A8_WGSL: &str = include_str!("../../nv-kernels/wgsl/gemv_nvfp4_w4a8.wgsl");
+const GEMV_W4A8_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/gemv_nvfp4_w4a8.wgsl");
 
-const W4A8_PRODUCER_WGSL: &str = include_str!("../../nv-kernels/wgsl/w4a8_producer_rowquant.wgsl");
+const W4A8_PRODUCER_WGSL: &str =
+    nv_kernels::wgsl!("../../nv-kernels/wgsl/w4a8_producer_rowquant.wgsl");
 
 const SPLICE_WGSL: &str = r#"
 struct Q3spParams { hidden_words: u32, m: u32, pad0: u32, pad1: u32 };
@@ -112,13 +128,13 @@ fn q3w_lmhead_bf16_expand_f32(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct LmheadExpandParams {
-    n_words: u32,
-    y_off_elems: u32,
-    pad0: u32,
-    pad1: u32,
+pod! {
+    struct LmheadExpandParams {
+        n_words: u32,
+        y_off_elems: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 }
 
 fn gemm_mk_source(m: usize) -> String {
@@ -126,53 +142,85 @@ fn gemm_mk_source(m: usize) -> String {
     assert!((2..=16).contains(&m), "gemm_mk m must be 2..=16, got {m}");
     let mut b = String::new();
     b.push_str(
-        "struct Q3gmParams {\n    n_rows: u32,\n    k_words: u32,\n    groups_x: u32,\n    w_row_words: u32,\n    x_stride_words: u32,\n    y_stride_words: u32,\n    pad0: u32,\n    pad1: u32,\n};\n\n",
+        "struct Q3gmParams {
+    n_rows: u32,
+    k_words: u32,
+    groups_x: u32,
+    w_row_words: u32,
+    x_stride_words: u32,
+    y_stride_words: u32,
+    pad0: u32,
+    pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> gm_w: array<u32>;
+@group(0) @binding(1) var<storage, read> gm_x: array<u32>;
+@group(0) @binding(2) var<uniform> gm_p: Q3gmParams;
+@group(0) @binding(3) var<storage, read_write> gm_y: array<u32>;
+
+var<workgroup> gm_red: array<f32, 256>;
+
+",
     );
-    b.push_str("@group(0) @binding(0) var<storage, read> gm_w: array<u32>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> gm_x: array<u32>;\n");
-    b.push_str("@group(0) @binding(2) var<uniform> gm_p: Q3gmParams;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> gm_y: array<u32>;\n\n");
-    b.push_str("var<workgroup> gm_red: array<f32, 256>;\n\n");
     writeln!(b, "@compute @workgroup_size(256)").unwrap();
     writeln!(b, "fn {}(", gemm_mk_entry(m)).unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>\n) {\n");
-    b.push_str("    let tid = lid.x;\n");
-    b.push_str("    let half = tid >> 7u;\n");
-    b.push_str("    let lane = tid & 127u;\n");
-    b.push_str("    let pair = wid.x + wid.y * gm_p.groups_x;\n");
-    b.push_str("    let row = pair * 2u + half;\n");
-    b.push_str("    let live = row < gm_p.n_rows;\n");
-    b.push_str("    let wbase = select(0u, row * gm_p.w_row_words, live);\n");
-    b.push_str("    let kw = select(0u, gm_p.k_words, live);\n");
-    writeln!(b, "    var acc: array<f32, {m}>;").unwrap();
+    b.push_str(
+        "    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let tid = lid.x;
+    let half = tid >> 7u;
+    let lane = tid & 127u;
+    let pair = wid.x + wid.y * gm_p.groups_x;
+    let row = pair * 2u + half;
+    let live = row < gm_p.n_rows;
+    let wbase = select(0u, row * gm_p.w_row_words, live);
+    let kw = select(0u, gm_p.k_words, live);
+",
+    );
     writeln!(
         b,
-        "    for (var mi = 0u; mi < {m}u; mi = mi + 1u) {{ acc[mi] = 0.0; }}"
+        "    var acc: array<f32, {m}>;
+    for (var mi = 0u; mi < {m}u; mi = mi + 1u) {{ acc[mi] = 0.0; }}"
     )
     .unwrap();
-    b.push_str("    for (var i = lane; i < kw; i = i + 128u) {\n");
-    b.push_str("        let ww = gm_w[wbase + i];\n");
+    b.push_str(
+        "    for (var i = lane; i < kw; i = i + 128u) {
+        let ww = gm_w[wbase + i];
+",
+    );
     writeln!(b, "        for (var mi = 0u; mi < {m}u; mi = mi + 1u) {{").unwrap();
-    b.push_str("            let xw = gm_x[mi * gm_p.x_stride_words + i];\n");
-    b.push_str("            acc[mi] = fma(bf16_lo(ww), bf16_lo(xw), acc[mi]);\n");
-    b.push_str("            acc[mi] = fma(bf16_hi(ww), bf16_hi(xw), acc[mi]);\n");
-    b.push_str("        }\n    }\n");
+    b.push_str(
+        "            let xw = gm_x[mi * gm_p.x_stride_words + i];
+            acc[mi] = fma(bf16_lo(ww), bf16_lo(xw), acc[mi]);
+            acc[mi] = fma(bf16_hi(ww), bf16_hi(xw), acc[mi]);
+        }
+    }
+",
+    );
     writeln!(b, "    for (var mi = 0u; mi < {m}u; mi = mi + 1u) {{").unwrap();
-    b.push_str("        gm_red[tid] = acc[mi];\n");
-    b.push_str("        workgroupBarrier();\n");
-    b.push_str("        for (var stride = 64u; stride > 0u; stride = stride >> 1u) {\n");
-    b.push_str("            if (lane < stride) {\n");
-    b.push_str("                gm_red[tid] = gm_red[tid] + gm_red[tid + stride];\n");
-    b.push_str("            }\n            workgroupBarrier();\n        }\n");
-    b.push_str("        if (tid == 0u) {\n");
-    b.push_str("            let lo = gm_red[0];\n");
-    b.push_str("            var hi = 0.0;\n");
-    b.push_str("            if (row + 1u < gm_p.n_rows) {\n");
-    b.push_str("                hi = gm_red[128];\n");
-    b.push_str("            }\n");
-    b.push_str("            gm_y[mi * gm_p.y_stride_words + (row >> 1u)] = bf16_pack(lo, hi);\n");
-    b.push_str("        }\n");
-    b.push_str("        workgroupBarrier();\n    }\n}\n");
+    b.push_str(
+        "        gm_red[tid] = acc[mi];
+        workgroupBarrier();
+        for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
+            if (lane < stride) {
+                gm_red[tid] = gm_red[tid] + gm_red[tid + stride];
+            }
+            workgroupBarrier();
+        }
+        if (tid == 0u) {
+            let lo = gm_red[0];
+            var hi = 0.0;
+            if (row + 1u < gm_p.n_rows) {
+                hi = gm_red[128];
+            }
+            gm_y[mi * gm_p.y_stride_words + (row >> 1u)] = bf16_pack(lo, hi);
+        }
+        workgroupBarrier();
+    }
+}
+",
+    );
     compose(&b)
 }
 
@@ -188,81 +236,128 @@ fn gemm_i8_mk_source(m: usize) -> String {
     );
     let mut b = String::new();
     b.push_str(
-        "struct Q3q8mParams {\n    n_rows: u32,\n    k_elems: u32,\n    groups_x: u32,\n    groups_per_row: u32,\n    group_shift: u32,\n    x_stride_words: u32,\n    y_stride_words: u32,\n    pad0: u32,\n};\n\n",
+        "struct Q3q8mParams {
+    n_rows: u32,
+    k_elems: u32,
+    groups_x: u32,
+    groups_per_row: u32,
+    group_shift: u32,
+    x_stride_words: u32,
+    y_stride_words: u32,
+    pad0: u32,
+};
+
+@group(0) @binding(0) var<storage, read> q8m_w: array<u32>;
+@group(0) @binding(1) var<storage, read> q8m_s: array<f32>;
+@group(0) @binding(2) var<storage, read> q8m_x: array<u32>;
+@group(0) @binding(3) var<storage, read_write> q8m_y: array<u32>;
+@group(0) @binding(4) var<uniform> q8m_p: Q3q8mParams;
+
+var<workgroup> q8m_pk_bits: array<u32, 8>;
+
+",
     );
-    b.push_str("@group(0) @binding(0) var<storage, read> q8m_w: array<u32>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> q8m_s: array<f32>;\n");
-    b.push_str("@group(0) @binding(2) var<storage, read> q8m_x: array<u32>;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> q8m_y: array<u32>;\n");
-    b.push_str("@group(0) @binding(4) var<uniform> q8m_p: Q3q8mParams;\n\n");
-    b.push_str("var<workgroup> q8m_pk_bits: array<u32, 8>;\n\n");
     for grouped in [true, false] {
         writeln!(b, "@compute @workgroup_size(256)").unwrap();
         writeln!(b, "fn {}(", gemm_i8_mk_entry(m, grouped)).unwrap();
-        b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(subgroup_id) sgid: u32,\n    @builtin(subgroup_invocation_id) lane: u32\n) {\n");
-        b.push_str("    let row = (wid.x + wid.y * q8m_p.groups_x) * 8u + sgid;\n");
-        b.push_str("    let live = row < q8m_p.n_rows;\n");
-        b.push_str("    let words = select(0u, q8m_p.k_elems >> 2u, live);\n");
-        b.push_str("    let wbase = select(0u, row * (q8m_p.k_elems >> 2u), live);\n");
+        b.push_str(
+            "    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_invocation_id) lane: u32
+) {
+    let row = (wid.x + wid.y * q8m_p.groups_x) * 8u + sgid;
+    let live = row < q8m_p.n_rows;
+    let words = select(0u, q8m_p.k_elems >> 2u, live);
+    let wbase = select(0u, row * (q8m_p.k_elems >> 2u), live);
+",
+        );
         if grouped {
-            b.push_str("    let sbase = select(0u, row * q8m_p.groups_per_row, live);\n");
-            b.push_str("    let gshift = q8m_p.group_shift;\n");
+            b.push_str(
+                "    let sbase = select(0u, row * q8m_p.groups_per_row, live);
+    let gshift = q8m_p.group_shift;
+",
+            );
         }
-        writeln!(b, "    var acc: array<f32, {m}>;").unwrap();
         writeln!(
             b,
-            "    for (var mi = 0u; mi < {m}u; mi = mi + 1u) {{ acc[mi] = 0.0; }}"
+            "    var acc: array<f32, {m}>;
+    for (var mi = 0u; mi < {m}u; mi = mi + 1u) {{ acc[mi] = 0.0; }}"
         )
         .unwrap();
-        b.push_str("    for (var i = lane; i < words; i = i + 32u) {\n");
-        b.push_str("        let w = q8m_w[wbase + i];\n");
+        b.push_str(
+            "    for (var i = lane; i < words; i = i + 32u) {
+        let w = q8m_w[wbase + i];
+",
+        );
         if grouped {
             b.push_str("        let sc = q8m_s[sbase + (i >> gshift)];\n");
         }
         writeln!(b, "        for (var mi = 0u; mi < {m}u; mi = mi + 1u) {{").unwrap();
-        b.push_str("            let x0 = q8m_x[mi * q8m_p.x_stride_words + 2u * i];\n");
-        b.push_str("            let x1 = q8m_x[mi * q8m_p.x_stride_words + 2u * i + 1u];\n");
+        b.push_str(
+            "            let x0 = q8m_x[mi * q8m_p.x_stride_words + 2u * i];
+            let x1 = q8m_x[mi * q8m_p.x_stride_words + 2u * i + 1u];
+",
+        );
         if grouped {
-            b.push_str("            var d = 0.0;\n");
-            b.push_str("            d = fma(int8_decode(w, 0u), bf16_lo(x0), d);\n");
-            b.push_str("            d = fma(int8_decode(w, 1u), bf16_hi(x0), d);\n");
-            b.push_str("            d = fma(int8_decode(w, 2u), bf16_lo(x1), d);\n");
-            b.push_str("            d = fma(int8_decode(w, 3u), bf16_hi(x1), d);\n");
-            b.push_str("            acc[mi] = fma(sc, d, acc[mi]);\n");
+            b.push_str(
+                "            var d = 0.0;
+            d = fma(int8_decode(w, 0u), bf16_lo(x0), d);
+            d = fma(int8_decode(w, 1u), bf16_hi(x0), d);
+            d = fma(int8_decode(w, 2u), bf16_lo(x1), d);
+            d = fma(int8_decode(w, 3u), bf16_hi(x1), d);
+            acc[mi] = fma(sc, d, acc[mi]);
+",
+            );
         } else {
-            b.push_str("            acc[mi] = fma(int8_decode(w, 0u), bf16_lo(x0), acc[mi]);\n");
-            b.push_str("            acc[mi] = fma(int8_decode(w, 1u), bf16_hi(x0), acc[mi]);\n");
-            b.push_str("            acc[mi] = fma(int8_decode(w, 2u), bf16_lo(x1), acc[mi]);\n");
-            b.push_str("            acc[mi] = fma(int8_decode(w, 3u), bf16_hi(x1), acc[mi]);\n");
+            b.push_str(
+                "            acc[mi] = fma(int8_decode(w, 0u), bf16_lo(x0), acc[mi]);
+            acc[mi] = fma(int8_decode(w, 1u), bf16_hi(x0), acc[mi]);
+            acc[mi] = fma(int8_decode(w, 2u), bf16_lo(x1), acc[mi]);
+            acc[mi] = fma(int8_decode(w, 3u), bf16_hi(x1), acc[mi]);
+",
+            );
         }
         b.push_str("        }\n    }\n");
         writeln!(b, "    for (var mi = 0u; mi < {m}u; mi = mi + 1u) {{").unwrap();
-        b.push_str("        var a = acc[mi];\n");
-        b.push_str("        a = a + subgroupShuffleXor(a, 16u);\n");
-        b.push_str("        a = a + subgroupShuffleXor(a, 8u);\n");
-        b.push_str("        a = a + subgroupShuffleXor(a, 4u);\n");
-        b.push_str("        a = a + subgroupShuffleXor(a, 2u);\n");
-        b.push_str("        a = a + subgroupShuffleXor(a, 1u);\n");
+        b.push_str(
+            "        var a = acc[mi];
+        a = a + subgroupShuffleXor(a, 16u);
+        a = a + subgroupShuffleXor(a, 8u);
+        a = a + subgroupShuffleXor(a, 4u);
+        a = a + subgroupShuffleXor(a, 2u);
+        a = a + subgroupShuffleXor(a, 1u);
+",
+        );
         if grouped {
-            b.push_str("        if (lane == 0u) {\n");
-            b.push_str("            q8m_pk_bits[sgid] = bf16_encode(a) & 0xffffu;\n");
-            b.push_str("        }\n");
-        } else {
-            b.push_str("        if (lane == 0u) {\n");
             b.push_str(
-                "            q8m_pk_bits[sgid] = bf16_encode(a * q8m_s[select(0u, row, live)]) & 0xffffu;\n",
-            );
-            b.push_str("        }\n");
+                "        if (lane == 0u) {
+            q8m_pk_bits[sgid] = bf16_encode(a) & 0xffffu;
         }
-        b.push_str("        workgroupBarrier();\n");
-        b.push_str("        if ((sgid & 1u) == 0u && lane == 0u && live) {\n");
-        b.push_str("            var word = q8m_pk_bits[sgid];\n");
-        b.push_str("            if (row + 1u < q8m_p.n_rows) {\n");
-        b.push_str("                word = word | (q8m_pk_bits[sgid + 1u] << 16u);\n");
-        b.push_str("            }\n");
-        b.push_str("            q8m_y[mi * q8m_p.y_stride_words + (row >> 1u)] = word;\n");
-        b.push_str("        }\n");
-        b.push_str("        workgroupBarrier();\n    }\n}\n\n");
+",
+            );
+        } else {
+            b.push_str(
+                "        if (lane == 0u) {
+            q8m_pk_bits[sgid] = bf16_encode(a * q8m_s[select(0u, row, live)]) & 0xffffu;
+        }
+",
+            );
+        }
+        b.push_str(
+            "        workgroupBarrier();
+        if ((sgid & 1u) == 0u && lane == 0u && live) {
+            var word = q8m_pk_bits[sgid];
+            if (row + 1u < q8m_p.n_rows) {
+                word = word | (q8m_pk_bits[sgid + 1u] << 16u);
+            }
+            q8m_y[mi * q8m_p.y_stride_words + (row >> 1u)] = word;
+        }
+        workgroupBarrier();
+    }
+}
+
+",
+        );
     }
     compose(&b)
 }
@@ -275,416 +370,336 @@ fn gemm_i8_mk_entry(m: usize, grouped: bool) -> String {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemmI8MkParams {
-    n_rows: u32,
-    k_elems: u32,
-    groups_x: u32,
-    groups_per_row: u32,
-    group_shift: u32,
-    x_stride_words: u32,
-    y_stride_words: u32,
-    pad0: u32,
-}
+pod! {
+    struct GemmI8MkParams {
+        n_rows: u32,
+        k_elems: u32,
+        groups_x: u32,
+        groups_per_row: u32,
+        group_shift: u32,
+        x_stride_words: u32,
+        y_stride_words: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemmMkParams {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    w_row_words: u32,
-    x_stride_words: u32,
-    y_stride_words: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct GemmMkParams {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        w_row_words: u32,
+        x_stride_words: u32,
+        y_stride_words: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct CkParams {
-    m_live: u32,
-    base: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct CkParams {
+        m_live: u32,
+        base: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct SpliceParams {
-    hidden_words: u32,
-    m: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct SpliceParams {
+        hidden_words: u32,
+        m: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ConvMParams {
-    conv_dim: u32,
-    kernel: u32,
-    x_words: u32,
-    mixed_stride: u32,
-}
+    struct ConvMParams {
+        conv_dim: u32,
+        kernel: u32,
+        x_words: u32,
+        mixed_stride: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct DeltaQkvMParams {
-    n_v: u32,
-    d_k: u32,
-    d_v: u32,
-    key_dim: u32,
-    v_per_k: u32,
-    mixed_stride: u32,
-    pad0: u32,
-    scale: f32,
-}
+    struct DeltaQkvMParams {
+        n_v: u32,
+        d_k: u32,
+        d_v: u32,
+        key_dim: u32,
+        v_per_k: u32,
+        mixed_stride: u32,
+        pad0: u32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct NormRopeMParams {
-    n_rows: u32,
-    head_dim: u32,
-    src_stride: u32,
-    rot_half: u32,
-    x_row_elems: u32,
-    y_row_elems: u32,
-    pad0: u32,
-    eps: f32,
-}
+    struct NormRopeMParams {
+        n_rows: u32,
+        head_dim: u32,
+        src_stride: u32,
+        rot_half: u32,
+        x_row_elems: u32,
+        y_row_elems: u32,
+        pad0: u32,
+        eps: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnGateMParams {
-    n_words: u32,
-    head_dim: u32,
-    src_stride: u32,
-    gate_off: u32,
-    has_gate: u32,
-    x_row_elems: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct AttnGateMParams {
+        n_words: u32,
+        head_dim: u32,
+        src_stride: u32,
+        gate_off: u32,
+        has_gate: u32,
+        x_row_elems: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvI8Params {
-    n_rows: u32,
-    k_elems: u32,
-    groups_x: u32,
-    groups_per_row: u32,
-    group_shift: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct GemvI8Params {
+        n_rows: u32,
+        k_elems: u32,
+        groups_x: u32,
+        groups_per_row: u32,
+        group_shift: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvBf16Params {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    out_f32: u32,
-    w_row_words: u32,
-    x_off_words: u32,
-    y_off_words: u32,
-    pad0: u32,
-    alpha: f32,
-    pad1: u32,
-    pad2: u32,
-    pad3: u32,
-}
+    struct GemvBf16Params {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        out_f32: u32,
+        w_row_words: u32,
+        x_off_words: u32,
+        y_off_words: u32,
+        pad0: u32,
+        alpha: f32,
+        pad1: u32,
+        pad2: u32,
+        pad3: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RmsParams {
-    hidden: u32,
-    batch: u32,
-    eps: f32,
-    words_per_row: u32,
-}
+    struct RmsParams {
+        hidden: u32,
+        batch: u32,
+        eps: f32,
+        words_per_row: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct KvFp8Params {
-    n_tokens: u32,
-    n_kv: u32,
-    head_dim: u32,
-    ring: u32,
-    pairs: u32,
-    start: u32,
-    slots: u32,
-    reserved: u32,
-}
+    struct KvFp8Params {
+        n_tokens: u32,
+        n_kv: u32,
+        head_dim: u32,
+        ring: u32,
+        pairs: u32,
+        start: u32,
+        slots: u32,
+        reserved: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct FdParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    total: u32,
-    start: u32,
-    splits: u32,
-    ring: u32,
-    out_bf16: u32,
-    scaling: f32,
-    pad0: u32,
-    fused: u32,
-    pad2: u32,
-    m_rows: u32,
-    window: u32,
-    pad3: u32,
-    pad4: u32,
-}
+    struct FdParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        total: u32,
+        start: u32,
+        splits: u32,
+        ring: u32,
+        out_bf16: u32,
+        scaling: f32,
+        pad0: u32,
+        fused: u32,
+        pad2: u32,
+        m_rows: u32,
+        window: u32,
+        pad3: u32,
+        pad4: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ResScaleParams {
-    n: u32,
-    n_words: u32,
-    scale: f32,
-    cap: f32,
-    inv_cap: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct ResScaleParams {
+        n: u32,
+        n_words: u32,
+        scale: f32,
+        cap: f32,
+        inv_cap: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ConvParams {
-    conv_dim: u32,
-    kernel: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct ConvParams {
+        conv_dim: u32,
+        kernel: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct DeltaQkvParams {
-    n_v: u32,
-    d_k: u32,
-    d_v: u32,
-    key_dim: u32,
-    v_per_k: u32,
-    pad0: u32,
-    pad1: u32,
-    scale: f32,
-}
+    struct DeltaQkvParams {
+        n_v: u32,
+        d_k: u32,
+        d_v: u32,
+        key_dim: u32,
+        v_per_k: u32,
+        pad0: u32,
+        pad1: u32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GatingParams {
-    n_v: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct GatingParams {
+        n_v: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RecurrentParams {
-    heads: u32,
-    d_k: u32,
-    d_v: u32,
-    pad0: u32,
-}
+    struct RecurrentParams {
+        heads: u32,
+        d_k: u32,
+        d_v: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct DeltaOutParams {
-    n_v: u32,
-    d_v: u32,
-    pad0: u32,
-    eps: f32,
-}
+    struct DeltaOutParams {
+        n_v: u32,
+        d_v: u32,
+        pad0: u32,
+        eps: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct NormRopeParams {
-    n_rows: u32,
-    head_dim: u32,
-    src_stride: u32,
-    rot_half: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-    eps: f32,
-}
+    struct NormRopeParams {
+        n_rows: u32,
+        head_dim: u32,
+        src_stride: u32,
+        rot_half: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+        eps: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct KvWriteParams {
-    words: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct KvWriteParams {
+        words: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnDecodeParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    max_seq: u32,
-    group: u32,
-    pad0: u32,
-    pad1: u32,
-    scale: f32,
-}
+    struct AttnDecodeParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        max_seq: u32,
+        group: u32,
+        pad0: u32,
+        pad1: u32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnGateParams {
-    n_words: u32,
-    head_dim: u32,
-    src_stride: u32,
-    gate_off: u32,
-    has_gate: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct AttnGateParams {
+        n_words: u32,
+        head_dim: u32,
+        src_stride: u32,
+        gate_off: u32,
+        has_gate: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct SiluMulParams {
-    n_words: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct SiluMulParams {
+        n_words: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct NormRopeFusedParams {
-    n_q_rows: u32,
-    n_k_rows: u32,
-    head_dim: u32,
-    q_src_stride: u32,
-    k_src_stride: u32,
-    rot_half: u32,
-    pad0: u32,
-    eps: f32,
-}
+    struct NormRopeFusedParams {
+        n_q_rows: u32,
+        n_k_rows: u32,
+        head_dim: u32,
+        q_src_stride: u32,
+        k_src_stride: u32,
+        rot_half: u32,
+        pad0: u32,
+        eps: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct BiasRopeFusedParams {
-    n_q_rows: u32,
-    n_k_rows: u32,
-    n_v_rows: u32,
-    head_dim: u32,
-    rot_half: u32,
-    write_kv: u32,
-    pad1: u32,
-    pad2: u32,
+    struct BiasRopeFusedParams {
+        n_q_rows: u32,
+        n_k_rows: u32,
+        n_v_rows: u32,
+        head_dim: u32,
+        rot_half: u32,
+        write_kv: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 }
 
 pub const ATTN_SHALLOW_ENV_ONE_DISPATCH_PER_LAYER_REPLACES_FLASH1_FLASH2_GATE_HD128_BF16KV_GATELESS_DEFAULT_OFF:
     &str = "NV_Q3D_ATTN_SHALLOW";
 
-pub const ATTN_FOLD_ENV_DEFAULT_ON_FOR_GROUP_6_MEGA_SET_0_FOR_THE_PER_QHEAD_MEGA_ARM: &str =
-    "NV_Q3D_ATTN_FOLD";
-
-fn attn_fold_enabled() -> bool {
-    std::env::var(ATTN_FOLD_ENV_DEFAULT_ON_FOR_GROUP_6_MEGA_SET_0_FOR_THE_PER_QHEAD_MEGA_ARM)
-        .ok()
-        .as_deref()
-        != Some("0")
-}
-
 pub const BIAS_ROPE_WRITES_KV_ENV_DROPS_THE_KVWRITE_PASS_LEAVES_ANY_FP8_PF_CACHE_STALE_PAST_THE_PROMPT_DEFAULT_OFF:
     &str = "NV_Q3D_BIAS_ROPE_KVW";
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnShallowParams {
-    n_kv: u32,
-    head_dim: u32,
-    group: u32,
-    rot_half: u32,
-    scale: f32,
-    splits: u32,
-    pad2: u32,
-    pad3: u32,
+pod! {
+    struct AttnShallowParams {
+        n_kv: u32,
+        head_dim: u32,
+        group: u32,
+        rot_half: u32,
+        scale: f32,
+        splits: u32,
+        pad2: u32,
+        pad3: u32,
+    }
 }
 
-pub const PF_ATTN_FLASH_M_ENV_DEFAULT_ON_FOR_THE_QKV_BIAS_ARCH_SET_0_FOR_THE_SCORES_OR_TILED_ARMS:
-    &str = "NV_Q3D_PF_ATTN_FLASH_M";
+pod! {
+    struct AttnFlashMParams {
+        n_kv: u32,
+        head_dim: u32,
+        group: u32,
+        q_row_elems: u32,
+        y_row_words: u32,
+        pad0: u32,
+        pad1: u32,
+        scale: f32,
+    }
 
-fn pf_attn_flash_m_enabled() -> bool {
-    std::env::var(
-        PF_ATTN_FLASH_M_ENV_DEFAULT_ON_FOR_THE_QKV_BIAS_ARCH_SET_0_FOR_THE_SCORES_OR_TILED_ARMS,
-    )
-    .ok()
-    .as_deref()
-        != Some("0")
-}
+    struct BiasRopeMParams {
+        n_rows: u32,
+        head_dim: u32,
+        src_stride: u32,
+        rot_half: u32,
+        x_row_elems: u32,
+        y_row_elems: u32,
+        bias_off: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnFlashMParams {
-    n_kv: u32,
-    head_dim: u32,
-    group: u32,
-    q_row_elems: u32,
-    y_row_words: u32,
-    pad0: u32,
-    pad1: u32,
-    scale: f32,
-}
+    struct GemvDnMergedParams {
+        qkv_pairs: u32,
+        z_pairs: u32,
+        ab_pairs: u32,
+        qkv_rows: u32,
+        z_rows: u32,
+        ab_rows: u32,
+        fp8_row_words: u32,
+        bf16_row_words: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct BiasRopeMParams {
-    n_rows: u32,
-    head_dim: u32,
-    src_stride: u32,
-    rot_half: u32,
-    x_row_elems: u32,
-    y_row_elems: u32,
-    bias_off: u32,
-    pad0: u32,
-}
+    struct GatherParams {
+        row_off: u32,
+        n_rows: u32,
+        hidden_words: u32,
+        vocab: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvDnMergedParams {
-    qkv_pairs: u32,
-    z_pairs: u32,
-    ab_pairs: u32,
-    qkv_rows: u32,
-    z_rows: u32,
-    ab_rows: u32,
-    fp8_row_words: u32,
-    bf16_row_words: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GatherParams {
-    row_off: u32,
-    n_rows: u32,
-    hidden_words: u32,
-    vocab: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ArgmaxParams {
-    n: u32,
-    groups: u32,
-    pad0: u32,
-    pad1: u32,
+    struct ArgmaxParams {
+        n: u32,
+        groups: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 }
 
 #[derive(Clone)]
@@ -796,9 +811,8 @@ pub const DELTA_AFFINE_RIDES_A_SIDE_CHANNEL_BECAUSE_HOST_DELTANET_FIELDS_ARE_BF1
 pub const FP8_PROJ_STREAMS_CHECKPOINT_BYTES_INSTEAD_OF_A_BF16_UPCAST: &str =
     "the qwen3.8 nvfp4 checkpoints ship the DeltaNet projections as F8_E4M3 with per-row \
      scales; loading them through load_bf16 upcasts 3-bit-mantissa data into an 8-bit-mantissa \
-     container and doubles the decode weight stream for zero information. NV_Q3D_FP8_PROJ=0 \
-     restores the upcast route; the prefill M-row gemm keeps the bf16 copy either way, so fp8 \
-     residency is additive VRAM, not a swap";
+     container and doubles the decode weight stream for zero information; the prefill M-row \
+     gemm keeps the bf16 copy, so fp8 residency is additive VRAM, not a swap";
 
 pub const Q3D_FOLDS_THE_FULL_GQA_GROUP_UNLIKE_E4B: &str =
     "q3d decode folds all group=6 query heads per kv head by default: the 168k sweep reads \
@@ -831,9 +845,9 @@ pub const FLASH_TILE_STAYS_OFF_THE_COOPERATIVE_DOT_PAYS_THE_REDUCE_NOT_THE_RESCA
      redesign, not a tile knob. default 0 = untiled ships";
 
 fn flash_tile_env() -> u32 {
-    static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static T: OnceLock<u32> = OnceLock::new();
     *T.get_or_init(|| {
-        std::env::var("NV_Q3D_FLASH_TILE")
+        env::var("NV_Q3D_FLASH_TILE")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|t| t.clamp(0, 8))
@@ -845,16 +859,14 @@ fn kv_fp8_enabled() -> bool {
     nv_config::env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins!("NV_Q3D_KV_FP8")
 }
 
-pub const KV_FP8_TP_ENV_DEFAULT_ON_SET_0_FOR_THE_POSITION_MAJOR_STAGE1: &str = "NV_Q3D_KV_FP8_TP";
-
 pub const KV_FP8_TP_LANE_PER_POSITION_STAGE1_OVER_A_SECOND_TRANSPOSED_K_CACHE: &str =
-    "NV_Q3D_KV_FP8_TP=1 stores the K fp8 bytes a second time in channel-plane-major order \
+    "the tp stage1 stores the K fp8 bytes a second time in channel-plane-major order \
      (word index (kvh * hd/4 + d4) * slots + pos, k_transposed_word_index) and routes decode \
      stage1 to the fdf*tp* fold arm, whose inner loop gives each subgroup lane its OWN KV \
      position: the q.k dot runs lane-serial over channels with no per-position 5-shuffle \
      butterfly, which FLASH_TILE_STAYS_OFF_THE_COOPERATIVE_DOT_PAYS_THE_REDUCE_NOT_THE_RESCALE \
-     identifies as where llama.cpp's fattn-vec edge lives. Synthetic fold6 hd256 ladder \
-     (q3d_flash_stage1_rate_ladder): stage1 us/dispatch 971->766 at 172032 depth 64 splits, \
+     identifies as where llama.cpp's fattn-vec edge lives. Synthetic fold6 hd256 ladder: \
+     stage1 us/dispatch 971->766 at 172032 depth 64 splits, \
      441->297 at 65536/64, 110->86 at 16384/64; loses 43->55 at 2048/16 where the dispatch is \
      a trivial share of the step. Real-checkpoint A/B: perf/runs.jsonl kv-fp8-tp rows. Costs \
      one extra K-sized fp8 state buffer per full-attn layer (max_seq*n_kv*head_dim bytes) plus \
@@ -862,33 +874,17 @@ pub const KV_FP8_TP_LANE_PER_POSITION_STAGE1_OVER_A_SECOND_TRANSPOSED_K_CACHE: &
      position-major K cache are unchanged because the chunk attention, mk verify, and nvfp4 \
      arms keep reading them";
 
-fn kv_fp8_tp_enabled() -> bool {
-    kv_fp8_enabled()
-        && nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            KV_FP8_TP_ENV_DEFAULT_ON_SET_0_FOR_THE_POSITION_MAJOR_STAGE1,
-        )
-}
-
-pub const KV_FP8_TPW_ENV_DEFAULT_ON_SET_0_FOR_THE_PER_ELEMENT_TP_STAGE1: &str = "NV_Q3D_KV_FP8_TPW";
-
 pub const TPW_ARM_SWAPS_THE_TP_STAGE1_BODY_NOT_THE_ARM_SELECTION: &str =
-    "NV_Q3D_KV_FP8_TPW (default on, =0 restores the per-element tp body) selects the fdf*tpw* \
-     stage1 entry wherever the tp depth gate already selects tp: same transposed K cache, same \
+    "the fdf*tpw* stage1 entry serves wherever the tp depth gate selects tp: same transposed K cache, same \
      bindings, same grid, and \
      TPW_IS_THE_TP_ARM_WITH_LANE_OWNED_V_WORDS_BITWISE_IDENTICAL_BY_CONSTRUCTION (nv-kernels \
      flash_decode) plus the tp-vs-tpw bitwise asserts in q3d_flash_stage1_rate (single-round \
      and multi-round) carry the proof that only the V load pattern changes -- the tp arm's \
      per-element word fetches issue four redundant loads per V word, tpw loads each word once \
-     per lane. M2 Ultra synthetic ladder (q3d_flash_stage1_rate_ladder, q38rival round): \
+     per lane. M2 Ultra synthetic ladder: \
      us/dispatch 5220 -> 2302 at 172032/64, 1995 -> 894 at 65536/64, 623 -> 291 at 16384/64; \
      e2e deep decode 123.0 -> 76.6 ms/tok at d172032; requires hd % 128 == 0, else the tp \
      body serves unchanged";
-
-fn kv_fp8_tpw_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins!(
-        KV_FP8_TPW_ENV_DEFAULT_ON_SET_0_FOR_THE_PER_ELEMENT_TP_STAGE1
-    )
-}
 
 pub const KV_FP8_TP_MIN_TOTAL_ENV_TP_RUNS_ONLY_AT_TOTAL_AT_OR_ABOVE_THIS_PLAIN_INTEGER: &str =
     "NV_Q3D_KV_FP8_TP_MIN_TOTAL";
@@ -931,9 +927,7 @@ pub const DEPTH_GATE_SELECTS_AT_ENCODE_BECAUSE_STEP_CBS_ARE_REENCODED_EVERY_STEP
      crossover. The mtp drafter graph records a single arm (its replay loops never filter).";
 
 fn kv_fp8_tp_min_total() -> u32 {
-    match std::env::var(
-        KV_FP8_TP_MIN_TOTAL_ENV_TP_RUNS_ONLY_AT_TOTAL_AT_OR_ABOVE_THIS_PLAIN_INTEGER,
-    ) {
+    match env::var(KV_FP8_TP_MIN_TOTAL_ENV_TP_RUNS_ONLY_AT_TOTAL_AT_OR_ABOVE_THIS_PLAIN_INTEGER) {
         Ok(v) => v.trim().parse::<u32>().unwrap_or_else(|_| {
             panic!(
                 "{}={v:?} must be a plain integer total-KV-depth threshold",
@@ -995,7 +989,7 @@ enum KvNvfp4Arm {
 }
 
 fn kv_nvfp4_arm() -> Option<KvNvfp4Arm> {
-    match std::env::var(KV_NVFP4_ENV_OFF_BY_DEFAULT_FP8_STAYS_THE_SHIPPED_KV_DECODE_FORMAT)
+    match env::var(KV_NVFP4_ENV_OFF_BY_DEFAULT_FP8_STAYS_THE_SHIPPED_KV_DECODE_FORMAT)
         .ok()
         .as_deref()
     {
@@ -1009,13 +1003,7 @@ fn kv_nvfp4_arm() -> Option<KvNvfp4Arm> {
     }
 }
 
-fn fp8_proj_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins!(
-        "NV_Q3D_FP8_PROJ"
-    )
-}
-
-pub const REQUANT_FP8_TO_NVFP4_ENV_DEFAULT_MLP_THE_MEASURED_QUALITY_NULL_SET_0_FOR_PURE_FP8_OR_A_COMMA_LIST_OF_ATTN_MLP_DN_LMHEAD:
+pub const REQUANT_FP8_TO_NVFP4_ENV_MLP_ALWAYS_REQUANTS_A_COMMA_LIST_OR_ALL_ADDS_ATTN_DN_LMHEAD:
     &str = "NV_Q3D_REQUANT_FP8_TO_NVFP4";
 
 pub const REQUANT_HALVES_THE_FP8_DECODE_WEIGHT_STREAM_BUT_CUTS_BELOW_CHECKPOINT_PRECISION_SO_THE_PPL_PAIR_ADJUDICATES:
@@ -1029,13 +1017,14 @@ pub const REQUANT_HALVES_THE_FP8_DECODE_WEIGHT_STREAM_BUT_CUTS_BELOW_CHECKPOINT_
      bf16 stage plus an expand pass because every shipping nvfp4 gemv stores bf16 y";
 
 fn requant_fp8_group_enabled(group: &str) -> bool {
-    let v = std::env::var(
-        REQUANT_FP8_TO_NVFP4_ENV_DEFAULT_MLP_THE_MEASURED_QUALITY_NULL_SET_0_FOR_PURE_FP8_OR_A_COMMA_LIST_OF_ATTN_MLP_DN_LMHEAD,
+    if group == "mlp" {
+        return true;
+    }
+    let v = env::var(
+        REQUANT_FP8_TO_NVFP4_ENV_MLP_ALWAYS_REQUANTS_A_COMMA_LIST_OR_ALL_ADDS_ATTN_DN_LMHEAD,
     )
     .unwrap_or_default();
     match v.trim() {
-        "" => group == "mlp",
-        "0" | "off" | "false" => false,
         "1" | "all" => true,
         list => list.split(',').any(|g| g.trim() == group),
     }
@@ -1056,14 +1045,14 @@ pub fn requant_fp8_rowscale_to_nvfp4(
     n: usize,
     k: usize,
 ) -> Result<HostNvfp4Lin> {
-    let t0 = std::time::Instant::now();
-    anyhow::ensure!(
+    let t0 = Instant::now();
+    ensure!(
         n.is_multiple_of(128) && k.is_multiple_of(NVFP4_BLOCK * 4),
         "requant fp8->nvfp4 needs n % 128 == 0 (the scale swizzle tile) and k % {} == 0 \
          (the quant_rows tile); got n={n} k={k}",
         NVFP4_BLOCK * 4
     );
-    let bytes: &[u8] = bytemuck::cast_slice(packed);
+    let bytes: &[u8] = cast_slice(packed);
     let amax = nv_quant::fp8::amax_e4m3_per_row(bytes, n, k, scales)?;
     let stored_global = if amax.is_finite() && amax > 0.0 {
         (448.0f32 * 6.0) / amax
@@ -1149,7 +1138,7 @@ fn requant_boot_report() {
     );
 }
 
-pub const PF_COOP_ENV_DEFAULT_ON_SET_0_FOR_THE_LEGACY_M16_GEMM_ARM: &str = "NV_Q3D_PF_COOP";
+pub const PF_COOP_ENV_1_ALSO_ROUTES_SMALL_M_GRAPHS_THROUGH_COOP: &str = "NV_Q3D_PF_COOP";
 
 pub const PF_COOP_ROUTES_PF_PROJECTIONS_THROUGH_16X16_COOPMAT_AND_DROPS_THE_FP8_BF16_TWIN: &str =
     "The chunked-prefill projections route through the 16x16 f16 cooperative-matrix kernels by \
@@ -1159,15 +1148,8 @@ pub const PF_COOP_ROUTES_PF_PROJECTIONS_THROUGH_16X16_COOPMAT_AND_DROPS_THE_FP8_
      NV_WGPU_PREFILL_M default from 16 to 512 (ceiling 1024) and skips the fp8 projections' bf16-twin \
      upload, whose only consumer was the m-row bf16 gemm the coop path replaces. Decode passes \
      are byte-identical on both arms; prefill numerics drift within the ppl gate because the \
-     a16 side multiplies f16 activations instead of quantized ones. NV_Q3D_PF_COOP=0 restores \
-     the m<=16 bf16 gemm prefill arm at the cost of the coop ladder's prefill throughput \
-     (the prefill cost of the legacy arm is on the runs.jsonl ladder).";
-
-fn pf_coop_requested() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        PF_COOP_ENV_DEFAULT_ON_SET_0_FOR_THE_LEGACY_M16_GEMM_ARM,
-    )
-}
+     a16 side multiplies f16 activations instead of quantized ones; the m<=16 bf16 gemm arm \
+     carries the small-m verify graphs and adapters without coop fragments.";
 
 pub const PF_ATTN_MK_ENV_DEFAULT_OFF_UNTIL_THE_LADDER_AND_PPL_GATE_ARE_ON_RECORD: &str =
     "NV_Q3D_PF_ATTN_MK";
@@ -1187,7 +1169,7 @@ pub const PF_ATTN_MK_STREAMS_KV_ONCE_PER_8_ROWS_INSTEAD_OF_MATERIALIZING_M_X_MAX
 const PF_ATTN_MK_ROWS_PER_DISPATCH_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS: usize = 8;
 
 fn pf_attn_mk_enabled() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+    env_arm_opt_in_eq_some_1_reread_every_call(
         PF_ATTN_MK_ENV_DEFAULT_OFF_UNTIL_THE_LADDER_AND_PPL_GATE_ARE_ON_RECORD,
     )
 }
@@ -1215,16 +1197,16 @@ fn q3w_pf_attn_mk_qcast(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfAttnMkQcastParams {
-    n_words: u32,
-    pad0: u32,
-    pad1: u32,
-    scale: f32,
+pod! {
+    struct PfAttnMkQcastParams {
+        n_words: u32,
+        pad0: u32,
+        pad1: u32,
+        scale: f32,
+    }
 }
 
-pub const PF_ATTN_TILED_ENV_DEFAULT_ON_SET_0_FOR_THE_SCORES_SLAB_ARM: &str = "NV_Q3D_PF_ATTN_TILED";
+pub const PF_ATTN_TILED_ENV_1_ALSO_ROUTES_SMALL_M_GRAPHS_THROUGH_TILED_FLASH: &str = "NV_Q3D_PF_ATTN_TILED";
 
 pub const PF_ATTN_TILED_REUSES_THE_MOE_TILED_FLASH_FAMILY_OVER_A_PF_FP8_KV_QUANTIZE: &str =
     "The M-row prefill attention routes through the qwen3_5_moe_wgpu tiled flash family by \
@@ -1240,15 +1222,10 @@ pub const PF_ATTN_TILED_REUSES_THE_MOE_TILED_FLASH_FAMILY_OVER_A_PF_FP8_KV_QUANT
      past m_live compute dead finite values into dead a_attn rows, exactly the class of stale \
      garbage the scores arm already leaves there. The full default stack's same-box ladder reads \
      faster prefill at every depth with same-session ppl held (perf/runs.jsonl ladder); \
-     NV_Q3D_PF_ATTN_TILED=0 restores the \
-     q3w_attn_decode_m scores-slab arm at that cost, and NV_Q3D_PF_ATTN_MK=1 selects the mk arm \
-     instead of the tiled one.";
-
-pub const PF_ATTN_COOP_ENV_DEFAULT_ON_SET_0_FOR_THE_SCALAR_SLOTML_ARM_PPL_BAND_AND_AB_ROWS_ARE_ON_RECORD:
-    &str = "NV_Q3D_PF_ATTN_COOP";
+     NV_Q3D_PF_ATTN_MK=1 selects the mk arm instead of the tiled one.";
 
 pub const PF_ATTN_COOP_REROUTES_TILED_STAGE1_THROUGH_16X16_F16_COOPMAT: &str =
-    "NV_Q3D_PF_ATTN_COOP=1 replaces the scalar tiled pf stage1 \
+    "the coop tiled pf stage1 replaces the scalar tiled pf stage1 \
      (q3w_pf_flash1_fp8kv_tiled_slotml_*) with q3w_pf_flash1_fp8kv_tiled_coop_sg: QK^T and P.V \
      run as 16x16x16 f16 cooperative-matrix products over an exactly-decoded f16 stage of the \
      fp8 KV cache (every e4m3 value is f16-representable), Q rides a bf16->f16 cast instead of \
@@ -1262,23 +1239,8 @@ pub const PF_ATTN_COOP_REROUTES_TILED_STAGE1_THROUGH_16X16_F16_COOPMAT: &str =
      4k-172k KV on the sm_120 box (runs.jsonl \"qwen3.8 prefill-r1\"); unsupported geometry \
      falls back to the slotml arm loudly.";
 
-fn pf_attn_coop_requested() -> bool {
-    !matches!(
-        std::env::var(
-            PF_ATTN_COOP_ENV_DEFAULT_ON_SET_0_FOR_THE_SCALAR_SLOTML_ARM_PPL_BAND_AND_AB_ROWS_ARE_ON_RECORD
-        )
-        .ok()
-        .as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
 fn pf_attn_tiled_enabled() -> bool {
-    std::env::var(PF_ATTN_TILED_ENV_DEFAULT_ON_SET_0_FOR_THE_SCORES_SLAB_ARM)
-        .ok()
-        .as_deref()
-        != Some("0")
-        && !pf_attn_mk_enabled()
+    !pf_attn_mk_enabled()
 }
 
 fn host_pf_projections_ride_the_coop_route(h: &HostDenseWeights, tile: Option<u32>) -> bool {
@@ -1331,7 +1293,7 @@ fn host_carries_affine_w4(h: &HostDenseWeights) -> bool {
 }
 
 fn loader_is_mlx_affine_probing_layer0_because_mlx_quantizes_the_whole_trunk(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
 ) -> bool {
     [
         "model.language_model.layers.0",
@@ -1345,8 +1307,8 @@ fn loader_is_mlx_affine_probing_layer0_because_mlx_quantizes_the_whole_trunk(
 pub const PF_COOP_AFFINE_ENV_DEFAULT_ON_FOR_THE_QKV_BIAS_ARCH_ONLY_BECAUSE_THE_QWEN3_AFFINE_PREFILL_NUMBERS_ARE_PINNED_ON_THE_M16_GEMM:
     &str = "NV_Q3D_PF_COOP_AFFINE";
 
-fn loader_affine_rides_pf_coop(w: &nv_weights::WeightLoader) -> bool {
-    match std::env::var(PF_COOP_AFFINE_ENV_DEFAULT_ON_FOR_THE_QKV_BIAS_ARCH_ONLY_BECAUSE_THE_QWEN3_AFFINE_PREFILL_NUMBERS_ARE_PINNED_ON_THE_M16_GEMM)
+fn loader_affine_rides_pf_coop(w: &WeightLoader) -> bool {
+    match env::var(PF_COOP_AFFINE_ENV_DEFAULT_ON_FOR_THE_QKV_BIAS_ARCH_ONLY_BECAUSE_THE_QWEN3_AFFINE_PREFILL_NUMBERS_ARE_PINNED_ON_THE_M16_GEMM)
         .ok()
         .as_deref()
     {
@@ -1364,7 +1326,7 @@ fn loader_affine_rides_pf_coop(w: &nv_weights::WeightLoader) -> bool {
 }
 
 fn loader_pf_projections_ride_the_coop_route_probing_layer0_of_each_type_because_checkpoints_are_uniform(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     cfg: &Qwen3_5DenseConfig,
     tile: Option<u32>,
 ) -> bool {
@@ -1433,20 +1395,17 @@ const PF_ATTN_TILED_ENTRY_IS_THE_MOE_DEFAULT_SLOTML_ARM_SG_THEN_WG: [&str; 2] = 
 
 const PF_ATTN_TILED_STAGE_ARRAYS_HOLD_FDT_POS_8_TIMES_HEAD_DIM_F32: usize = 2048;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfKvqMParams {
-    tokens: u32,
-    x_stride_elems: u32,
-    pad0: u32,
-    pad1: u32,
+pod! {
+    struct PfKvqMParams {
+        tokens: u32,
+        x_stride_elems: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 }
 
 fn pf_coop_tile(ctx: &WgpuContext) -> Option<u32> {
-    if !pf_coop_requested() {
-        return None;
-    }
-    static T: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    static T: OnceLock<Option<u32>> = OnceLock::new();
     *T.get_or_init(
         || match wk::gemm_coop_f16::select(ctx, wk::gemm_coop_f16::Operand::F16) {
             Ok(g) => Some(g.tile),
@@ -1466,17 +1425,13 @@ pub const APPLE_COOP_IS_8X8_SO_THE_AFFINE_PREFILL_RIDES_AN_F16_TWIN_NOT_THE_WQ16
     "metal simdgroup matrices are 8x8; the wq16 in-kernel-dequant coop arms stage one 16-code      weight block per fragment row and require 16x16 fragments, so on an 8x8 adapter the      mlx-affine projections dequantize to an f16 twin at load (prefill-only VRAM, the decode      gemvs keep the packed w4) and ride the plain-f16 tile-8 coop gemm instead";
 
 fn pf_coop_active(ctx: &WgpuContext) -> bool {
-    if !pf_coop_requested() {
-        return false;
-    }
-    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static OK: OnceLock<bool> = OnceLock::new();
     *OK.get_or_init(
         || match wk::gemm_coop_f16::select(ctx, wk::gemm_coop_f16::Operand::F16) {
             Ok(g) if g.tile == 16 => true,
             Ok(g) => {
                 eprintln!(
-                    "[q3d-wgpu] the default coop prefill \
-                     ({PF_COOP_ENV_DEFAULT_ON_SET_0_FOR_THE_LEGACY_M16_GEMM_ARM}) needs 16x16 f16 \
+                    "[q3d-wgpu] the default coop prefill needs 16x16 f16 \
                      fragments for the wq16 staging unpack but the adapter serves only {t}x{t}; \
                      keeping the m<=16 gemm path",
                     t = g.tile
@@ -1485,8 +1440,7 @@ fn pf_coop_active(ctx: &WgpuContext) -> bool {
             }
             Err(why) => {
                 eprintln!(
-                    "[q3d-wgpu] the default coop prefill \
-                     ({PF_COOP_ENV_DEFAULT_ON_SET_0_FOR_THE_LEGACY_M16_GEMM_ARM}) is unavailable: \
+                    "[q3d-wgpu] the default coop prefill is unavailable: \
                      {why}; keeping the m<=16 gemm path"
                 );
                 false
@@ -1495,11 +1449,10 @@ fn pf_coop_active(ctx: &WgpuContext) -> bool {
     )
 }
 
-pub const PF_SCAN_WY_ENV_DEFAULT_ON_SET_0_FOR_THE_TOKEN_SERIAL_SCAN: &str = "NV_Q3D_PF_SCAN_WY";
+pub const PF_SCAN_WY_ENV_1_ALSO_ROUTES_SMALL_M_GRAPHS_THROUGH_THE_WY_SCAN: &str = "NV_Q3D_PF_SCAN_WY";
 
 pub const PF_SCAN_WY_SOLVES_32_TOKEN_SUBCHUNKS_AS_A_UT_TRANSFORM_INSTEAD_OF_TOKEN_SERIAL: &str =
-    "The prefill DeltaNet scan routes through q3w_delta_scan_wy by default \
-     (NV_Q3D_PF_SCAN_WY=0 restores the token-serial q3w_delta_scan), which \
+    "The prefill DeltaNet scan routes through q3w_delta_scan_wy by default, which \
      rewrites each 32-token sub-chunk of the sequential recurrence as (I + A) U = diag(beta) \
      (V - decayed K S_prev) solved by forward substitution, with outputs and the state update \
      as chunk-level rank-32 products: the 64 KB per-head f32 state is touched 2 reads + 1 \
@@ -1536,7 +1489,7 @@ pub const PF_SCAN_WY_V2_SPLITS_THE_WY_SCAN_INTO_A_SERIAL_LADDER_AND_A_PARALLEL_O
      this experiment without first unfusing cheaper than the o pass re-pays.";
 
 fn pf_scan_wy_v2_requested() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+    env_arm_opt_in_eq_some_1_reread_every_call(
         PF_SCAN_WY_V2_ENV_OPT_IN_SET_1_TO_HOIST_OUTPUTS_OFF_THE_SERIAL_LADDER,
     )
 }
@@ -1552,10 +1505,6 @@ fn pf_scan_wy_route(d_k: usize, d_v: usize, max_workgroup_storage: u32) -> (&'st
             >= WY16_SCAN_WORKGROUP_BYTES_TWO_8K_VEC4_TILES_TWO_1K_TRIANGLES_ONE_2K_SCALAR_U_TWO_64B_LANES
             && d_k == 128
             && d_v == 128
-            && std::env::var(PF_SCAN_WY_ENV_DEFAULT_ON_SET_0_FOR_THE_TOKEN_SERIAL_SCAN)
-                .ok()
-                .as_deref()
-                != Some("0")
         {
             eprintln!(
                 "[q3d-wgpu] wy32 needs {} B of workgroup storage, adapter reports \
@@ -1578,13 +1527,7 @@ fn pf_scan_wy_route(d_k: usize, d_v: usize, max_workgroup_storage: u32) -> (&'st
         );
         return ("q3w_delta_scan", 1);
     }
-    if d_k == 128
-        && d_v == 128
-        && std::env::var(PF_SCAN_WY_ENV_DEFAULT_ON_SET_0_FOR_THE_TOKEN_SERIAL_SCAN)
-            .ok()
-            .as_deref()
-            != Some("0")
-    {
+    if d_k == 128 && d_v == 128 {
         (
             "q3w_delta_scan_wy",
             PF_SCAN_WY_VSPLIT_4_WORKGROUPS_PER_HEAD_EACH_OWNS_32_V_COLUMNS,
@@ -1594,7 +1537,7 @@ fn pf_scan_wy_route(d_k: usize, d_v: usize, max_workgroup_storage: u32) -> (&'st
     }
 }
 
-pub const VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SET_0_FOR_THE_SCORES_SLAB_ARM: &str =
+pub const VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SMV2_LOOP_OR_MIN_TOTAL_PICK_AN_ARM: &str =
     "NV_Q3D_VF_ATTN_FLASH";
 
 pub const VF_ATTN_FLASH_GIVES_SMALL_M_VERIFY_GRAPHS_SPLIT_K_FLASH_OVER_THE_FP8_KV_CACHE: &str =
@@ -1627,24 +1570,22 @@ enum VfAttnFlashArm {
     RowLoop,
 }
 
-fn vf_attn_flash_arm() -> Option<(VfAttnFlashArm, Option<u32>)> {
-    let raw = std::env::var(
-        VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SET_0_FOR_THE_SCORES_SLAB_ARM,
-    )
-    .ok();
+fn vf_attn_flash_arm() -> (VfAttnFlashArm, Option<u32>) {
+    let raw =
+        env::var(VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SMV2_LOOP_OR_MIN_TOTAL_PICK_AN_ARM)
+            .ok();
     match raw.as_deref() {
-        None | Some("") | Some("gate") => Some((
+        None | Some("") | Some("gate") => (
             VfAttnFlashArm::RowLoop,
             Some(VF_FLASH_LOOP_ENGAGES_AT_THE_MEASURED_VERIFY_CROSSOVER_TOTAL),
-        )),
-        Some("0") => None,
-        Some("smv2") | Some("1") => Some((VfAttnFlashArm::Smv2, None)),
-        Some("loop") => Some((VfAttnFlashArm::RowLoop, None)),
+        ),
+        Some("smv2") | Some("1") => (VfAttnFlashArm::Smv2, None),
+        Some("loop") => (VfAttnFlashArm::RowLoop, None),
         Some(other) => match other.parse::<u32>() {
-            Ok(min_total) if min_total >= 2 => Some((VfAttnFlashArm::RowLoop, Some(min_total))),
+            Ok(min_total) if min_total >= 2 => (VfAttnFlashArm::RowLoop, Some(min_total)),
             _ => panic!(
-                "{VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SET_0_FOR_THE_SCORES_SLAB_ARM}={other}: \
-                 set smv2 (or 1), loop, gate, a min-total integer >= 2, or 0"
+                "{VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SMV2_LOOP_OR_MIN_TOTAL_PICK_AN_ARM}={other}: \
+                 set smv2 (or 1), loop, gate, or a min-total integer >= 2"
             ),
         },
     }
@@ -1716,15 +1657,7 @@ pub struct HostDenseWeights {
 
 pub enum WeightSource<'a> {
     Host(&'a HostDenseWeights),
-    Loader(&'a nv_weights::WeightLoader),
-}
-
-fn bf16_bits(x: f32) -> u16 {
-    half::bf16::from_f32(x).to_bits()
-}
-
-fn bf16_val(b: u16) -> f32 {
-    f32::from_bits((b as u32) << 16)
+    Loader(&'a WeightLoader),
 }
 
 fn pack_pairs(src: &[u16]) -> Vec<u32> {
@@ -1754,14 +1687,9 @@ pub fn rope_tables(rotary_dim: usize, theta: f32, rows: usize) -> (Vec<f32>, Vec
 
 pub use crate::embed_row_splice::EmbedRowSplice as ImageRowSplice;
 
-struct ChunkRowSplice<'a> {
-    rel_pos: usize,
-    row_words: &'a [u32],
-}
-
 struct Pass {
-    pipeline: std::sync::Arc<wgpu::ComputePipeline>,
-    bind: wgpu::BindGroup,
+    pipeline: Arc<ComputePipeline>,
+    bind: BindGroup,
     grid: (u32, u32, u32),
     label: String,
 }
@@ -1796,12 +1724,12 @@ pub const REWIND_DROPS_CHECKPOINTS_ABOVE_THE_TARGET_BECAUSE_THE_RESUMED_STREAM_D
 
 struct Verify {
     rows: usize,
-    res2_rows: wgpu::Buffer,
+    res2_rows: Buffer,
     resadd: Pass,
     chunk_resadd: Pass,
-    tok: wgpu::Buffer,
-    row_logits: Option<wgpu::Buffer>,
-    rollback: Vec<wgpu::Buffer>,
+    tok: Buffer,
+    row_logits: Option<Buffer>,
+    rollback: Vec<Buffer>,
     validated: bool,
     pending: Option<Vec<u32>>,
     pending_rode_vf: bool,
@@ -1812,19 +1740,14 @@ pub const PF_M_DEFAULT_512_PPL_PAIR_IS_PLUS_0_0109_NATS_OVER_M256_ACCEPTED_BY_US
 pub const PF_M_EXPLICIT_ENV_CEILING_1024_ON_THE_COOP_ROUTE: usize = 1024;
 
 pub fn prefill_m() -> usize {
-    let (default_m, cap) = if pf_coop_requested() {
-        (
-            PF_M_DEFAULT_512_PPL_PAIR_IS_PLUS_0_0109_NATS_OVER_M256_ACCEPTED_BY_USER_UNDER_THE_WIDENED_0_011_NAT_BAND,
-            PF_M_EXPLICIT_ENV_CEILING_1024_ON_THE_COOP_ROUTE,
-        )
-    } else {
-        (16, 16)
-    };
-    match std::env::var("NV_WGPU_PREFILL_M")
+    let (default_m, cap) = (
+        PF_M_DEFAULT_512_PPL_PAIR_IS_PLUS_0_0109_NATS_OVER_M256_ACCEPTED_BY_USER_UNDER_THE_WIDENED_0_011_NAT_BAND,
+        PF_M_EXPLICIT_ENV_CEILING_1024_ON_THE_COOP_ROUTE,
+    );
+    match env::var("NV_WGPU_PREFILL_M")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     {
-        Some(0) | Some(1) => 0,
         Some(m) => m.clamp(2, cap),
         None => default_m,
     }
@@ -1845,21 +1768,18 @@ pub const VERIFY_M_DEFAULT_RECORDS_ONLY_BESIDE_A_COOP_PREFILL_GRAPH: &str =
      an explicit NV_Q3D_VERIFY_M still records beside any strictly larger prefill graph";
 
 pub fn verify_m_dedicated_graph_rows_requested() -> usize {
-    std::env::var(VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM)
+    env::var(VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(VERIFY_M_UNSET_DEFAULT_4_THE_KP1_CHAIN_AT_THE_SHIPPED_K3)
 }
 
 pub fn verify_m_env_is_explicit() -> bool {
-    std::env::var(VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM)
+    env::var(VERIFY_M_ENV_DEFAULT_4_ROW_CHAIN_GRAPH_SET_0_FOR_THE_PF_M_PADDED_ARM)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .is_some()
 }
-
-pub const MTP_COMMIT_SCAN_REPLAY_ENV_DEFAULT_ON_SET_0_FOR_THE_COMMIT_ONLY_REFORWARD_ARM: &str =
-    "NV_Q3D_MTP_COMMIT_SCAN_REPLAY";
 
 pub const MTP_COMMIT_SCAN_REPLAY_RESTORES_THE_SNAPSHOT_AND_REDISPATCHES_ONLY_EACH_DELTANET_CONV_SHIFT_AND_SCAN:
     &str = "every m-row kernel in the verify graph is causal in the row index and the graph \
@@ -1871,32 +1791,10 @@ pub const MTP_COMMIT_SCAN_REPLAY_RESTORES_THE_SNAPSHOT_AND_REDISPATCHES_ONLY_EAC
      commits a partial accept by restoring the rollback snapshot and re-dispatching only each \
      DeltaNet layer's conv_shift and scan at m_live = n, reproducing the commit-only reforward's \
      committed state bit-for-bit while skipping every projection, attention and MLP pass. The \
-     arm needs the dedicated verify graph and is inert without it; \
-     NV_Q38_MTP_VERIFY_REPLAY=1 still restores the increment-1 M=1 replay commit.";
-
-const NV_Q38_MTP_VERIFY_REPLAY_ENV_MIRRORS_NV_SPECDECODE_QWEN38_MTP_SO_THE_M1_REPLAY_ESCAPE_ALSO_DISARMS_SCAN_REPLAY:
-    &str = "NV_Q38_MTP_VERIFY_REPLAY";
-
-pub fn mtp_commit_scan_replay_requested() -> bool {
-    std::env::var(MTP_COMMIT_SCAN_REPLAY_ENV_DEFAULT_ON_SET_0_FOR_THE_COMMIT_ONLY_REFORWARD_ARM)
-        .ok()
-        .as_deref()
-        != Some("0")
-}
-
-fn mtp_verify_replay_escape_selected() -> bool {
-    std::env::var(NV_Q38_MTP_VERIFY_REPLAY_ENV_MIRRORS_NV_SPECDECODE_QWEN38_MTP_SO_THE_M1_REPLAY_ESCAPE_ALSO_DISARMS_SCAN_REPLAY)
-        .ok()
-        .as_deref()
-        .map(str::trim)
-        == Some("1")
-}
+     arm needs the dedicated verify graph and is inert without it.";
 
 fn na_enabled() -> bool {
-    matches!(
-        std::env::var("NV_WGPU_NA").ok().as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
+    env_on("NV_WGPU_NA")
 }
 
 struct PfCoop {
@@ -1905,9 +1803,9 @@ struct PfCoop {
     tn: u32,
     sg: u32,
     m_alloc: u32,
-    x_f16: wgpu::Buffer,
-    y_f32: wgpu::Buffer,
-    zero: wgpu::Buffer,
+    x_f16: Buffer,
+    y_f32: Buffer,
+    zero: Buffer,
     helpers: String,
 }
 
@@ -1983,52 +1881,50 @@ fn q3w_pf_coop_pack_y(
 }
 "#;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct CoopCastParams {
-    k_elems: u32,
-    x_stride_words: u32,
-    rows_in: u32,
-    rows_out: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+pod! {
+    struct CoopCastParams {
+        k_elems: u32,
+        x_stride_words: u32,
+        rows_in: u32,
+        rows_out: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct CoopPackParams {
-    n_cols: u32,
-    y_src_stride: u32,
-    y_dst_stride_words: u32,
-    rows: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    alpha: f32,
+    struct CoopPackParams {
+        n_cols: u32,
+        y_src_stride: u32,
+        y_dst_stride_words: u32,
+        rows: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+        alpha: f32,
+    }
 }
 
 struct PfAttnMk {
-    q_f32: wgpu::Buffer,
-    scratch: wgpu::Buffer,
-    fd: Vec<wgpu::Buffer>,
+    q_f32: Buffer,
+    scratch: Buffer,
+    fd: Vec<Buffer>,
 }
 
 struct PfAttnTiled {
-    q_f32: wgpu::Buffer,
-    scratch: wgpu::Buffer,
-    fd: wgpu::Buffer,
-    start: wgpu::Buffer,
-    q_f16_coop: Option<wgpu::Buffer>,
+    q_f32: Buffer,
+    scratch: Buffer,
+    fd: Buffer,
+    start: Buffer,
+    q_f16_coop: Option<Buffer>,
 }
 
 struct PfAttnVflash {
     arm: VfAttnFlashArm,
     gate_min_total: Option<u32>,
-    q_f32: wgpu::Buffer,
-    scratch: wgpu::Buffer,
-    row_fd: Vec<wgpu::Buffer>,
+    q_f32: Buffer,
+    scratch: Buffer,
+    row_fd: Vec<Buffer>,
 }
 
 struct Pf {
@@ -2037,44 +1933,44 @@ struct Pf {
     attn_mk: Option<PfAttnMk>,
     attn_tiled: Option<PfAttnTiled>,
     attn_vflash: Option<PfAttnVflash>,
-    attn_kvq_fd_start: Option<(wgpu::Buffer, wgpu::Buffer)>,
-    na: Option<std::sync::Arc<wgpu::ComputePipeline>>,
+    attn_kvq_fd_start: Option<(Buffer, Buffer)>,
+    na: Option<Arc<ComputePipeline>>,
     coop: Option<PfCoop>,
     gemm_src: String,
     gemm_entry: String,
     gemm_i8_src: String,
-    ck: wgpu::Buffer,
-    tok: wgpu::Buffer,
-    splice: wgpu::Buffer,
-    mask: wgpu::Buffer,
-    res: wgpu::Buffer,
-    normed: wgpu::Buffer,
-    mix: wgpu::Buffer,
-    mlp_out: wgpu::Buffer,
-    normed_post: wgpu::Buffer,
-    d_qkv: wgpu::Buffer,
-    d_z: wgpu::Buffer,
-    d_ab: wgpu::Buffer,
-    d_mixed: wgpu::Buffer,
-    d_q: wgpu::Buffer,
-    d_k: wgpu::Buffer,
-    d_v: wgpu::Buffer,
-    d_g: wgpu::Buffer,
-    d_beta: wgpu::Buffer,
-    d_core: wgpu::Buffer,
-    d_wy_ckpt: Option<(wgpu::Buffer, wgpu::Buffer)>,
-    d_gated: wgpu::Buffer,
-    a_qraw: wgpu::Buffer,
-    a_kraw: wgpu::Buffer,
-    a_vraw: wgpu::Buffer,
-    a_q: wgpu::Buffer,
-    a_k: wgpu::Buffer,
-    a_scores: wgpu::Buffer,
-    a_attn: wgpu::Buffer,
-    a_gated: wgpu::Buffer,
-    m_ygate: wgpu::Buffer,
-    m_yup: wgpu::Buffer,
-    m_act: wgpu::Buffer,
+    ck: Buffer,
+    tok: Buffer,
+    splice: Buffer,
+    mask: Buffer,
+    res: Buffer,
+    normed: Buffer,
+    mix: Buffer,
+    mlp_out: Buffer,
+    normed_post: Buffer,
+    d_qkv: Buffer,
+    d_z: Buffer,
+    d_ab: Buffer,
+    d_mixed: Buffer,
+    d_q: Buffer,
+    d_k: Buffer,
+    d_v: Buffer,
+    d_g: Buffer,
+    d_beta: Buffer,
+    d_core: Buffer,
+    d_wy_ckpt: Option<(Buffer, Buffer)>,
+    d_gated: Buffer,
+    a_qraw: Buffer,
+    a_kraw: Buffer,
+    a_vraw: Buffer,
+    a_q: Buffer,
+    a_k: Buffer,
+    a_scores: Buffer,
+    a_attn: Buffer,
+    a_gated: Buffer,
+    m_ygate: Buffer,
+    m_yup: Buffer,
+    m_act: Buffer,
 }
 
 struct Builder {
@@ -2105,11 +2001,11 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<Pass> {
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
         Ok(Pass {
             pipeline,
@@ -2128,7 +2024,7 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
         let pass = self.make(label, source, entry, binds, grid)?;
@@ -2157,10 +2053,10 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
-        if nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q3D_DUMP_PF_PASSES") {
+        if env_arm_opt_in_eq_some_1_reread_every_call("NV_Q3D_DUMP_PF_PASSES") {
             eprintln!(
                 "[pf-pass {}{:>3}] {label} :: {entry} grid={grid:?}",
                 if self.pf_dst_vf { "vf " } else { "" },
@@ -2177,11 +2073,11 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer, u64)],
+        binds: &[(u32, &Buffer, u64)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group_offsets(self.ctx, &pipeline, binds);
         let pass = Pass {
             pipeline,
@@ -2200,8 +2096,8 @@ impl Builder {
     fn push_pf_pipeline(
         &mut self,
         label: &str,
-        pipeline: std::sync::Arc<wgpu::ComputePipeline>,
-        binds: &[(u32, &wgpu::Buffer)],
+        pipeline: Arc<ComputePipeline>,
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) {
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
@@ -2407,15 +2303,15 @@ impl Sources {
 }
 
 struct Bf16Gpu {
-    w: wgpu::Buffer,
+    w: Buffer,
     n: usize,
     k: usize,
 }
 
 struct Nvfp4Gpu {
-    w: wgpu::Buffer,
-    scales: wgpu::Buffer,
-    scales_linear: Option<wgpu::Buffer>,
+    w: Buffer,
+    scales: Buffer,
+    scales_linear: Option<Buffer>,
     alpha: f32,
     input_global: f32,
     n: usize,
@@ -2423,18 +2319,18 @@ struct Nvfp4Gpu {
 }
 
 struct I8Gpu {
-    w: wgpu::Buffer,
-    s: wgpu::Buffer,
+    w: Buffer,
+    s: Buffer,
     n: usize,
     k: usize,
     group: usize,
 }
 
 struct AffineW4Gpu {
-    w: wgpu::Buffer,
-    scales: wgpu::Buffer,
-    biases: wgpu::Buffer,
-    f16_twin: Option<wgpu::Buffer>,
+    w: Buffer,
+    scales: Buffer,
+    biases: Buffer,
+    f16_twin: Option<Buffer>,
     n: usize,
     k: usize,
     gs: usize,
@@ -2478,11 +2374,11 @@ impl DenseLinGpu {
 }
 
 struct QuantIn {
-    xq: wgpu::Buffer,
-    xs: wgpu::Buffer,
-    sel: wgpu::Buffer,
-    alpha_dummy: wgpu::Buffer,
-    xm: Option<wgpu::Buffer>,
+    xq: Buffer,
+    xs: Buffer,
+    sel: Buffer,
+    alpha_dummy: Buffer,
+    xm: Option<Buffer>,
 }
 
 pub const MTP_HEAD_CONVENTIONS_ZERO_CENTERED_NORMS_EMB_FIRST_FC_AND_SHIFT_BY_ONE_KV_WITH_A_ZERO_HIDDEN_AT_POS_0:
@@ -2545,7 +2441,7 @@ pub fn mtp_speculator_deltas_from_adapter_dir(
         serde_json::from_str(&raw).with_context(|| format!("parse {}", main_cfg_path.display()))?;
     let sdir = adapter_dir.join(SPECULATOR_SUBDIR);
     let Some(kind) = main_cfg.get(SPECULATOR_KIND_KEY).and_then(|k| k.as_str()) else {
-        anyhow::ensure!(
+        ensure!(
             !sdir.exists(),
             "{} exists but the main adapter_config.json carries no {SPECULATOR_KIND_KEY}: the \
              kind is authoritative in the main config (the eagle3 writer never tags the subdir \
@@ -2554,7 +2450,7 @@ pub fn mtp_speculator_deltas_from_adapter_dir(
         );
         return Ok(None);
     };
-    anyhow::ensure!(
+    ensure!(
         kind == nv_train::qwen38::QWEN38_MTP_SPECULATOR_KIND,
         "adapter {} carries speculator kind {kind:?} but this engine's drafter is the qwen3.8 \
          MTP head ({:?}); refusing the whole artifact instead of serving the target adapter \
@@ -2573,16 +2469,16 @@ pub fn mtp_speculator_deltas_from_adapter_dir(
     > = std::collections::BTreeMap::new();
     for (name, t) in tensors {
         let stripped = name.strip_prefix("base_model.model.").ok_or_else(|| {
-            anyhow::anyhow!("{st_path:?}: tensor {name} is not a peft base_model.model.* entry")
+            anyhow!("{st_path:?}: tensor {name} is not a peft base_model.model.* entry")
         })?;
         let (module, is_a) = if let Some(m) = stripped.strip_suffix(".lora_A.weight") {
             (m, true)
         } else if let Some(m) = stripped.strip_suffix(".lora_B.weight") {
             (m, false)
         } else {
-            anyhow::bail!("{st_path:?}: tensor {name} is neither a lora_A nor a lora_B weight");
+            bail!("{st_path:?}: tensor {name} is neither a lora_A nor a lora_B weight");
         };
-        anyhow::ensure!(
+        ensure!(
             MTP_SPECULATOR_LORA_TARGETS_ARE_THE_8_HEAD_PROJECTIONS_NORMS_EMBED_AND_LM_HEAD_ARE_NEVER_TARGETS
                 .contains(&module),
             "{st_path:?}: {module} is not an MTP-head LoRA target; norms load zero-centered as \
@@ -2595,21 +2491,21 @@ pub fn mtp_speculator_deltas_from_adapter_dir(
         } else {
             &mut slot_pair.1
         };
-        anyhow::ensure!(slot.is_none(), "{st_path:?}: duplicate tensor {name}");
+        ensure!(slot.is_none(), "{st_path:?}: duplicate tensor {name}");
         *slot = Some(t);
     }
-    anyhow::ensure!(
+    ensure!(
         !pending.is_empty(),
         "{st_path:?}: the speculator artifact holds no LoRA pairs; the trainers refuse to save \
          an empty speculator, so this artifact is corrupt"
     );
     let mut entries = Vec::with_capacity(pending.len());
     for (module, (a, b)) in pending {
-        let a = a.ok_or_else(|| anyhow::anyhow!("{st_path:?}: {module} is missing lora_A"))?;
-        let b = b.ok_or_else(|| anyhow::anyhow!("{st_path:?}: {module} is missing lora_B"))?;
+        let a = a.ok_or_else(|| anyhow!("{st_path:?}: {module} is missing lora_A"))?;
+        let b = b.ok_or_else(|| anyhow!("{st_path:?}: {module} is missing lora_B"))?;
         let (a_r, in_dim) = a.dims2().with_context(|| format!("{module} lora_A dims"))?;
         let (out_dim, b_r) = b.dims2().with_context(|| format!("{module} lora_B dims"))?;
-        anyhow::ensure!(
+        ensure!(
             a_r == scfg.r && b_r == scfg.r,
             "{module}: lora_A is [{a_r}, {in_dim}] and lora_B is [{out_dim}, {b_r}] but the \
              speculator config says r={}",
@@ -2637,7 +2533,7 @@ pub fn mtp_speculator_deltas_from_adapter_dir(
 fn dense_lin_bf16_for_merge<'a>(l: &'a HostDenseLin, module: &str) -> Result<&'a HostBf16Lin> {
     match l {
         HostDenseLin::Bf16(b) => Ok(b),
-        _ => anyhow::bail!(
+        _ => bail!(
             "speculator deltas merge into the host bf16 drafter weights before any load-time \
              quant arm, but {module} is already quantized"
         ),
@@ -2650,7 +2546,7 @@ fn dense_lin_bf16_for_merge_mut<'a>(
 ) -> Result<&'a mut HostBf16Lin> {
     match l {
         HostDenseLin::Bf16(b) => Ok(b),
-        _ => anyhow::bail!(
+        _ => bail!(
             "speculator deltas merge into the host bf16 drafter weights before any load-time \
              quant arm, but {module} is already quantized"
         ),
@@ -2662,7 +2558,7 @@ fn add_delta_skipping_zero_because_adding_0_to_minus_0_would_flip_the_sign_bit(
     dv: f32,
 ) {
     if dv != 0.0 {
-        *w = half::bf16::from_f32(half::bf16::from_bits(*w).to_f32() + dv).to_bits();
+        *w = bf16::from_f32(bf16::from_bits(*w).to_f32() + dv).to_bits();
     }
 }
 
@@ -2677,7 +2573,7 @@ impl MtpHostWeights {
             "mtp.layers.0.mlp.gate_proj" => dense_lin_bf16_for_merge(&self.mlp.gate, module),
             "mtp.layers.0.mlp.up_proj" => dense_lin_bf16_for_merge(&self.mlp.up, module),
             "mtp.layers.0.mlp.down_proj" => dense_lin_bf16_for_merge(&self.mlp.down, module),
-            _ => anyhow::bail!("{module} is not an MTP-head LoRA target"),
+            _ => bail!("{module} is not an MTP-head LoRA target"),
         }
     }
 
@@ -2703,18 +2599,18 @@ impl MtpHostWeights {
             "mtp.layers.0.mlp.down_proj" => {
                 dense_lin_bf16_for_merge_mut(&mut self.mlp.down, module)
             }
-            _ => anyhow::bail!("{module} is not an MTP-head LoRA target"),
+            _ => bail!("{module} is not an MTP-head LoRA target"),
         }
     }
 
     pub fn merge_speculator(&mut self, d: &MtpSpeculatorDeltas) -> Result<usize> {
-        anyhow::ensure!(
+        ensure!(
             !d.entries.is_empty(),
             "an empty speculator delta set has nothing to merge and hides a corrupt artifact"
         );
         for e in &d.entries {
             let lin = self.speculator_target(&e.module)?;
-            anyhow::ensure!(
+            ensure!(
                 lin.n == e.out_dim && lin.k == e.in_dim && e.rank > 0,
                 "speculator delta for {} is [{}, {}] against a drafter weight of [{}, {}]: a \
                  mismatched-drafter artifact refuses whole with no partial merge (the gated \
@@ -2754,14 +2650,14 @@ impl MtpHostWeights {
 struct MtpDraft {
     passes: Vec<Pass>,
     kv_end: usize,
-    pos_buf: wgpu::Buffer,
-    fd_buf: wgpu::Buffer,
-    hid: wgpu::Buffer,
+    pos_buf: Buffer,
+    fd_buf: Buffer,
+    hid: Buffer,
     len: usize,
     round_base: Option<usize>,
     validated_kv: bool,
     validated_full: bool,
-    _buffers: Vec<wgpu::Buffer>,
+    _buffers: Vec<Buffer>,
 }
 
 #[derive(Clone, Copy)]
@@ -2789,62 +2685,60 @@ pub struct Qwen3_5DenseWgpu {
     passes: Vec<Pass>,
     pf_passes: Vec<Pass>,
     pf_m: usize,
-    pf_tok: Option<wgpu::Buffer>,
-    pf_ck: Option<wgpu::Buffer>,
-    pf_splice: Option<wgpu::Buffer>,
-    pf_mask: Option<wgpu::Buffer>,
-    pf_attn_mk_fd: Vec<wgpu::Buffer>,
-    pf_vflash_row_fd: Vec<wgpu::Buffer>,
-    pf_attn_out_for_arm_probe: Option<wgpu::Buffer>,
-    vf_attn_out_for_arm_probe: Option<wgpu::Buffer>,
+    pf_tok: Option<Buffer>,
+    pf_ck: Option<Buffer>,
+    pf_splice: Option<Buffer>,
+    pf_mask: Option<Buffer>,
+    pf_attn_mk_fd: Vec<Buffer>,
+    pf_vflash_row_fd: Vec<Buffer>,
+    pf_attn_out_for_arm_probe: Option<Buffer>,
+    vf_attn_out_for_arm_probe: Option<Buffer>,
     pf_vflash_gate_min_total: Option<u32>,
-    pf_chunk_fd_and_start: Option<(wgpu::Buffer, wgpu::Buffer)>,
-    pf_res: Option<wgpu::Buffer>,
+    pf_chunk_fd_and_start: Option<(Buffer, Buffer)>,
+    pf_res: Option<Buffer>,
     pf_embed_end: usize,
     vf_passes: Vec<Pass>,
     vf_commit_passes: Vec<Pass>,
     vf_commit_validated: bool,
     vf_m: usize,
-    vf_tok: Option<wgpu::Buffer>,
-    vf_ck: Option<wgpu::Buffer>,
-    vf_mask: Option<wgpu::Buffer>,
-    vf_attn_mk_fd: Vec<wgpu::Buffer>,
-    vf_vflash_row_fd: Vec<wgpu::Buffer>,
+    vf_tok: Option<Buffer>,
+    vf_ck: Option<Buffer>,
+    vf_mask: Option<Buffer>,
+    vf_attn_mk_fd: Vec<Buffer>,
+    vf_vflash_row_fd: Vec<Buffer>,
     vf_vflash_gate_min_total: Option<u32>,
-    vf_chunk_fd_and_start: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    vf_chunk_fd_and_start: Option<(Buffer, Buffer)>,
     head_start: usize,
     final_start: usize,
     verify: Option<Verify>,
-    _buffers: Vec<wgpu::Buffer>,
-    tok_buf: wgpu::Buffer,
-    pos_buf: wgpu::Buffer,
-    fd_buf: wgpu::Buffer,
+    _buffers: Vec<Buffer>,
+    tok_buf: Buffer,
+    pos_buf: Buffer,
+    fd_buf: Buffer,
     fd_base: FdParams,
-    res: wgpu::Buffer,
-    res2: wgpu::Buffer,
-    final_x: wgpu::Buffer,
+    res: Buffer,
+    res2: Buffer,
+    final_x: Buffer,
     embed_gather_end: usize,
     mtp: Option<MtpDraft>,
     mtp_replay: bool,
     lora_active: bool,
     _lora_keep: Vec<Box<dyn std::any::Any + Send>>,
-    token_out: wgpu::Buffer,
-    logits: wgpu::Buffer,
-    state_buffers: Vec<(wgpu::Buffer, u64)>,
-    recurrent_states: Vec<(wgpu::Buffer, u64)>,
-    resume_checkpoint: Vec<wgpu::Buffer>,
+    token_out: Buffer,
+    logits: Buffer,
+    state_buffers: Vec<(Buffer, u64)>,
+    recurrent_states: Vec<(Buffer, u64)>,
+    resume_checkpoint: Vec<Buffer>,
     resume_checkpoint_pos: Option<usize>,
-    grid_checkpoints: Vec<(Option<usize>, Vec<wgpu::Buffer>)>,
-    rope_row_buffers: Vec<(wgpu::Buffer, wgpu::Buffer)>,
-    attn_kv_bf16_caches: Vec<(wgpu::Buffer, wgpu::Buffer)>,
+    grid_checkpoints: Vec<(Option<usize>, Vec<Buffer>)>,
+    rope_row_buffers: Vec<(Buffer, Buffer)>,
+    attn_kv_bf16_caches: Vec<(Buffer, Buffer)>,
     rope_std_host_cos_sin: (Vec<f32>, Vec<f32>),
     mrope_rows_installed: bool,
     vocab: usize,
     vram: VramReport,
-    preenc: bool,
-    pending_cb: Option<(bool, wgpu::CommandBuffer)>,
-    staged_read: bool,
-    tok_stage: wgpu::Buffer,
+    pending_cb: Option<(bool, CommandBuffer)>,
+    tok_stage: Buffer,
     stage1_pairs: Vec<(usize, usize)>,
     tp_min_total: u32,
     last_step_stage1_engaged_tp: Option<bool>,
@@ -2854,60 +2748,11 @@ pub fn vram_report_enabled() -> bool {
     crate::wgpu_ledger::vram_report_var_enabled("NV_QWEN35_DENSE_WGPU_VRAM")
 }
 
-const PREENC_ENV_A_CB_ENCODED_LAST_STEP_READS_THIS_STEPS_UNIFORMS_BECAUSE_QUEUE_WRITE_BUFFER_ORDERS_BEFORE_EVERY_LATER_SUBMIT: &str =
-    "NV_QWEN35_DENSE_WGPU_PREENC";
-
-fn preenc_enabled() -> bool {
-    std::env::var(PREENC_ENV_A_CB_ENCODED_LAST_STEP_READS_THIS_STEPS_UNIFORMS_BECAUSE_QUEUE_WRITE_BUFFER_ORDERS_BEFORE_EVERY_LATER_SUBMIT)
-        .ok()
-        .as_deref()
-        != Some("0")
-}
-
-const STAGED_READ_ENV_PERSISTENT_MAP_READ_STAGE_SKIPS_PER_STEP_STAGING_ALLOC_AND_A_SECOND_SUBMIT:
-    &str = "NV_QWEN35_DENSE_WGPU_STAGED_READ";
-
-fn staged_read_enabled() -> bool {
-    std::env::var(
-        STAGED_READ_ENV_PERSISTENT_MAP_READ_STAGE_SKIPS_PER_STEP_STAGING_ALLOC_AND_A_SECOND_SUBMIT,
-    )
-    .ok()
-    .as_deref()
-        != Some("0")
-}
-
 const QKV_GATED_ENV_FUSION_IS_BIT_IDENTICAL_BY_SHARED_LANE_FNS_BUT_UNMEASURED_SO_DEFAULT_OFF: &str =
     "NV_QWEN35_DENSE_WGPU_QKV_GATED";
 
 fn qkv_gated_enabled() -> bool {
-    matches!(
-        std::env::var(
-            QKV_GATED_ENV_FUSION_IS_BIT_IDENTICAL_BY_SHARED_LANE_FNS_BUT_UNMEASURED_SO_DEFAULT_OFF
-        )
-        .ok()
-        .as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
-}
-
-pub const FUSE_DN_ENV_SPLIT_GATING_RECURRENT_OUT_ARE_ONE_DISPATCH_PER_DN_LAYER_BIT_IDENTICAL_DEFAULT_ON_SET_0_FOR_THE_CHAIN:
-    &str = "NV_Q3D_FUSE_DN";
-
-pub const FUSE_ATTN_ENV_QNORM_KNORM_QCAST_ARE_ONE_DISPATCH_PER_ATTN_LAYER_BIT_IDENTICAL_DEFAULT_ON_SET_0_FOR_THE_CHAIN:
-    &str = "NV_Q3D_FUSE_ATTN";
-
-pub const FUSE_DN_GEMV_ENV_QKV_Z_AB_PROJECTIONS_ARE_ONE_DISPATCH_PER_DN_LAYER_BIT_IDENTICAL_DEFAULT_ON_SET_0_FOR_THE_CHAIN:
-    &str = "NV_Q3D_FUSE_DN_GEMV";
-
-fn fuse_env_on(name: &str) -> bool {
-    !matches!(
-        std::env::var(name).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
-fn fuse_dn_enabled() -> bool {
-    fuse_env_on(FUSE_DN_ENV_SPLIT_GATING_RECURRENT_OUT_ARE_ONE_DISPATCH_PER_DN_LAYER_BIT_IDENTICAL_DEFAULT_ON_SET_0_FOR_THE_CHAIN)
+    env_on(QKV_GATED_ENV_FUSION_IS_BIT_IDENTICAL_BY_SHARED_LANE_FNS_BUT_UNMEASURED_SO_DEFAULT_OFF)
 }
 
 pub const DN_HEAD_WIDE_ENV_512_LANE_ROW_SPLIT_MEASURED_A_WALL_NULL_ON_THE_DGAP_LADDER_SO_THE_HEAD_IS_NOT_OCCUPANCY_BOUND_REASSOCIATES_SUMS_DEFAULT_OFF:
@@ -2918,60 +2763,21 @@ pub const DN_HEAD_WIDE_REQUIRES_DK_128: usize = 128;
 pub const DN_HEAD_WIDE_REQUIRES_DV_128: usize = 128;
 
 fn dn_head_wide_enabled() -> bool {
-    matches!(
-        std::env::var(DN_HEAD_WIDE_ENV_512_LANE_ROW_SPLIT_MEASURED_A_WALL_NULL_ON_THE_DGAP_LADDER_SO_THE_HEAD_IS_NOT_OCCUPANCY_BOUND_REASSOCIATES_SUMS_DEFAULT_OFF)
-            .ok()
-            .as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
-}
-
-fn fuse_attn_enabled() -> bool {
-    fuse_env_on(FUSE_ATTN_ENV_QNORM_KNORM_QCAST_ARE_ONE_DISPATCH_PER_ATTN_LAYER_BIT_IDENTICAL_DEFAULT_ON_SET_0_FOR_THE_CHAIN)
-}
-
-fn fuse_dn_gemv_enabled() -> bool {
-    fuse_env_on(FUSE_DN_GEMV_ENV_QKV_Z_AB_PROJECTIONS_ARE_ONE_DISPATCH_PER_DN_LAYER_BIT_IDENTICAL_DEFAULT_ON_SET_0_FOR_THE_CHAIN)
-}
-
-pub const FUSE_MLP_ENV_SILU_AND_DOWN_QUANT_ARE_ONE_DISPATCH_PER_LAYER_BIT_IDENTICAL_DEFAULT_ON_SET_0_FOR_THE_CHAIN:
-    &str = "NV_Q3D_FUSE_MLP";
-
-fn fuse_mlp_enabled() -> bool {
-    fuse_env_on(FUSE_MLP_ENV_SILU_AND_DOWN_QUANT_ARE_ONE_DISPATCH_PER_LAYER_BIT_IDENTICAL_DEFAULT_ON_SET_0_FOR_THE_CHAIN)
+    env_on(DN_HEAD_WIDE_ENV_512_LANE_ROW_SPLIT_MEASURED_A_WALL_NULL_ON_THE_DGAP_LADDER_SO_THE_HEAD_IS_NOT_OCCUPANCY_BOUND_REASSOCIATES_SUMS_DEFAULT_OFF)
 }
 
 pub const FUSE_MLP_GEMV_ENV_GATE_AND_UP_NVFP4_GEMVS_ARE_ONE_MROW2_2W_DISPATCH_PER_MLP_BIT_IDENTICAL_DEFAULT_OFF_SET_1_TO_ENGAGE:
     &str = "NV_Q3D_FUSE_MLP_GEMV";
 
-fn fuse_env_opt_in(name: &str) -> bool {
-    matches!(
-        std::env::var(name).ok().as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
-}
-
 fn fuse_mlp_gemv_enabled() -> bool {
-    fuse_env_opt_in(FUSE_MLP_GEMV_ENV_GATE_AND_UP_NVFP4_GEMVS_ARE_ONE_MROW2_2W_DISPATCH_PER_MLP_BIT_IDENTICAL_DEFAULT_OFF_SET_1_TO_ENGAGE)
+    env_on(FUSE_MLP_GEMV_ENV_GATE_AND_UP_NVFP4_GEMVS_ARE_ONE_MROW2_2W_DISPATCH_PER_MLP_BIT_IDENTICAL_DEFAULT_OFF_SET_1_TO_ENGAGE)
 }
 
 pub const FUSE_KVW_ENV_KV_WRITE_AND_THE_FP8_KV_QUANT_PAIR_ARE_ONE_DISPATCH_PER_ATTN_LAYER_BIT_IDENTICAL_DEFAULT_OFF_SET_1_TO_ENGAGE:
     &str = "NV_Q3D_FUSE_KVW";
 
 fn fuse_kvw_enabled() -> bool {
-    fuse_env_opt_in(FUSE_KVW_ENV_KV_WRITE_AND_THE_FP8_KV_QUANT_PAIR_ARE_ONE_DISPATCH_PER_ATTN_LAYER_BIT_IDENTICAL_DEFAULT_OFF_SET_1_TO_ENGAGE)
-}
-
-pub const MLP_W4A8_ENV_DEFAULT_ON_COSTS_0_0070_NATS_OF_TEACHER_FORCED_FLOOR_FOR_2PCT_DECODE_MEASURED_POST_FLIP_THE_FLIP_CLAIM_HAD_NO_LANDED_ROW_SET_0_FOR_THE_BF16_ACTIVATION_MLP_ARM:
-    &str = "NV_Q3D_MLP_W4A8";
-
-fn mlp_w4a8_enabled() -> bool {
-    !matches!(
-        std::env::var(MLP_W4A8_ENV_DEFAULT_ON_COSTS_0_0070_NATS_OF_TEACHER_FORCED_FLOOR_FOR_2PCT_DECODE_MEASURED_POST_FLIP_THE_FLIP_CLAIM_HAD_NO_LANDED_ROW_SET_0_FOR_THE_BF16_ACTIVATION_MLP_ARM)
-            .ok()
-            .as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
+    env_on(FUSE_KVW_ENV_KV_WRITE_AND_THE_FP8_KV_QUANT_PAIR_ARE_ONE_DISPATCH_PER_ATTN_LAYER_BIT_IDENTICAL_DEFAULT_OFF_SET_1_TO_ENGAGE)
 }
 
 const W4A8_GEMV_ENTRY: &str = "gemv_nvfp4_w4a8_mrow2";
@@ -3006,11 +2812,9 @@ pub const W4A8_SILU_NOSMEM_ROUTE_IS_THE_OVER_LIMIT_WORKGROUP_FIX: &str =
      NV_Q3D_W4A8_SILU_SMEM pins either body for A/B.";
 
 fn w4a8_silu_use_smem(max_workgroup_storage: u32) -> bool {
-    match std::env::var(
-        W4A8_SILU_SMEM_ENV_UNSET_ROUTES_BY_ADAPTER_LIMIT_1_FORCES_SMEM_0_FORCES_NOSMEM,
-    )
-    .ok()
-    .as_deref()
+    match env::var(W4A8_SILU_SMEM_ENV_UNSET_ROUTES_BY_ADAPTER_LIMIT_1_FORCES_SMEM_0_FORCES_NOSMEM)
+        .ok()
+        .as_deref()
     {
         Some("1") => true,
         Some("0") => false,
@@ -3021,34 +2825,26 @@ fn w4a8_silu_use_smem(max_workgroup_storage: u32) -> bool {
     }
 }
 
-pub const LORA_GEMV_FOLD_ENV_EXPAND_RIDES_THE_W4A8_GEMV_EPILOGUE_ADDING_DELTA_BEFORE_THE_BF16_ENCODE_DEFAULT_ON_SET_0_FOR_THE_TWO_PASS_SITE:
-    &str = "NV_Q3D_LORA_GEMV_FOLD";
-
-fn lora_gemv_fold_enabled() -> bool {
-    fuse_env_on(LORA_GEMV_FOLD_ENV_EXPAND_RIDES_THE_W4A8_GEMV_EPILOGUE_ADDING_DELTA_BEFORE_THE_BF16_ENCODE_DEFAULT_ON_SET_0_FOR_THE_TWO_PASS_SITE)
-}
-
 pub const LORA_GEMV_FOLD_ATTN_DN_ENV_OPT_IN_MEASURED_PLUS_0_9MS_AT_D256_BECAUSE_2ROW_FP8_WORKGROUPS_RESTAGE_H_4X_DENSER_THAN_W4A8_AND_THE_SHRINK_BECOMES_A_CRITICAL_PATH_PREDECESSOR_OF_THE_WIDEST_GEMVS:
     &str = "NV_Q3D_LORA_GEMV_FOLD_ATTN_DN";
 
 fn lora_gemv_fold_attn_dn_enabled() -> bool {
-    lora_gemv_fold_enabled()
-        && fuse_env_opt_in(
+    env_on(
             LORA_GEMV_FOLD_ATTN_DN_ENV_OPT_IN_MEASURED_PLUS_0_9MS_AT_D256_BECAUSE_2ROW_FP8_WORKGROUPS_RESTAGE_H_4X_DENSER_THAN_W4A8_AND_THE_SHRINK_BECOMES_A_CRITICAL_PATH_PREDECESSOR_OF_THE_WIDEST_GEMVS,
         )
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct W48LoraFoldParams {
-    rank: u32,
-    n_tiles: u32,
-    part_base: u32,
-    b_base: u32,
-    scale: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+pod! {
+    struct W48LoraFoldParams {
+        rank: u32,
+        n_tiles: u32,
+        part_base: u32,
+        b_base: u32,
+        scale: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 }
 
 struct LoraFoldSlice<'a> {
@@ -3093,18 +2889,18 @@ const FP8_GEMV_LORA_FOLD_ENTRY: &str = "q3w_gemv_fp8_rowscale_lora_fold";
 
 const DN_MERGED_GEMV_LORA_FOLD_ENTRY: &str = "q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab_lora_fold";
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct DnMergedLoraFoldParams {
-    rank: u32,
-    n_tiles: u32,
-    ab_a_rows: u32,
-    pad0: u32,
-    b_base: [u32; 4],
-    scale: f32,
-    pad1: u32,
-    pad2: u32,
-    pad3: u32,
+pod! {
+    struct DnMergedLoraFoldParams {
+        rank: u32,
+        n_tiles: u32,
+        ab_a_rows: u32,
+        pad0: u32,
+        b_base: [u32; 4],
+        scale: f32,
+        pad1: u32,
+        pad2: u32,
+        pad3: u32,
+    }
 }
 
 struct DnMergedLoraFold<'a> {
@@ -3175,9 +2971,6 @@ const W4A8_SILU_SMEM_WORDS_MIRRORS_THE_WGSL_40KB_ARRAY_SO_THE_ARM_CLAMPS_INTER_A
     10240;
 
 fn mlp_w4a8_build_arm(ctx: &WgpuContext, cfg: &Qwen3_5DenseConfig) -> bool {
-    if !mlp_w4a8_enabled() {
-        return false;
-    }
     let mut reasons: Vec<&str> = Vec::new();
     if !wk::gemv_nvfp4_v2::subgroup32_ok(ctx) {
         reasons.push("subgroup width 32 unavailable");
@@ -3197,7 +2990,7 @@ fn mlp_w4a8_build_arm(ctx: &WgpuContext, cfg: &Qwen3_5DenseConfig) -> bool {
         return true;
     }
     eprintln!(
-        "[q3d-wgpu] NV_Q3D_MLP_W4A8=1 clamped ({}); MLP stays on the shipping nvfp4 route",
+        "[q3d-wgpu] the w4a8 MLP route clamped ({}); MLP stays on the nvfp4 route",
         reasons.join("; ")
     );
     false
@@ -3211,24 +3004,23 @@ fn mlp_w4a8_layer_arm(build_arm: bool, li: usize, m: &HostDenseMlp) -> bool {
         return true;
     }
     eprintln!(
-        "[q3d-wgpu] NV_Q3D_MLP_W4A8=1 but layer {li} MLP is not all-nvfp4; layer stays on the \
-         shipping route"
+        "[q3d-wgpu] layer {li} MLP is not all-nvfp4; layer stays off the w4a8 route"
     );
     false
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct W4a8ProducerParams {
-    k_blocks: u32,
-    words_per_row: u32,
-    hidden: u32,
-    eps: f32,
+pod! {
+    struct W4a8ProducerParams {
+        k_blocks: u32,
+        words_per_row: u32,
+        hidden: u32,
+        eps: f32,
+    }
 }
 
 struct W4a8Quant {
-    xq: wgpu::Buffer,
-    xs: wgpu::Buffer,
+    xq: Buffer,
+    xs: Buffer,
 }
 
 const MLP_GEMV_2W_ROUTE_IS_EXACTLY_THE_MROW2_DECODE_ROUTE_ANY_OTHER_ENTRY_KEEPS_THE_PAIR: &str =
@@ -3302,12 +3094,12 @@ impl Qwen3_5DenseWgpu {
         section: [usize; 3],
     ) -> Result<()> {
         let rh = self.rope_rot_half();
-        anyhow::ensure!(
+        ensure!(
             section.iter().sum::<usize>() == rh,
             "mrope section {section:?} must tile the {rh} rotary half-frequencies of this graph"
         );
         let n = pos.len();
-        anyhow::ensure!(
+        ensure!(
             n > 0 && n <= self.max_seq,
             "mrope prompt of {n} tokens does not fit max_seq {}",
             self.max_seq
@@ -3323,7 +3115,7 @@ impl Qwen3_5DenseWgpu {
                     2 => pos.w[i],
                     _ => pos.t[i],
                 } as usize;
-                anyhow::ensure!(
+                ensure!(
                     p < self.max_seq,
                     "mrope axis-{axis} position {p} at token {i} exceeds the {}-row rope table",
                     self.max_seq
@@ -3335,7 +3127,7 @@ impl Qwen3_5DenseWgpu {
         let delta = pos.delta_added_to_token_index_for_every_position_after_this_prefill;
         for i in n..self.max_seq {
             let p = i as i64 + delta;
-            anyhow::ensure!(
+            ensure!(
                 (0..self.max_seq as i64).contains(&p),
                 "mrope continuation row {i} shifts to {p}, outside the {}-row rope table",
                 self.max_seq
@@ -3345,12 +3137,8 @@ impl Qwen3_5DenseWgpu {
             sin[i * rh..(i + 1) * rh].copy_from_slice(&std_sin[p * rh..(p + 1) * rh]);
         }
         for (cb, sb) in &self.rope_row_buffers {
-            self.ctx
-                .queue
-                .write_buffer(cb, 0, bytemuck::cast_slice(&cos));
-            self.ctx
-                .queue
-                .write_buffer(sb, 0, bytemuck::cast_slice(&sin));
+            self.ctx.queue.write_buffer(cb, 0, cast_slice(&cos));
+            self.ctx.queue.write_buffer(sb, 0, cast_slice(&sin));
         }
         self.mrope_rows_installed = true;
         Ok(())
@@ -3362,12 +3150,8 @@ impl Qwen3_5DenseWgpu {
         }
         let (std_cos, std_sin) = &self.rope_std_host_cos_sin;
         for (cb, sb) in &self.rope_row_buffers {
-            self.ctx
-                .queue
-                .write_buffer(cb, 0, bytemuck::cast_slice(std_cos));
-            self.ctx
-                .queue
-                .write_buffer(sb, 0, bytemuck::cast_slice(std_sin));
+            self.ctx.queue.write_buffer(cb, 0, cast_slice(std_cos));
+            self.ctx.queue.write_buffer(sb, 0, cast_slice(std_sin));
         }
         self.mrope_rows_installed = false;
     }
@@ -3380,11 +3164,11 @@ impl Qwen3_5DenseWgpu {
         let (cb, sb) = self
             .rope_row_buffers
             .get(layer)
-            .ok_or_else(|| anyhow::anyhow!("no attention layer {layer} with rope rows"))?;
+            .ok_or_else(|| anyhow!("no attention layer {layer} with rope rows"))?;
         let rows = self.max_seq * self.rope_rot_half();
         Ok((
-            dispatch::read_back::<f32>(self.ctx, cb, rows).map_err(|e| anyhow::anyhow!("{e}"))?,
-            dispatch::read_back::<f32>(self.ctx, sb, rows).map_err(|e| anyhow::anyhow!("{e}"))?,
+            dispatch::read_back::<f32>(self.ctx, cb, rows).map_err(|e| anyhow!("{e}"))?,
+            dispatch::read_back::<f32>(self.ctx, sb, rows).map_err(|e| anyhow!("{e}"))?,
         ))
     }
 
@@ -3403,12 +3187,12 @@ impl Qwen3_5DenseWgpu {
         n_pos: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let (kc, vc) = self.attn_kv_bf16_caches.get(attn_layer).ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow!(
                 "no attention layer {attn_layer}: this trunk carries {} full-attention layers",
                 self.attn_kv_bf16_caches.len()
             )
         })?;
-        anyhow::ensure!(
+        ensure!(
             start_pos + n_pos <= self.max_seq,
             "kv rows {start_pos}..{} past max_seq {}",
             start_pos + n_pos,
@@ -3425,10 +3209,10 @@ impl Qwen3_5DenseWgpu {
         };
         let k =
             dispatch::read_back_at::<u32>(self.ctx, kc, start_pos * row_words, n_pos * row_words)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(|e| anyhow!("{e}"))?;
         let v =
             dispatch::read_back_at::<u32>(self.ctx, vc, start_pos * row_words, n_pos * row_words)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(|e| anyhow!("{e}"))?;
         Ok((unpack(k), unpack(v)))
     }
 
@@ -3439,27 +3223,27 @@ impl Qwen3_5DenseWgpu {
         rows: &[f32],
         k_not_v: bool,
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             !kv_fp8_enabled(),
             "the rotkv debug overwrite reaches decode only through the bf16 KV cache; with \
              NV_Q3D_KV_FP8 on, stage1 reads the fp8 mirror written before this overwrite and \
              the probe would silently measure nothing -- set NV_Q3D_KV_FP8=0 for mangle arms"
         );
         let row_f32s = self.attn_kv_row_f32s();
-        anyhow::ensure!(
+        ensure!(
             !rows.is_empty() && rows.len().is_multiple_of(row_f32s),
             "kv overwrite wants whole rows of {row_f32s} f32s; got {}",
             rows.len()
         );
         let n_pos = rows.len() / row_f32s;
-        anyhow::ensure!(
+        ensure!(
             start_pos + n_pos <= self.max_seq,
             "kv overwrite {start_pos}..{} past max_seq {}",
             start_pos + n_pos,
             self.max_seq
         );
         let (kc, vc) = self.attn_kv_bf16_caches.get(attn_layer).ok_or_else(|| {
-            anyhow::anyhow!(
+            anyhow!(
                 "no attention layer {attn_layer}: this trunk carries {} full-attention layers",
                 self.attn_kv_bf16_caches.len()
             )
@@ -3467,8 +3251,8 @@ impl Qwen3_5DenseWgpu {
         let packed: Vec<u32> = rows
             .chunks_exact(2)
             .map(|p| {
-                let lo = half::bf16::from_f32(p[0]).to_bits() as u32;
-                let hi = half::bf16::from_f32(p[1]).to_bits() as u32;
+                let lo = bf16::from_f32(p[0]).to_bits() as u32;
+                let hi = bf16::from_f32(p[1]).to_bits() as u32;
                 lo | (hi << 16)
             })
             .collect();
@@ -3476,7 +3260,7 @@ impl Qwen3_5DenseWgpu {
         let target = if k_not_v { kc } else { vc };
         self.ctx
             .queue
-            .write_buffer(target, byte_off, bytemuck::cast_slice(&packed));
+            .write_buffer(target, byte_off, cast_slice(&packed));
         Ok(())
     }
 
@@ -3502,7 +3286,7 @@ impl Qwen3_5DenseWgpu {
         &mut self,
         pos: usize,
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             pos <= self.max_seq,
             "synthetic fill pos {pos} past max_seq {}; the full-attention window and gdn state \
              selection are pure functions of pos, so pos alone is the cache-depth state",
@@ -3547,7 +3331,7 @@ impl Qwen3_5DenseWgpu {
 
     pub fn from_loader(
         config: Qwen3_5DenseConfig,
-        weights: &nv_weights::WeightLoader,
+        weights: &WeightLoader,
         max_seq: usize,
     ) -> Result<Self> {
         Self::build(config, WeightSource::Loader(weights), max_seq, None)
@@ -3555,7 +3339,7 @@ impl Qwen3_5DenseWgpu {
 
     pub fn from_loader_with_lora(
         config: Qwen3_5DenseConfig,
-        weights: &nv_weights::WeightLoader,
+        weights: &WeightLoader,
         max_seq: usize,
         lora: Option<&Q3dLora>,
     ) -> Result<Self> {
@@ -3568,43 +3352,43 @@ impl Qwen3_5DenseWgpu {
         max_seq: usize,
         lora: Option<&Q3dLora>,
     ) -> Result<Self> {
-        let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
         let s = Sources::new(ctx);
         let cfg = &config;
 
-        anyhow::ensure!(max_seq > 0, "max_seq must be positive");
-        anyhow::ensure!(
+        ensure!(max_seq > 0, "max_seq must be positive");
+        ensure!(
             cfg.hidden_size.is_multiple_of(4),
             "hidden_size {} must be a multiple of 4",
             cfg.hidden_size
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.intermediate_size.is_multiple_of(2),
             "intermediate_size {} must be even",
             cfg.intermediate_size
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.head_dim <= MAX_HEAD_DIM && cfg.head_dim.is_multiple_of(2),
             "head_dim {} must be even and <= {MAX_HEAD_DIM}",
             cfg.head_dim
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.linear_key_head_dim <= MAX_LIN_HEAD_DIM
                 && cfg.linear_value_head_dim <= MAX_LIN_HEAD_DIM
                 && cfg.linear_value_head_dim.is_multiple_of(2),
             "linear head dims must be even and <= {MAX_LIN_HEAD_DIM}"
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.linear_num_value_heads
                 .is_multiple_of(cfg.linear_num_key_heads),
             "linear value heads must be a multiple of key heads"
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.num_attention_heads
                 .is_multiple_of(cfg.num_key_value_heads),
             "attention heads must be a multiple of kv heads"
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.layer_types.len() == cfg.num_hidden_layers,
             "layer_types has {} entries for {} layers",
             cfg.layer_types.len(),
@@ -3620,7 +3404,6 @@ impl Qwen3_5DenseWgpu {
             core: crate::wgpu_ledger::VramLedger::new(
                 ctx,
                 "q3d-",
-                staging_flush_enabled,
                 STAGING_FLUSH_BYTES,
             ),
             passes: Vec::new(),
@@ -3631,7 +3414,7 @@ impl Qwen3_5DenseWgpu {
         };
 
         if let Some(l) = lora {
-            anyhow::ensure!(
+            ensure!(
                 l.layer_count() == cfg.num_hidden_layers,
                 "lora carries {} layers for {} config layers",
                 l.layer_count(),
@@ -3659,29 +3442,29 @@ impl Qwen3_5DenseWgpu {
         };
         let fd_buf = b.uni("q3d-fd", fd_base);
 
-        anyhow::ensure!(
+        ensure!(
             cfg.linear_conv_kernel_dim >= 1 && cfg.linear_conv_kernel_dim <= 8,
             "linear_conv_kernel_dim {} out of 1..=8",
             cfg.linear_conv_kernel_dim
         );
 
-        anyhow::ensure!(
+        ensure!(
             !(pf_attn_mk_enabled()
-                && std::env::var(PF_ATTN_TILED_ENV_DEFAULT_ON_SET_0_FOR_THE_SCORES_SLAB_ARM)
+                && env::var(PF_ATTN_TILED_ENV_1_ALSO_ROUTES_SMALL_M_GRAPHS_THROUGH_TILED_FLASH)
                     .ok()
                     .as_deref()
                     == Some("1")),
             "{} and {} both request the pf attention explicitly; the arms are alternatives, not \
              a ladder, so set at most one",
             PF_ATTN_MK_ENV_DEFAULT_OFF_UNTIL_THE_LADDER_AND_PPL_GATE_ARE_ON_RECORD,
-            PF_ATTN_TILED_ENV_DEFAULT_ON_SET_0_FOR_THE_SCORES_SLAB_ARM
+            PF_ATTN_TILED_ENV_1_ALSO_ROUTES_SMALL_M_GRAPHS_THROUGH_TILED_FLASH
         );
 
         let tiled_routed = |m: usize| {
             pf_attn_tiled_enabled()
                 && (!pf_small_m_legacy(m)
-                    || nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
-                        PF_ATTN_TILED_ENV_DEFAULT_ON_SET_0_FOR_THE_SCORES_SLAB_ARM,
+                    || env_arm_opt_in_eq_some_1_reread_every_call(
+                        PF_ATTN_TILED_ENV_1_ALSO_ROUTES_SMALL_M_GRAPHS_THROUGH_TILED_FLASH,
                     ))
         };
         let qwen2_bias_arch = match &src {
@@ -3699,7 +3482,6 @@ impl Qwen3_5DenseWgpu {
         let flash_m_lane = qwen2_bias_arch
             && cfg.head_dim == 128
             && !cfg.attn_output_gate
-            && pf_attn_flash_m_enabled()
             && !pf_attn_mk_enabled();
         let coop_adapter = pf_coop_tile(ctx).is_some();
         let projections_ride_coop = prefill_m() > 16
@@ -3718,9 +3500,7 @@ impl Qwen3_5DenseWgpu {
             let mut m = m_req;
             if m > 16 && !coop_adapter {
                 eprintln!(
-                    "[q3d-wgpu] prefill m={m} needs the coop route \
-                     ({PF_COOP_ENV_DEFAULT_ON_SET_0_FOR_THE_LEGACY_M16_GEMM_ARM} not 0) and a \
-                     16x16 f16 coop adapter; clamping to 16"
+                    "[q3d-wgpu] prefill m={m} needs a 16x16 f16 coop adapter; clamping to 16"
                 );
                 m = 16;
             }
@@ -3778,8 +3558,8 @@ impl Qwen3_5DenseWgpu {
                 };
                 let use_coop = coop_lane_open
                     && (!small_m
-                        || nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
-                            PF_COOP_ENV_DEFAULT_ON_SET_0_FOR_THE_LEGACY_M16_GEMM_ARM,
+                        || env_arm_opt_in_eq_some_1_reread_every_call(
+                            PF_COOP_ENV_1_ALSO_ROUTES_SMALL_M_GRAPHS_THROUGH_COOP,
                         ));
                 let use_tiled = tiled_routed(m) && !flash_m_lane;
                 let coop = if use_coop {
@@ -3830,22 +3610,15 @@ impl Qwen3_5DenseWgpu {
                 };
                 let attn_tiled = if use_tiled {
                     let splits = wk::flash_decode::splits_for(max_seq);
-                    let q_f16_coop = if pf_attn_coop_requested() {
-                        match wk::pf_flash_tiled_coop::supported(ctx, hd, m, 0, 0) {
-                            Ok(()) => {
-                                Some(b.zeros("q3d-pf-at-cq-qf16", mu * (n_h * hd * 2) as u64))
-                            }
-                            Err(why) => {
-                                eprintln!(
-                                    "[q3d-wgpu] {} requested but unsupported ({why}); the slotml \
-                                     tiled stage1 stays",
-                                    PF_ATTN_COOP_ENV_DEFAULT_ON_SET_0_FOR_THE_SCALAR_SLOTML_ARM_PPL_BAND_AND_AB_ROWS_ARE_ON_RECORD
-                                );
-                                None
-                            }
+                    let q_f16_coop = match wk::pf_flash_tiled_coop::supported(ctx, hd, m, 0, 0) {
+                        Ok(()) => Some(b.zeros("q3d-pf-at-cq-qf16", mu * (n_h * hd * 2) as u64)),
+                        Err(why) => {
+                            eprintln!(
+                                "[q3d-wgpu] the coop tiled pf stage1 is unsupported ({why}); the \
+                                 slotml tiled stage1 stays"
+                            );
+                            None
                         }
-                    } else {
-                        None
                     };
                     Some(PfAttnTiled {
                         q_f32: b.zeros("q3d-pf-at-td-qf32", mu * (n_h * hd * 4) as u64),
@@ -3869,7 +3642,7 @@ impl Qwen3_5DenseWgpu {
                     None
                 };
                 let attn_vflash = match vf_attn_flash_arm() {
-                    Some((arm, gate_min_total))
+                    (arm, gate_min_total)
                         if small_m
                             && attn_mk.is_none()
                             && attn_tiled.is_none()
@@ -3985,7 +3758,7 @@ impl Qwen3_5DenseWgpu {
             }
         };
         let mut pfs: Vec<Pf> = Vec::new();
-        let affine_chunked_opt_in = nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        let affine_chunked_opt_in = env_arm_opt_in_eq_some_1_reread_every_call(
             "NV_Q3D_AFFINE_CHUNKED_PF_V2_MEASURES_26TOK_0_97S_1613TOK_27_8MS_VS_STEPPED_1_10S_38_5MS",
         );
         let stepped_default_guards_the_qwen3_arch_basis_only = {
@@ -4124,10 +3897,10 @@ impl Qwen3_5DenseWgpu {
         }
         let pf_embed_end = b.pf_passes.len();
 
-        let mut state_buffers: Vec<(wgpu::Buffer, u64)> = Vec::new();
-        let mut recurrent_states: Vec<(wgpu::Buffer, u64)> = Vec::new();
-        let mut rope_row_buffers: Vec<(wgpu::Buffer, wgpu::Buffer)> = Vec::new();
-        let mut attn_kv_bf16_caches: Vec<(wgpu::Buffer, wgpu::Buffer)> = Vec::new();
+        let mut state_buffers: Vec<(Buffer, u64)> = Vec::new();
+        let mut recurrent_states: Vec<(Buffer, u64)> = Vec::new();
+        let mut rope_row_buffers: Vec<(Buffer, Buffer)> = Vec::new();
+        let mut attn_kv_bf16_caches: Vec<(Buffer, Buffer)> = Vec::new();
         let w4a8_build_arm = mlp_w4a8_build_arm(b.ctx, cfg);
 
         for li in 0..cfg.num_hidden_layers {
@@ -4444,14 +4217,14 @@ impl Qwen3_5DenseWgpu {
             eprintln!(
                 "[q3d-wgpu] {}=lmhead clamped (vocab {vocab} % 128 or hidden {hidden} % {} != 0); \
                  lm_head stays fp8",
-                REQUANT_FP8_TO_NVFP4_ENV_DEFAULT_MLP_THE_MEASURED_QUALITY_NULL_SET_0_FOR_PURE_FP8_OR_A_COMMA_LIST_OF_ATTN_MLP_DN_LMHEAD,
+                REQUANT_FP8_TO_NVFP4_ENV_MLP_ALWAYS_REQUANTS_A_COMMA_LIST_OR_ALL_ADDS_ATTN_DN_LMHEAD,
                 NVFP4_BLOCK * 4
             );
         }
         #[cfg(target_arch = "wasm32")]
         let lm_view_handled = if let Some((lm_module, lm_gs)) = &lm_affine_view {
             let WeightSource::Loader(w) = &src else {
-                anyhow::bail!("affine lm_head view arm requires a loader source");
+                bail!("affine lm_head view arm requires a loader source");
             };
             let w = *w;
             let limit = b
@@ -4494,7 +4267,7 @@ impl Qwen3_5DenseWgpu {
 
         if lm_view_handled {
         } else if let Some(l) = &lm_affine {
-            anyhow::ensure!(
+            ensure!(
                 l.n == vocab && l.k == hidden,
                 "affine lm_head is [{}, {}], want [{vocab}, {hidden}]",
                 l.n,
@@ -4545,7 +4318,7 @@ impl Qwen3_5DenseWgpu {
         } else if lmh_requant && lmh_nv4_aligned {
             let (packed, scales) = lm_fp8.as_ref().expect("lmh_requant checked lm_fp8");
             let row_words = hidden / 4;
-            anyhow::ensure!(
+            ensure!(
                 packed.len() == vocab * row_words,
                 "fp8 lm_head has {} words, want {}",
                 packed.len(),
@@ -4553,7 +4326,7 @@ impl Qwen3_5DenseWgpu {
             );
             let max_bind = b.ctx.caps.max_storage_buffer_binding_size as usize;
             let rows_cap = ((max_bind / (hidden / 2)) & !127usize).min(vocab);
-            anyhow::ensure!(
+            ensure!(
                 rows_cap >= 128,
                 "q3d-lmhead-nv4: max_storage_buffer_binding_size {max_bind} holds fewer than \
                  128 nvfp4 rows of k={hidden}"
@@ -4578,13 +4351,11 @@ impl Qwen3_5DenseWgpu {
             let consumers: Vec<&DenseLinGpu> = lm_chunks.iter().map(|(w, _, _)| w).collect();
             let lq = quant_for(&mut b, &s, "q3d-lmhead-quant", &final_x, hidden, &consumers)?
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "q3d-lmhead-quant: nvfp4 lm_head chunks must yield a quant plan"
-                    )
+                    anyhow!("q3d-lmhead-quant: nvfp4 lm_head chunks must yield a quant plan")
                 })?;
             for (wchunk, coff, rows) in &lm_chunks {
                 let DenseLinGpu::Nvfp4(wv) = wchunk else {
-                    anyhow::bail!("q3d-lmhead-nv4: chunks are uploaded nvfp4")
+                    bail!("q3d-lmhead-nv4: chunks are uploaded nvfp4")
                 };
                 let y_bf16 = b.zeros("q3d-lmhead-ybf16", (*rows * 2) as u64);
                 push_gemv_nvfp4(&mut b, &s, "q3d-lmhead-nv4", wv, &lq, &y_bf16)?;
@@ -4607,7 +4378,7 @@ impl Qwen3_5DenseWgpu {
             }
         } else if let Some((packed, scales)) = lm_fp8 {
             let row_words = hidden / 4;
-            anyhow::ensure!(
+            ensure!(
                 packed.len() == vocab * row_words,
                 "fp8 lm_head has {} words, want {}",
                 packed.len(),
@@ -4654,7 +4425,7 @@ impl Qwen3_5DenseWgpu {
             }
         } else {
             let lm = src.lm_head(cfg)?;
-            anyhow::ensure!(
+            ensure!(
                 lm.len() == vocab * hidden,
                 "lm_head has {} values, want {}",
                 lm.len(),
@@ -4833,7 +4604,7 @@ impl Qwen3_5DenseWgpu {
         let tok_stage = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("q3d-token-stage"),
             size: 4,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -4939,9 +4710,7 @@ impl Qwen3_5DenseWgpu {
             mrope_rows_installed: false,
             vocab,
             vram,
-            preenc: preenc_enabled(),
             pending_cb: None,
-            staged_read: staged_read_enabled(),
             tok_stage,
             stage1_pairs,
             tp_min_total,
@@ -4964,7 +4733,7 @@ impl Qwen3_5DenseWgpu {
         dispatch::profile::enabled() && self.ctx.caps.timestamp_query
     }
 
-    fn encode_step_cb(&self, full: bool, engage_tp: bool) -> wgpu::CommandBuffer {
+    fn encode_step_cb(&self, full: bool, engage_tp: bool) -> CommandBuffer {
         let skip = self.stage1_skip_idxs(engage_tp);
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
         {
@@ -4978,12 +4747,10 @@ impl Qwen3_5DenseWgpu {
                 if skip.binary_search(&i).is_ok() {
                     continue;
                 }
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                dispatch_pass!(pass, p);
             }
         }
-        if full && self.staged_read {
+        if full {
             enc.copy_buffer_to_buffer(&self.token_out, 0, &self.tok_stage, 0, 4);
         }
         enc.finish()
@@ -4995,17 +4762,15 @@ impl Qwen3_5DenseWgpu {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.ctx
-            .poll_blocking()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        self.ctx.poll_blocking().map_err(|e| anyhow!("{e}"))?;
         rx.recv()
-            .map_err(|e| anyhow::anyhow!("token stage map callback: {e}"))?
-            .map_err(|e| anyhow::anyhow!("token stage map: {e}"))?;
+            .map_err(|e| anyhow!("token stage map callback: {e}"))?
+            .map_err(|e| anyhow!("token stage map: {e}"))?;
         let t = {
             let view = slice
                 .get_mapped_range()
-                .map_err(|e| anyhow::anyhow!("token stage mapped range: {e}"))?;
-            bytemuck::cast_slice::<u8, u32>(&view)[0]
+                .map_err(|e| anyhow!("token stage mapped range: {e}"))?;
+            cast_slice::<u8, u32>(&view)[0]
         };
         self.tok_stage.unmap();
         Ok(t)
@@ -5016,18 +4781,18 @@ impl Qwen3_5DenseWgpu {
     }
 
     async fn read_token_out_arm(&self, arm: dispatch::ReadbackArm) -> Result<u32> {
-        if arm == dispatch::ReadbackArm::Blocking && self.staged_read && !self.profiled() {
+        if arm == dispatch::ReadbackArm::Blocking && !self.profiled() {
             return self.read_token_stage();
         }
         let t: Vec<u32> = dispatch::read_back_arm(self.ctx, &self.token_out, 1, arm)
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|e| anyhow!("{e}"))?;
         Ok(t[0])
     }
 
     fn step_inner(&mut self, token: u32, full: bool) -> Result<()> {
-        anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
-        anyhow::ensure!(
+        ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+        ensure!(
             self.pos < self.max_seq,
             "kv cache full at {} (max_seq {})",
             self.pos,
@@ -5035,15 +4800,13 @@ impl Qwen3_5DenseWgpu {
         );
         self.ctx
             .queue
-            .write_buffer(&self.tok_buf, 0, bytemuck::bytes_of(&(token as i32)));
+            .write_buffer(&self.tok_buf, 0, bytes_of(&(token as i32)));
         self.ctx
             .queue
-            .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(self.pos as i32)));
+            .write_buffer(&self.pos_buf, 0, bytes_of(&(self.pos as i32)));
         let mut fd = self.fd_base;
         fd.total = (self.pos + 1) as u32;
-        self.ctx
-            .queue
-            .write_buffer(&self.fd_buf, 0, bytemuck::bytes_of(&fd));
+        self.ctx.queue.write_buffer(&self.fd_buf, 0, bytes_of(&fd));
 
         let need_scope = if full {
             !self.validated
@@ -5051,11 +4814,7 @@ impl Qwen3_5DenseWgpu {
             !self.validated && !self.prefix_validated
         };
         let scope = if need_scope {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         } else {
             None
         };
@@ -5067,7 +4826,7 @@ impl Qwen3_5DenseWgpu {
             } else {
                 &self.passes[..self.head_start]
             };
-            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = passes
+            let raw: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = passes
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| skip.binary_search(i).is_err())
@@ -5080,7 +4839,7 @@ impl Qwen3_5DenseWgpu {
                 .map(|(_, p)| p.label.clone())
                 .collect();
             dispatch::submit_profiled_slices(self.ctx, &raw, &labels)
-                .map_err(|e| anyhow::anyhow!("profiled submit: {e}"))?;
+                .map_err(|e| anyhow!("profiled submit: {e}"))?;
         } else {
             let cb = if full {
                 match self.pending_cb.take() {
@@ -5091,7 +4850,7 @@ impl Qwen3_5DenseWgpu {
                 self.encode_step_cb(false, engage_tp)
             };
             self.ctx.queue.submit([cb]);
-            if full && self.preenc {
+            if full {
                 let next_tp = self.stage1_tp_engaged_at_total((self.pos + 2) as u32);
                 self.pending_cb = Some((next_tp, self.encode_step_cb(true, next_tp)));
             }
@@ -5099,7 +4858,7 @@ impl Qwen3_5DenseWgpu {
         self.last_step_stage1_engaged_tp = (!self.stage1_pairs.is_empty()).then_some(engage_tp);
         if let Some(scope) = scope {
             if let Some(e) = dispatch::pop_scope(scope) {
-                anyhow::bail!("qwen3_5_dense_wgpu decode step validation: {e}");
+                bail!("qwen3_5_dense_wgpu decode step validation: {e}");
             }
             if full {
                 self.validated = true;
@@ -5143,7 +4902,7 @@ impl Qwen3_5DenseWgpu {
         let t = self.read_token_out_arm(arm).await?;
         let l: Vec<f32> = dispatch::read_back_arm(self.ctx, &self.logits, self.vocab, arm)
             .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|e| anyhow!("{e}"))?;
         Ok((t, l))
     }
 
@@ -5173,7 +4932,7 @@ impl Qwen3_5DenseWgpu {
         splices: &[(usize, Vec<u16>)],
     ) -> Result<Vec<u16>> {
         let m = self.pf_m;
-        anyhow::ensure!(
+        ensure!(
             m >= 2 && chunk.len() == m,
             "needs the pf graph and a full chunk"
         );
@@ -5182,38 +4941,29 @@ impl Qwen3_5DenseWgpu {
         let splice_buf = self.pf_splice.as_ref().expect("pf splice buffer");
         let mut mask = vec![0u32; m];
         for (rel, row) in splices {
-            anyhow::ensure!(*rel < m && row.len() == hidden, "bad debug splice row");
+            ensure!(*rel < m && row.len() == hidden, "bad debug splice row");
             mask[*rel] = 1;
             self.ctx.queue.write_buffer(
                 splice_buf,
                 (*rel * hidden_words * 4) as u64,
-                bytemuck::cast_slice(&pack_pairs(row)),
+                cast_slice(&pack_pairs(row)),
             );
         }
         self.ctx.queue.write_buffer(
             self.pf_mask.as_ref().expect("pf mask buffer"),
             0,
-            bytemuck::cast_slice(&mask),
+            cast_slice(&mask),
         );
         let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
         self.ctx.queue.write_buffer(
             self.pf_tok.as_ref().expect("pf tok buffer"),
             0,
-            bytemuck::cast_slice(&ids),
+            cast_slice(&ids),
         );
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            for p in &self.pf_passes[..self.pf_embed_end] {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-            }
-        }
-        self.ctx.queue.submit([enc.finish()]);
+        submit_passes!(self.ctx, &self.pf_passes[..self.pf_embed_end]);
         let res = self.pf_res.as_ref().expect("pf res buffer");
         let words: Vec<u32> = dispatch::read_back::<u32>(self.ctx, res, m * hidden_words)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|e| anyhow!("{e}"))?;
         let mut out = Vec::with_capacity(m * hidden);
         for w in words {
             out.push((w & 0xffff) as u16);
@@ -5253,7 +5003,7 @@ impl Qwen3_5DenseWgpu {
             .collect()
     }
 
-    fn write_row_group_fds(&self, fds: &[wgpu::Buffer], rows: usize, live: usize, base: usize) {
+    fn write_row_group_fds(&self, fds: &[Buffer], rows: usize, live: usize, base: usize) {
         for (g, buf) in fds.iter().enumerate() {
             let start = g * rows;
             let mr = live.saturating_sub(start).min(rows);
@@ -5264,11 +5014,11 @@ impl Qwen3_5DenseWgpu {
             } else {
                 (base + start + mr) as u32
             };
-            self.ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&fd));
+            self.ctx.queue.write_buffer(buf, 0, bytes_of(&fd));
         }
     }
 
-    fn write_pf_attn_mk_fd(&self, fds: &[wgpu::Buffer], live: usize, base: usize) {
+    fn write_pf_attn_mk_fd(&self, fds: &[Buffer], live: usize, base: usize) {
         self.write_row_group_fds(
             fds,
             PF_ATTN_MK_ROWS_PER_DISPATCH_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS,
@@ -5279,7 +5029,7 @@ impl Qwen3_5DenseWgpu {
 
     fn write_pf_chunk_fd_whole_view_and_start_for_tiled_flash_and_fp8_chunk_quantize(
         &self,
-        pair: Option<&(wgpu::Buffer, wgpu::Buffer)>,
+        pair: Option<&(Buffer, Buffer)>,
         m: usize,
         base: usize,
     ) {
@@ -5287,12 +5037,10 @@ impl Qwen3_5DenseWgpu {
             let mut fd = self.fd_base;
             fd.m_rows = m as u32;
             fd.total = (base + m) as u32;
+            self.ctx.queue.write_buffer(fd_buf, 0, bytes_of(&fd));
             self.ctx
                 .queue
-                .write_buffer(fd_buf, 0, bytemuck::bytes_of(&fd));
-            self.ctx
-                .queue
-                .write_buffer(start_buf, 0, bytemuck::bytes_of(&(base as i32)));
+                .write_buffer(start_buf, 0, bytes_of(&(base as i32)));
         }
     }
 
@@ -5303,30 +5051,30 @@ impl Qwen3_5DenseWgpu {
         splices: &[ChunkRowSplice],
     ) -> Result<()> {
         let m = self.pf_m;
-        anyhow::ensure!(chunk.len() == m && (1..=m).contains(&live), "bad chunk");
-        anyhow::ensure!(
+        ensure!(chunk.len() == m && (1..=m).contains(&live), "bad chunk");
+        ensure!(
             splices.is_empty() || self.mtp.is_none(),
             "the mtp drafter has no image-splice row convention: its KV row embeds the token id, \
              not the spliced media row; serve mm without the mtp head attached"
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + live <= self.max_seq,
             "kv cache full at {} + {live} (max_seq {})",
             self.pos,
             self.max_seq
         );
         for &t in chunk {
-            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+            ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
         let hidden_words = self.config.hidden_size / 2;
         let mut mask = vec![0u32; m];
         for sp in splices {
-            anyhow::ensure!(
+            ensure!(
                 sp.rel_pos < live,
                 "splice rel_pos {} >= live {live}",
                 sp.rel_pos
             );
-            anyhow::ensure!(
+            ensure!(
                 sp.row_words.len() == hidden_words,
                 "splice row has {} words, want {hidden_words}",
                 sp.row_words.len()
@@ -5339,26 +5087,22 @@ impl Qwen3_5DenseWgpu {
             self.ctx.queue.write_buffer(
                 splice_buf,
                 (sp.rel_pos * hidden_words * 4) as u64,
-                bytemuck::cast_slice(sp.row_words),
+                cast_slice(sp.row_words),
             );
         }
         let mask_buf = self
             .pf_mask
             .as_ref()
             .expect("prefill chunk without pf list");
-        self.ctx
-            .queue
-            .write_buffer(mask_buf, 0, bytemuck::cast_slice(&mask));
+        self.ctx.queue.write_buffer(mask_buf, 0, cast_slice(&mask));
         let tok = self.pf_tok.as_ref().expect("prefill chunk without pf list");
         let ck = self.pf_ck.as_ref().expect("prefill chunk without pf list");
         let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
-        self.ctx
-            .queue
-            .write_buffer(tok, 0, bytemuck::cast_slice(&ids));
+        self.ctx.queue.write_buffer(tok, 0, cast_slice(&ids));
         self.ctx.queue.write_buffer(
             ck,
             0,
-            bytemuck::bytes_of(&CkParams {
+            bytes_of(&CkParams {
                 m_live: live as u32,
                 base: self.pos as u32,
                 pad0: 0,
@@ -5375,11 +5119,7 @@ impl Qwen3_5DenseWgpu {
         let scope = if self.pf_validated {
             None
         } else {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         let gate_total = (self.pos + live) as u32;
         if dispatch::profile::enabled() && self.ctx.caps.timestamp_query {
@@ -5388,13 +5128,13 @@ impl Qwen3_5DenseWgpu {
                 .iter()
                 .filter(|p| vfl_gate_keeps(&p.label, self.pf_vflash_gate_min_total, gate_total))
                 .collect();
-            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = kept
+            let raw: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = kept
                 .iter()
                 .map(|p| (p.pipeline.as_ref(), &p.bind, p.grid))
                 .collect();
             let labels: Vec<String> = kept.iter().map(|p| p.label.clone()).collect();
             dispatch::submit_profiled_slices(self.ctx, &raw, &labels)
-                .map_err(|e| anyhow::anyhow!("profiled prefill submit: {e}"))?;
+                .map_err(|e| anyhow!("profiled prefill submit: {e}"))?;
         } else {
             let mut enc = self.ctx.device.create_command_encoder(&Default::default());
             {
@@ -5403,16 +5143,14 @@ impl Qwen3_5DenseWgpu {
                     if !vfl_gate_keeps(&p.label, self.pf_vflash_gate_min_total, gate_total) {
                         continue;
                     }
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                    dispatch_pass!(pass, p);
                 }
             }
             self.ctx.queue.submit([enc.finish()]);
         }
         if let Some(scope) = scope {
             if let Some(e) = dispatch::pop_scope(scope) {
-                anyhow::bail!("qwen3_5_dense_wgpu prefill chunk validation: {e}");
+                bail!("qwen3_5_dense_wgpu prefill chunk validation: {e}");
             }
             self.pf_validated = true;
         }
@@ -5452,27 +5190,25 @@ impl Qwen3_5DenseWgpu {
         splices: &[ImageRowSplice],
     ) -> Result<usize> {
         let m = self.prefill_chunk_len();
-        anyhow::ensure!(
+        ensure!(
             m >= 2,
-            "image-row splice prefill requires the chunked prefill graph: NV_WGPU_PREFILL_M>=2 and \
-             a live pf pass list"
+            "image-row splice prefill requires the chunked prefill graph and a live pf pass list"
         );
         let hidden = self.config.hidden_size;
-        let hidden_words = hidden / 2;
         let mut prev_end = 0usize;
         let mut packed: Vec<Vec<u32>> = Vec::with_capacity(splices.len());
         for sp in splices {
-            anyhow::ensure!(
+            ensure!(
                 sp.rows_bf16.len() % hidden == 0,
                 "splice rows_bf16 len {} not a multiple of hidden {hidden}",
                 sp.rows_bf16.len()
             );
             let n_slots = sp.rows_bf16.len() / hidden;
-            anyhow::ensure!(
+            ensure!(
                 sp.position >= prev_end,
                 "image splices must be sorted and non-overlapping"
             );
-            anyhow::ensure!(
+            ensure!(
                 sp.position + n_slots <= tokens.len(),
                 "image splice at {} with {n_slots} slots exceeds {} tokens",
                 sp.position,
@@ -5484,32 +5220,13 @@ impl Qwen3_5DenseWgpu {
         let mut done = 0usize;
         while done < tokens.len() {
             let live = m.min(tokens.len() - done);
-            anyhow::ensure!(
+            ensure!(
                 self.pos + live <= self.max_seq,
                 "kv cache full at {} + {live} (max_seq {})",
                 self.pos,
                 self.max_seq
             );
-            let mut chunk: Vec<u32> = tokens[done..done + live].to_vec();
-            let pad = *chunk.last().expect("non-empty chunk");
-            chunk.resize(m, pad);
-            let chunk_end = done + live;
-            let mut rows: Vec<ChunkRowSplice> = Vec::new();
-            for (si, sp) in splices.iter().enumerate() {
-                let n_slots = sp.rows_bf16.len() / hidden;
-                let s0 = sp.position;
-                let s1 = sp.position + n_slots;
-                let lo = s0.max(done);
-                let hi = s1.min(chunk_end);
-                for abs in lo..hi {
-                    let slot = abs - s0;
-                    let w0 = slot * hidden_words;
-                    rows.push(ChunkRowSplice {
-                        rel_pos: abs - done,
-                        row_words: &packed[si][w0..w0 + hidden_words],
-                    });
-                }
-            }
+            let (chunk, rows) = spliced_chunk(tokens, splices, &packed, hidden, m, done, live);
             self.prefill_chunk_masked(&chunk, live, &rows)?;
             done += live;
         }
@@ -5526,7 +5243,7 @@ impl Qwen3_5DenseWgpu {
     }
 
     async fn prefill_arm(&mut self, tokens: &[u32], arm: dispatch::ReadbackArm) -> Result<u32> {
-        anyhow::ensure!(!tokens.is_empty(), "prefill needs at least one token");
+        ensure!(!tokens.is_empty(), "prefill needs at least one token");
         let (last, rest) = tokens.split_last().expect("non-empty");
         let done = self.prefill_tokens(rest)?;
         for t in &rest[done..] {
@@ -5575,9 +5292,8 @@ impl Qwen3_5DenseWgpu {
         } else {
             self.pf_attn_out_for_arm_probe.as_ref()
         }
-        .ok_or_else(|| anyhow::anyhow!("no M-row graph recorded, so no verify attention output"))?;
-        dispatch::read_back(self.ctx, buf, (buf.size() / 4) as usize)
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        .ok_or_else(|| anyhow!("no M-row graph recorded, so no verify attention output"))?;
+        dispatch::read_back(self.ctx, buf, (buf.size() / 4) as usize).map_err(|e| anyhow!("{e}"))
     }
 
     pub fn verify_chain_commit_only(&mut self, batch: &[u32]) -> Result<()> {
@@ -5599,33 +5315,33 @@ impl Qwen3_5DenseWgpu {
         let commit_only = tail == VerifyTail::SkippedBecauseCommitOnlyCallersAlreadyKnowEveryToken;
         let vf_on = !padded_prefill_graph_forced_for_test && !self.vf_passes.is_empty();
         let rows = self.verify_max_rows();
-        anyhow::ensure!(
+        ensure!(
             rows >= 2,
-            "verify_chain needs the M-row prefill graph: NV_WGPU_PREFILL_M >= 2"
+            "verify_chain needs the M-row prefill graph"
         );
         let live = batch.len();
-        anyhow::ensure!(
+        ensure!(
             (1..=rows).contains(&live),
             "verify_chain batch {live} out of 1..={rows}"
         );
-        anyhow::ensure!(
+        ensure!(
             self.verify.as_ref().is_some_and(|v| v.pending.is_none()),
             "verify_chain twice without advance(): {VERIFY_CHAIN_COMMITS_BY_SNAPSHOT_AND_M1_REPLAY_BECAUSE_DELTANET_STATE_IS_RECURRENT_NOT_POSITION_MASKED}"
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + live <= self.max_seq,
             "kv cache full at {} + {live} (max_seq {})",
             self.pos,
             self.max_seq
         );
         for &t in batch {
-            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+            ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
         let hidden_words = self.config.hidden_size / 2;
         let row_bytes = (hidden_words * 4) as u64;
         let vocab_bytes = (self.vocab * 4) as u64;
         if self.verify.as_ref().is_some_and(|v| v.rollback.is_empty()) {
-            let rollback: Vec<wgpu::Buffer> = self
+            let rollback: Vec<Buffer> = self
                 .recurrent_states
                 .iter()
                 .map(|(_, bytes)| dispatch::storage_zeroed(self.ctx, "q3d-vf-rollback", *bytes))
@@ -5657,14 +5373,12 @@ impl Qwen3_5DenseWgpu {
         };
         self.ctx
             .queue
-            .write_buffer(mask, 0, bytemuck::cast_slice(&vec![0u32; graph_m]));
-        self.ctx
-            .queue
-            .write_buffer(tok, 0, bytemuck::cast_slice(&ids));
+            .write_buffer(mask, 0, cast_slice(&vec![0u32; graph_m]));
+        self.ctx.queue.write_buffer(tok, 0, cast_slice(&ids));
         self.ctx.queue.write_buffer(
             ck,
             0,
-            bytemuck::bytes_of(&CkParams {
+            bytes_of(&CkParams {
                 m_live: live as u32,
                 base: self.pos as u32,
                 pad0: 0,
@@ -5690,11 +5404,8 @@ impl Qwen3_5DenseWgpu {
         }
 
         let v = self.verify.as_ref().expect("verify list");
-        let scope = (!v.validated).then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
+        let scope =
+            (!v.validated).then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
         for ((src, bytes), dst) in self.recurrent_states.iter().zip(&v.rollback) {
             enc.copy_buffer_to_buffer(src, 0, dst, 0, *bytes);
@@ -5717,9 +5428,7 @@ impl Qwen3_5DenseWgpu {
                 if !vfl_gate_keeps(&p.label, gate_min, gate_total) {
                     continue;
                 }
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                dispatch_pass!(pass, p);
             }
         }
         if !commit_only {
@@ -5734,9 +5443,7 @@ impl Qwen3_5DenseWgpu {
                 {
                     let mut pass = enc.begin_compute_pass(&Default::default());
                     for p in &self.passes[self.final_start..] {
-                        pass.set_pipeline(&p.pipeline);
-                        pass.set_bind_group(0, &p.bind, &[]);
-                        pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                        dispatch_pass!(pass, p);
                     }
                 }
                 enc.copy_buffer_to_buffer(&self.token_out, 0, &v.tok, r as u64 * 4, 4);
@@ -5755,17 +5462,18 @@ impl Qwen3_5DenseWgpu {
         self.ctx.queue.submit([enc.finish()]);
         if let Some(scope) = scope {
             if let Some(e) = dispatch::pop_scope(scope) {
-                anyhow::bail!("qwen3_5_dense_wgpu verify chain validation: {e}");
+                bail!("qwen3_5_dense_wgpu verify chain validation: {e}");
             }
         }
         let toks: Vec<u32> = if commit_only {
             Vec::new()
         } else {
-            dispatch::read_back(self.ctx, &v.tok, live).map_err(|e| anyhow::anyhow!("{e}"))?
+            dispatch::read_back(self.ctx, &v.tok, live).map_err(|e| anyhow!("{e}"))?
         };
         let logits = match v.row_logits.as_ref().filter(|_| want_logits) {
-            Some(rl) => dispatch::read_back(self.ctx, rl, live * self.vocab)
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            Some(rl) => {
+                dispatch::read_back(self.ctx, rl, live * self.vocab).map_err(|e| anyhow!("{e}"))?
+            }
             None => Vec::new(),
         };
         let vm = self.verify.as_mut().expect("verify list");
@@ -5780,8 +5488,8 @@ impl Qwen3_5DenseWgpu {
             .verify
             .as_ref()
             .and_then(|v| v.pending.as_ref().map(|b| b.len()))
-            .ok_or_else(|| anyhow::anyhow!("advance() without a pending verify_chain"))?;
-        anyhow::ensure!(
+            .ok_or_else(|| anyhow!("advance() without a pending verify_chain"))?;
+        ensure!(
             n <= rows,
             "advance {n} beyond the {rows} rows verify_chain forwarded"
         );
@@ -5829,11 +5537,11 @@ impl Qwen3_5DenseWgpu {
     }
 
     pub fn mtp_commit_scan_replay_active(&self) -> bool {
-        !self.vf_commit_passes.is_empty() && !mtp_verify_replay_escape_selected()
+        !self.vf_commit_passes.is_empty()
     }
 
     fn commit_accepted_prefix_by_dn_scan_replay(&mut self, n: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             n >= 1 && !self.vf_commit_passes.is_empty(),
             "{MTP_COMMIT_SCAN_REPLAY_RESTORES_THE_SNAPSHOT_AND_REDISPATCHES_ONLY_EACH_DELTANET_CONV_SHIFT_AND_SCAN}"
         );
@@ -5844,31 +5552,19 @@ impl Qwen3_5DenseWgpu {
         self.ctx.queue.write_buffer(
             ck,
             0,
-            bytemuck::bytes_of(&CkParams {
+            bytes_of(&CkParams {
                 m_live: n as u32,
                 base: self.pos as u32,
                 pad0: 0,
                 pad1: 0,
             }),
         );
-        let scope = (!self.vf_commit_validated).then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
-        let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            for p in &self.vf_commit_passes {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-            }
-        }
-        self.ctx.queue.submit([enc.finish()]);
+        let scope = (!self.vf_commit_validated)
+            .then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
+        submit_passes!(self.ctx, &self.vf_commit_passes);
         if let Some(scope) = scope {
             if let Some(e) = dispatch::pop_scope(scope) {
-                anyhow::bail!("qwen3_5_dense_wgpu scan-replay commit validation: {e}");
+                bail!("qwen3_5_dense_wgpu scan-replay commit validation: {e}");
             }
             self.vf_commit_validated = true;
         }
@@ -5881,14 +5577,14 @@ impl Qwen3_5DenseWgpu {
     }
 
     fn ensure_not_mid_verify(&self, what: &str) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.verify.as_ref().is_none_or(|v| v.pending.is_none()),
             "{what} mid-verify: advance() has not committed or rolled back"
         );
         Ok(())
     }
 
-    fn copy_recurrent_states(&self, from_live: bool, other: &[wgpu::Buffer]) {
+    fn copy_recurrent_states(&self, from_live: bool, other: &[Buffer]) {
         let mut enc = self.ctx.device.create_command_encoder(&Default::default());
         for ((live, bytes), o) in self.recurrent_states.iter().zip(other) {
             let (src, dst) = if from_live { (live, o) } else { (o, live) };
@@ -5897,7 +5593,7 @@ impl Qwen3_5DenseWgpu {
         self.ctx.queue.submit([enc.finish()]);
     }
 
-    fn alloc_checkpoint_clone(&self) -> Vec<wgpu::Buffer> {
+    fn alloc_checkpoint_clone(&self) -> Vec<Buffer> {
         self.recurrent_states
             .iter()
             .map(|(_, bytes)| dispatch::storage_zeroed(self.ctx, "q3d-resume-ckpt", *bytes))
@@ -5998,7 +5694,7 @@ impl Qwen3_5DenseWgpu {
             return Ok(false);
         }
         self.ensure_not_mid_verify("rewind_to")?;
-        anyhow::ensure!(
+        ensure!(
             pos <= self.pos,
             "rewind_to {pos} is ahead of the live pos {}: the checkpoint outlived a state it \
              never saw",
@@ -6032,13 +5728,13 @@ impl Qwen3_5DenseWgpu {
         self.lora_active
     }
 
-    pub fn mtp_attach(&mut self, w: &nv_weights::WeightLoader) -> Result<()> {
+    pub fn mtp_attach(&mut self, w: &WeightLoader) -> Result<()> {
         self.mtp_attach_with_adapter(w, None).map(|_| ())
     }
 
     pub fn mtp_attach_with_adapter(
         &mut self,
-        w: &nv_weights::WeightLoader,
+        w: &WeightLoader,
         adapter_dir: Option<&std::path::Path>,
     ) -> Result<usize> {
         let cfg = &self.config;
@@ -6097,10 +5793,10 @@ impl Qwen3_5DenseWgpu {
     }
 
     pub fn mtp_attach_host(&mut self, w: &MtpHostWeights) -> Result<()> {
-        anyhow::ensure!(self.mtp.is_none(), "mtp head already attached");
-        anyhow::ensure!(
+        ensure!(self.mtp.is_none(), "mtp head already attached");
+        ensure!(
             self.verify.is_some(),
-            "the mtp drafter needs the M-row prefill graph (NV_WGPU_PREFILL_M >= 2): drafts are \
+            "the mtp drafter needs the M-row prefill graph: drafts are \
              verified through verify_chain and the prompt/round KV catch-up reads its hidden rows"
         );
         let cfg = self.config.clone();
@@ -6111,7 +5807,7 @@ impl Qwen3_5DenseWgpu {
         let heads = cfg.num_attention_heads;
         let q_out = heads * hd * if cfg.attn_output_gate { 2 } else { 1 };
         let kv_out = cfg.num_key_value_heads * hd;
-        anyhow::ensure!(
+        ensure!(
             w.fc.n == hidden && w.fc.k == 2 * hidden,
             "mtp fc must be [{hidden}, {}], got [{}, {}]; \
              {MTP_HEAD_CONVENTIONS_ZERO_CENTERED_NORMS_EMB_FIRST_FC_AND_SHIFT_BY_ONE_KV_WITH_A_ZERO_HIDDEN_AT_POS_0}",
@@ -6119,7 +5815,7 @@ impl Qwen3_5DenseWgpu {
             w.fc.n,
             w.fc.k
         );
-        anyhow::ensure!(
+        ensure!(
             w.attn.q.n() == q_out
                 && w.attn.q.k() == hidden
                 && w.attn.k.n() == kv_out
@@ -6133,7 +5829,7 @@ impl Qwen3_5DenseWgpu {
             cfg.num_key_value_heads,
             cfg.attn_output_gate
         );
-        anyhow::ensure!(
+        ensure!(
             w.pre_fc_norm_embedding.len() == hidden
                 && w.pre_fc_norm_hidden.len() == hidden
                 && w.input_ln.len() == hidden
@@ -6147,7 +5843,6 @@ impl Qwen3_5DenseWgpu {
             core: crate::wgpu_ledger::VramLedger::new(
                 self.ctx,
                 "q3d-",
-                staging_flush_enabled,
                 STAGING_FLUSH_BYTES,
             ),
             passes: Vec::new(),
@@ -6250,11 +5945,10 @@ impl Qwen3_5DenseWgpu {
             (1, 1, 1),
         )?;
 
-        let mut kv_state: Vec<(wgpu::Buffer, u64)> = Vec::new();
+        let mut kv_state: Vec<(Buffer, u64)> = Vec::new();
         let no_pf: [Pf; 0] = [];
-        let mut mtp_rope_rows_never_mrope_swapped: Vec<(wgpu::Buffer, wgpu::Buffer)> = Vec::new();
-        let mut mtp_kv_caches_not_probed_by_the_rotkv_debug_api: Vec<(wgpu::Buffer, wgpu::Buffer)> =
-            Vec::new();
+        let mut mtp_rope_rows_never_mrope_swapped: Vec<(Buffer, Buffer)> = Vec::new();
+        let mut mtp_kv_caches_not_probed_by_the_rotkv_debug_api: Vec<(Buffer, Buffer)> = Vec::new();
         let kv_end = build_attn(
             &mut b,
             &s,
@@ -6338,8 +6032,8 @@ impl Qwen3_5DenseWgpu {
         pre: MtpHid,
         after: MtpAfter,
     ) -> Result<Option<u32>> {
-        anyhow::ensure!((tok as usize) < self.vocab, "mtp token {tok} out of vocab");
-        anyhow::ensure!(
+        ensure!((tok as usize) < self.vocab, "mtp token {tok} out of vocab");
+        ensure!(
             pos < self.max_seq,
             "mtp kv full at {pos} (max_seq {})",
             self.max_seq
@@ -6347,30 +6041,25 @@ impl Qwen3_5DenseWgpu {
         let row_bytes = (self.config.hidden_size / 2 * 4) as u64;
         self.ctx
             .queue
-            .write_buffer(&self.tok_buf, 0, bytemuck::bytes_of(&(tok as i32)));
+            .write_buffer(&self.tok_buf, 0, bytes_of(&(tok as i32)));
         let needs_scope;
         {
             let m = self.mtp.as_ref().expect("mtp_run without an attached head");
             self.ctx
                 .queue
-                .write_buffer(&m.pos_buf, 0, bytemuck::bytes_of(&(pos as i32)));
+                .write_buffer(&m.pos_buf, 0, bytes_of(&(pos as i32)));
             if full {
                 let mut fd = self.fd_base;
                 fd.total = (pos + 1) as u32;
-                self.ctx
-                    .queue
-                    .write_buffer(&m.fd_buf, 0, bytemuck::bytes_of(&fd));
+                self.ctx.queue.write_buffer(&m.fd_buf, 0, bytes_of(&fd));
             }
             needs_scope = if full {
                 !m.validated_full
             } else {
                 !m.validated_kv
             };
-            let scope = needs_scope.then(|| {
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation)
-            });
+            let scope =
+                needs_scope.then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
             let mut enc = self.ctx.device.create_command_encoder(&Default::default());
             match pre {
                 MtpHid::Keep => {}
@@ -6403,9 +6092,7 @@ impl Qwen3_5DenseWgpu {
                 };
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for p in gather.iter().chain(mtp_slice).chain(head) {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                    dispatch_pass!(pass, p);
                 }
             }
             match after {
@@ -6430,7 +6117,7 @@ impl Qwen3_5DenseWgpu {
             self.ctx.queue.submit([enc.finish()]);
             if let Some(scope) = scope {
                 if let Some(e) = dispatch::pop_scope(scope) {
-                    anyhow::bail!("qwen3_5_dense_wgpu mtp step validation: {e}");
+                    bail!("qwen3_5_dense_wgpu mtp step validation: {e}");
                 }
             }
         }
@@ -6445,33 +6132,33 @@ impl Qwen3_5DenseWgpu {
         if !full {
             return Ok(None);
         }
-        let t: Vec<u32> = dispatch::read_back(self.ctx, &self.token_out, 1)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let t: Vec<u32> =
+            dispatch::read_back(self.ctx, &self.token_out, 1).map_err(|e| anyhow!("{e}"))?;
         Ok(Some(t[0]))
     }
 
     pub fn debug_mtp_last_draft_logits_for_test(&self) -> Result<Vec<f32>> {
-        anyhow::ensure!(
+        ensure!(
             self.mtp.is_some(),
             "no mtp head attached, so the logits buffer holds no draft row"
         );
-        dispatch::read_back(self.ctx, &self.logits, self.vocab).map_err(|e| anyhow::anyhow!("{e}"))
+        dispatch::read_back(self.ctx, &self.logits, self.vocab).map_err(|e| anyhow!("{e}"))
     }
 
     pub fn mtp_draft_round(&mut self, anchor: u32, k: usize) -> Result<Vec<u32>> {
-        anyhow::ensure!(k >= 1, "mtp draft round needs k >= 1");
-        anyhow::ensure!(
+        ensure!(k >= 1, "mtp draft round needs k >= 1");
+        ensure!(
             self.verify.as_ref().is_some_and(|v| v.pending.is_none()),
             "mtp draft round during a pending verify_chain"
         );
         let l = self.mtp_len();
-        anyhow::ensure!(
+        ensure!(
             self.mtp.is_some() && l == self.pos,
             "mtp kv desync: drafter holds {l} rows but the trunk committed {}; \
              {MTP_HEAD_CONVENTIONS_ZERO_CENTERED_NORMS_EMB_FIRST_FC_AND_SHIFT_BY_ONE_KV_WITH_A_ZERO_HIDDEN_AT_POS_0}",
             self.pos
         );
-        anyhow::ensure!(
+        ensure!(
             l + k <= self.max_seq && self.pos + k < self.max_seq,
             "mtp round does not fit: committed={l}, k={k}, max_seq={}",
             self.max_seq
@@ -6500,9 +6187,7 @@ impl Qwen3_5DenseWgpu {
             .mtp
             .as_mut()
             .and_then(|m| m.round_base.take())
-            .ok_or_else(|| {
-                anyhow::anyhow!("mtp_post_verify without a preceding mtp_draft_round")
-            })?;
+            .ok_or_else(|| anyhow!("mtp_post_verify without a preceding mtp_draft_round"))?;
         let n = accepted.len();
         for (j, &t) in accepted.iter().enumerate() {
             let after = if j + 1 == n {
@@ -6524,7 +6209,7 @@ impl Qwen3_5DenseWgpu {
             self.ctx.queue.submit([enc.finish()]);
         }
         self.mtp.as_mut().expect("mtp attached").len = base + 1 + n;
-        anyhow::ensure!(
+        ensure!(
             self.mtp_len() == self.pos,
             "mtp kv catch-up desync: drafter holds {} rows, trunk committed {}",
             self.mtp_len(),
@@ -6535,7 +6220,7 @@ impl Qwen3_5DenseWgpu {
 
     fn mtp_sync_committed_step(&mut self, token: u32) -> Result<()> {
         let pos_before = self.pos - 1;
-        anyhow::ensure!(
+        ensure!(
             self.mtp_len() == pos_before,
             "mtp kv desync at an M=1 step: drafter holds {} rows, trunk committed {pos_before}",
             self.mtp_len()
@@ -6553,7 +6238,7 @@ impl Qwen3_5DenseWgpu {
     fn mtp_sync_committed_chunk(&mut self, live_tokens: &[u32]) -> Result<()> {
         let live = live_tokens.len();
         let base = self.pos - live;
-        anyhow::ensure!(
+        ensure!(
             self.mtp_len() == base,
             "mtp kv desync at a prefill chunk: drafter holds {} rows, trunk committed {base}",
             self.mtp_len()
@@ -6610,8 +6295,8 @@ fn push_gemv_bf16(
     s: &Sources,
     label: &str,
     w: &Bf16Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     out_f32: bool,
 ) -> Result<()> {
     let pairs = w.n.div_ceil(2);
@@ -6640,9 +6325,9 @@ fn push_gemv_bf16(
 }
 
 struct Fp8Gpu {
-    w: wgpu::Buffer,
-    s: wgpu::Buffer,
-    s_plain: Option<wgpu::Buffer>,
+    w: Buffer,
+    s: Buffer,
+    s_plain: Option<Buffer>,
     n: usize,
     k: usize,
 }
@@ -6676,25 +6361,24 @@ fn push_gemv_fp8_rowscale(
     s: &Sources,
     label: &str,
     w: &Fp8Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     out_f32: bool,
 ) -> Result<()> {
     push_gemv_fp8_rowscale_lora(b, s, label, w, x, y, out_f32, None)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_fp8_rowscale_lora(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Fp8Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     out_f32: bool,
     lora: Option<LoraFoldSlice<'_>>,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         w.k.is_multiple_of(4),
         "{label}: fp8 rowscale gemv packs 4 e4m3 bytes per word; k {} % 4 != 0",
         w.k
@@ -6746,7 +6430,6 @@ fn push_gemv_fp8_rowscale_lora(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_dn_merged(
     b: &mut Builder,
     s: &Sources,
@@ -6754,20 +6437,20 @@ fn push_gemv_dn_merged(
     qkv: &Fp8Gpu,
     z: &Fp8Gpu,
     ab: &Bf16Gpu,
-    x: &wgpu::Buffer,
-    y_qkv: &wgpu::Buffer,
-    y_z: &wgpu::Buffer,
-    y_ab: &wgpu::Buffer,
+    x: &Buffer,
+    y_qkv: &Buffer,
+    y_z: &Buffer,
+    y_ab: &Buffer,
     lora: Option<DnMergedLoraFold<'_>>,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         qkv.k == z.k && qkv.k == ab.k,
         "{label}: merged DN projections read one normed x, so k must agree; got qkv {} z {} ab {}",
         qkv.k,
         z.k,
         ab.k
     );
-    anyhow::ensure!(
+    ensure!(
         qkv.k.is_multiple_of(4),
         "{label}: fp8 rowscale gemv packs 4 e4m3 bytes per word; k {} % 4 != 0",
         qkv.k
@@ -6849,29 +6532,28 @@ pub const PF_FP8_REPLAY_ROWS_REPLAY_THE_DECODE_GEMV_PER_SLOT: &str =
      them M times and only a small verify graph can afford that.";
 
 fn pf_fp8_replay_enabled() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q3D_PF_FP8_REPLAY")
+    env_arm_opt_in_eq_some_1_reread_every_call("NV_Q3D_PF_FP8_REPLAY")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_fp8_rowscale_pf(
     b: &mut Builder,
     s: &Sources,
     pf: &Pf,
     label: &str,
     w: &Fp8Gpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_stride_words: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
 ) -> Result<()> {
     b.pf_dst_vf = pf.vf;
-    anyhow::ensure!(
+    ensure!(
         pf.m <= 16,
         "{label}: NV_Q3D_PF_FP8_REPLAY streams the full weight once per slot, which only the \
          small verify graphs can afford; m={} is a coop-scale prefill and the replay is refused",
         pf.m
     );
-    anyhow::ensure!(
+    ensure!(
         w.k.is_multiple_of(4),
         "{label}: fp8 rowscale gemv packs 4 e4m3 bytes per word; k {} % 4 != 0",
         w.k
@@ -6964,17 +6646,10 @@ pub enum W8Scope {
 pub const FP8_LMHEAD_DEFAULT_ON_FOR_THE_SAME_REASON_AS_FP8_PROJ: &str =
     "lm_head.weight ships as F8_E4M3 with per-row scales in the qwen3.8 nvfp4 checkpoints; \
      the bf16 route upcasts it to 2x the bytes for zero information (see \
-     FP8_PROJ_STREAMS_CHECKPOINT_BYTES_INSTEAD_OF_A_BF16_UPCAST). NV_Q3D_WGPU_FP8_LMHEAD=0 \
-     restores the upcast route";
-
-pub fn fp8_lm_head_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_Q3D_WGPU_FP8_LMHEAD",
-    )
-}
+     FP8_PROJ_STREAMS_CHECKPOINT_BYTES_INSTEAD_OF_A_BF16_UPCAST).";
 
 pub fn w8_mode() -> (bool, bool) {
-    let v = std::env::var("NV_Q3D_WGPU_W8").unwrap_or_default();
+    let v = env::var("NV_Q3D_WGPU_W8").unwrap_or_default();
     match v.trim() {
         "ffn" => (false, true),
         "attn" => (true, false),
@@ -7033,7 +6708,7 @@ fn upload_lin(
 ) -> DenseLinGpu {
     match l {
         HostDenseLin::Bf16(x) => DenseLinGpu::Bf16(upload_bf16(b, label, x)),
-        HostDenseLin::Fp8 { fp8, bf16 } if fp8_proj_enabled() => {
+        HostDenseLin::Fp8 { fp8, bf16 } => {
             let g = upload_fp8(b, &format!("{label}-fp8"), fp8);
             let twin = if g.s_plain.is_some() && !pf_fp8_replay_enabled() && pf_rides_coop {
                 None
@@ -7042,7 +6717,6 @@ fn upload_lin(
             };
             DenseLinGpu::Fp8(g, twin)
         }
-        HostDenseLin::Fp8 { bf16, .. } => DenseLinGpu::Bf16(upload_bf16(b, label, bf16)),
         HostDenseLin::Nvfp4(x) if w8_enabled(b.ctx, scope) => {
             DenseLinGpu::Int8(upload_nvfp4_i8(b, label, x))
         }
@@ -7061,15 +6735,15 @@ fn push_gemv_i8(
     s: &Sources,
     label: &str,
     w: &I8Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         b.ctx.caps.subgroup,
         "{label}: every q3d i8 gemv entry rides subgroup butterflies, and this device grants no \
          subgroups, so its module ships stripped of them; serve a non-i8 checkpoint here"
     );
-    anyhow::ensure!(
+    ensure!(
         w.k.is_multiple_of(4),
         "{label}: i8 gemv needs k % 4 == 0, got {}",
         w.k
@@ -7108,7 +6782,7 @@ fn quant_for(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     k: usize,
     consumers: &[&DenseLinGpu],
 ) -> Result<Option<QuantIn>> {
@@ -7117,7 +6791,7 @@ fn quant_for(
         let Some(g) = c.input_global() else { continue };
         match global {
             None => global = Some(g),
-            Some(prev) => anyhow::ensure!(
+            Some(prev) => ensure!(
                 (prev - g).abs() <= 1e-6,
                 "{label}: consumers disagree on input_global_scale ({prev} vs {g})"
             ),
@@ -7127,7 +6801,7 @@ fn quant_for(
         return Ok(None);
     };
     let k_blocks = k / NVFP4_BLOCK;
-    anyhow::ensure!(
+    ensure!(
         k.is_multiple_of(NVFP4_BLOCK) && k_blocks.is_multiple_of(4),
         "{label}: k {k} must be a multiple of {}",
         NVFP4_BLOCK * 4
@@ -7174,13 +6848,13 @@ fn push_silu_mul_quant_rows(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    y_gate: &wgpu::Buffer,
-    y_up: &wgpu::Buffer,
+    y_gate: &Buffer,
+    y_up: &Buffer,
     w: &Nvfp4Gpu,
     k: usize,
 ) -> Result<QuantIn> {
     let k_blocks = k / NVFP4_BLOCK;
-    anyhow::ensure!(
+    ensure!(
         k.is_multiple_of(NVFP4_BLOCK) && k_blocks.is_multiple_of(4),
         "{label}: k {k} must be a multiple of {}",
         NVFP4_BLOCK * 4
@@ -7241,10 +6915,10 @@ fn push_rmsres_post_w4a8(
     s: &Sources,
     hidden: usize,
     eps: f32,
-    mixed_out: &wgpu::Buffer,
-    res: &wgpu::Buffer,
-    post_w: &wgpu::Buffer,
-    normed_post: &wgpu::Buffer,
+    mixed_out: &Buffer,
+    res: &Buffer,
+    post_w: &Buffer,
+    normed_post: &Buffer,
 ) -> Result<W4a8Quant> {
     let q = W4a8Quant {
         xq: b.zeros("q3d-mlp-q8x", hidden as u64),
@@ -7281,16 +6955,16 @@ fn push_silu_mul_rowquant_w4a8(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    y_gate: &wgpu::Buffer,
-    y_up: &wgpu::Buffer,
+    y_gate: &Buffer,
+    y_up: &Buffer,
     k: usize,
-    act_bf16_out: Option<&wgpu::Buffer>,
+    act_bf16_out: Option<&Buffer>,
 ) -> Result<W4a8Quant> {
-    anyhow::ensure!(
+    ensure!(
         k.is_multiple_of(32),
         "{label}: w4a8 silu rowquant emits whole even/odd word groups, k {k} must be 32-aligned"
     );
-    anyhow::ensure!(
+    ensure!(
         k / 2 <= W4A8_SILU_SMEM_WORDS_MIRRORS_THE_WGSL_40KB_ARRAY_SO_THE_ARM_CLAMPS_INTER_AT_20480,
         "{label}: k {k} exceeds the silu rowquant 40KB workgroup stage"
     );
@@ -7348,10 +7022,10 @@ fn push_gemv_nvfp4_w4a8(
     label: &str,
     w: &Nvfp4Gpu,
     q: &W4a8Quant,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     lora: Option<LoraFoldSlice<'_>>,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         w.k.is_multiple_of(32),
         "{label}: gemv_nvfp4_w4a8_mrow2 consumes block pairs, k {} must be 32-aligned",
         w.k
@@ -7404,7 +7078,7 @@ fn push_gemv_nvfp4(
     label: &str,
     w: &Nvfp4Gpu,
     q: &QuantIn,
-    y: &wgpu::Buffer,
+    y: &Buffer,
 ) -> Result<()> {
     let k_blocks = w.k / NVFP4_BLOCK;
     let route = nvfp4_v2_route(b.ctx, w.n, w.k, k_blocks, 1);
@@ -7472,8 +7146,8 @@ fn push_gemv_nvfp4_2w(
     wa: &Nvfp4Gpu,
     wb: &Nvfp4Gpu,
     q: &QuantIn,
-    ya: &wgpu::Buffer,
-    yb: &wgpu::Buffer,
+    ya: &Buffer,
+    yb: &Buffer,
 ) -> Result<bool> {
     if wa.n != wb.n
         || wa.k != wb.k
@@ -7599,21 +7273,21 @@ fn q3w_affine_y_expand_f32(
 }
 "#;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct AffYParams {
-    n: u32,
-    y_off: u32,
-    groups_x: u32,
-    pad0: u32,
+pod! {
+    struct AffYParams {
+        n: u32,
+        y_off: u32,
+        groups_x: u32,
+        pad0: u32,
+    }
 }
 
 fn push_gemv_affine_w4_raw_words(
     b: &mut Builder,
     label: &str,
     w: &AffineW4Gpu,
-    x: &wgpu::Buffer,
-) -> Result<wgpu::Buffer> {
+    x: &Buffer,
+) -> Result<Buffer> {
     let raw = b.zeros(&format!("{label}-affy"), (w.n * 4) as u64);
     push_gemv_affine_w4(b, label, w, x, &raw)?;
     Ok(raw)
@@ -7622,48 +7296,38 @@ fn push_gemv_affine_w4_raw_words(
 pub const AFFINE_MROW4H_ENV_HALF_WIDTH_WORKGROUP_MEASURED_2X_ON_DOTS_MLP_SHAPES_DEFAULT_OFF_QWEN38_NUMBERS_PINNED_ON_MROW4:
     &str = "NV_Q3D_AFFINE_MROW4H";
 
-pub const AFFINE_BLOCK_FORCED_ENV_WARP_PER_ROW_BUTTERFLY_AB_AGAINST_THE_MROW_FAMILY: &str =
-    "NV_Q3D_AFFINE_BLOCK";
-
 fn push_gemv_affine_w4_into_pairs(
     b: &mut Builder,
     label: &str,
     w: &AffineW4Gpu,
-    x: &wgpu::Buffer,
-    y_pairs: &wgpu::Buffer,
+    x: &Buffer,
+    y_pairs: &Buffer,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         b.ctx.caps.subgroup,
         "{label}: every gemv_w4a16_affine entry rides the subgroupShuffleXor butterfly with no \
          workgroup-tree twin, and this device grants no subgroups; an affine-w4 checkpoint \
          cannot decode here (browser pipeline errors are fire-and-forget, so without this \
          refusal the dispatches silently no-op)"
     );
-    anyhow::ensure!(
+    ensure!(
         w.n.is_multiple_of(2),
         "{label}: the pk entry packs two rows per word; n {} must be even",
         w.n
     );
     let mrow = w.gs.is_multiple_of(32);
     let mrow4h = mrow
-        && nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        && env_arm_opt_in_eq_some_1_reread_every_call(
             AFFINE_MROW4H_ENV_HALF_WIDTH_WORKGROUP_MEASURED_2X_ON_DOTS_MLP_SHAPES_DEFAULT_OFF_QWEN38_NUMBERS_PINNED_ON_MROW4,
         );
-    let block_forced = nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
-        AFFINE_BLOCK_FORCED_ENV_WARP_PER_ROW_BUTTERFLY_AB_AGAINST_THE_MROW_FAMILY,
-    );
-    let rows_per_group = if block_forced {
-        wk::gemv_w4a16_affine::ROWS_PER_GROUP
-    } else if mrow4h {
+    let rows_per_group = if mrow4h {
         wk::gemv_w4a16_affine::MROW4H_ROWS_PER_GROUP
     } else if mrow {
         wk::gemv_w4a16_affine::MROW4_ROWS_PER_GROUP
     } else {
         wk::gemv_w4a16_affine::ROWS_PER_GROUP
     };
-    let entry = if block_forced {
-        wk::gemv_w4a16_affine::BLOCK_PK_ENTRY
-    } else if mrow4h {
+    let entry = if mrow4h {
         wk::gemv_w4a16_affine::MROW4H_PK_ENTRY_REQUIRES_GS_MULTIPLE_OF_32
     } else if mrow {
         wk::gemv_w4a16_affine::MROW4_PK_ENTRY_REQUIRES_GS_MULTIPLE_OF_32
@@ -7703,10 +7367,10 @@ fn push_gemv_affine_w4_into_pairs(
 fn push_affine_y_expand_f32(
     b: &mut Builder,
     label: &str,
-    raw: &wgpu::Buffer,
+    raw: &Buffer,
     rows: usize,
     y_off: usize,
-    y_f32: &wgpu::Buffer,
+    y_f32: &Buffer,
 ) -> Result<()> {
     let grid = b.grid1(rows as u64, 256);
     let p = b.uni(
@@ -7731,10 +7395,10 @@ fn push_gemv_affine_w4(
     b: &mut Builder,
     label: &str,
     w: &AffineW4Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         b.ctx.caps.subgroup,
         "{label}: every gemv_w4a16_affine entry rides the subgroupShuffleXor butterfly with no \
          workgroup-tree twin, and this device grants no subgroups; an affine-w4 checkpoint \
@@ -7743,7 +7407,7 @@ fn push_gemv_affine_w4(
     );
     let mrow = w.gs.is_multiple_of(32);
     let mrow4h = mrow
-        && nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        && env_arm_opt_in_eq_some_1_reread_every_call(
             AFFINE_MROW4H_ENV_HALF_WIDTH_WORKGROUP_MEASURED_2X_ON_DOTS_MLP_SHAPES_DEFAULT_OFF_QWEN38_NUMBERS_PINNED_ON_MROW4,
         );
     let rows_per_group = if mrow4h {
@@ -7798,9 +7462,9 @@ fn push_gemv_affine_w4_gu_pairs(
     label: &str,
     a: &AffineW4Gpu,
     u: &AffineW4Gpu,
-    x: &wgpu::Buffer,
-    y_gate: &wgpu::Buffer,
-    y_up: &wgpu::Buffer,
+    x: &Buffer,
+    y_gate: &Buffer,
+    y_up: &Buffer,
 ) -> Result<bool> {
     let same = a.k == u.k && a.gs == u.gs;
     let routable = a.gs.is_multiple_of(32) && a.n.is_multiple_of(4) && u.n.is_multiple_of(4);
@@ -7886,10 +7550,10 @@ fn push_gemv_affine_w4_qkv_pairs(
     w: &AffineW4Gpu,
     nq: usize,
     nk: usize,
-    x: &wgpu::Buffer,
-    y_q: &wgpu::Buffer,
-    y_k: &wgpu::Buffer,
-    y_v: &wgpu::Buffer,
+    x: &Buffer,
+    y_q: &Buffer,
+    y_k: &Buffer,
+    y_v: &Buffer,
 ) -> Result<()> {
     let grid = b.grid1(w.n as u64, wk::gemv_w4a16_affine::MROW4_ROWS_PER_GROUP);
     let p = b.uni(
@@ -7973,7 +7637,7 @@ fn mlx_affine_dequant_f16_pairs(l: &HostAffineW4Lin) -> Vec<u32> {
 fn upload_affine_w4_rows_from_loader_view_so_wasm32_never_hosts_a_full_copy(
     b: &mut Builder,
     label: &str,
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     module: &str,
     off: usize,
     rows: usize,
@@ -8047,9 +7711,9 @@ fn push_gemv(
     s: &Sources,
     label: &str,
     w: &DenseLinGpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     q: Option<&QuantIn>,
-    y: &wgpu::Buffer,
+    y: &Buffer,
 ) -> Result<()> {
     match w {
         DenseLinGpu::Bf16(w) => push_gemv_bf16(b, s, label, w, x, y, false),
@@ -8057,7 +7721,7 @@ fn push_gemv(
         DenseLinGpu::Fp8(w, _) => push_gemv_fp8_rowscale(b, s, label, w, x, y, false),
         DenseLinGpu::Int8(w) => push_gemv_i8(b, s, label, w, x, y),
         DenseLinGpu::Nvfp4(w) => {
-            let q = q.ok_or_else(|| anyhow::anyhow!("{label}: nvfp4 gemv without quantized x"))?;
+            let q = q.ok_or_else(|| anyhow!("{label}: nvfp4 gemv without quantized x"))?;
             push_gemv_nvfp4(b, s, label, w, q, y)
         }
     }
@@ -8148,18 +7812,15 @@ fn pf_coop_ku(k: usize, tn: u32, sg: u32) -> u32 {
 }
 
 enum PfCoopW<'a> {
-    Wq(wk::gemm_coop_f16::WqFmt, &'a wgpu::Buffer, &'a wgpu::Buffer),
+    Wq(wk::gemm_coop_f16::WqFmt, &'a Buffer, &'a Buffer),
     WqAffine {
-        w: &'a wgpu::Buffer,
-        scales: &'a wgpu::Buffer,
-        biases: &'a wgpu::Buffer,
+        w: &'a Buffer,
+        scales: &'a Buffer,
+        biases: &'a Buffer,
         gs: usize,
     },
-    F16(&'a wgpu::Buffer),
+    F16(&'a Buffer),
 }
-
-pub const PF_GEMM_ROUTE_ENV_DEFAULT_ON_SET_0_FOR_THE_SINGLE_TM8_CONFIG_ARM: &str =
-    "NV_Q3D_PF_GEMM_ROUTE";
 
 pub const PF_GEMM_ROUTE_TABLE_ADJUDICATED_BY_THE_IN_MODEL_PROFILE_NOT_THE_STANDALONE_LADDER: &str =
     "The chunk-prefill projection GEMMs route per (weight-format, n, k, m_alloc) through \
@@ -8173,17 +7834,9 @@ pub const PF_GEMM_ROUTE_TABLE_ADJUDICATED_BY_THE_IN_MODEL_PROFILE_NOT_THE_STANDA
      the same 16-wide fragments in ascending-k order, asserted bit-equal at the exact \
      shapes and both m_alloc bases by \
      pf_gemm_route_table_configs_are_bit_equal_to_the_default_route. \
-     NV_Q3D_PF_GEMM_ROUTE=0 restores the single-config arm, whose published numbers are \
-     the runs.jsonl rows named 'qwen3.8 prefill-r1 *' and 'qwen3.8 prefill-r2 wgpu \
-     default'. The deleted k>n narrow-column heuristic (NV_Q3D_PF_COOP_NARROW) is \
+     The deleted k>n narrow-column heuristic (NV_Q3D_PF_COOP_NARROW) is \
      superseded: its down-proj pick is the table's m=512 row and loses to the table's \
      m=256 row by 1.26x in-model.";
-
-fn pf_gemm_route_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        PF_GEMM_ROUTE_ENV_DEFAULT_ON_SET_0_FOR_THE_SINGLE_TM8_CONFIG_ARM,
-    )
-}
 
 fn pf_gemm_route_cfg(
     m_alloc: u32,
@@ -8191,9 +7844,6 @@ fn pf_gemm_route_cfg(
     n: usize,
     k: usize,
 ) -> Option<(u32, u32, u32, u32)> {
-    if !pf_gemm_route_enabled() {
-        return None;
-    }
     wk::gemm_coop_f16::q38_pf_route(m_alloc, kind, n as u32, k as u32)
 }
 
@@ -8201,7 +7851,7 @@ fn pf_coop_cast_x(
     b: &mut Builder,
     pf: &Pf,
     label: &str,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_stride_words: usize,
     k: usize,
 ) -> Result<()> {
@@ -8209,8 +7859,8 @@ fn pf_coop_cast_x(
     let cp = pf
         .coop
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("{label}: coop cast without a coop plan"))?;
-    anyhow::ensure!(
+        .ok_or_else(|| anyhow!("{label}: coop cast without a coop plan"))?;
+    ensure!(
         k.is_multiple_of(16),
         "{label}: the 16x16 coop fragments need k % 16 == 0, got {k}"
     );
@@ -8236,7 +7886,6 @@ fn pf_coop_cast_x(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_coop_gemm(
     b: &mut Builder,
     pf: &Pf,
@@ -8245,7 +7894,7 @@ fn pf_coop_gemm(
     n: usize,
     k: usize,
     alpha: f32,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
 ) -> Result<()> {
     use wk::gemm_coop_f16 as cf;
@@ -8253,12 +7902,12 @@ fn pf_coop_gemm(
     let cp = pf
         .coop
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("{label}: coop gemm without a coop plan"))?;
-    anyhow::ensure!(
+        .ok_or_else(|| anyhow!("{label}: coop gemm without a coop plan"))?;
+    ensure!(
         n.is_multiple_of(16) && k.is_multiple_of(16),
         "{label}: the coop epilogue stores whole 16x16 fragments; n={n} k={k} must be 16-aligned"
     );
-    anyhow::ensure!(
+    ensure!(
         y_stride_words * 2 == n,
         "{label}: pf consumers read bf16 rows of n/2 words; y_stride_words {y_stride_words} != {}",
         n / 2
@@ -8268,7 +7917,7 @@ fn pf_coop_gemm(
         PfCoopW::WqAffine { .. } => Some(wk::gemm_coop_f16::WqFmt::MlxAffineGe16),
         PfCoopW::F16(_) => None,
     };
-    anyhow::ensure!(
+    ensure!(
         cp.tile == 16
             || matches!(&w, PfCoopW::F16(_))
             || matches!(&w, PfCoopW::WqAffine { .. }),
@@ -8277,7 +7926,7 @@ fn pf_coop_gemm(
     );
     let wq8 = cp.tile == 8 && matches!(&w, PfCoopW::WqAffine { .. });
     if wq8 {
-        anyhow::ensure!(
+        ensure!(
             alpha == 1.0,
             "{label}: the wq8 affine arm stores raw f32 rows and folds no alpha"
         );
@@ -8464,7 +8113,7 @@ fn quant_for_m_rows(
     s: &Sources,
     pf: &Pf,
     label: &str,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     k: usize,
     consumers: &[&DenseLinGpu],
 ) -> Result<Option<QuantIn>> {
@@ -8474,7 +8123,7 @@ fn quant_for_m_rows(
         let Some(g) = c.input_global() else { continue };
         match global {
             None => global = Some(g),
-            Some(prev) => anyhow::ensure!(
+            Some(prev) => ensure!(
                 (prev - g).abs() <= 1e-6,
                 "{label}: consumers disagree on input_global_scale ({prev} vs {g})"
             ),
@@ -8483,7 +8132,7 @@ fn quant_for_m_rows(
     let Some(global) = global else {
         return Ok(None);
     };
-    anyhow::ensure!(
+    ensure!(
         pf.m <= 16,
         "{label}: the m-row nvfp4 quant/gemv routes (slotshared included) carry per-slot state \
          sized for m 2..=16; m={} runs only through the NV_Q3D_PF_COOP coop route, which does \
@@ -8492,7 +8141,7 @@ fn quant_for_m_rows(
     );
     let m = pf.m;
     let k_blocks = k / NVFP4_BLOCK;
-    anyhow::ensure!(
+    ensure!(
         k.is_multiple_of(NVFP4_BLOCK) && k_blocks.is_multiple_of(4),
         "{label}: k {k} must be a multiple of {}",
         NVFP4_BLOCK * 4
@@ -8526,7 +8175,7 @@ fn quant_for_m_rows(
         ],
         (gx, m as u32, 1),
     )?;
-    let xm = if crate::qwen3_5_moe_wgpu::nvfp4_slotshared_enabled() {
+    let xm = {
         let xm = b.zeros(label, (m * k_blocks * 16) as u64);
         let mp = b.uni(
             label,
@@ -8545,8 +8194,6 @@ fn quant_for_m_rows(
             (gx, m as u32, 1),
         )?;
         Some(xm)
-    } else {
-        None
     };
     Ok(Some(QuantIn {
         xq,
@@ -8564,17 +8211,17 @@ fn push_gemm_pf_nvfp4(
     label: &str,
     w: &Nvfp4Gpu,
     q: &QuantIn,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
 ) -> Result<()> {
     b.pf_dst_vf = pf.vf;
-    anyhow::ensure!(
+    ensure!(
         pf.m <= 16,
         "{label}: the nvfp4 m-row gemv routes dispatch one z-slice per slot and were only ever \
          built for m 2..=16; m={} runs only through the NV_Q3D_PF_COOP coop route",
         pf.m
     );
-    anyhow::ensure!(
+    ensure!(
         y_stride_words == w.n / 2,
         "{label}: the nvfp4 M-row GEMV writes one packed row of n/2 words per slot, \
          so the caller's y row stride {y_stride_words} must equal n/2 = {}",
@@ -8613,7 +8260,7 @@ fn push_gemm_pf_nvfp4(
     let m = if one_weight_sweep { 1 } else { pf.m as u32 };
     if let Some(r) = route {
         let (w_slot, x_slot) = if r.vec4 { (18, 19) } else { (10, 12) };
-        let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![
+        let mut binds: Vec<(u32, &Buffer)> = vec![
             (w_slot, &w.w),
             (11, &w.scales),
             (13, &q.xs),
@@ -8624,7 +8271,7 @@ fn push_gemm_pf_nvfp4(
         ];
         if one_weight_sweep {
             let xm = q.xm.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("{label}: slotshared route without the i8-mapped x buffer")
+                anyhow!("{label}: slotshared route without the i8-mapped x buffer")
             })?;
             binds.push((20, xm));
         } else {
@@ -8650,26 +8297,25 @@ fn push_gemm_pf_nvfp4(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemm_pf_affine(
     b: &mut Builder,
     pf: &Pf,
     label: &str,
     w: &AffineW4Gpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_stride_words: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
 ) -> Result<()> {
     b.pf_dst_vf = pf.vf;
-    anyhow::ensure!(
+    ensure!(
         b.ctx.caps.subgroup,
         "{label}: gemm_w4a16_affine rides subgroup reductions with no subgroup-free twin, and \
          this device grants no subgroups"
     );
-    wk::gemm_w4a16_affine::m_rule(pf.m).map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
-    wk::gemm_w4a16_affine::grain_rule(w.gs).map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
-    anyhow::ensure!(
+    wk::gemm_w4a16_affine::m_rule(pf.m).map_err(|e| anyhow!("{label}: {e}"))?;
+    wk::gemm_w4a16_affine::grain_rule(w.gs).map_err(|e| anyhow!("{label}: {e}"))?;
+    ensure!(
         w.n.is_multiple_of(2) && x_stride_words.is_multiple_of(4),
         "{label}: mrows_pk packs bf16 row pairs (n {} even) and reads x as vec4 (stride {} % 4)",
         w.n,
@@ -8706,17 +8352,16 @@ fn push_gemm_pf_affine(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemm_pf_dense(
     b: &mut Builder,
     s: &Sources,
     pf: &Pf,
     label: &str,
     w: &DenseLinGpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_stride_words: usize,
     q: Option<&QuantIn>,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
 ) -> Result<()> {
     b.pf_dst_vf = pf.vf;
@@ -8773,7 +8418,7 @@ fn push_gemm_pf_dense(
                 y_stride_words,
             ),
             DenseLinGpu::Bf16(_) | DenseLinGpu::Int8(_) => {
-                anyhow::bail!("{label}: pf_coop_covers never selects bf16/int8 weights")
+                bail!("{label}: pf_coop_covers never selects bf16/int8 weights")
             }
         };
     }
@@ -8787,7 +8432,7 @@ fn push_gemm_pf_dense(
                 push_gemv_fp8_rowscale_pf(b, s, pf, label, f, x, x_stride_words, y, y_stride_words)
             } else {
                 let w = w.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
+                    anyhow!(
                         "{label}: the fp8 bf16 twin was not uploaded because the coop route was \
                          selected at upload time, yet the coop route does not cover this dispatch"
                     )
@@ -8796,8 +8441,7 @@ fn push_gemm_pf_dense(
             }
         }
         DenseLinGpu::Nvfp4(w) => {
-            let q =
-                q.ok_or_else(|| anyhow::anyhow!("{label}: nvfp4 M-row gemm without quantized x"))?;
+            let q = q.ok_or_else(|| anyhow!("{label}: nvfp4 M-row gemm without quantized x"))?;
             push_gemm_pf_nvfp4(b, s, pf, label, w, q, y, y_stride_words)
         }
         DenseLinGpu::Int8(w) => {
@@ -8806,39 +8450,38 @@ fn push_gemm_pf_dense(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemm_pf_i8(
     b: &mut Builder,
     pf: &Pf,
     label: &str,
     w: &I8Gpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_stride_words: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
 ) -> Result<()> {
     b.pf_dst_vf = pf.vf;
-    anyhow::ensure!(
+    ensure!(
         pf.m <= 16,
         "{label}: q3d_gemv_i8*_m<m> keeps one accumulator register per row and is generated \
          only for m 2..=16; m={} needs the NV_Q3D_PF_COOP coop route, which does not carry \
          int8 weights",
         pf.m
     );
-    anyhow::ensure!(
+    ensure!(
         wk::gemv_nvfp4_v2::subgroup32_ok(b.ctx),
         "{label}: the i8 M-row GEMV reduces with subgroupShuffleXor over exactly 32 lanes, the \
          same predicate that gates the per-token int8 entries; upload_lin only produces Int8 \
          weights where subgroup32_ok holds, so portable adapters take the nvfp4 arm and must \
          never reach this dispatch"
     );
-    anyhow::ensure!(
+    ensure!(
         w.k.is_multiple_of(4) && x_stride_words * 2 == w.k,
         "{label}: i8 M-row gemm needs k % 4 == 0 and an x row stride of k/2 packed-bf16 words; \
          got k={} x_stride_words={x_stride_words}",
         w.k
     );
-    anyhow::ensure!(
+    ensure!(
         y_stride_words == w.n.div_ceil(2),
         "{label}: the i8 M-row GEMV packs two bf16 rows per output word, so the caller's y row \
          stride {y_stride_words} must equal ceil(n/2) = {}",
@@ -8871,20 +8514,19 @@ fn push_gemm_pf_i8(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemm_pf(
     b: &mut Builder,
     pf: &Pf,
     label: &str,
     w: &Bf16Gpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_stride_words: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
 ) -> Result<()> {
     use nv_kernels::wgpu_backend::na_bf16;
     b.pf_dst_vf = pf.vf;
-    anyhow::ensure!(
+    ensure!(
         pf.m <= 16,
         "{label}: q3w_gemm_bf16_m<m> keeps one accumulator register per row and is generated \
          only for m 2..=16; m={} needs the NV_Q3D_PF_COOP coop route, which does not carry \
@@ -8936,7 +8578,6 @@ fn push_gemm_pf(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_delta(
     b: &mut Builder,
     s: &Sources,
@@ -8944,9 +8585,9 @@ fn build_delta(
     d: &HostDeltaNet,
     dfp8: &DeltaFp8,
     daff: &DeltaAffineW4,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
-    states: &mut Vec<(wgpu::Buffer, u64)>,
+    x: &Buffer,
+    out: &Buffer,
+    states: &mut Vec<(Buffer, u64)>,
     pfs: &[Pf],
     lora: Option<&LoraSiteCtx>,
 ) -> Result<()> {
@@ -8969,18 +8610,9 @@ fn build_delta(
             })
     };
 
-    let g_qkv = match (&dfp8.qkv, fp8_proj_enabled()) {
-        (Some(f), true) => Some(upload_fp8(b, "q3d-dn-qkv-fp8", f)),
-        _ => None,
-    };
-    let g_z = match (&dfp8.z, fp8_proj_enabled()) {
-        (Some(f), true) => Some(upload_fp8(b, "q3d-dn-z-fp8", f)),
-        _ => None,
-    };
-    let g_out = match (&dfp8.out, fp8_proj_enabled()) {
-        (Some(f), true) => Some(upload_fp8(b, "q3d-dn-oproj-fp8", f)),
-        _ => None,
-    };
+    let g_qkv = dfp8.qkv.as_ref().map(|f| upload_fp8(b, "q3d-dn-qkv-fp8", f));
+    let g_z = dfp8.z.as_ref().map(|f| upload_fp8(b, "q3d-dn-z-fp8", f));
+    let g_out = dfp8.out.as_ref().map(|f| upload_fp8(b, "q3d-dn-oproj-fp8", f));
     let dn_requant = requant_fp8_group_enabled("dn");
     let requant_dn_lin = |f: &Option<HostFp8Lin>| -> Result<Option<HostNvfp4Lin>> {
         match f {
@@ -9057,8 +8689,7 @@ fn build_delta(
     let qkv = b.zeros("q3d-dn-qkvbuf", (conv_dim * 2) as u64);
     let z = b.zeros("q3d-dn-zbuf", (value_dim * 2) as u64);
     let ab = b.zeros("q3d-dn-abbuf", (2 * n_v * 2).max(4) as u64);
-    let merged_gemv = fuse_dn_gemv_enabled()
-        && nv_qkv.is_none()
+    let merged_gemv = nv_qkv.is_none()
         && nv_z.is_none()
         && g_qkv.is_some()
         && g_z.is_some()
@@ -9104,7 +8735,7 @@ fn build_delta(
             }
             (None, None, None, Some(w)) => push_gemv_bf16(b, s, "q3d-dn-qkv", w, x, &qkv, false)?,
             (None, None, None, None) => {
-                anyhow::bail!("q3d-dn-qkv: neither affine, fp8 nor bf16 weights uploaded")
+                bail!("q3d-dn-qkv: neither affine, fp8 nor bf16 weights uploaded")
             }
         }
         match (&a_z, &nv_z, &g_z, &w_z) {
@@ -9113,7 +8744,7 @@ fn build_delta(
             (None, None, Some(g), _) => push_gemv_fp8_rowscale(b, s, "q3d-dn-z", g, x, &z, false)?,
             (None, None, None, Some(w)) => push_gemv_bf16(b, s, "q3d-dn-z", w, x, &z, false)?,
             (None, None, None, None) => {
-                anyhow::bail!("q3d-dn-z: neither affine, fp8 nor bf16 weights uploaded")
+                bail!("q3d-dn-z: neither affine, fp8 nor bf16 weights uploaded")
             }
         }
         push_gemv_bf16(b, s, "q3d-dn-ab", &w_ab, x, &ab, false)?;
@@ -9188,7 +8819,7 @@ fn build_delta(
         },
     );
     let wg = DELTA_HEAD_FUSED_WG128_COVERS_ONE_LANE_PER_DV_AND_ONE_REDUCTION_SLOT_PER_DK;
-    let fused_head = fuse_dn_enabled() && d_k <= wg && d_v <= wg && d_v.is_multiple_of(2);
+    let fused_head = d_k <= wg && d_v <= wg && d_v.is_multiple_of(2);
     let wide_head = fused_head
         && dn_head_wide_enabled()
         && d_k == DN_HEAD_WIDE_REQUIRES_DK_128
@@ -9201,7 +8832,7 @@ fn build_delta(
     let split_head = fused_head
         && d_k == 128
         && d_v == 128
-        && nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q3D_DN_HEAD_SPLIT");
+        && env_arm_opt_in_eq_some_1_reread_every_call("NV_Q3D_DN_HEAD_SPLIT");
     if split_head {
         let core = b.zeros("q3d-dn-core", (n_v * d_v * 4) as u64);
         b.push(
@@ -9314,20 +8945,11 @@ fn build_delta(
                 pad0: 0,
             },
         );
-        let (rec_entry, rec_lanes) = delta_recurrent_kernel();
-        anyhow::ensure!(
-            rec_lanes > 0 || d_v <= 128,
-            "{rec_entry} covers one lane per invocation of a 128-wide workgroup, got d_v {d_v}"
-        );
-        let rec_grid_y = if rec_lanes > 0 {
-            (d_v as u32).div_ceil(rec_lanes)
-        } else {
-            1
-        };
+        let rec_grid_y = (d_v as u32).div_ceil(DELTA_RECURRENT_LANES_PER_WORKGROUP);
         b.push(
             "q3d-dn-recurrent",
             &s.delta,
-            rec_entry,
+            DELTA_RECURRENT_ENTRY,
             &[
                 (30, &qg),
                 (31, &kg),
@@ -9387,7 +9009,7 @@ fn build_delta(
         },
         (None, None, None, Some(w)) => push_gemv_bf16(b, s, "q3d-dn-oproj", w, &gated, out, false)?,
         (None, None, None, None) => {
-            anyhow::bail!("q3d-dn-oproj: neither affine, fp8 nor bf16 weights uploaded")
+            bail!("q3d-dn-oproj: neither affine, fp8 nor bf16 weights uploaded")
         }
     }
     if !dn_out_folded {
@@ -9402,7 +9024,7 @@ fn build_delta(
         let conv_words = conv_dim / 2;
         let value_words = value_dim / 2;
         let m = pf.m as u32;
-        let commit_replay = pf.vf && mtp_commit_scan_replay_requested();
+        let commit_replay = pf.vf;
         let mu = pf.m as u64;
         let (d_qkv_b, d_q_b, d_k_b, d_v_b, d_g_b, d_beta_b) = if commit_replay {
             (
@@ -9666,8 +9288,8 @@ fn build_delta(
             },
         );
         let (scan_entry, scan_grid_y) = if pf_small_m_legacy(pf.m)
-            && !nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
-                PF_SCAN_WY_ENV_DEFAULT_ON_SET_0_FOR_THE_TOKEN_SERIAL_SCAN,
+            && !env_arm_opt_in_eq_some_1_reread_every_call(
+                PF_SCAN_WY_ENV_1_ALSO_ROUTES_SMALL_M_GRAPHS_THROUGH_THE_WY_SCAN,
             ) {
             ("q3w_delta_scan", 1)
         } else {
@@ -9910,21 +9532,20 @@ fn build_delta(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_attn(
     b: &mut Builder,
     s: &Sources,
     cfg: &Qwen3_5DenseConfig,
     a: &HostDenseAttention,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
-    pos_buf: &wgpu::Buffer,
-    fd_buf: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
+    pos_buf: &Buffer,
+    fd_buf: &Buffer,
     max_seq: usize,
-    states: &mut Vec<(wgpu::Buffer, u64)>,
+    states: &mut Vec<(Buffer, u64)>,
     pfs: &[Pf],
-    rope_rows: &mut Vec<(wgpu::Buffer, wgpu::Buffer)>,
-    kv_caches: &mut Vec<(wgpu::Buffer, wgpu::Buffer)>,
+    rope_rows: &mut Vec<(Buffer, Buffer)>,
+    kv_caches: &mut Vec<(Buffer, Buffer)>,
     dual_stage1: bool,
     lora: Option<&LoraSiteCtx>,
 ) -> Result<usize> {
@@ -9932,7 +9553,7 @@ fn build_attn(
     let n_h = cfg.num_attention_heads;
     let n_kv = cfg.num_key_value_heads;
     let rot = cfg.rotary_dim();
-    anyhow::ensure!(
+    ensure!(
         rot.is_multiple_of(2) && rot <= hd,
         "rotary_dim {rot} invalid"
     );
@@ -9947,7 +9568,7 @@ fn build_attn(
     let q_raw = b.zeros("q3d-at-qraw", (wq.n() * 2) as u64);
     let k_raw = b.zeros("q3d-at-kraw", (wk_.n() * 2) as u64);
     let v_raw = b.zeros("q3d-at-vraw", (wv.n() * 2) as u64);
-    let qkv_fused_arm = nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+    let qkv_fused_arm = env_arm_opt_in_eq_some_1_reread_every_call(
         "NV_Q3D_QKV_FUSED_E2E_NULL_METAL_ALREADY_OVERLAPS_HAZARD_FREE_NEIGHBORS",
     );
     if let Some(fused) = qkv_fused_arm
@@ -10021,20 +9642,20 @@ fn build_attn(
     let bias_mode = !a.qkv_bias_bf16.is_empty();
     let bias_writes_kv = bias_mode
         && !kv_fp8_enabled()
-        && nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        && env_arm_opt_in_eq_some_1_reread_every_call(
             BIAS_ROPE_WRITES_KV_ENV_DROPS_THE_KVWRITE_PASS_LEAVES_ANY_FP8_PF_CACHE_STALE_PAST_THE_PROMPT_DEFAULT_OFF,
         );
-    anyhow::ensure!(
+    ensure!(
         !bias_mode || (a.q_norm.is_empty() && a.k_norm.is_empty() && !cfg.attn_output_gate),
         "qkv bias rides the qwen2 arch: a checkpoint carrying q/k/v projection biases must not \
          also carry q_norm/k_norm or an attention output gate"
     );
-    anyhow::ensure!(
+    ensure!(
         bias_mode || (!a.q_norm.is_empty() && !a.k_norm.is_empty()),
         "attention layer carries neither qk-norm weights nor qkv biases; the loader should have \
          rejected this checkpoint"
     );
-    anyhow::ensure!(
+    ensure!(
         !bias_mode || a.qkv_bias_bf16.len() == (n_h + 2 * n_kv) * hd,
         "qkv bias has {} elems, want q||k||v = {}",
         a.qkv_bias_bf16.len(),
@@ -10054,7 +9675,7 @@ fn build_attn(
         None
     };
     let attn_mega = bias_writes_kv
-        && nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+        && env_arm_opt_in_eq_some_1_reread_every_call(
             ATTN_SHALLOW_ENV_ONE_DISPATCH_PER_LAYER_REPLACES_FLASH1_FLASH2_GATE_HD128_BF16KV_GATELESS_DEFAULT_OFF,
         )
         && hd == 128
@@ -10068,8 +9689,7 @@ fn build_attn(
     } else {
         v_raw.clone()
     };
-    let fused_norm = fuse_attn_enabled()
-        && hd <= MAX_HEAD_DIM
+    let fused_norm = hd <= MAX_HEAD_DIM
         && hd.is_multiple_of(2)
         && b.ctx.caps.max_storage_buffers_per_shader_stage
             >= ATTN_FUSED_NORM_BINDS_TEN_STORAGE_BUFFERS;
@@ -10299,14 +9919,13 @@ fn build_attn(
         && b.ctx.caps.subgroup
         && b.ctx.subgroup_width() == Some(32)
         && (n_h / n_kv).min(wk::flash_decode::MAX_GQA_FOLD) > 1;
-    if kv_fp8_tp_enabled() && !tp_capable {
+    if kv_fp8_enabled() && !tp_capable {
         eprintln!(
-            "[q3d-wgpu] {} needs the fp8 decode cache, no nvfp4 KV arm, width-32 subgroups \
-             and a foldable GQA group; keeping the position-major stage1",
-            KV_FP8_TP_ENV_DEFAULT_ON_SET_0_FOR_THE_POSITION_MAJOR_STAGE1
+            "[q3d-wgpu] the transposed-K tp stage1 needs the fp8 decode cache, no nvfp4 KV arm, \
+             width-32 subgroups and a foldable GQA group; keeping the position-major stage1"
         );
     }
-    let kv_tp = if kv_fp8_tp_enabled() && tp_capable {
+    let kv_tp = if kv_fp8_enabled() && tp_capable {
         let (_, _, ksc, _, kvq_p) = kv8
             .as_ref()
             .expect("kv8_decode just ensured the fp8 KV cache is allocated");
@@ -10333,7 +9952,7 @@ fn build_attn(
     let kv8_dec = if kv8_decode { kv8.as_ref() } else { None };
 
     let kv4_arm = kv_nvfp4_arm();
-    anyhow::ensure!(
+    ensure!(
         kv4_arm.is_none() || kv8_decode,
         "{} rides the fp8 cache for its first {} sink slots and for chunk coherence, so it \
          cannot pair with NV_Q3D_KV_FP8=0; unset one",
@@ -10341,11 +9960,11 @@ fn build_attn(
         wk::kv_nvfp4::KV_NVFP4_SINK_SLOTS_STAY_FP8_TO_ANCHOR_SOFTMAX
     );
     let kv4 = if let Some(arm) = kv4_arm {
-        anyhow::ensure!(
+        ensure!(
             hd.is_multiple_of(8),
             "kv_nvfp4 packs 8 e2m1 nibbles per u32 word; head_dim {hd} % 8 != 0"
         );
-        anyhow::ensure!(
+        ensure!(
             b.ctx.caps.max_storage_buffers_per_shader_stage
                 >= wk::flash_decode::KV_NVFP4_STAGE1_BINDS_TEN_STORAGE_BUFFERS,
             "the k4v4 stage1 binds {} storage buffers (fp8 sink K/V + scales, nvfp4 K/V + \
@@ -10441,14 +10060,14 @@ fn build_attn(
         1
     };
     let gated = b.zeros("q3d-at-gated", (n_h * hd * 2) as u64);
-    let shallow_attn = nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+    let shallow_attn = env_arm_opt_in_eq_some_1_reread_every_call(
         ATTN_SHALLOW_ENV_ONE_DISPATCH_PER_LAYER_REPLACES_FLASH1_FLASH2_GATE_HD128_BF16KV_GATELESS_DEFAULT_OFF,
     ) && b.ctx.caps.subgroup
         && hd == 128
         && !cfg.attn_output_gate
         && kv8_dec.is_none()
         && kv4.is_none();
-    anyhow::ensure!(
+    ensure!(
         !attn_mega || shallow_attn,
         "the mega arm skipped the bias-rope pass expecting to rope in-attention, but the \
          shallow arm disqualified itself (an nvfp4/fp8 KV arm is set); unset it or drop {}",
@@ -10467,7 +10086,7 @@ fn build_attn(
                 ..Default::default()
             },
         );
-        if attn_mega && group == 6 && attn_fold_enabled() {
+        if attn_mega && group == 6 {
             let fold_scratch = b.zeros(
                 "q3d-at-fold-scr",
                 (n_h * splits as usize * (hd + 2) * 4) as u64,
@@ -10543,7 +10162,7 @@ fn build_attn(
         let entry =
             wk::flash_decode::fold_stage1_entry_nvfp4(hd as u32, sg, fold as u32, k4.is_some());
         let src = fold_composed(sg, &body);
-        let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![
+        let mut binds: Vec<(u32, &Buffer)> = vec![
             (0, &q_f32),
             (4, fd_buf),
             (5, kc8),
@@ -10600,7 +10219,7 @@ fn build_attn(
             )?;
         }
         if let Some(kc8t) = kv_tp.as_ref() {
-            let tpw = kv_fp8_tpw_enabled() && hd.is_multiple_of(128);
+            let tpw = hd.is_multiple_of(128);
             let (tp_body, tp_entry) = if tpw {
                 (
                     wk::flash_decode::fold_stage1_source_sd_tpw(hd as u32, fold as u32),
@@ -10630,12 +10249,10 @@ fn build_attn(
             )?;
         }
     } else {
-        anyhow::ensure!(
+        ensure!(
             kv_tp.is_none(),
-            "{} only replaces the fold stage1; with fold 1 (NV_WGPU_GQA_FOLD=1 or an \
-             indivisible group) the transposed cache would be written and never read, so the \
-             A/B would silently measure the stock arm",
-            KV_FP8_TP_ENV_DEFAULT_ON_SET_0_FOR_THE_POSITION_MAJOR_STAGE1
+            "the tp stage1 only replaces the fold stage1; with fold 1 (NV_WGPU_GQA_FOLD=1 or an \
+             indivisible group) the transposed cache would be written and never read"
         );
         b.push(
             "q3d-at-flash1",
@@ -10942,7 +10559,7 @@ fn build_attn(
             .as_ref()
             .map(|td| &td.start)
             .or_else(|| pf.attn_kvq_fd_start.as_ref().map(|(_, start)| start));
-        anyhow::ensure!(
+        ensure!(
             !kv8_decode || chunk_kvq_start.is_some(),
             "NV_Q3D_KV_FP8 decode reads the fp8 cache for every row, so every chunk arm must \
              record the q3w_pf_quantize_kv_fp8_m pair for chunk rows; an arm that skips it \
@@ -10952,7 +10569,7 @@ fn build_attn(
         );
         if let Some(start) = chunk_kvq_start {
             let (kc8, vc8, ksc, vsc, kvq_p) = kv8.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
+                anyhow!(
                     "a chunk-quantize start buffer exists (tiled arm or fp8-KV decode), so \
                      build_attn must have allocated the fp8 KV cache above"
                 )
@@ -11011,7 +10628,7 @@ fn build_attn(
                 )?;
             }
             if let Some((k4, v4w, v4s)) = kv4.as_ref() {
-                anyhow::ensure!(
+                ensure!(
                     pf_kv_write_recorded > 0,
                     "the nvfp4 chunk quantizers read the bf16 KV cache the chunk just wrote, so \
                      q3w_kv_write_m must stay recorded before them in the pf pass list"
@@ -11043,7 +10660,7 @@ fn build_attn(
                 }
             }
         }
-        anyhow::ensure!(
+        ensure!(
             kv4.is_none() || chunk_kvq_start.is_some(),
             "{} decode reads the nvfp4 caches for every non-sink row, so every chunk arm must \
              record the nvfp4 chunk quantizers; an arm without a chunk-quantize start buffer \
@@ -11052,12 +10669,12 @@ fn build_attn(
         );
         if let Some(td) = pf.attn_tiled.as_ref() {
             let (kc8, vc8, ksc, vsc, _) = kv8.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
+                anyhow!(
                     "the tiled pf attention streams the fp8 KV cache, so build_attn must have \
                      allocated it above whenever pf.attn_tiled is set"
                 )
             })?;
-            anyhow::ensure!(
+            ensure!(
                 pf_kv_write_recorded > 0,
                 "the M=1 decode path keeps reading the bf16 KV cache under the tiled pf arm, so \
                  q3w_kv_write_m must stay recorded in the pf pass list; dropping it would starve \
@@ -11070,20 +10687,20 @@ fn build_attn(
                 pf_attn_tiled_stage1_source_exact_decode_because_the_sd_twin_measured_a_1pct_null_here(
                     subgroup,
                 );
-            anyhow::ensure!(
+            ensure!(
                 rows_t == 32 && tiled_src.contains("const FDT_ROWS: u32 = 32u"),
                 "the tiled flash tile height is baked as 32 on both sides; \
                  PF_TILED_FLASH_ROWS_ONE_KV_STREAM_SERVES_32_ROWS_AT_4_PER_WARP and the kernel's \
                  FDT_ROWS must move together"
             );
-            anyhow::ensure!(
+            ensure!(
                 8 * hd <= PF_ATTN_TILED_STAGE_ARRAYS_HOLD_FDT_POS_8_TIMES_HEAD_DIM_F32,
                 "head_dim {hd} overflows the tiled kernel's 2048-f32 workgroup K/V stages \
                  (FDT_POS 8 x head_dim)"
             );
             let qc_words = (pf.m * n_h * hd / 2) as u64;
             let qc_grid = qc_words.div_ceil(256);
-            anyhow::ensure!(
+            ensure!(
                 qc_grid <= 65535,
                 "pf tiled qcast grid {qc_grid} exceeds the 1d dispatch limit"
             );
@@ -11158,7 +10775,7 @@ fn build_attn(
                 (n_h as u32, m, 1),
             )?;
         } else if let Some(mk) = pf.attn_mk.as_ref() {
-            anyhow::ensure!(
+            ensure!(
                 pf_kv_write_recorded > 0,
                 "the mk flash prefill attention reads chunk rows 0..base+m_live from the bf16 KV \
                  cache, so q3w_kv_write_m must be recorded in the same pf pass list before the mk \
@@ -11167,12 +10784,12 @@ fn build_attn(
             );
             let rows = PF_ATTN_MK_ROWS_PER_DISPATCH_BOUND_BY_THE_MK_KERNELS_8_WIDE_MREG_ARRAYS;
             let group_bytes = (rows * n_h * hd * 4) as u64;
-            anyhow::ensure!(
+            ensure!(
                 group_bytes.is_multiple_of(256),
                 "pf mk row-group bind offset stride {group_bytes} (8 rows x {n_h} heads x hd {hd} \
                  x 4B) must sit on the 256-byte storage-binding alignment"
             );
-            anyhow::ensure!(
+            ensure!(
                 pf.m.div_ceil(rows) == mk.fd.len(),
                 "pf mk fd uniforms {} disagree with ceil(m {}/{rows}) row groups",
                 mk.fd.len(),
@@ -11180,7 +10797,7 @@ fn build_attn(
             );
             let qc_words = (pf.m * n_h * hd / 2) as u64;
             let qc_grid = qc_words.div_ceil(256);
-            anyhow::ensure!(
+            ensure!(
                 qc_grid <= 65535,
                 "pf mk qcast grid {qc_grid} exceeds the 1d dispatch limit"
             );
@@ -11226,13 +10843,13 @@ fn build_attn(
             }
         } else if let Some(vfl) = pf.attn_vflash.as_ref() {
             let (kc8, vc8, ksc, vsc, _) = kv8.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
+                anyhow!(
                     "{} needs the fp8 KV decode cache (NV_Q3D_KV_FP8 not 0): both flash arms \
                      stream fp8 e4m3 KV; unset one",
-                    VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SET_0_FOR_THE_SCORES_SLAB_ARM
+                    VF_ATTN_FLASH_ENV_DEFAULT_GATE_AT_THE_MEASURED_KNEE_SMV2_LOOP_OR_MIN_TOTAL_PICK_AN_ARM
                 )
             })?;
-            anyhow::ensure!(
+            ensure!(
                 pf_kv_write_recorded > 0 && pf.attn_kvq_fd_start.is_some(),
                 "the vflash verify attention reads chain rows 0..base+row+1 from the fp8 KV \
                  cache, so q3w_kv_write_m and the q3w_pf_quantize_kv_fp8_m pair must be recorded \
@@ -11241,7 +10858,7 @@ fn build_attn(
             );
             let qc_words = (pf.m * n_h * hd / 2) as u64;
             let qc_grid = qc_words.div_ceil(256);
-            anyhow::ensure!(
+            ensure!(
                 qc_grid <= 65535,
                 "vflash qcast grid {qc_grid} exceeds the 1d dispatch limit"
             );
@@ -11263,7 +10880,7 @@ fn build_attn(
             let splits = wk::flash_decode::splits_for(max_seq) as u32;
             match vfl.arm {
                 VfAttnFlashArm::Smv2 => {
-                    anyhow::ensure!(
+                    ensure!(
                         hd <= wk::flash_decode::MAX_HEAD_DIM_MK
                             && pf.m <= wk::flash_decode::MAX_MK_ROWS,
                         "smv2 handles head_dim<={} and m<={} (got hd {hd}, m {}); use =loop",
@@ -11305,7 +10922,7 @@ fn build_attn(
                 }
                 VfAttnFlashArm::RowLoop => {
                     let row_bytes = (n_h * hd * 4) as u64;
-                    anyhow::ensure!(
+                    ensure!(
                         row_bytes.is_multiple_of(256) && vfl.row_fd.len() == pf.m,
                         "vflash row loop needs 256-byte-aligned q/out row offsets ({row_bytes}) \
                          and one fd uniform per row ({} vs m {})",
@@ -11374,7 +10991,6 @@ fn build_attn(
             && b.ctx.caps.subgroup
             && hd == 128
             && !cfg.attn_output_gate
-            && pf_attn_flash_m_enabled()
             && pf.attn_mk.is_none()
             && pf.attn_tiled.is_none()
             && pf.attn_vflash.is_none();
@@ -11497,14 +11113,13 @@ fn build_attn(
     Ok(kv_written_pass_end)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_mlp(
     b: &mut Builder,
     s: &Sources,
     cfg: &Qwen3_5DenseConfig,
     m: &HostDenseMlp,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
     pfs: &[Pf],
     w4a8: Option<&W4a8Quant>,
     lora: Option<&LoraSiteCtx>,
@@ -11513,7 +11128,7 @@ fn build_mlp(
     let lora_down = mlp_lora.and_then(|lc| lc.layer.down.as_ref());
     let lora_gate_up = mlp_lora.and_then(|lc| lc.layer.gate_up.as_ref());
     let inter = cfg.intermediate_size;
-    anyhow::ensure!(
+    ensure!(
         m.gate.n() == inter && m.up.n() == inter && m.down.k() == inter,
         "mlp shapes disagree with intermediate_size {inter}"
     );
@@ -11528,12 +11143,12 @@ fn build_mlp(
     if let Some(a) = w4a8 {
         let (DenseLinGpu::Nvfp4(g), DenseLinGpu::Nvfp4(u), DenseLinGpu::Nvfp4(d)) = (&wg, &wu, &wd)
         else {
-            anyhow::bail!(
+            bail!(
                 "q3d-mlp-w4a8: mlp_w4a8_layer_arm admits only all-nvfp4 MLP weights, \
                  upload_lin disagreed"
             );
         };
-        let fold = mlp_lora.is_some() && lora_gemv_fold_enabled();
+        let fold = mlp_lora.is_some();
         let gu_fold = match (mlp_lora, lora_gate_up, fold) {
             (Some(lc), Some(site), true) => Some(lc.push_site_shrink(b, site, x)),
             _ => None,
@@ -11616,7 +11231,7 @@ fn build_mlp(
                 push_gemv_nvfp4_2w(b, "q3d-mlp-guproj", a, u, q, &y_gate, &y_up)?
             }
             (DenseLinGpu::AffineW4(a), DenseLinGpu::AffineW4(u), _)
-                if nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
+                if env_arm_opt_in_eq_some_1_reread_every_call(
                     AFFINE_GU_FUSED_ENV_GATE_AND_UP_ARE_ONE_MROW4H_DISPATCH_PER_MLP_DEFAULT_OFF_SET_1_TO_ENGAGE,
                 ) =>
             {
@@ -11635,13 +11250,13 @@ fn build_mlp(
         }
 
         let fused_mlp = if let DenseLinGpu::Nvfp4(w) = &wd {
-            fuse_mlp_enabled() && w.k.is_multiple_of(NVFP4_BLOCK * 4) && lora_down.is_none()
+            w.k.is_multiple_of(NVFP4_BLOCK * 4) && lora_down.is_none()
         } else {
             false
         };
         if fused_mlp {
             let DenseLinGpu::Nvfp4(w) = &wd else {
-                anyhow::bail!("q3d-mlp-siluq: fused_mlp checked the nvfp4 arm")
+                bail!("q3d-mlp-siluq: fused_mlp checked the nvfp4 arm")
             };
             let down_q =
                 push_silu_mul_quant_rows(b, s, "q3d-mlp-siluq", &y_gate, &y_up, w, wd.k())?;
@@ -11805,7 +11420,7 @@ impl EmbedHostArm {
         off: usize,
         rows: usize,
         hidden: usize,
-    ) -> Result<wgpu::Buffer> {
+    ) -> Result<Buffer> {
         match self {
             Self::Whole(e) => {
                 let _ = src;
@@ -11817,9 +11432,9 @@ impl EmbedHostArm {
             #[cfg(target_arch = "wasm32")]
             Self::AffineView { module, gs } => {
                 let WeightSource::Loader(w) = src else {
-                    anyhow::bail!("affine embed view arm requires a loader source");
+                    bail!("affine embed view arm requires a loader source");
                 };
-                anyhow::ensure!(hidden.is_multiple_of(8));
+                ensure!(hidden.is_multiple_of(8));
                 let row_bytes = (hidden / 2) * 4;
                 let buf = b.zeros("q3d-embed", (rows * row_bytes) as u64);
                 let words_of = |bytes: &[u8]| -> Vec<u32> {
@@ -11864,11 +11479,9 @@ impl EmbedHostArm {
                     );
                     let bits: Vec<u16> = f32s.iter().map(|x| bf16_bits(*x)).collect();
                     let packed = pack_pairs(&bits);
-                    b.ctx.queue.write_buffer(
-                        &buf,
-                        (r0 * row_bytes) as u64,
-                        bytemuck::cast_slice(&packed),
-                    );
+                    b.ctx
+                        .queue
+                        .write_buffer(&buf, (r0 * row_bytes) as u64, cast_slice(&packed));
                     r0 += seg;
                 }
                 Ok(buf)
@@ -11904,7 +11517,7 @@ impl WeightSource<'_> {
             }
         }
         let e = self.embed(cfg)?;
-        anyhow::ensure!(
+        ensure!(
             e.len() == cfg.vocab_size * cfg.hidden_size,
             "embed has {} values, want {}",
             e.len(),
@@ -11980,18 +11593,17 @@ impl WeightSource<'_> {
             return Ok(None);
         };
         if cfg.tie_word_embeddings
-            || !fp8_lm_head_enabled()
             || w.st_dtype_of("lm_head.weight") != Some(nv_weights::StDtype::F8_E4M3)
         {
             return Ok(None);
         }
         let (vocab, hidden) = (cfg.vocab_size, cfg.hidden_size);
-        anyhow::ensure!(
+        ensure!(
             hidden % 4 == 0,
             "fp8 lm_head packs 4 e4m3 bytes per word; hidden {hidden} % 4 != 0"
         );
         let qw = w.load_quantized_weight("lm_head.weight", nv_weights::QuantScheme::Fp8E4m3)?;
-        anyhow::ensure!(
+        ensure!(
             qw.shape == [vocab, hidden],
             "lm_head.weight: fp8 shape {:?} != [{vocab}, {hidden}]",
             qw.shape
@@ -11999,7 +11611,7 @@ impl WeightSource<'_> {
         let scales = qw
             .fp8_weight_scale_rows()?
             .unwrap_or_else(|| vec![1.0f32; vocab]);
-        anyhow::ensure!(
+        ensure!(
             scales.len() == vocab,
             "lm_head.weight_scale rows {} != vocab {vocab}",
             scales.len()
@@ -12050,7 +11662,7 @@ impl WeightSource<'_> {
     }
 }
 
-fn load_bf16(w: &nv_weights::WeightLoader, names: &[&str], shape: &[usize]) -> Result<Vec<u16>> {
+fn load_bf16(w: &WeightLoader, names: &[&str], shape: &[usize]) -> Result<Vec<u16>> {
     for n in names {
         if w.has(n) {
             if w.st_dtype_of(n) == Some(nv_weights::StDtype::F8_E4M3) {
@@ -12059,12 +11671,12 @@ fn load_bf16(w: &nv_weights::WeightLoader, names: &[&str], shape: &[usize]) -> R
             let t = w
                 .get(n, candle_core::DType::BF16)
                 .with_context(|| format!("load {n}"))?;
-            anyhow::ensure!(t.dims() == shape, "{n}: shape {:?} != {shape:?}", t.dims());
-            let v: Vec<half::bf16> = t.flatten_all()?.to_vec1()?;
+            ensure!(t.dims() == shape, "{n}: shape {:?} != {shape:?}", t.dims());
+            let v: Vec<bf16> = t.flatten_all()?.to_vec1()?;
             return Ok(v.into_iter().map(|x| x.to_bits()).collect());
         }
     }
-    anyhow::bail!("none of {names:?} found")
+    bail!("none of {names:?} found")
 }
 
 pub const MLX_VLM_NESTS_THE_TEXT_TRUNK_AS_LANGUAGE_MODEL_MODEL_A_PURE_RENAME_OF_THE_HF_NAMES: &str =
@@ -12072,7 +11684,7 @@ pub const MLX_VLM_NESTS_THE_TEXT_TRUNK_AS_LANGUAGE_MODEL_MODEL_A_PURE_RENAME_OF_
      language_model.lm_head.*, where HF exports use model.language_model.* and a bare lm_head; \
      every loader candidate list carries both spellings, the normalize_module_name precedent";
 
-fn layer_base_prefix(w: &nv_weights::WeightLoader, idx: usize) -> String {
+fn layer_base_prefix(w: &WeightLoader, idx: usize) -> String {
     let candidates = [
         format!("model.language_model.layers.{idx}"),
         format!("language_model.model.layers.{idx}"),
@@ -12086,32 +11698,27 @@ fn layer_base_prefix(w: &nv_weights::WeightLoader, idx: usize) -> String {
     candidates[2].clone()
 }
 
-pub fn affine_w4_gs(
-    w: &nv_weights::WeightLoader,
-    module: &str,
-    n: usize,
-    k: usize,
-) -> Result<usize> {
+pub fn affine_w4_gs(w: &WeightLoader, module: &str, n: usize, k: usize) -> Result<usize> {
     let name = format!("{module}.weight");
     let packed_dtype = w
         .st_dtype_of(&name)
-        .ok_or_else(|| anyhow::anyhow!("missing dtype for {name}"))?;
-    anyhow::ensure!(
+        .ok_or_else(|| anyhow!("missing dtype for {name}"))?;
+    ensure!(
         packed_dtype == nv_weights::StDtype::U32,
         "{name}: mlx-affine packed weight must be U32 (8 LSB-first nibbles per word), got \
          {packed_dtype:?}"
     );
     let shape = w
         .shape_of(&name)
-        .ok_or_else(|| anyhow::anyhow!("missing shape for {name}"))?;
-    anyhow::ensure!(
+        .ok_or_else(|| anyhow!("missing shape for {name}"))?;
+    ensure!(
         k.is_multiple_of(8) && shape == [n, k / 8],
         "{name}: packed shape {shape:?} != [{n}, {}]",
         k / 8
     );
     for part in ["scales", "biases"] {
         let pn = format!("{module}.{part}");
-        anyhow::ensure!(
+        ensure!(
             w.st_dtype_of(&pn) == Some(nv_weights::StDtype::BF16),
             "{pn}: mlx-affine scales/biases must be BF16, got {:?}",
             w.st_dtype_of(&pn)
@@ -12119,17 +11726,17 @@ pub fn affine_w4_gs(
     }
     let n_scales = w.raw_len(&format!("{module}.scales"))? / 2;
     let n_biases = w.raw_len(&format!("{module}.biases"))? / 2;
-    anyhow::ensure!(
+    ensure!(
         n_scales > 0 && n_scales == n_biases,
         "{module}: scales ({n_scales}) and biases ({n_biases}) disagree"
     );
     let groups = n_scales / n;
-    anyhow::ensure!(
+    ensure!(
         groups > 0 && n_scales == n * groups && k.is_multiple_of(groups),
         "{module}: {n_scales} scales do not tile [{n}, {k}] into whole groups"
     );
     let gs = k / groups;
-    anyhow::ensure!(
+    ensure!(
         gs.is_multiple_of(8),
         "{module}: group size {gs} is not a multiple of the 8-nibble word the gemv decodes"
     );
@@ -12137,7 +11744,7 @@ pub fn affine_w4_gs(
 }
 
 pub fn load_affine_w4_lin(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     module: &str,
     n: usize,
     k: usize,
@@ -12185,11 +11792,7 @@ pub fn mlx_affine_dequant_bf16_bits(l: &HostAffineW4Lin) -> Vec<u16> {
     .collect()
 }
 
-fn load_bf16_or_mlx_affine(
-    w: &nv_weights::WeightLoader,
-    names: &[&str],
-    shape: &[usize],
-) -> Result<Vec<u16>> {
+fn load_bf16_or_mlx_affine(w: &WeightLoader, names: &[&str], shape: &[usize]) -> Result<Vec<u16>> {
     for name in names {
         let Some(module) = name.strip_suffix(".weight") else {
             continue;
@@ -12206,7 +11809,7 @@ fn load_bf16_or_mlx_affine(
 
 fn load_delta_affine_w4(
     cfg: &Qwen3_5DenseConfig,
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     idx: usize,
 ) -> Result<DeltaAffineW4> {
     let p = format!("{}.linear_attn", layer_base_prefix(w, idx));
@@ -12226,15 +11829,11 @@ fn load_delta_affine_w4(
     })
 }
 
-fn load_fp8_e4m3_as_bf16(
-    w: &nv_weights::WeightLoader,
-    name: &str,
-    shape: &[usize],
-) -> Result<Vec<u16>> {
+fn load_fp8_e4m3_as_bf16(w: &WeightLoader, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
     let rows = *shape.first().unwrap_or(&1);
     let cols: usize = shape.iter().skip(1).product::<usize>().max(1);
     let qw = w.load_quantized_weight(name, nv_weights::QuantScheme::Fp8E4m3)?;
-    anyhow::ensure!(
+    ensure!(
         qw.shape == shape,
         "{name}: fp8 shape {:?} != {shape:?}",
         qw.shape
@@ -12246,11 +11845,7 @@ fn load_fp8_e4m3_as_bf16(
     Ok(dequant.iter().map(|&x| bf16_bits(x)).collect())
 }
 
-fn load_norm_plus_one(
-    w: &nv_weights::WeightLoader,
-    names: &[&str],
-    dim: usize,
-) -> Result<Vec<u16>> {
+fn load_norm_plus_one(w: &WeightLoader, names: &[&str], dim: usize) -> Result<Vec<u16>> {
     let raw = load_bf16(w, names, &[dim])?;
     let mlx_export_already_folded_the_plus_one = names
         .iter()
@@ -12271,12 +11866,7 @@ pub const MLX_EXPORTS_STORE_ZERO_CENTERED_NORMS_WITH_THE_PLUS_ONE_FOLDED_IN: &st
      exactly hf+1.0, the non-centered linear_attn.norm is bit-identical), so a tensor resolved \
      under the language_model.* spelling skips the loader's +1";
 
-fn load_f32_vec(w: &nv_weights::WeightLoader, names: &[&str], dim: usize) -> Result<Vec<f32>> {
-    let raw = load_bf16(w, names, &[dim])?;
-    Ok(raw.into_iter().map(bf16_val).collect())
-}
-
-fn load_lin(w: &nv_weights::WeightLoader, name: &str, n: usize, k: usize) -> Result<HostBf16Lin> {
+fn load_lin(w: &WeightLoader, name: &str, n: usize, k: usize) -> Result<HostBf16Lin> {
     Ok(HostBf16Lin {
         w: load_bf16_or_mlx_affine(w, &[name], &[n, k])?,
         n,
@@ -12284,17 +11874,12 @@ fn load_lin(w: &nv_weights::WeightLoader, name: &str, n: usize, k: usize) -> Res
     })
 }
 
-fn load_fp8_lin(
-    w: &nv_weights::WeightLoader,
-    name: &str,
-    n: usize,
-    k: usize,
-) -> Result<Option<HostFp8Lin>> {
+fn load_fp8_lin(w: &WeightLoader, name: &str, n: usize, k: usize) -> Result<Option<HostFp8Lin>> {
     if w.st_dtype_of(name) != Some(nv_weights::StDtype::F8_E4M3) || !k.is_multiple_of(4) {
         return Ok(None);
     }
     let qw = w.load_quantized_weight(name, nv_weights::QuantScheme::Fp8E4m3)?;
-    anyhow::ensure!(
+    ensure!(
         qw.shape == [n, k],
         "{name}: fp8 shape {:?} != [{n}, {k}]",
         qw.shape
@@ -12302,7 +11887,7 @@ fn load_fp8_lin(
     let scales = qw
         .fp8_weight_scale_rows()?
         .unwrap_or_else(|| vec![1.0f32; n]);
-    anyhow::ensure!(
+    ensure!(
         scales.len() == n,
         "{name}: fp8 weight_scale rows {} != {n}",
         scales.len()
@@ -12321,7 +11906,7 @@ fn load_fp8_lin(
 }
 
 fn load_dense_lin(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     module: &str,
     n: usize,
     k: usize,
@@ -12354,14 +11939,10 @@ fn load_dense_lin(
     if w.has(&format!("{module}.weight_packed")) {
         return Ok(HostDenseLin::Nvfp4(load_nvfp4(w, module, n, k)?));
     }
-    anyhow::bail!("{module}: neither .weight nor .weight_packed present")
+    bail!("{module}: neither .weight nor .weight_packed present")
 }
 
-fn load_layer(
-    cfg: &Qwen3_5DenseConfig,
-    w: &nv_weights::WeightLoader,
-    idx: usize,
-) -> Result<HostDenseLayer> {
+fn load_layer(cfg: &Qwen3_5DenseConfig, w: &WeightLoader, idx: usize) -> Result<HostDenseLayer> {
     let base = layer_base_prefix(w, idx);
     let input_ln = load_norm_plus_one(
         w,
@@ -12467,12 +12048,12 @@ fn load_layer(
             let kv_out = cfg.num_key_value_heads * hd;
             let has_qk_norm = w.has(&format!("{p}.q_norm.weight"));
             let has_qkv_bias = w.has(&format!("{p}.q_proj.bias"));
-            anyhow::ensure!(
+            ensure!(
                 has_qk_norm != has_qkv_bias,
                 "{p}: expected exactly one of qk-norm weights (qwen3 arch) or q/k/v projection \
                  biases (qwen2 arch); found norm={has_qk_norm} bias={has_qkv_bias}"
             );
-            anyhow::ensure!(
+            ensure!(
                 !has_qkv_bias || !cfg.attn_output_gate,
                 "{p}: qkv biases and attn_output_gate cannot combine"
             );
@@ -12525,30 +12106,6 @@ fn load_layer(
     })
 }
 
-fn rbf(x: f32) -> f32 {
-    bf16_val(bf16_bits(x))
-}
-
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-
-fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
-}
-
-fn ref_gemv_bf16(w: &HostBf16Lin, x: &[f32]) -> Vec<f32> {
-    let mut y = vec![0f32; w.n];
-    for (r, yr) in y.iter_mut().enumerate() {
-        let mut acc = 0f32;
-        for (c, xc) in x.iter().enumerate().take(w.k) {
-            acc += bf16_val(w.w[r * w.k + c]) * xc;
-        }
-        *yr = acc;
-    }
-    y
-}
-
 fn ref_gemv_dense(w: &HostDenseLin, x: &[f32]) -> Vec<f32> {
     match w {
         HostDenseLin::Bf16(l) => ref_gemv_bf16(l, x),
@@ -12594,13 +12151,12 @@ pub fn debug_push_gemv_dense_reading_packed_pairs_for_test(
     l: &HostDenseLin,
     x: &[f32],
 ) -> Result<Vec<f32>> {
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+    let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
     let s = Sources::new(ctx);
     let mut b = Builder {
         core: crate::wgpu_ledger::VramLedger::new(
             ctx,
             "q3d-dbg-",
-            staging_flush_enabled,
             STAGING_FLUSH_BYTES,
         ),
         passes: Vec::new(),
@@ -12609,14 +12165,14 @@ pub fn debug_push_gemv_dense_reading_packed_pairs_for_test(
         vf_commit_passes: Vec::new(),
         pf_dst_vf: false,
     };
-    anyhow::ensure!(
+    ensure!(
         x.len() == l.k(),
         "x has {} elements, weight k is {}",
         x.len(),
         l.k()
     );
     let n = l.n();
-    anyhow::ensure!(
+    ensure!(
         n.is_multiple_of(2),
         "packed-pairs readback needs even n, got {n}"
     );
@@ -12627,55 +12183,14 @@ pub fn debug_push_gemv_dense_reading_packed_pairs_for_test(
     let q = quant_for(&mut b, &s, "q3d-dbg-quant", &xb, w.k(), &[&w])?;
     push_gemv(&mut b, &s, "q3d-dbg-gemv", &w, &xb, q.as_ref(), &y)?;
     b.flush_staging();
-    let mut enc = ctx.device.create_command_encoder(&Default::default());
-    {
-        let mut pass = enc.begin_compute_pass(&Default::default());
-        for p in &b.passes {
-            pass.set_pipeline(&p.pipeline);
-            pass.set_bind_group(0, &p.bind, &[]);
-            pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-        }
-    }
-    ctx.queue.submit([enc.finish()]);
-    let words: Vec<u32> =
-        dispatch::read_back(ctx, &y, n / 2).map_err(|e| anyhow::anyhow!("{e}"))?;
+    submit_passes!(ctx, &b.passes);
+    let words: Vec<u32> = dispatch::read_back(ctx, &y, n / 2).map_err(|e| anyhow!("{e}"))?;
     let mut out = Vec::with_capacity(n);
     for word in words {
         out.push(f32::from_bits((word & 0xffff) << 16));
         out.push(f32::from_bits((word >> 16) << 16));
     }
     Ok(out)
-}
-
-fn ref_rmsnorm(x: &[f32], w: &[u16], eps: f32) -> Vec<f32> {
-    let n = x.len();
-    let mut ss = 0f32;
-    for v in x {
-        ss += v * v;
-    }
-    let inv = 1.0 / (ss / n as f32 + eps).sqrt();
-    (0..n).map(|i| rbf(x[i] * inv * bf16_val(w[i]))).collect()
-}
-
-pub struct RefState {
-    conv: Vec<Vec<f32>>,
-    rec: Vec<Vec<f32>>,
-    kc: Vec<Vec<f32>>,
-    vc: Vec<Vec<f32>>,
-    pos: usize,
-}
-
-impl RefState {
-    pub fn new(cfg: &Qwen3_5DenseConfig) -> Self {
-        let l = cfg.num_hidden_layers;
-        Self {
-            conv: vec![Vec::new(); l],
-            rec: vec![Vec::new(); l],
-            kc: vec![Vec::new(); l],
-            vc: vec![Vec::new(); l],
-            pos: 0,
-        }
-    }
 }
 
 pub fn reference_step(
@@ -12688,6 +12203,7 @@ pub fn reference_step(
     let eps = cfg.rms_norm_eps as f32;
     let pos = st.pos;
 
+    let trunk = cfg.trunk();
     let mut res: Vec<f32> = (0..hidden)
         .map(|i| bf16_val(hw.embed[token as usize * hidden + i]))
         .collect();
@@ -12696,7 +12212,7 @@ pub fn reference_step(
         let layer = &hw.layers[li];
         let normed = ref_rmsnorm(&res, &layer.input_ln, eps);
         let mixed = match &layer.mixer {
-            HostDenseMixer::Delta(d) => ref_delta(cfg, d, &normed, st, li),
+            HostDenseMixer::Delta(d) => ref_delta(&trunk, d, &normed, st, li),
             HostDenseMixer::Attn(a) => ref_attn(cfg, a, &normed, st, li, pos),
         };
         for i in 0..hidden {
@@ -12717,137 +12233,6 @@ pub fn reference_step(
     };
     st.pos += 1;
     Ok(ref_gemv_bf16(&lm, &fx))
-}
-
-fn ref_delta(
-    cfg: &Qwen3_5DenseConfig,
-    d: &HostDeltaNet,
-    x: &[f32],
-    st: &mut RefState,
-    li: usize,
-) -> Vec<f32> {
-    let n_k = cfg.linear_num_key_heads;
-    let n_v = cfg.linear_num_value_heads;
-    let d_k = cfg.linear_key_head_dim;
-    let d_v = cfg.linear_value_head_dim;
-    let key_dim = n_k * d_k;
-    let value_dim = n_v * d_v;
-    let conv_dim = 2 * key_dim + value_dim;
-    let ks = cfg.linear_conv_kernel_dim;
-    let hist = ks - 1;
-
-    let qkv: Vec<f32> = ref_gemv_bf16(&d.in_proj_qkv, x)
-        .into_iter()
-        .map(rbf)
-        .collect();
-    let z: Vec<f32> = ref_gemv_bf16(&d.in_proj_z, x)
-        .into_iter()
-        .map(rbf)
-        .collect();
-    let ab: Vec<f32> = ref_gemv_bf16(&d.in_proj_ab, x)
-        .into_iter()
-        .map(rbf)
-        .collect();
-
-    if st.conv[li].is_empty() {
-        st.conv[li] = vec![0f32; conv_dim * hist];
-    }
-    let mut mixed = vec![0f32; conv_dim];
-    for c in 0..conv_dim {
-        let mut acc = 0f32;
-        for j in 0..hist {
-            acc += d.conv1d[c * ks + j] * st.conv[li][c * hist + j];
-        }
-        acc += d.conv1d[c * ks + hist] * qkv[c];
-        for j in 0..hist.saturating_sub(1) {
-            st.conv[li][c * hist + j] = st.conv[li][c * hist + j + 1];
-        }
-        if hist > 0 {
-            st.conv[li][c * hist + hist - 1] = qkv[c];
-        }
-        mixed[c] = rbf(silu(acc));
-    }
-
-    let v_per_k = n_v / n_k;
-    let scale = 1.0 / (d_k as f32).sqrt();
-    let mut qg = vec![0f32; n_v * d_k];
-    let mut kg = vec![0f32; n_v * d_k];
-    let mut vg = vec![0f32; n_v * d_v];
-    for h in 0..n_v {
-        let kh = h / v_per_k;
-        let mut sq = 0f32;
-        let mut sk = 0f32;
-        for i in 0..d_k {
-            let qv = mixed[kh * d_k + i];
-            let kv = mixed[key_dim + kh * d_k + i];
-            sq += qv * qv;
-            sk += kv * kv;
-        }
-        let nq = (sq + 1e-6).sqrt();
-        let nk = (sk + 1e-6).sqrt();
-        for i in 0..d_k {
-            qg[h * d_k + i] = (mixed[kh * d_k + i] / nq) * scale;
-            kg[h * d_k + i] = mixed[key_dim + kh * d_k + i] / nk;
-        }
-        for i in 0..d_v {
-            vg[h * d_v + i] = mixed[2 * key_dim + h * d_v + i];
-        }
-    }
-
-    let mut gexp = vec![0f32; n_v];
-    let mut beta = vec![0f32; n_v];
-    for i in 0..n_v {
-        let a = ab[i];
-        let bb = ab[n_v + i];
-        beta[i] = sigmoid(bb);
-        let t = a + d.dt_bias[i];
-        let sp = t.max(0.0) + (1.0 + (-t.abs()).exp()).ln();
-        gexp[i] = (sp * -(d.a_log[i].exp())).exp();
-    }
-
-    if st.rec[li].is_empty() {
-        st.rec[li] = vec![0f32; n_v * d_k * d_v];
-    }
-    let mut core = vec![0f32; n_v * d_v];
-    for h in 0..n_v {
-        let base = h * d_k * d_v;
-        for dv in 0..d_v {
-            let mut kv_mem = 0f32;
-            for dk in 0..d_k {
-                let s = st.rec[li][base + dk * d_v + dv] * gexp[h];
-                st.rec[li][base + dk * d_v + dv] = s;
-                kv_mem += s * kg[h * d_k + dk];
-            }
-            let delta = (vg[h * d_v + dv] - kv_mem) * beta[h];
-            let mut outv = 0f32;
-            for dk in 0..d_k {
-                let s = st.rec[li][base + dk * d_v + dv] + kg[h * d_k + dk] * delta;
-                st.rec[li][base + dk * d_v + dv] = s;
-                outv += s * qg[h * d_k + dk];
-            }
-            core[h * d_v + dv] = outv;
-        }
-    }
-
-    let mut gated = vec![0f32; value_dim];
-    for h in 0..n_v {
-        let mut ss = 0f32;
-        for i in 0..d_v {
-            let c = rbf(core[h * d_v + i]);
-            ss += c * c;
-        }
-        let inv = 1.0 / (ss / d_v as f32 + cfg.rms_norm_eps as f32).sqrt();
-        for i in 0..d_v {
-            let c = rbf(core[h * d_v + i]);
-            let n = rbf(c * inv * bf16_val(d.norm_w[i]));
-            let g = rbf(silu(z[h * d_v + i]));
-            gated[h * d_v + i] = rbf(n * g);
-        }
-    }
-    ref_gemv_bf16(&d.out_proj, &gated)
-        .into_iter()
-        .map(rbf)
-        .collect()
 }
 
 fn ref_attn(
@@ -13050,12 +12435,12 @@ impl Q3dLora {
         config: &Qwen3_5DenseConfig,
     ) -> Result<Self> {
         let rank = adapter.config.r;
-        anyhow::ensure!(
+        ensure!(
             rank > 0 && rank <= wk::lora::FUSED_MAX_RANK,
             "lora rank {rank} outside 1..={}",
             wk::lora::FUSED_MAX_RANK
         );
-        anyhow::ensure!(
+        ensure!(
             config.layer_types.len() == config.num_hidden_layers,
             "config carries {} layer_types for {} layers",
             config.layer_types.len(),
@@ -13083,7 +12468,7 @@ impl Q3dLora {
                 let vp = format!("{p}.self_attn.v_proj");
                 if config.attn_output_gate {
                     if let Some(w) = adapter.loras.get(&q) {
-                        anyhow::ensure!(
+                        ensure!(
                             w.lora_b.dim(0)? == q_out,
                             "{q}: lora_B has {} out rows, the gated projection has {q_out}. \
                              {Q3D_LORA_Q_GATE_ADAPTER_MUST_COVER_VALUE_AND_GATE_LANES}",
@@ -13179,7 +12564,7 @@ impl Q3dLora {
                 skipped[0]
             );
         }
-        anyhow::ensure!(
+        ensure!(
             matched > 0,
             "lora adapter matched no qwen3.8-dense projection; it carries {} modules, the first \
              of which is {:?}. Expected names like {Q3D_LORA_PREFIX}.0.self_attn.q_proj",
@@ -13254,13 +12639,7 @@ struct LoraSiteCtx<'a> {
 }
 
 impl LoraSiteCtx<'_> {
-    fn push_site(
-        &self,
-        b: &mut Builder,
-        site: &LoraSiteGpu,
-        x: &wgpu::Buffer,
-        segs: &[&wgpu::Buffer],
-    ) {
+    fn push_site(&self, b: &mut Builder, site: &LoraSiteGpu, x: &Buffer, segs: &[&Buffer]) {
         let ctx = b.ctx;
         let mut emitted: Vec<crate::wgpu_lora::Pass> = Vec::new();
         let mut keep = self.keep.borrow_mut();
@@ -13275,12 +12654,7 @@ impl LoraSiteCtx<'_> {
         }
     }
 
-    fn push_site_shrink(
-        &self,
-        b: &mut Builder,
-        site: &LoraSiteGpu,
-        x: &wgpu::Buffer,
-    ) -> LoraShrinkFold {
+    fn push_site_shrink(&self, b: &mut Builder, site: &LoraSiteGpu, x: &Buffer) -> LoraShrinkFold {
         let ctx = b.ctx;
         let mut emitted: Vec<crate::wgpu_lora::Pass> = Vec::new();
         let mut keep = self.keep.borrow_mut();
@@ -13301,8 +12675,8 @@ impl LoraSiteCtx<'_> {
         b: &mut Builder,
         m: usize,
         site: &LoraSiteGpu,
-        x: &wgpu::Buffer,
-        segs: &[&wgpu::Buffer],
+        x: &Buffer,
+        segs: &[&Buffer],
     ) {
         let ctx = b.ctx;
         let mut emitted: Vec<crate::wgpu_lora::Pass> = Vec::new();
@@ -13320,7 +12694,6 @@ impl LoraSiteCtx<'_> {
 }
 
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn w4a8_lora_fold_probe(
     x_bf16: &[u16],
     a_bf16: &[u16],
@@ -13334,22 +12707,22 @@ pub fn w4a8_lora_fold_probe(
     k: usize,
     rank: usize,
 ) -> Result<(Vec<u16>, Vec<u16>)> {
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
-    anyhow::ensure!(
+    let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
+    ensure!(
         x_bf16.len() == k,
         "probe x is {} elements, want {k}",
         x_bf16.len()
     );
-    anyhow::ensure!(
+    ensure!(
         k.is_multiple_of(32) && n.is_multiple_of(2),
         "probe geometry: k {k} must be 32-aligned and n {n} even"
     );
-    anyhow::ensure!(
+    ensure!(
         widths[slice_id] == n,
         "probe slice {slice_id} is {} wide, gemv writes {n}",
         widths[slice_id]
     );
-    anyhow::ensure!(
+    ensure!(
         w_packed.len() == n * k / 8,
         "probe packed weight is {} words, want {}",
         w_packed.len(),
@@ -13368,7 +12741,7 @@ pub fn w4a8_lora_fold_probe(
     let src_gemv = compose(GEMV_W4A8_WGSL);
     let mk = |label: &str, entry: &str| {
         dispatch::cached_compute_pipeline(ctx, label, &src_gemv, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))
     };
     let q_pipe = mk("w48-fold-probe-qx", "w48_quantize_x_evenodd")?;
     let base_pipe = mk("w48-fold-probe-base", W4A8_GEMV_ENTRY)?;
@@ -13452,7 +12825,7 @@ pub fn w4a8_lora_fold_probe(
     refs.push((fold_pipe.as_ref(), &fold_bind, groups));
     dispatch::submit_pass_list(ctx, refs);
     ctx.poll_blocking()
-        .map_err(|e| anyhow::anyhow!("probe poll: {e}"))?;
+        .map_err(|e| anyhow!("probe poll: {e}"))?;
     let unpack = |words: Vec<u32>| -> Vec<u16> {
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
@@ -13468,12 +12841,12 @@ pub fn w4a8_lora_fold_probe(
     let yb = unpack(
         y_base
             .download(ctx)
-            .map_err(|e| anyhow::anyhow!("probe download base: {e}"))?,
+            .map_err(|e| anyhow!("probe download base: {e}"))?,
     );
     let yf = unpack(
         y_fused
             .download(ctx)
-            .map_err(|e| anyhow::anyhow!("probe download fused: {e}"))?,
+            .map_err(|e| anyhow!("probe download fused: {e}"))?,
     );
     Ok((yb, yf))
 }
@@ -13509,7 +12882,6 @@ fn probe_shrink_passes(
 }
 
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn fp8_rowscale_lora_fold_probe(
     x_bf16: &[u16],
     a_bf16: &[u16],
@@ -13519,19 +12891,19 @@ pub fn fp8_rowscale_lora_fold_probe(
     w: &HostFp8Lin,
     rank: usize,
 ) -> Result<(Vec<u16>, Vec<u16>)> {
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+    let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
     let (n, k) = (w.n, w.k);
-    anyhow::ensure!(
+    ensure!(
         x_bf16.len() == k,
         "probe x is {} elements, want {k}",
         x_bf16.len()
     );
-    anyhow::ensure!(
+    ensure!(
         widths[slice_id] == n,
         "probe slice {slice_id} is {} wide, gemv writes {n}",
         widths[slice_id]
     );
-    anyhow::ensure!(w.packed.len() == n * k / 4, "probe fp8 word count");
+    ensure!(w.packed.len() == n * k / 4, "probe fp8 word count");
     let pl = build_lora_pipelines(ctx)?;
     let host = LoraSite {
         a: a_bf16.to_vec(),
@@ -13545,7 +12917,7 @@ pub fn fp8_rowscale_lora_fold_probe(
     let src = compose(GEMV_BF16_WGSL);
     let mk = |label: &str, entry: &str| {
         dispatch::cached_compute_pipeline(ctx, label, &src, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))
     };
     let base_pipe = mk("f8-fold-probe-base", "q3w_gemv_fp8_rowscale")?;
     let fold_pipe = mk("f8-fold-probe-fold", FP8_GEMV_LORA_FOLD_ENTRY)?;
@@ -13626,7 +12998,6 @@ pub fn fp8_rowscale_lora_fold_probe(
 }
 
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn dn_merged_lora_fold_probe(
     x_bf16: &[u16],
     a_bf16: &[u16],
@@ -13637,15 +13008,15 @@ pub fn dn_merged_lora_fold_probe(
     ab: &HostBf16Lin,
     rank: usize,
 ) -> Result<(Vec<Vec<u16>>, Vec<Vec<u16>>)> {
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+    let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
     let k = qkv.k;
-    anyhow::ensure!(z.k == k && ab.k == k, "probe k mismatch");
-    anyhow::ensure!(
+    ensure!(z.k == k && ab.k == k, "probe k mismatch");
+    ensure!(
         x_bf16.len() == k,
         "probe x is {} elements, want {k}",
         x_bf16.len()
     );
-    anyhow::ensure!(
+    ensure!(
         widths.len() == 4
             && widths[0] == qkv.n
             && widths[1] == z.n
@@ -13669,7 +13040,7 @@ pub fn dn_merged_lora_fold_probe(
     let src = compose(GEMV_BF16_WGSL);
     let mk = |label: &str, entry: &str| {
         dispatch::cached_compute_pipeline(ctx, label, &src, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))
     };
     let base_pipe = mk(
         "mg-fold-probe-base",

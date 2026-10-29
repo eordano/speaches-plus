@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use nv_weights::WeightLoader;
 use tokenizers::Tokenizer;
@@ -16,7 +16,8 @@ use crate::dots_ocr::DotsPrecision;
 pub const GOT_PRECISION_ENV: &str = "NV_GOT_DEC_PRECISION";
 
 pub fn got_precision(raw: Option<&str>, default: DotsPrecision) -> Result<DotsPrecision> {
-    DotsPrecision::parse(raw, default).map_err(|e| anyhow!("{GOT_PRECISION_ENV}: {e:#}"))
+    DotsPrecision::parse(raw.filter(|v| *v != "bf16"), default)
+        .map_err(|e| anyhow!("{GOT_PRECISION_ENV}: {e:#}"))
 }
 
 pub fn got_default_precision(device: &Device) -> DotsPrecision {
@@ -112,7 +113,7 @@ impl GotOcrPipeline {
         if precision == DotsPrecision::Nvfp4 {
             anyhow::bail!(
                 "got-ocr2: DotsPrecision::Nvfp4 requires the cuda feature; \
-                 rebuild with --features cuda or set {GOT_PRECISION_ENV}=bf16"
+                 rebuild with --features cuda or unset {GOT_PRECISION_ENV}"
             );
         }
         let raw = std::fs::read_to_string(dir.join("config.json"))
@@ -123,7 +124,7 @@ impl GotOcrPipeline {
         let len = std::fs::metadata(&weight_path)
             .with_context(|| format!("stat {}", weight_path.display()))?
             .len();
-        anyhow::ensure!(
+        ensure!(
             len == nv_ocr::WEIGHT_FILE_BYTES_INCLUDING_SAFETENSORS_HEADER,
             "{} is {len} bytes, expected {} (safetensors header + {} bytes bf16 payload)",
             weight_path.display(),
@@ -134,7 +135,7 @@ impl GotOcrPipeline {
         let weights = WeightLoader::open_dir(dir, device)
             .with_context(|| format!("open GOT-OCR2 checkpoint dir {}", dir.display()))?;
         let names = weights.names();
-        anyhow::ensure!(
+        ensure!(
             names.len() == nv_ocr::WEIGHT_TENSOR_COUNT,
             "checkpoint has {} tensors, expected {}",
             names.len(),
@@ -151,12 +152,12 @@ impl GotOcrPipeline {
 
         let text_cfg = DotsDecoderConfig::from_hf_json_str(&text_config_json(&raw)?)
             .context("parse GOT text_config as Qwen2 decoder config")?;
-        anyhow::ensure!(
+        ensure!(
             text_cfg.hidden_size == 1024,
             "GOT text_config hidden_size {} must be 1024 to match the projector output",
             text_cfg.hidden_size
         );
-        anyhow::ensure!(
+        ensure!(
             text_cfg.tie_word_embeddings,
             "GOT ties word embeddings; a checkpoint with a separate lm_head breaks the 471-tensor gate"
         );
@@ -213,7 +214,7 @@ impl GotOcrPipeline {
                 .to_vec())
         };
         let imgpad = enc("<imgpad>")?;
-        anyhow::ensure!(
+        ensure!(
             imgpad == [cfg.image_token_index],
             "<imgpad> must encode to the config image_token_index {}, got {imgpad:?}",
             cfg.image_token_index
@@ -221,7 +222,7 @@ impl GotOcrPipeline {
         let image_token = cfg.image_token_index;
         let one = |s: &str| -> Result<u32> {
             let e = enc(s)?;
-            anyhow::ensure!(e.len() == 1, "{s} must be a single token, got {e:?}");
+            ensure!(e.len() == 1, "{s} must be a single token, got {e:?}");
             Ok(e[0])
         };
         let im_end = one("<|im_end|>")?;
@@ -276,18 +277,18 @@ impl GotOcrPipeline {
             .iter()
             .position(|&t| t == self.image_token)
             .context("rendered prompt has no image token")?;
-        anyhow::ensure!(
+        ensure!(
             vision_start + GOT_IMAGE_TOKENS <= ids.len()
                 && ids[vision_start..vision_start + GOT_IMAGE_TOKENS]
                     .iter()
                     .all(|&t| t == self.image_token),
             "image token run at {vision_start} is not {GOT_IMAGE_TOKENS} contiguous imgpad tokens"
         );
-        anyhow::ensure!(
+        ensure!(
             vision_start == 0 || ids[vision_start - 1] != self.image_token,
             "image token run starts before {vision_start}"
         );
-        anyhow::ensure!(
+        ensure!(
             vision_start + GOT_IMAGE_TOKENS >= ids.len()
                 || ids[vision_start + GOT_IMAGE_TOKENS] != self.image_token,
             "image token run exceeds {GOT_IMAGE_TOKENS} tokens"
@@ -309,7 +310,7 @@ impl GotOcrPipeline {
         max_new_tokens: usize,
     ) -> Result<GotPageResult> {
         let feats = self.encode_image(img)?;
-        anyhow::ensure!(
+        ensure!(
             feats.dims2()? == (GOT_IMAGE_TOKENS, self.decoder.config().hidden_size),
             "GOT vision produced {:?}, expected [{GOT_IMAGE_TOKENS}, {}]",
             feats.dims(),
@@ -350,7 +351,7 @@ impl GotOcrPipeline {
         let d = &self.decoder;
         let cfg = d.config();
         let prompt_len = prompt_tokens.len();
-        anyhow::ensure!(
+        ensure!(
             prompt_len < d.rope_span(),
             "prompt of {prompt_len} tokens exceeds the rope span {}",
             d.rope_span()
@@ -358,7 +359,7 @@ impl GotOcrPipeline {
         let budget = (prompt_len + opts.max_new_tokens + 1).min(d.rope_span());
         let mut cache = DotsKvCache::new_with_mode(cfg, budget, d.device(), d.dtype(), true)?;
         let n = vision_features.dim(0)?;
-        anyhow::ensure!(
+        ensure!(
             vision_start + n <= prompt_len,
             "vision span {vision_start}+{n} exceeds prompt {prompt_len}"
         );
@@ -419,17 +420,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn precision_parse_accepts_bf16_nvfp4_and_rejects_the_rest() {
+    fn precision_parse_accepts_nvfp4_rejects_the_rest_and_cpu_defaults_to_bf16() {
+        assert_eq!(got_default_precision(&Device::Cpu), DotsPrecision::Bf16);
         assert_eq!(
             got_precision(None, DotsPrecision::Nvfp4).unwrap(),
             DotsPrecision::Nvfp4
         );
         assert_eq!(
             got_precision(Some(""), DotsPrecision::Bf16).unwrap(),
-            DotsPrecision::Bf16
-        );
-        assert_eq!(
-            got_precision(Some("bf16"), DotsPrecision::Nvfp4).unwrap(),
             DotsPrecision::Bf16
         );
         assert_eq!(
@@ -443,10 +441,5 @@ mod tests {
             err.contains(GOT_PRECISION_ENV),
             "error names the env var: {err}"
         );
-    }
-
-    #[test]
-    fn cpu_default_precision_is_bf16_nvfp4_kernels_are_cuda_only() {
-        assert_eq!(got_default_precision(&Device::Cpu), DotsPrecision::Bf16);
     }
 }

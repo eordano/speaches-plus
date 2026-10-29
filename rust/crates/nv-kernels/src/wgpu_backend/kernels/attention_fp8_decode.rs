@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::dequant::bytes_to_words;
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
@@ -183,29 +181,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn head_dim_selects_the_matching_entry_point() {
-        assert_eq!(entry_for(64).unwrap(), "attention_fp8_decode_hd64");
-        assert_eq!(entry_for(512).unwrap(), "attention_fp8_decode_hd512");
-        assert!(entry_for(96).is_err());
-        assert!(entry_for(1024).is_err());
-    }
-
-    #[test]
-    fn wgsl_declares_every_entry_point() {
-        for hd in SUPPORTED_HEAD_DIMS {
-            assert!(WGSL.contains(entry_for(hd).unwrap()));
+    fn entries_params_and_widening_follow_the_shader_contract() {
+        {
+            assert_eq!(entry_for(64).unwrap(), "attention_fp8_decode_hd64");
+            assert_eq!(entry_for(512).unwrap(), "attention_fp8_decode_hd512");
+            assert!(entry_for(96).is_err());
+            assert!(entry_for(1024).is_err());
         }
-        assert!(compose(WGSL).contains("fn e4m3_decode("));
-    }
-
-    #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert_eq!(std::mem::size_of::<AttnFp8Params>() % 16, 0);
-    }
-
-    #[test]
-    fn byte_and_halfword_widening_round_trips() {
-        assert_eq!(widen_u16(&[0x3f80, 0xbf00]), vec![0x3f80u32, 0xbf00u32]);
-        assert_eq!(bytes_to_words(&[1, 2, 3, 4]), vec![0x04030201u32]);
+        {
+            for hd in SUPPORTED_HEAD_DIMS {
+                assert!(WGSL.contains(entry_for(hd).unwrap()));
+            }
+            assert!(compose(WGSL).contains("fn e4m3_decode("));
+        }
+        {
+            assert_eq!(std::mem::size_of::<AttnFp8Params>() % 16, 0);
+        }
+        {
+            assert_eq!(widen_u16(&[0x3f80, 0xbf00]), vec![0x3f80u32, 0xbf00u32]);
+            assert_eq!(bytes_to_words(&[1, 2, 3, 4]), vec![0x04030201u32]);
+        }
     }
 }

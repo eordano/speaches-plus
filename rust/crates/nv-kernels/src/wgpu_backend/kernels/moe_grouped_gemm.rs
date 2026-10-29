@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::dequant::{bytes_to_words, NVFP4_BLOCK_SIZE};
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
@@ -327,7 +325,6 @@ pub fn moe_grouped_nvfp4_gemm_bf16(
     Ok(path)
 }
 
-#[allow(clippy::type_complexity)]
 fn variant_bindings<'a>(
     variant: ScalarVariant,
     a: &'a wgpu::Buffer,
@@ -373,180 +370,58 @@ fn variant_bindings<'a>(
     }
 }
 
-pub fn moe_grouped_scalar_probe(
-    ctx: &WgpuContext,
-    a_packed: &[u8],
-    a_scales: &[u8],
-    b_packed: &[u8],
-    b_scales: &[u8],
-    expert_offsets: &[i32],
-    expert_id_sets: &[Vec<i32>],
-    alphas: &[f32],
-    n: usize,
-    k: usize,
-    e_total: usize,
-    variant: ScalarVariant,
-    warmup: usize,
-    iters: usize,
-) -> Result<(Vec<u16>, f64)> {
-    let first = expert_id_sets
-        .first()
-        .ok_or_else(|| WgpuError::Shape("probe needs at least one expert id set".into()))?;
-    let total_m = validate_groups(expert_offsets, first, alphas, e_total)?;
-    if total_m == 0 || n == 0 || k == 0 || !k.is_multiple_of(NVFP4_BLOCK_SIZE) {
-        return Err(WgpuError::Shape(format!(
-            "probe needs non-empty aligned operands; total_m={total_m} n={n} k={k}"
-        )));
-    }
-    if !variant.supports(n, k) {
-        return Err(WgpuError::Shape(format!(
-            "{:?} does not support n={n} k={k}",
-            variant
-        )));
-    }
-    let k_blocks = k / NVFP4_BLOCK_SIZE;
-    let row_words = k / 8;
-    let b_sf_stride = swizzled_scale_len(n, k_blocks);
-    dispatch::check_len("probe a_packed", a_packed.len(), total_m * k / 2)?;
-    dispatch::check_len("probe b_packed", b_packed.len(), e_total * n * k / 2)?;
-
-    let a_buf = dispatch::storage_from_slice(ctx, "moe-probe-a", &bytes_to_words(a_packed));
-    let a_sf_buf = dispatch::storage_from_slice(ctx, "moe-probe-a-sf", &bytes_to_words(a_scales));
-    let b_buf = dispatch::storage_from_slice(ctx, "moe-probe-b", &bytes_to_words(b_packed));
-    let b_sf_buf = dispatch::storage_from_slice(ctx, "moe-probe-b-sf", &bytes_to_words(b_scales));
-    let d_buf = dispatch::storage_zeroed(ctx, "moe-probe-d", (total_m * n * 4) as u64);
-    let map = row_group_map(expert_offsets, total_m);
-    let map_buf = dispatch::storage_from_slice(ctx, "moe-probe-map", &map);
-
-    let groups = dispatch::workgroup_count_1d(ctx, (total_m * n) as u64, SCALAR_WORKGROUP_SIZE);
-    let params = MoeGemmParams {
-        n: n as u32,
-        k: k as u32,
-        row_words: row_words as u32,
-        k_tiles: k_tiles(k_blocks) as u32,
-        b_sf_stride_bytes: b_sf_stride as u32,
-        b_words_per_expert: (n * row_words) as u32,
-        total_m: total_m as u32,
-        groups_x: groups.0,
-        total_tiles: 0,
-        pad0: 0,
-        pad1: 0,
-        pad2: 0,
-    };
-    let params_buf = dispatch::uniform_from(ctx, "moe-probe-params", &params);
-
-    let pipeline = dispatch::cached_compute_pipeline(
-        ctx,
-        "moe-gemm-scalar-probe",
-        &scalar_source(),
-        variant.entry(),
-    )?;
-    let mut bind_groups = Vec::new();
-    for ids in expert_id_sets {
-        validate_groups(expert_offsets, ids, alphas, e_total)?;
-        let meta: Vec<u32> = ids
-            .iter()
-            .zip(alphas.iter())
-            .flat_map(|(id, a)| [*id as u32, a.to_bits()])
-            .collect();
-        let meta_buf = dispatch::storage_from_slice(ctx, "moe-probe-meta", &meta);
-        let bindings = variant_bindings(
-            variant,
-            &a_buf,
-            &a_sf_buf,
-            &b_buf,
-            &b_sf_buf,
-            &params_buf,
-            &d_buf,
-            &meta_buf,
-            &map_buf,
-        );
-        bind_groups.push(dispatch::bind_group(ctx, &pipeline, &bindings));
-    }
-
-    let submit = |count: usize| {
-        let mut enc = ctx.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&pipeline);
-            for i in 0..count {
-                pass.set_bind_group(0, &bind_groups[i % bind_groups.len()], &[]);
-                pass.dispatch_workgroups(groups.0, groups.1, groups.2);
-            }
-        }
-        ctx.queue.submit([enc.finish()]);
-    };
-    submit(warmup.max(1));
-    ctx.poll_blocking()?;
-
-    let start = std::time::Instant::now();
-    submit(iters);
-    ctx.poll_blocking()?;
-    let secs = start.elapsed().as_secs_f64();
-
-    let words: Vec<u32> = dispatch::read_back(ctx, &d_buf, total_m * n)?;
-    let out = words.iter().map(|w| (*w & 0xffff) as u16).collect();
-    Ok((out, secs))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn sections_split_and_carry_their_entry_points() {
-        let (head, tail) = split_sections();
-        assert!(head.contains(SCALAR_ENTRY));
-        assert!(!head.contains(COOP_ENTRY));
-        assert!(tail.contains(COOP_ENTRY));
-        assert!(!tail.contains(SCALAR_ENTRY));
+    fn the_sections_split_and_only_the_coop_one_asks_for_16x16x16_f16_f32() {
+        {
+            let (head, tail) = split_sections();
+            assert!(head.contains(SCALAR_ENTRY));
+            assert!(!head.contains(COOP_ENTRY));
+            assert!(tail.contains(COOP_ENTRY));
+            assert!(!tail.contains(SCALAR_ENTRY));
+        }
+        {
+            let coop = coop_source();
+            assert!(coop.starts_with("enable f16;\nenable wgpu_cooperative_matrix;\n"));
+            assert!(coop.contains("coopMultiplyAdd("));
+            let scalar = scalar_source();
+            assert!(!scalar.contains("enable "));
+            assert!(!scalar.contains("coopMultiplyAdd("));
+        }
+        {
+            assert!(scalar_source().contains("fn nvfp4_scale_byte_index("));
+            assert!(coop_source().contains("fn nvfp4_scale_byte_index("));
+        }
+        {
+            use crate::wgpu_backend::qualify::{coop_requests_in_wgsl, CoopRequest, CoopScalar};
+            assert_eq!(
+                coop_requests_in_wgsl(&coop_source()),
+                vec![CoopRequest::square(16, CoopScalar::F16, CoopScalar::F32)]
+            );
+            assert!(coop_requests_in_wgsl(&scalar_source()).is_empty());
+        }
     }
 
     #[test]
-    fn only_the_coop_source_carries_the_enable_directives() {
-        let coop = coop_source();
-        assert!(coop.starts_with("enable f16;\nenable wgpu_cooperative_matrix;\n"));
-        assert!(coop.contains("coopMultiplyAdd("));
-        let scalar = scalar_source();
-        assert!(!scalar.contains("enable "));
-        assert!(!scalar.contains("coopMultiplyAdd("));
-    }
-
-    #[test]
-    fn both_sources_include_the_dequant_prelude() {
-        assert!(scalar_source().contains("fn nvfp4_scale_byte_index("));
-        assert!(coop_source().contains("fn nvfp4_scale_byte_index("));
-    }
-
-    #[test]
-    fn the_shipped_coop_shader_asks_for_16x16x16_f16_f32_and_nothing_else() {
-        use crate::wgpu_backend::qualify::{coop_requests_in_wgsl, CoopRequest, CoopScalar};
-        assert_eq!(
-            coop_requests_in_wgsl(&coop_source()),
-            vec![CoopRequest::square(16, CoopScalar::F16, CoopScalar::F32)]
-        );
-        assert!(coop_requests_in_wgsl(&scalar_source()).is_empty());
-    }
-
-    #[test]
-    fn params_are_forty_eight_bytes() {
-        assert_eq!(std::mem::size_of::<MoeGemmParams>(), 48);
-    }
-
-    #[test]
-    fn row_group_map_covers_ragged_and_empty_groups() {
-        let map = row_group_map(&[0, 2, 2, 5], 5);
-        assert_eq!(map, vec![0, 0, 2, 2, 2]);
-    }
-
-    #[test]
-    fn tile_table_skips_empty_groups_and_masks_ragged_rows() {
-        let table = tile_table(&[0, 33, 33, 40], 40);
-        assert_eq!(table.len() / 4, (2 + 1) * 2);
-        assert_eq!(&table[0..4], &[0, 0, 33, 0]);
-        assert_eq!(&table[4..8], &[0, 0, 33, 32]);
-        assert_eq!(&table[8..12], &[0, 32, 33, 0]);
-        assert_eq!(&table[16..20], &[2, 33, 40, 0]);
-        assert!(table.iter().skip(2).step_by(4).all(|&hi| hi <= 40));
+    fn params_row_group_map_and_tile_table_follow_the_shader_layout() {
+        {
+            assert_eq!(std::mem::size_of::<MoeGemmParams>(), 48);
+        }
+        {
+            let map = row_group_map(&[0, 2, 2, 5], 5);
+            assert_eq!(map, vec![0, 0, 2, 2, 2]);
+        }
+        {
+            let table = tile_table(&[0, 33, 33, 40], 40);
+            assert_eq!(table.len() / 4, (2 + 1) * 2);
+            assert_eq!(&table[0..4], &[0, 0, 33, 0]);
+            assert_eq!(&table[4..8], &[0, 0, 33, 32]);
+            assert_eq!(&table[8..12], &[0, 32, 33, 0]);
+            assert_eq!(&table[16..20], &[2, 33, 40, 0]);
+            assert!(table.iter().skip(2).step_by(4).all(|&hi| hi <= 40));
+        }
     }
 }

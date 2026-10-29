@@ -63,18 +63,12 @@ pub struct ChunkedScanFwd {
     pub checkpoints_dense_from_the_fused_kernel: Option<Tensor>,
 }
 
-pub const NV_Q38_GDN_SCAN_KERNEL_DEFAULT_ON_0_RESTORES_THE_PER_TOKEN_CANDLE_SCAN_WHOSE_TEN_LAUNCHES_PER_TOKEN_MADE_THE_WINDOW_BACKWARD_2_1_S_OF_A_3_0_S_STEP: &str =
-    "NV_Q38_GDN_SCAN_KERNEL";
-
 #[cfg(feature = "cuda")]
 pub fn fused_scan_kernel_serves(q: &Tensor, d_k: usize, d_v: usize) -> bool {
-    std::env::var(NV_Q38_GDN_SCAN_KERNEL_DEFAULT_ON_0_RESTORES_THE_PER_TOKEN_CANDLE_SCAN_WHOSE_TEN_LAUNCHES_PER_TOKEN_MADE_THE_WINDOW_BACKWARD_2_1_S_OF_A_3_0_S_STEP)
-        .as_deref()
-        != Ok("0")
-        && d_k == 128
+    d_k == 128
         && d_v == 128
         && q.dtype() == candle_core::DType::F32
-        && matches!(q.device(), candle_core::Device::Cuda(_))
+        && q.device().is_cuda()
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -105,7 +99,10 @@ mod fused {
     }
 
     pub fn f32_ptr(t: &Tensor, d: &Dev) -> Result<u64> {
-        ensure!(t.dtype() == DType::F32, "fused gdn scan operand must be f32");
+        ensure!(
+            t.dtype() == DType::F32,
+            "fused gdn scan operand must be f32"
+        );
         let (st, layout) = t.storage_and_layout();
         let candle_core::Storage::Cuda(c) = &*st else {
             anyhow::bail!("fused gdn scan operand not cuda")
@@ -129,7 +126,6 @@ mod fused {
         nv_layers::step_arena::device_ptr_for_a_kernel_to_write(t)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn scan_fwd(
         q3: &Tensor,
         k3: &Tensor,
@@ -172,7 +168,6 @@ mod fused {
         Ok((out, ckpt))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn scan_bwd(
         q3: &Tensor,
         k3: &Tensor,
@@ -229,7 +224,6 @@ mod fused {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn scan_chunked_fwd(
     q: &Tensor,
     k: &Tensor,
@@ -289,7 +283,6 @@ pub fn scan_chunked_fwd(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn scan_chunked_input_grads(
     q: &Tensor,
     k: &Tensor,
@@ -326,13 +319,38 @@ pub fn scan_chunked_input_grads(
         let ckpt = Tensor::stack(checkpoints, 0)?;
         let (dq, dk, dv, dg, dbe) =
             fused::scan_bwd(&q3, &k3, &v3, &g2, &be2, &do3, &ckpt, bn, t, chunk)?;
-        if std::env::var("NV_Q38_GDN_SCAN_CHECK_PRINTS_THE_KERNEL_VS_CANDLE_DIVERGENCE_PER_CALL").as_deref() == Ok("1") {
-            std::env::set_var(NV_Q38_GDN_SCAN_KERNEL_DEFAULT_ON_0_RESTORES_THE_PER_TOKEN_CANDLE_SCAN_WHOSE_TEN_LAUNCHES_PER_TOKEN_MADE_THE_WINDOW_BACKWARD_2_1_S_OF_A_3_0_S_STEP, "0");
-            let r = scan_chunked_input_grads(q, k, v, g_exp, beta, d_out, checkpoints, b, t, n_v, d_k, d_v, chunk);
-            std::env::remove_var(NV_Q38_GDN_SCAN_KERNEL_DEFAULT_ON_0_RESTORES_THE_PER_TOKEN_CANDLE_SCAN_WHOSE_TEN_LAUNCHES_PER_TOKEN_MADE_THE_WINDOW_BACKWARD_2_1_S_OF_A_3_0_S_STEP);
-            let r = r?;
+        if std::env::var("NV_Q38_GDN_SCAN_CHECK_PRINTS_THE_KERNEL_VS_CANDLE_DIVERGENCE_PER_CALL")
+            .as_deref()
+            == Ok("1")
+        {
+            let cpu = |x: &Tensor| x.to_device(&candle_core::Device::Cpu);
+            let cpu_checkpoints = checkpoints
+                .iter()
+                .map(cpu)
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            let r = scan_chunked_input_grads(
+                &cpu(q)?,
+                &cpu(k)?,
+                &cpu(v)?,
+                &cpu(g_exp)?,
+                &cpu(beta)?,
+                &cpu(d_out)?,
+                &cpu_checkpoints,
+                b,
+                t,
+                n_v,
+                d_k,
+                d_v,
+                chunk,
+            )?;
             let rel = |a: &Tensor, w: &Tensor| -> Result<(f32, f32)> {
-                let d = a.sub(w)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+                let w = w.to_device(a.device())?;
+                let d = a
+                    .sub(&w)?
+                    .abs()?
+                    .flatten_all()?
+                    .max(0)?
+                    .to_scalar::<f32>()?;
                 let m = w.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
                 Ok((d, m))
             };

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub const ERR_KINDS: &[&str] = &[
     "error",
     "raised",
@@ -30,8 +28,4 @@ pub const LANES: &[&str] = &[
 
 pub fn is_error_kind(kind: &str) -> bool {
     ERR_KINDS.contains(&kind)
-}
-
-pub fn is_known_lane(lane: &str) -> bool {
-    LANES.contains(&lane)
 }

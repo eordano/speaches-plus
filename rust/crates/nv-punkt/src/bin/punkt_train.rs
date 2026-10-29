@@ -113,7 +113,7 @@ fn main() {
     let ortho: BTreeMap<&str, u8> = params
         .ortho_context
         .iter()
-        .filter(|(t, &f)| {
+        .filter(|&(t, &f)| {
             let n = t.chars().count();
             f != 0
                 && clean_type(t)

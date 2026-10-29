@@ -132,17 +132,17 @@ satisfies I1, I7, and I9 and emits no wire events.
 
 ### 2.2 Invariants (`checkInvariants` in state.go)
 
-- **I1** Mutual exclusion: `vad.speaking => resp ∉ {Created, Streaming, Drain}`. Predicted is exempt because it emits no wire event.
-- **I2** Single-slot response: at most one Created/Streaming/Drain. A second `response.create` raises `response_already_active`.
-- **I3** Buffer immutability: once a buffer is rotated (Committed) it accepts no further appends.
-- **I4** Response terminality: every `response.created(R)` is paired with exactly one terminal `response.done(R)` (W1 on the wire).
-- **I5** Epoch monotonicity: `respPhase.epoch` is incremented on every retire (cancel, complete, drain-cap, Predicted rollback).
-- **I6** Buffer-conversation consistency: a `Voiced` user buffer with `item_id=A` does not coexist with `conv[A].status=in_progress`.
-- **I7** Predicted invisibility: `Predicted => wireEmitted == false`.
-- **I8** Rotation-at-commit: buffer rotation happens synchronously with commit, not on `Speaking -> Stopped`. Enables the §6.7 EOU re-entry path that reuses the same buffer's item_id and audio_start_ms.
-- **I9** Predicted retirement: `Predicted -> None` increments epoch and aborts the runner; `Predicted -> Created` preserves id and epoch and reuses the runner.
-- **I10** Session monotonicity: `sessionPhase` follows `Pending -> Active -> Terminated`; no other order, no rewind.
-- **I11** Conversation/wire consistency: every accepted `conversation.item.create` is followed by exactly one `conversation.item.created` referencing the same id (W8 on the wire).
+- I1 Mutual exclusion: `vad.speaking => resp ∉ {Created, Streaming, Drain}`. Predicted is exempt because it emits no wire event.
+- I2 Single-slot response: at most one Created/Streaming/Drain. A second `response.create` raises `response_already_active`.
+- I3 Buffer immutability: once a buffer is rotated (Committed) it accepts no further appends.
+- I4 Response terminality: every `response.created(R)` is paired with exactly one terminal `response.done(R)` (W1 on the wire).
+- I5 Epoch monotonicity: `respPhase.epoch` is incremented on every retire (cancel, complete, drain-cap, Predicted rollback).
+- I6 Buffer-conversation consistency: a `Voiced` user buffer with `item_id=A` does not coexist with `conv[A].status=in_progress`.
+- I7 Predicted invisibility: `Predicted => wireEmitted == false`.
+- I8 Rotation-at-commit: buffer rotation happens synchronously with commit, not on `Speaking -> Stopped`. Enables the §6.7 EOU re-entry path that reuses the same buffer's item_id and audio_start_ms.
+- I9 Predicted retirement: `Predicted -> None` increments epoch and aborts the runner; `Predicted -> Created` preserves id and epoch and reuses the runner.
+- I10 Session monotonicity: `sessionPhase` follows `Pending -> Active -> Terminated`; no other order, no rewind.
+- I11 Conversation/wire consistency: every accepted `conversation.item.create` is followed by exactly one `conversation.item.created` referencing the same id (W8 on the wire).
 
 `debugInvariants = true` (constants.go); in tests where no `violationHook`
 is installed, a violation panics so the property fuzzer surfaces them. In
@@ -152,7 +152,7 @@ internal_state_error}` and terminates the transport (§9.6).
 
 ## 3. Audio buffer model (§3)
 
-`inputBuffer` rotates synchronously with **commit**, not on
+`inputBuffer` rotates synchronously with commit, not on
 Speaking->Stopped. The Stopped buffer survives the commit_timer window so
 that a `vad.speech_started` during the timer can re-enter the same
 `item_id` and `audio_start_ms` (§6.6).
@@ -193,9 +193,9 @@ task per session and is restarted on §6.6 Stopped->Speaking re-entry.
 
 `eou.Kind ∈ {vad, heuristic, text, audio, fusion, integrated}`.
 
-| Kind         | Source                                                         | Notes                                              |
-|--------------|----------------------------------------------------------------|----------------------------------------------------|
-| `vad`        | (none -- silence-only, score=1.0)                               | RFC v3 spec default.                               |
+| Kind | Source | Notes |
+|---|---|---|
+| `vad` | (none -- silence-only, score=1.0) | RFC v3 spec default. |
 | `heuristic`  | `internal/eou/heuristic.go`                                    | Rule-based partial-transcript scorer. Extension.   |
 | `text`       | `internal/eou/onnx.go` (LiveKit Qwen2.5)                       | RFC v3 §6.2.1.                                     |
 | `audio`      | `internal/eou/audio.go` (`AudioONNXModel`) running smart-turn-v3 ONNX over an 8 s @ 16 kHz Whisper-Tiny log-mel `[1, 80, 800]`. Loaded from `--eou-audio-model` / `EOU_AUDIO_MODEL_PATH`; falls back to heuristic if unset/missing. | RFC v3 §6.2.2.                                     |
@@ -210,8 +210,8 @@ The default is `KindVad` (matches RFC v3).
 parallel goroutines and combines their probabilities via
 `eou.FuseScores(rule, pText, pAudio, weightText)`:
 
-| Rule (`eou.fusion_rule`) | Formula                                  |
-|--------------------------|------------------------------------------|
+| Rule (`eou.fusion_rule`) | Formula |
+|---|---|
 | `noisy_or`               | `1 - (1 - p_text)(1 - p_audio)`          |
 | `max`                    | `max(p_text, p_audio)`                   |
 | `mean`                   | `(p_text + p_audio) / 2`                 |
@@ -253,7 +253,7 @@ under `client/`:
    transcript -> smart-turn-v3 `p_audio` -> heuristic `p_text` ->
    JSONL feature row.
 2. `client/gated_fusion/train.py` fits a logistic regression on the
-   *combined* score (BCE on `r = g·p_audio + (1-g)·p_text`, NOT on `g`
+   combined score (BCE on `r = g·p_audio + (1-g)·p_text`, NOT on `g`
    -- chain-rule derivation in the script header). 5-fold
    cross-validation held-out accuracy is the honest number. Output is a
    Go + Rust + Python literal so one re-train pastes into all three.
@@ -276,8 +276,8 @@ the gate is a function of the full upstream pipeline.
 
 Other scaffolding scripts (also under `client/`, all Python):
 
-| Script                              | Replaces (was)                |
-|-------------------------------------|-------------------------------|
+| Script | Replaces (was) |
+|---|---|
 | `client/eou_fixture.py`             | `go/cmd/eou-fixture`          |
 | `client/eou_matrix.py`              | `go/cmd/eou-runner` + `client/eou_inspector_matrix_rust.py` |
 | `client/eou_divergence_probe.py`    | `go/cmd/eou-divergence-probe` |
@@ -317,14 +317,14 @@ Chat-template special tokens:
 
 ### 6.4 Hard-cap parallel timer (RFC v3 §6.3, mandatory pattern)
 
-The hard cap is a deadline derived **once** at `vad.speech_stopped` and
-observed at **two** points:
+The hard cap is a deadline derived once at `vad.speech_stopped` and
+observed at two points:
 
-1. **During EOU compute** -- `runEOU` races the inference goroutine
+1. During EOU compute -- `runEOU` races the inference goroutine
    against `hardCapDeadline`. If the cap fires first, returns
    `verdict.phase = "during_eou"` and emits inspector
    `eou.hard_cap_fired{phase:"during_eou", score:null}`.
-2. **During verdict-derived sleep** -- `runPartialAndScheduleCommit`
+2. During verdict-derived sleep -- `runPartialAndScheduleCommit`
    builds two timers (`commitTimer` for the verdict delay,
    `commitHardCapTimer` for the cap) and races them via a shared
    `sync.Once`-guarded `commitFire`. Whichever fires first commits;
@@ -354,7 +354,7 @@ preferring slow-commit set both to the opposite end (p=0, delay=max).
 ### 6.7 Backchannel filter (RFC v3 §7.1 + §7.2)
 
 `min_speech_for_response_ms` (default `defaultMinSpeechForResponseMs =
-600`) is the auto-response gate. Buffers shorter than this **commit**
+600`) is the auto-response gate. Buffers shorter than this commit
 (for the conversation record) but suppress `create_response`. Buffers
 shorter than `min_speech_ms` (default `defaultMinSpeechMs = 100`) are
 rejected with `input_audio_buffer_commit_empty`. Telemetry on the
@@ -391,7 +391,7 @@ On STT failure: emit
 
 ### 7.3 played_ms (RFC v3 §7.3 / Appendix C.7)
 
-`outboundAudio.playedMs` is an `atomic.Int64` incremented **after**
+`outboundAudio.playedMs` is an `atomic.Int64` incremented after
 `Track.WriteSample` returns OK. Synthesis time is too early; SCTP-acks
 are too late. The barge-in path takes the snapshot via a callable
 under the same lock that decides to cancel (TOCTOU-free).
@@ -410,9 +410,9 @@ Polled every `drainPollIntervalMs = 20` ms.
 
 Two layers:
 
-- **Audio frames**: `Track.WriteSample` blocks naturally; encoder
+- Audio frames: `Track.WriteSample` blocks naturally; encoder
   throttles. `playedMs` continues to reflect successful writes.
-- **Non-audio events**: `sendFragmentedWith` checks
+- Non-audio events: `sendFragmentedWith` checks
   `DataChannel.BufferedAmount() > OutboundBufferLimit`
   (default `defaultOutboundBufferLimit = 1 MiB`) and returns
   `errClientTooSlow`. `safeSend` catches that, emits
@@ -452,7 +452,7 @@ status for it.
 `phaseState.onVadSpeechStart` runs under the session mutex and returns
 a `bargeInEffect` (cancel snapshot + cancelTimer flag). The caller
 emits without re-entering the lock. The `playedMs` snapshot is taken
-**inside** the same critical section via a snapshot callable, never
+inside the same critical section via a snapshot callable, never
 read after lock release.
 
 ### 9.2 Delay
@@ -467,7 +467,7 @@ On `handleBargeIn`:
 
 1. `played_ms` is snapshotted from the outbound pacer.
 2. Emit `response.done{status:cancelled, audio_end_ms}`.
-3. **If `played_ms > 0`**, truncate the assistant `conversation.item`
+3. If `played_ms > 0`, truncate the assistant `conversation.item`
    server-side and emit
    `conversation.item.assistant_truncated{audio_end_ms, transcript}`
    -- distinct from the client-issued `conversation.item.truncate` /
@@ -530,9 +530,9 @@ application (the v2 anti-pattern, App. D.5) is forbidden.
 
 ### 11.1 Validated session-mutable fields
 
-| Field                                       | Range / values                  | Default constant                |
-|---------------------------------------------|---------------------------------|---------------------------------|
-| `instructions`                              | non-empty string                | (empty)                         |
+| Field | Range / values | Default constant |
+|---|---|---|
+| `instructions` | non-empty string | (empty) |
 | `voice`                                     | string                          | `defaultVoice = "af_heart"`     |
 | `turn_detection.type`                       | `server_vad` \| `none`          | `defaultTurnDetectionType`      |
 | `turn_detection.threshold`                  | `[0, 1]`                        | `defaultVADThreshold = 0.5`     |
@@ -625,15 +625,9 @@ Rust implementation's `realtime/inspect/`. File layout: §1 (the WAV
 header helper and `.raw` + sidecar writer live in
 `inspect/audio_store.go`).
 
-HTTP endpoints (mounted in `cmd/server/main.go`):
-
-| Path | Behavior |
-|---|---|
-| `GET /v1/inspect/sessions`                         | live `SessionMeta` list from registry |
-| `GET /v1/inspect/sessions/history`                 | NDJSON files on disk, sorted by mtime desc |
-| `GET /v1/inspect/sessions/history/{sid}`           | application/x-ndjson stream of one session |
-| `GET /v1/inspect/sessions/{sid}/audio?channel=&from_ms=&to_ms=` | audio/wav slice -- live `AudioStore` for in-memory sessions, `.raw` + sidecar `offset_ms` for ended ones |
-| `GET /v1/inspect/{sid}` / `GET /v1/inspect/{sid}/stream` | replay-buffer snapshot then live broadcast; falls back to NDJSON replay-from-disk + close when session is gone |
+HTTP endpoints (mounted in `cmd/server/main.go`): the same surface as
+`rust/IMPLEMENTATION.md` §"Inspector lane (§14.1)", plus the bare
+`GET /v1/inspect/{sid}` alias of `/v1/inspect/{sid}/stream`.
 
 NDJSON is persisted under `INSPECT_SESSION_DIR` (default
 `~/.cache/speaches/sessions`); raw audio captured per channel:
@@ -698,27 +692,15 @@ and `fusion_rules`. Implemented in `capabilities.go`.
 Three endpoints exist primarily so the server can sit behind LiteLLM
 or any OpenAI SDK client without translation:
 
-- `GET /v1/models` -- `internal/oapi/models_handler.go`. Returns the
-  speaches-shape list (`{"object":"list","data":[...]}`) of executors
-  the server has loaded. Each entry carries `id`, `object="model"`,
-  `created`, `owned_by`, `language` (always present, possibly null),
-  `task` (`automatic-speech-recognition` / `text-to-speech` /
-  `voice-activity-detection`), plus per-model extras (Kokoro adds
-  `sample_rate` and `voices`). The `?task=` query param filters the
-  list. Whisper id is derived from whatever was loaded -- HF-shaped
-  strings (`user/repo`) pass through with `owned_by=user`; local
-  paths get `owned_by=speaches-plus` and a basename id.
-- `POST /v1/audio/transcriptions` -- `internal/stt/http.go`. Multipart
-  upload, `text` and `json` response formats. `verbose_json`/`srt`/
-  `vtt` are the open gap.
-- `POST /v1/audio/speech` -- `internal/tts/http.go`. JSON body, Kokoro
-  synthesis chunked through ffmpeg per format. Behaviour matches
-  Python speaches except for one deliberate divergence: out-of-range
-  `speed` returns **400** with an OpenAI error envelope; speaches
-  validates inside the streaming generator and returns 200 + zero
-  bytes (we fail loudly so SDK callers see the mistake). See
-  `client/check_speech_endpoint.py --allow-python-quirk` for the
-  matrix of cases.
+- `GET /v1/models` (`internal/oapi/models_handler.go`), `POST
+  /v1/audio/transcriptions` (`internal/stt/http.go`, multipart) and `POST
+  /v1/audio/speech` (`internal/tts/http.go`, Kokoro chunked through
+  ffmpeg per format) return the same shapes as the Rust server: see
+  `rust/IMPLEMENTATION.md` §"OpenAI-compat surface" for the model-entry
+  fields, `?task=` filter, Whisper id derivation, the open
+  `verbose_json`/`srt`/`vtt` gap and the deliberate 400 on out-of-range
+  `speed`. `client/check_speech_endpoint.py --allow-python-quirk` runs
+  the `speed` matrix.
 
 ### 14.6 Error envelopes (`internal/oapi/errors.go`)
 
@@ -772,46 +754,46 @@ live at `<repo>/conformance/fixtures/`, alongside the endpoint and
 declarative manifest bands (020-071) described in
 `conformance/README.md`:
 
-| ID  | Name                                       | Pins                                                  |
-|-----|--------------------------------------------|-------------------------------------------------------|
-| 001 | clean-utterance                            | W1, W3, W6 -- full happy turn                          |
-| 002 | barge-in-streaming                         | W4, W6, W7 -- barge-in mid-stream (also pins §15.3 "barge-in straddling drain") |
-| 003 | eou-reentry                                | §6.6 re-entry preserves item_id (also pins §15.3 "mid-utterance pause" -- wire-equivalent at the phase layer) |
-| 004 | backchannel                                | §7.1 + §7.2 -- short utterance commits, no auto-response (pins §15.3 "short utterance below response threshold") |
-| 005 | manual-response-create                     | C1 dispatch + `instructions` override                 |
-| 006 | session-update-atomic                      | §11.2.1 atomic update rejection + reflective echo     |
-| 007 | per-status-audio-end-ms-completed          | §8.5 / W4 on `completed` (closes the v2 D.4 self-hiding bug) |
-| 008 | per-status-audio-end-ms-cancelled          | §8.5 / W4 on `cancelled`                              |
-| 009 | per-status-audio-end-ms-incomplete         | §8.5 / W4 on `incomplete` (drain_cap)                 |
-| 010 | session-update-atomic-both-fields          | §11.2.1 / D.5 -- valid+invalid pair, atomic rejection  |
-| 011 | silence-only-input                         | §15.3 -- markActive only; trace = session.created      |
-| 012 | per-status-audio-end-ms-failed             | §8.5 / W4 on `failed` (closes the per-status set)     |
-| 013 | session-update-invalid-no-speech-prob      | §11.2 + §17.4 -- out-of-range `no_speech_prob_threshold` rejected atomically |
-| 014 | session-update-invalid-neg-threshold       | §11.2 -- `turn_detection.neg_threshold` outside `[0, 1]` rejected |
+| ID | Name | Pins |
+|---|---|---|
+| 001 | clean-utterance | W1, W3, W6 -- full happy turn |
+| 002 | barge-in-streaming | W4, W6, W7 -- barge-in mid-stream (also pins §15.3 "barge-in straddling drain") |
+| 003 | eou-reentry | §6.6 re-entry preserves item_id (also pins §15.3 "mid-utterance pause" -- wire-equivalent at the phase layer) |
+| 004 | backchannel | §7.1 + §7.2 -- short utterance commits, no auto-response (pins §15.3 "short utterance below response threshold") |
+| 005 | manual-response-create | C1 dispatch + `instructions` override |
+| 006 | session-update-atomic | §11.2.1 atomic update rejection + reflective echo |
+| 007 | per-status-audio-end-ms-completed | §8.5 / W4 on `completed` (closes the v2 D.4 self-hiding bug) |
+| 008 | per-status-audio-end-ms-cancelled | §8.5 / W4 on `cancelled` |
+| 009 | per-status-audio-end-ms-incomplete | §8.5 / W4 on `incomplete` (drain_cap) |
+| 010 | session-update-atomic-both-fields | §11.2.1 / D.5 -- valid+invalid pair, atomic rejection |
+| 011 | silence-only-input | §15.3 -- markActive only; trace = session.created |
+| 012 | per-status-audio-end-ms-failed | §8.5 / W4 on `failed` (closes the per-status set) |
+| 013 | session-update-invalid-no-speech-prob | §11.2 + §17.4 -- out-of-range `no_speech_prob_threshold` rejected atomically |
+| 014 | session-update-invalid-neg-threshold | §11.2 -- `turn_detection.neg_threshold` outside `[0, 1]` rejected |
 | 015 | session-update-invalid-min-speech-duration | §11.2 -- `min_speech_duration_ms` above the 60 s cap rejected |
 
 The §15.3 scenarios that exercise real-timer behavior live as runtime
 tests in §15.7 instead of wire-trace fixtures:
 
-| Scenario                    | Test                                                                |
-|-----------------------------|---------------------------------------------------------------------|
-| hard-cap-eou-stall          | `TestRunEOU_HardCapFiresDuringEOU` + the two `RegressV2*` companions |
-| hard-cap-low-eou-score      | `TestRunPartialAndScheduleCommit_HardCapFiresDuringWait`            |
-| simultaneous-bargein (§9.5) | `TestArmBargeInTask_SimultaneousReplacesSlot` (`bargein_test.go`)   |
+| Scenario | Test |
+|---|---|
+| hard-cap-eou-stall | `TestRunEOU_HardCapFiresDuringEOU` + the two `RegressV2*` companions |
+| hard-cap-low-eou-score | `TestRunPartialAndScheduleCommit_HardCapFiresDuringWait` |
+| simultaneous-bargein (§9.5) | `TestArmBargeInTask_SimultaneousReplacesSlot` (`bargein_test.go`) |
 
 `go test ./internal/realtime/ -run TestConformanceCorpus` replays each
 through a synthesizer and diffs against the canonical expected trace.
-**A failing fixture is a release blocker.**
+A failing fixture is a release blocker.
 
 §15.7 runtime regression tests:
 
-| Test                                          | Pins                                            |
-|-----------------------------------------------|-------------------------------------------------|
-| `TestRunEOU_HardCapFiresDuringEOU`            | §6.3 / D.2 -- clamp pattern would never fire     |
-| `TestRunEOU_RegressV2RustNoHardCap`           | §15.7 alias of the above (Rust v2 postmortem)   |
-| `TestRunEOU_RegressV2GoClampNotTimer`         | §15.7 alias (Go v2 postmortem)                  |
-| `TestRunEOUFusion_NoisyOrCombines`            | §6.2.3 -- combiner formula                       |
-| `TestRunEOUFusion_DegradesWhenAudioHeadFails` | §6.2.3 + §6.5 -- graceful degradation            |
+| Test | Pins |
+|---|---|
+| `TestRunEOU_HardCapFiresDuringEOU` | §6.3 / D.2 -- clamp pattern would never fire |
+| `TestRunEOU_RegressV2RustNoHardCap` | §15.7 alias of the above (Rust v2 postmortem) |
+| `TestRunEOU_RegressV2GoClampNotTimer` | §15.7 alias (Go v2 postmortem) |
+| `TestRunEOUFusion_NoisyOrCombines` | §6.2.3 -- combiner formula |
+| `TestRunEOUFusion_DegradesWhenAudioHeadFails` | §6.2.3 + §6.5 -- graceful degradation |
 
 ### 15.4 Property fuzzer (§15.5)
 
@@ -824,106 +806,106 @@ step index for replay.
 
 ### 16.1 Constants -- single source of truth
 
-**Two files. No defaults anywhere else.**
+Two files. No defaults anywhere else.
 
 #### `internal/realtime/constants.go`
 
-| Group        | Constant                          | Default | Spec ref            |
-|--------------|-----------------------------------|---------|---------------------|
-| Audio rates  | `opusSampleRate`                  | 48000   | WebRTC standard     |
-|              | `whisperSampleRate`               | 16000   | §3.0                |
-|              | `maxOpusFrameInt16`               | 5760    | 120 ms @ 48 kHz     |
-|              | `rtpOutSampleRate`                | 48000   | §12.4               |
-|              | `opusFrameMs`                     | 20      | Standard frame      |
-|              | `opusEncodeScratchCap`            | 1500    | MTU-bounded buf     |
-| EOU          | `defaultEOUMinDelayMs`            | 500     | §6.4.2              |
-|              | `defaultEOUMaxDelayMs`            | 3000    | §6.4.2              |
-|              | `defaultHardCapMs`                | 5000    | §6.3                |
-|              | `defaultEOUCurveK`                | 12.0    | §6.4.2              |
-|              | `defaultEOUContextTurns`          | 4       | §6.4.2              |
-|              | `defaultEOUFailureP`              | 1.0     | §6.5                |
-|              | `defaultEOUFailureDelay`          | "min"   | §6.5                |
-|              | `eouHistoryFallbackTurns`         | 6       | fallback when cfg=0 |
-|              | `defaultEOUAudioWindowMs`         | 8000    | §6.2.2              |
-| Buffer/STT   | `defaultMinSpeechMs`              | 100     | §7.1                |
-|              | `defaultMinSpeechForResponseMs`   | 600     | §7.2 / §17.4        |
-|              | `defaultPartialTickMs`            | 500     | §5                  |
-|              | `defaultStartSpeechSamples`       | 800     | 50 ms @ 16 kHz      |
-|              | `defaultSealedBufferRetention`    | 4       | §3.4                |
-| Session/resp | `defaultSessionMaxDurSec`         | 1800    | §11.3               |
-|              | `defaultLLMTimeoutSec`            | 60      | operational         |
-|              | `defaultDrainCapFloorMs`          | 5000    | §8.3                |
-|              | `defaultDrainCapCeilingMs`        | 60000   | §8.3                |
-|              | `drainPollIntervalMs`             | 20      | §8.3 polling        |
-| Wire         | `defaultOutboundQueueCap`         | 256     | §7.4                |
-|              | `defaultDataChannelFragmentMax`   | 900     | §10.4               |
-|              | `defaultOutboundBufferLimit`      | 1 MiB   | §7.4                |
-|              | `envelopeBudget`                  | 100     | §10.4 wrapper       |
-|              | `wsWriteTimeoutSec`               | 5       | WS write deadline   |
-| VAD          | `defaultVADThreshold`             | 0.5     | §4.2                |
-|              | `defaultVADSilenceDurationMs`     | 350     | §4.2                |
-|              | `defaultVADPrefixPaddingMs`       | 300     | §4.2                |
-|              | `defaultVADLessSilenceMs`         | 1500    | watchdog fallback   |
-|              | `defaultNonSilenceThreshold`      | 0.005   | watchdog RMS floor  |
-|              | `silenceWatchdogTickMs`           | 200     | watchdog cadence    |
-|              | `defaultVADModel`                 | silero_v5 | §4.1              |
-|              | `defaultTurnDetectionType`        | server_vad | §4.5             |
-| Eager        | `defaultPredictedTokenBufferCap`  | 256     | extension           |
-|              | `defaultEagerMaxInflight`         | 1       | extension           |
-|              | `defaultEagerIntervalMs`          | 250     | extension           |
-| Inspector    | `defaultInspectorTransitions`     | true    | §14.2               |
-|              | `defaultInspectorSampleRate`      | 1.0     | §14.2               |
-| Misc         | `sentenceChunkerMinChars`         | 120     | TTS chunk granularity |
-|              | `defaultVoice`                    | af_heart | TTS default voice  |
-|              | `tracerName`                      | speaches/realtime | OTel       |
-|              | `debugInvariants`                 | true    | §2.4                |
-|              | `defaultInferenceTimeoutMs`       | 100     | §6.4.2 (realtime mirror) |
-| Capabilities | `capabilityRFCVersion`            | "v3"    | §14.4 endpoint payload |
-|              | `defaultInputAudioFormat`         | pcm16   | §3.3 fallback       |
-|              | `defaultOutputAudioFormat`        | pcm16   | §12.4 fallback      |
-|              | `defaultFusionRule`               | gated    | §6.2.3             |
-|              | `defaultFusionWeightText`         | 0.5     | §6.2.3 weighted     |
-| Inspector WS | `inspectorBusBufferPerSub`        | 256     | §14.1 backpressure  |
-|              | `inspectorWSWriteTimeout`         | 5       | §14.1 write deadline |
+| Group | Constant | Default | Spec ref |
+|---|---|---|---|
+| Audio rates | `opusSampleRate` | 48000 | WebRTC standard |
+|  | `whisperSampleRate` | 16000 | §3.0 |
+|  | `maxOpusFrameInt16` | 5760 | 120 ms @ 48 kHz |
+|  | `rtpOutSampleRate` | 48000 | §12.4 |
+|  | `opusFrameMs` | 20 | Standard frame |
+|  | `opusEncodeScratchCap` | 1500 | MTU-bounded buf |
+| EOU | `defaultEOUMinDelayMs` | 500 | §6.4.2 |
+|  | `defaultEOUMaxDelayMs` | 3000 | §6.4.2 |
+|  | `defaultHardCapMs` | 5000 | §6.3 |
+|  | `defaultEOUCurveK` | 12.0 | §6.4.2 |
+|  | `defaultEOUContextTurns` | 4 | §6.4.2 |
+|  | `defaultEOUFailureP` | 1.0 | §6.5 |
+|  | `defaultEOUFailureDelay` | "min" | §6.5 |
+|  | `eouHistoryFallbackTurns` | 6 | fallback when cfg=0 |
+|  | `defaultEOUAudioWindowMs` | 8000 | §6.2.2 |
+| Buffer/STT | `defaultMinSpeechMs` | 100 | §7.1 |
+|  | `defaultMinSpeechForResponseMs` | 600 | §7.2 / §17.4 |
+|  | `defaultPartialTickMs` | 500 | §5 |
+|  | `defaultStartSpeechSamples` | 800 | 50 ms @ 16 kHz |
+|  | `defaultSealedBufferRetention` | 4 | §3.4 |
+| Session/resp | `defaultSessionMaxDurSec` | 1800 | §11.3 |
+|  | `defaultLLMTimeoutSec` | 60 | operational |
+|  | `defaultDrainCapFloorMs` | 5000 | §8.3 |
+|  | `defaultDrainCapCeilingMs` | 60000 | §8.3 |
+|  | `drainPollIntervalMs` | 20 | §8.3 polling |
+| Wire | `defaultOutboundQueueCap` | 256 | §7.4 |
+|  | `defaultDataChannelFragmentMax` | 900 | §10.4 |
+|  | `defaultOutboundBufferLimit` | 1 MiB | §7.4 |
+|  | `envelopeBudget` | 100 | §10.4 wrapper |
+|  | `wsWriteTimeoutSec` | 5 | WS write deadline |
+| VAD | `defaultVADThreshold` | 0.5 | §4.2 |
+|  | `defaultVADSilenceDurationMs` | 350 | §4.2 |
+|  | `defaultVADPrefixPaddingMs` | 300 | §4.2 |
+|  | `defaultVADLessSilenceMs` | 1500 | watchdog fallback |
+|  | `defaultNonSilenceThreshold` | 0.005 | watchdog RMS floor |
+|  | `silenceWatchdogTickMs` | 200 | watchdog cadence |
+|  | `defaultVADModel` | silero_v5 | §4.1 |
+|  | `defaultTurnDetectionType` | server_vad | §4.5 |
+| Eager | `defaultPredictedTokenBufferCap` | 256 | extension |
+|  | `defaultEagerMaxInflight` | 1 | extension |
+|  | `defaultEagerIntervalMs` | 250 | extension |
+| Inspector | `defaultInspectorTransitions` | true | §14.2 |
+|  | `defaultInspectorSampleRate` | 1.0 | §14.2 |
+| Misc | `sentenceChunkerMinChars` | 120 | TTS chunk granularity |
+|  | `defaultVoice` | af_heart | TTS default voice |
+|  | `tracerName` | speaches/realtime | OTel |
+|  | `debugInvariants` | true | §2.4 |
+|  | `defaultInferenceTimeoutMs` | 100 | §6.4.2 (realtime mirror) |
+| Capabilities | `capabilityRFCVersion` | "v3" | §14.4 endpoint payload |
+|  | `defaultInputAudioFormat` | pcm16 | §3.3 fallback |
+|  | `defaultOutputAudioFormat` | pcm16 | §12.4 fallback |
+|  | `defaultFusionRule` | gated | §6.2.3 |
+|  | `defaultFusionWeightText` | 0.5 | §6.2.3 weighted |
+| Inspector WS | `inspectorBusBufferPerSub` | 256 | §14.1 backpressure |
+|  | `inspectorWSWriteTimeout` | 5 | §14.1 write deadline |
 
 #### `internal/eou/constants.go`
 
-| Group           | Constant                            | Default     |
-|-----------------|-------------------------------------|-------------|
-| Curve           | `DefaultCurveK`                     | 12.0        |
-| Defaults        | `defaultMinDelayMs`                 | 500         |
-|                 | `defaultMaxDelayMs`                 | 3000        |
-|                 | `defaultHardCapMs`                  | 5000        |
-|                 | `defaultInferenceTimeoutMs`         | 100         |
-|                 | `defaultContextTurns`               | 4           |
-|                 | `defaultEagerMaxInflight`           | 1           |
-|                 | `defaultEagerIntervalMs`            | 250         |
-|                 | `defaultMinSpeechForCommit`         | 600         |
-|                 | `defaultMaxContextTokens`           | 1024        |
-|                 | `defaultPThreshold`                 | 0.5         |
-|                 | `defaultEotThreshold`               | 0.7         |
-|                 | `defaultEagerEotThreshold`          | 0.5         |
-|                 | `defaultAudioWindowMs`              | 8000        |
-|                 | `defaultFusionRule`                 | gated       |
-|                 | `defaultFusionWeightText`           | 0.5         |
-| Heuristic       | `heuristicScoreEmpty`               | 0.5         |
-|                 | `heuristicScoreStrongTerminator`    | 0.95        |
-|                 | `heuristicScoreSoftTerminator`      | 0.65        |
-|                 | `heuristicScoreHesitation`          | 0.10        |
-|                 | `heuristicScoreContinuation`        | 0.25        |
-|                 | `heuristicScoreDefault`             | 0.55        |
-| Eagerness       | `eagernessLowPThreshold`            | 0.7         |
-|                 | `eagernessLowMinDelayMs`            | 800         |
-|                 | `eagernessLowMaxDelayMs`            | 3000        |
-|                 | `eagernessMediumPThreshold`         | 0.5         |
-|                 | `eagernessMediumMinDelayMs`         | 500         |
-|                 | `eagernessMediumMaxDelayMs`         | 2500        |
-|                 | `eagernessHighPThreshold`           | 0.4         |
-|                 | `eagernessHighMinDelayMs`           | 300         |
-|                 | `eagernessHighMaxDelayMs`           | 1500        |
-| ONNX            | `onnxInputIDs`                      | "input_ids" |
-|                 | `onnxAttentionMask`                 | "attention_mask" |
-|                 | `onnxOutputLogits`                  | "logits"    |
+| Group | Constant | Default |
+|---|---|---|
+| Curve | `DefaultCurveK` | 12.0 |
+| Defaults | `defaultMinDelayMs` | 500 |
+|  | `defaultMaxDelayMs` | 3000 |
+|  | `defaultHardCapMs` | 5000 |
+|  | `defaultInferenceTimeoutMs` | 100 |
+|  | `defaultContextTurns` | 4 |
+|  | `defaultEagerMaxInflight` | 1 |
+|  | `defaultEagerIntervalMs` | 250 |
+|  | `defaultMinSpeechForCommit` | 600 |
+|  | `defaultMaxContextTokens` | 1024 |
+|  | `defaultPThreshold` | 0.5 |
+|  | `defaultEotThreshold` | 0.7 |
+|  | `defaultEagerEotThreshold` | 0.5 |
+|  | `defaultAudioWindowMs` | 8000 |
+|  | `defaultFusionRule` | gated |
+|  | `defaultFusionWeightText` | 0.5 |
+| Heuristic | `heuristicScoreEmpty` | 0.5 |
+|  | `heuristicScoreStrongTerminator` | 0.95 |
+|  | `heuristicScoreSoftTerminator` | 0.65 |
+|  | `heuristicScoreHesitation` | 0.10 |
+|  | `heuristicScoreContinuation` | 0.25 |
+|  | `heuristicScoreDefault` | 0.55 |
+| Eagerness | `eagernessLowPThreshold` | 0.7 |
+|  | `eagernessLowMinDelayMs` | 800 |
+|  | `eagernessLowMaxDelayMs` | 3000 |
+|  | `eagernessMediumPThreshold` | 0.5 |
+|  | `eagernessMediumMinDelayMs` | 500 |
+|  | `eagernessMediumMaxDelayMs` | 2500 |
+|  | `eagernessHighPThreshold` | 0.4 |
+|  | `eagernessHighMinDelayMs` | 300 |
+|  | `eagernessHighMaxDelayMs` | 1500 |
+| ONNX | `onnxInputIDs` | "input_ids" |
+|  | `onnxAttentionMask` | "attention_mask" |
+|  | `onnxOutputLogits` | "logits" |
 | Chat template   | `ImStart`                           | `<|im_start|>` |
 |                 | `ImEnd`                             | `<|im_end|>`   |
 
@@ -953,31 +935,31 @@ These live with their type because they ARE the type:
 
 ## 17. RFC v3 compliance status
 
-| §                                            | Status   |
-|----------------------------------------------|----------|
+| § | Status |
+|---|---|
 | §0.2 Deviation register (assistant_truncated, audio_end_ms-on-all, client_too_slow, eou.* namespace) | PASS |
-| §2 Session model + I1..I11 invariants        | PASS     |
-| §3 Buffer + sealed map                       | PASS     |
-| §4 VAD                                       | PASS     |
-| §5 Partial transcription                     | PASS     |
+| §2 Session model + I1..I11 invariants | PASS |
+| §3 Buffer + sealed map | PASS |
+| §4 VAD | PASS |
+| §5 Partial transcription | PASS |
 | §6 EOU (vad, text, audio, fusion mandatory; heuristic, integrated extension) | PASS |
 | §6.2.3 Fusion combiner (noisy_or/max/mean/weighted/gated) | PASS |
-| §6.3 Hard-cap parallel timer with `phase` discriminator | PASS  |
-| §6.5 Failure policy fast-commit (configurable) | PASS  |
-| §7 Commit / played_ms / backpressure         | PASS     |
+| §6.3 Hard-cap parallel timer with `phase` discriminator | PASS |
+| §6.5 Failure policy fast-commit (configurable) | PASS |
+| §7 Commit / played_ms / backpressure | PASS |
 | §8 Response lifecycle / Drain / W4 audio_end_ms on all statuses | PASS |
 | §9 Barge-in / delay / suppression / W7 played_ms gate | PASS |
-| §10 Wire protocol / W1..W8 / errors          | PASS     |
+| §10 Wire protocol / W1..W8 / errors | PASS |
 | §11 Session config / atomic update / hard timeout | PASS |
-| §11.2.1 parse-validate-commit pattern        | PASS     |
-| §12 WebRTC + WebSocket                       | PASS     |
-| §13 IdSource                                 | PASS     |
+| §11.2.1 parse-validate-commit pattern | PASS |
+| §12 WebRTC + WebSocket | PASS |
+| §13 IdSource | PASS |
 | §14.1 Inspector lane (`/v1/inspect` WebSocket fan-out + slog) | PASS |
 | §14.4 Capabilities endpoint (`GET /v1/realtime/capabilities`) | PASS |
 | §15 Testability -- fuzzer + 12 conformance fixtures + §15.7 regression suite | PASS |
 | §15.2 Canonical lib bridge via subprocess (`canonical_bridge_test.go`) | PASS |
 | §15.3 Synthetic audio fixture corpus -- 12 wire-replay fixtures + 4 runtime tests | PASS |
-| §17 Configuration reference                  | PASS     |
+| §17 Configuration reference | PASS |
 
 ## 18. Build and run
 
@@ -1033,7 +1015,7 @@ otherwise wouldn't survive a re-read live here.
 
 In `internal/realtime/state.go`, `withLock` takes `s.mu`, runs the
 caller's function, snapshots transitions + invariant violations, then
-releases the lock **before** invoking `transitionHook` /
+releases the lock before invoking `transitionHook` /
 `violationHook`. Hooks call into the wire layer; data-channel writes are
 synchronous and can block on a slow client. Holding `s.mu` across that
 path would deadlock every other state transition while the SCTP buffer
@@ -1052,9 +1034,9 @@ unclosed, both fall into `default`, both call `close`, and panic with
 ### 19.3 Pointer-typed Whisper gate thresholds -- three-state shape
 
 `sessionConfig.NoSpeechProbThreshold` and `AvgLogprobThreshold` are
-`*float32`. `nil` means **gate disabled** (matches Python's `None`
+`*float32`. `nil` means gate disabled (matches Python's `None`
 default). `session.update` carries a parallel `*Null bool` per field
-because Go's `encoding/json` collapses *absent* and *explicit `null`*
+because Go's `encoding/json` collapses absent and *explicit `null`*
 into the same `nil` pointer -- the bool restores the third state so a
 client can disable a previously-enabled gate. The Rust side encodes the
 same `Option<Option<f32>>` shape as NaN bits in `AtomicU32` (see Rust
@@ -1101,7 +1083,7 @@ enabled and parses `<|t.tt|>` markers in Go; sequence-level
 ### 19.6 Diarized transcription -- `serveDiarized` in `internal/stt/http.go`
 
 Single Whisper + diarizer pass; each Whisper segment is assigned to the
-diarizer cluster whose time range contains its **midpoint** (with
+diarizer cluster whose time range contains its midpoint (with
 inclusive end). Ties pick the first cluster; segments past the last
 cluster fall to the nearest. When the diarizer is unavailable or the
 input is too short for it to emit clusters, the response still carries
@@ -1118,7 +1100,7 @@ shift the verdict as much as a 1 s segment.
 
 ### 19.7 Silero VAD -- ring + LSTM state propagation trade-off
 
-`internal/vad/silero.go` runs Silero v5 **incrementally** -- one forward
+`internal/vad/silero.go` runs Silero v5 incrementally -- one forward
 pass per 512-sample window -- and applies Python's
 `silero_vad_v5.get_speech_timestamps` hysteresis state machine over a
 trailing probability ring (3 s = `MaxProbRing ~ 94` entries). The

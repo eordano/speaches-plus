@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
+use anyhow::{bail, ensure, Context, Result};
+use candle_core::{CudaDevice, DType, Device, Tensor};
 use nv_layers::attn::{flash_attn, AttnConfig};
 use nv_layers::linear::Linear;
 use nv_layers::linear_attn::{LinAttnState, LinearAttention, LinearAttentionConfig};
@@ -16,7 +16,37 @@ use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cuda")]
+use candle_core::op::BackpropOp;
+#[cfg(feature = "cuda")]
+use candle_core::CudaStorage;
+#[cfg(feature = "cuda")]
+use candle_core::Storage;
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaStream;
+#[cfg(feature = "cuda")]
+use nv_layers::moe_grouped::GroupedDecodeContext;
+#[cfg(feature = "cuda")]
+use nv_quant::fp8::Fp8GemmRunner;
+#[cfg(feature = "cuda")]
+use nv_quant::nvfp4::Nvfp4GemmRunner;
+use serde_json::Value;
+#[cfg(feature = "cuda")]
+use std::cell::RefCell;
+#[cfg(feature = "cuda")]
+use std::collections::hash_map::Entry;
+use std::collections::BTreeMap;
+#[cfg(feature = "cuda")]
+use std::collections::HashMap;
+use std::env;
+#[cfg(feature = "cuda")]
 use std::ffi::c_void;
+#[cfg(feature = "cuda")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "cuda")]
+use std::sync::Once;
+use std::time::Instant;
 
 pub trait MoeDispatch: Send + Sync {
     fn forward(&self, layer_idx: usize, moe: &MoeBlock, x: &Tensor) -> Result<Tensor>;
@@ -70,15 +100,54 @@ pub struct Qwen3MoeConfig {
     pub tie_word_embeddings: bool,
 }
 
-fn scoped_token_id(scopes: [&serde_json::Value; 2], k: &str) -> Option<u32> {
+fn hf_text_config(v: &Value) -> Result<&Value> {
+    v.get("text_config")
+        .ok_or_else(|| anyhow::anyhow!("missing text_config"))
+}
+
+fn hf_json_usize(text: &Value, k: &str) -> Result<usize> {
+    text.get(k)
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .ok_or_else(|| anyhow::anyhow!("missing/invalid {k}"))
+}
+
+fn hf_json_f64(text: &Value, k: &str) -> Result<f64> {
+    text.get(k)
+        .and_then(|x| x.as_f64())
+        .ok_or_else(|| anyhow::anyhow!("missing/invalid {k}"))
+}
+
+fn hf_layer_types(text: &Value) -> Result<Vec<LayerType>> {
+    text.get("layer_types")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| anyhow::anyhow!("missing layer_types"))?
+        .iter()
+        .map(|x| match x.as_str() {
+            Some("linear_attention") => Ok(LayerType::LinearAttention),
+            Some("full_attention") => Ok(LayerType::FullAttention),
+            other => Err(anyhow::anyhow!("unknown layer type {:?}", other)),
+        })
+        .collect()
+}
+
+fn hf_rope_param(text: &Value, k: &str, default: f64) -> f32 {
+    text.get("rope_parameters")
+        .and_then(|p| p.get(k))
+        .and_then(|x| x.as_f64())
+        .or_else(|| text.get(k).and_then(|x| x.as_f64()))
+        .unwrap_or(default) as f32
+}
+
+fn scoped_token_id(scopes: [&Value; 2], k: &str) -> Option<u32> {
     for scope in scopes {
         match scope.get(k) {
-            Some(serde_json::Value::Number(n)) => {
+            Some(Value::Number(n)) => {
                 if let Some(x) = n.as_u64() {
                     return Some(x as u32);
                 }
             }
-            Some(serde_json::Value::Array(a)) => {
+            Some(Value::Array(a)) => {
                 if let Some(x) = a.first().and_then(|x| x.as_u64()) {
                     return Some(x as u32);
                 }
@@ -89,7 +158,7 @@ fn scoped_token_id(scopes: [&serde_json::Value; 2], k: &str) -> Option<u32> {
     None
 }
 
-fn scoped_bool(scopes: [&serde_json::Value; 2], k: &str) -> Option<bool> {
+fn scoped_bool(scopes: [&Value; 2], k: &str) -> Option<bool> {
     scopes
         .into_iter()
         .find_map(|s| s.get(k).and_then(|x| x.as_bool()))
@@ -97,48 +166,13 @@ fn scoped_bool(scopes: [&serde_json::Value; 2], k: &str) -> Option<bool> {
 
 impl Qwen3MoeConfig {
     pub fn from_hf_json_str(s: &str) -> Result<Self> {
-        let v: serde_json::Value =
-            serde_json::from_str(s).context("parse qwen3_5_moe config json")?;
-        let text = v
-            .get("text_config")
-            .ok_or_else(|| anyhow::anyhow!("missing text_config"))?;
-        let get_u = |k: &str| -> Result<usize> {
-            text.get(k)
-                .and_then(|x| x.as_u64())
-                .map(|x| x as usize)
-                .ok_or_else(|| anyhow::anyhow!("missing/invalid {k}"))
-        };
-        let get_f = |k: &str| -> Result<f64> {
-            text.get(k)
-                .and_then(|x| x.as_f64())
-                .ok_or_else(|| anyhow::anyhow!("missing/invalid {k}"))
-        };
-        let layer_types_raw = text
-            .get("layer_types")
-            .and_then(|x| x.as_array())
-            .ok_or_else(|| anyhow::anyhow!("missing layer_types"))?;
-        let layer_types: Vec<LayerType> = layer_types_raw
-            .iter()
-            .map(|x| match x.as_str() {
-                Some("linear_attention") => Ok(LayerType::LinearAttention),
-                Some("full_attention") => Ok(LayerType::FullAttention),
-                other => Err(anyhow::anyhow!("unknown layer type {:?}", other)),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let rope_params = text
-            .get("rope_parameters")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let rope_theta = rope_params
-            .get("rope_theta")
-            .and_then(|x| x.as_f64())
-            .or_else(|| text.get("rope_theta").and_then(|x| x.as_f64()))
-            .unwrap_or(10_000_000.0) as f32;
-        let partial_rotary_factor = rope_params
-            .get("partial_rotary_factor")
-            .and_then(|x| x.as_f64())
-            .or_else(|| text.get("partial_rotary_factor").and_then(|x| x.as_f64()))
-            .unwrap_or(1.0) as f32;
+        let v: Value = serde_json::from_str(s).context("parse qwen3_5_moe config json")?;
+        let text = hf_text_config(&v)?;
+        let get_u = |k: &str| hf_json_usize(text, k);
+        let get_f = |k: &str| hf_json_f64(text, k);
+        let layer_types = hf_layer_types(text)?;
+        let rope_theta = hf_rope_param(text, "rope_theta", 10_000_000.0);
+        let partial_rotary_factor = hf_rope_param(text, "partial_rotary_factor", 1.0);
         let bos = scoped_token_id([text, &v], "bos_token_id").unwrap_or(0);
         let eos = scoped_token_id([text, &v], "eos_token_id")
             .ok_or_else(|| anyhow::anyhow!("missing eos_token_id"))?;
@@ -172,7 +206,7 @@ impl Qwen3MoeConfig {
             tie_word_embeddings: scoped_bool([text, &v], "tie_word_embeddings").unwrap_or(false),
         };
         let _ = cfg.moe_config()?;
-        anyhow::ensure!(
+        ensure!(
             cfg.layer_types.len() == cfg.num_hidden_layers,
             "layer_types has {} entries but num_hidden_layers is {}",
             cfg.layer_types.len(),
@@ -184,7 +218,7 @@ impl Qwen3MoeConfig {
     nv_weights::hf_json_from_file!(from_hf_json_file, from_hf_json_str);
 
     pub fn moe_config(&self) -> Result<MoeConfig> {
-        anyhow::ensure!(
+        ensure!(
             self.num_experts > 0 && self.num_experts_per_tok > 0 && self.moe_intermediate_size > 0,
             "not a MoE config: num_experts={} num_experts_per_tok={} moe_intermediate_size={}",
             self.num_experts,
@@ -233,7 +267,6 @@ pub struct AttentionLayer {
 }
 
 impl AttentionLayer {
-    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         q_proj: Linear,
         k_proj: Linear,
@@ -271,7 +304,7 @@ impl AttentionLayer {
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
         let dims = x.dims().to_vec();
         if dims.len() != 3 {
-            anyhow::bail!("attention forward expects [B, T, H]");
+            bail!("attention forward expects [B, T, H]");
         }
         let b = dims[0];
         let t = dims[1];
@@ -291,7 +324,7 @@ impl AttentionLayer {
         let gate_fused_reads_the_gate_strided_from_q_raw_the_sliced_sigmoid_mul_chain_serves_only_non_cuda_or_non_bf16_since_its_escape_crashed_at_32k_and_was_deleted_2026_09_14 =
             cfg!(feature = "cuda")
                 && x.dtype() == DType::BF16
-                && matches!(x.device(), Device::Cuda(_));
+                && x.device().is_cuda();
         let (q_value, q_gate) = if self.attn_output_gate
             && gate_fused_reads_the_gate_strided_from_q_raw_the_sliced_sigmoid_mul_chain_serves_only_non_cuda_or_non_bf16_since_its_escape_crashed_at_32k_and_was_deleted_2026_09_14
         {
@@ -395,7 +428,7 @@ impl AttentionLayer {
     ) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         if dims.len() != 3 {
-            anyhow::bail!("attention forward_with_cache expects [B, T, H]");
+            bail!("attention forward_with_cache expects [B, T, H]");
         }
         let b = dims[0];
         let t = dims[1];
@@ -404,14 +437,13 @@ impl AttentionLayer {
         if b == 1
             && t == 1
             && in_dtype == DType::BF16
-            && nv_q38_fused_qkv_prep_env_kill_switch_nv_q38_fused_qkv_0()
             && self.head_dim.is_multiple_of(32)
             && self.head_dim <= 1024
             && self.rotary_dim >= 2
             && self.rotary_dim.is_multiple_of(2)
             && self.rotary_dim <= self.head_dim
             && rope.cos().dtype() == DType::F32
-            && matches!(x.device(), Device::Cuda(_))
+            && x.device().is_cuda()
         {
             let (q_raw, k_raw, v_raw) = (
                 self.q_proj.forward(x)?,
@@ -460,7 +492,7 @@ impl AttentionLayer {
                 decode_prof::lap("attn_gate_oproj");
                 return Ok(out);
             }
-            anyhow::bail!(
+            bail!(
                 "fused qkv decode: projections not bf16 on a bf16 input; the projection arm \
                  changed dtype and the fused gate must learn its new contract"
             );
@@ -476,17 +508,15 @@ impl AttentionLayer {
             && self.rotary_dim <= self.head_dim
             && rope.cos().dtype() == DType::F32
             && positions.dtype() == DType::I32
-            && matches!(x.device(), Device::Cuda(_))
+            && x.device().is_cuda()
         {
-            let mrow_fp8mma =
-                nv_q38_attn_mrow_fp8mma_env_opt_in_1_routes_the_verify_row_q_k_v_o_projections_to_the_e4m3_f16mma_kernel();
-            let q_raw = attn_mrow_proj(&self.q_proj, x, t, mrow_fp8mma)?;
-            let k_raw = attn_mrow_proj(&self.k_proj, x, t, mrow_fp8mma)?;
-            let v_raw = attn_mrow_proj(&self.v_proj, x, t, mrow_fp8mma)?;
+            let q_raw = attn_mrow_proj(&self.q_proj, x, t, true)?;
+            let k_raw = attn_mrow_proj(&self.k_proj, x, t, true)?;
+            let v_raw = attn_mrow_proj(&self.v_proj, x, t, true)?;
             decode_prof::lap("attn_qkv_proj");
             #[cfg(feature = "cuda")]
             trunk_events::attn_sub_mark(0);
-            anyhow::ensure!(
+            ensure!(
                 q_raw.dtype() == DType::BF16
                     && k_raw.dtype() == DType::BF16
                     && v_raw.dtype() == DType::BF16,
@@ -513,7 +543,7 @@ impl AttentionLayer {
             #[cfg(feature = "cuda")]
             trunk_events::attn_sub_mark(1);
             {
-                static ONCE: std::sync::Once = std::sync::Once::new();
+                static ONCE: Once = Once::new();
                 ONCE.call_once(|| {
                     eprintln!(
                         "[qwen3_5_moe] NV_Q36_ATTN_VERIFY_PREP verify path active (one \
@@ -558,12 +588,11 @@ impl AttentionLayer {
                 Some(sig) => flat.mul(&sig)?,
                 None => flat,
             };
-            let out = attn_mrow_proj(&self.o_proj, &gated, t, mrow_fp8mma)?;
+            let out = attn_mrow_proj(&self.o_proj, &gated, t, true)?;
             decode_prof::lap("attn_gate_oproj");
             return Ok(out);
         }
-        let mrow_fp8mma = (2..=MK_VERIFY_CONTIGUOUS_ROWS_8_THE_ONE_LAUNCH_SMEM_CAP_AND_SCRATCH_POOL_ROW_BUDGET_SPARSE_MK_RUNGS_CONTINUE_PAST_IT).contains(&t)
-            && nv_q38_attn_mrow_fp8mma_env_opt_in_1_routes_the_verify_row_q_k_v_o_projections_to_the_e4m3_f16mma_kernel();
+        let mrow_fp8mma = (2..=MK_VERIFY_CONTIGUOUS_ROWS_8_THE_ONE_LAUNCH_SMEM_CAP_AND_SCRATCH_POOL_ROW_BUDGET_SPARSE_MK_RUNGS_CONTINUE_PAST_IT).contains(&t);
         let (q_final, k_final, v, q_gate) = self.project_qkv(x, rope, positions, mrow_fp8mma)?;
         decode_prof::lap("attn_qkv_proj");
         #[cfg(feature = "cuda")]
@@ -640,7 +669,7 @@ impl AttentionLayer {
         positions: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
         let dims = x.dims().to_vec();
-        anyhow::ensure!(dims.len() == 3, "project_kv_only expects [B, T, H]");
+        ensure!(dims.len() == 3, "project_kv_only expects [B, T, H]");
         let (b, t) = (dims[0], dims[1]);
         let in_dtype = x.dtype();
         let k_raw = self.k_proj.forward(x)?;
@@ -717,10 +746,10 @@ impl LayerFfn {
 
 #[cfg(feature = "cuda")]
 struct Qwen3MoeKvSlotFp8 {
-    k_fp8: cudarc::driver::CudaSlice<u8>,
-    v_fp8: cudarc::driver::CudaSlice<u8>,
-    k_scales: cudarc::driver::CudaSlice<f32>,
-    v_scales: cudarc::driver::CudaSlice<f32>,
+    k_fp8: CudaSlice<u8>,
+    v_fp8: CudaSlice<u8>,
+    k_scales: CudaSlice<f32>,
+    v_scales: CudaSlice<f32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -740,25 +769,15 @@ pub struct Qwen3MoeKvCache {
     n_kv_heads: usize,
     head_dim: usize,
     device: Device,
-    write_pos_dev: cudarc::driver::CudaSlice<i32>,
-    n_total_dev: cudarc::driver::CudaSlice<i32>,
+    write_pos_dev: CudaSlice<i32>,
+    n_total_dev: CudaSlice<i32>,
     host_write_pos: Box<[i32; 1]>,
     host_n_total: Box<[i32; 1]>,
-    scores_scratch_because_smem_decode_caps_at_12k_positions_at_48kb:
-        Option<cudarc::driver::CudaSlice<f32>>,
-    scratch_heads: usize,
-    splitk_scratch_and_fan_in_gated_by_nv_q36_graphed_decode_fix_because_the_smem_kernel_serializes_a_block_reduce_per_kv_position_costing_82ms_at_8k:
-        Option<(
-            cudarc::driver::CudaSlice<f32>,
-            cudarc::driver::CudaSlice<u32>,
-        )>,
-    mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view_kill_switch_nv_q38_mk_verify_0:
-        Option<(
-            cudarc::driver::CudaSlice<f32>,
-            cudarc::driver::CudaSlice<u32>,
-        )>,
+    splitk_scratch_and_fan_in: (CudaSlice<f32>, CudaSlice<u32>),
+    mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view:
+        Option<(CudaSlice<f32>, CudaSlice<u32>)>,
     verify_tree_parents_dev_written_once_because_the_two_branch_shape_is_fixed:
-        Option<cudarc::driver::CudaSlice<i32>>,
+        Option<CudaSlice<i32>>,
     verify_tree_rows_active: Option<usize>,
 }
 
@@ -813,7 +832,7 @@ pub const MK_VERIFY_DEEP_TWO_WAVE_ENV_OPT_IN_1_RIDES_THE_94_SPLIT_TWO_WAVE_PICK_
 #[cfg(feature = "cuda")]
 pub fn mk_verify_deep_two_wave_armed() -> bool {
     matches!(
-        std::env::var(MK_VERIFY_DEEP_TWO_WAVE_ENV_OPT_IN_1_RIDES_THE_94_SPLIT_TWO_WAVE_PICK_PAST_64K_TOTAL_AND_PINS_THE_MEASURED_64_BELOW_IT)
+        env::var(MK_VERIFY_DEEP_TWO_WAVE_ENV_OPT_IN_1_RIDES_THE_94_SPLIT_TWO_WAVE_PICK_PAST_64K_TOTAL_AND_PINS_THE_MEASURED_64_BELOW_IT)
             .as_deref(),
         Ok("1")
     )
@@ -869,14 +888,6 @@ pub fn nv_q36_moe_events_env_opt_in_nv_q36_moe_events_1_in_capture_globaltimer_l
 }
 
 #[cfg(feature = "cuda")]
-pub fn nv_q36_graphed_decode_fix_default_on_signed_off_2026_09_03_gemma4_proven_splitk_flash_reads_21_219_and_22_173_ms_tok_at_256_and_8192_vs_serial_smem_26_408_and_158_905_set_nv_q36_graphed_decode_fix_0_for_the_serial_smem_route(
-) -> bool {
-    crate::host_serving_util::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_Q36_GRAPHED_DECODE_FIX",
-    )
-}
-
-#[cfg(feature = "cuda")]
 pub fn nv_q36_gdn_fp8_env_opt_in_quantizes_bf16_checkpoint_gdn_projections_to_fp8_resident() -> bool
 {
     crate::host_serving_util::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q36_GDN_FP8")
@@ -886,27 +897,6 @@ pub fn nv_q36_gdn_fp8_env_opt_in_quantizes_bf16_checkpoint_gdn_projections_to_fp
 pub fn nv_q36_lm_head_fp8_env_opt_in_quantizes_a_bf16_checkpoint_lm_head_to_fp8_resident() -> bool {
     crate::host_serving_util::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q36_LM_HEAD_FP8")
 }
-
-pub const Q36_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF:
-    bool = false;
-
-pub const Q36_MOE_SHARED_FOLD_KEYSTONE_LARGEST_SINGLE_ARM_AT_8192_BUT_NOT_BITWISE_THE_FOLD_ROUTES_THE_SHARED_EXPERT_THROUGH_THE_QUANTIZED_GROUPED_TILE_AND_NO_CORPUS_QUALITY_INSTRUMENT_HAS_RUN:
-    bool = Q36_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
-
-pub const Q36_GDN_FP8_KEYSTONE_SECOND_LARGEST_AT_8192_BUT_IT_REQUANTIZES_BF16_CHECKPOINT_WEIGHTS_AND_NO_CORPUS_QUALITY_INSTRUMENT_HAS_RUN:
-    bool = Q36_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
-
-pub const Q36_MOE_FUSED_CHAIN_KEYSTONE_THIRD_AT_8192_BITWISE_CLASS_VS_THE_GROUPED_VERIFY_WHEN_THE_FOLD_IS_OFF_PER_THE_VCHAIN_PARITY_SUITE:
-    bool = Q36_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
-
-pub const Q36_LM_HEAD_FP8_MINOR_ARM_AT_8192_SUB_TENTH_MS_JOINTLY_WITH_DEPTHGATE_AND_IT_REQUANTIZES_THE_BF16_LM_HEAD:
-    bool = Q36_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
-
-pub const Q36_MOE_ROUTER_GEMV_NOT_STAGED_NEAR_INERT_AT_M1_SERVING_IT_IS_A_VERIFY_LANE_ARM: bool =
-    Q36_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
-
-pub const Q36_ATTN_DEPTHGATE_NOT_STAGED_INDIVIDUALLY_UNRESOLVED_BELOW_ITS_SPLIT_KNEE_AND_A_SPLIT_COUNT_CHANGE_REASSOCIATES:
-    bool = Q36_KEYSTONE_FLIP_PACKAGE_STAGED_2026_09_04_DEFAULTS_STAY_OFF_ANY_FLIP_NEEDS_USER_SIGN_OFF;
 
 #[cfg(feature = "cuda")]
 pub fn nv_q36_attn_verify_prep_env_opt_in_nv_q36_attn_verify_prep_1_one_kernel_qknorm_rope_sigmoid_kv_fp8_store_for_2_to_8_verify_rows(
@@ -934,53 +924,18 @@ fn attn_mrow_proj(lin: &Linear, x: &Tensor, _rows: usize, _on: bool) -> Result<T
     lin.forward(x)
 }
 
-pub const ATTN_MROW_FP8MMA_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_00331_TILED_PLUS_0_00256_FREEFORM_MINUS_0_01129_MEAN_MINUS_0_00181_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_64_LEDGER_2048_ATTN_CLASS_4_35_TO_2_85_SET_0_TO_RESTORE_CUBLASLT: &str =
-    "temp/q38-coord/reports/host-runs/fusedtc-64-attnmrow-graphed-walk.log";
-
-#[cfg(feature = "cuda")]
-pub fn nv_q38_attn_mrow_fp8mma_env_opt_in_1_routes_the_verify_row_q_k_v_o_projections_to_the_e4m3_f16mma_kernel(
-) -> bool {
-    let _ = ATTN_MROW_FP8MMA_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_00331_TILED_PLUS_0_00256_FREEFORM_MINUS_0_01129_MEAN_MINUS_0_00181_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_64_LEDGER_2048_ATTN_CLASS_4_35_TO_2_85_SET_0_TO_RESTORE_CUBLASLT;
-    nv_layers::linear_attn::q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11(
-        std::env::var_os("NV_Q38_ATTN_MROW_FP8MMA").as_deref(),
-    )
-}
-
-#[cfg(feature = "cuda")]
-pub fn nv_q38_fused_qkv_prep_env_kill_switch_nv_q38_fused_qkv_0() -> bool {
-    crate::host_serving_util::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_Q38_FUSED_QKV",
-    )
-}
-
-#[cfg(feature = "cuda")]
-pub fn nv_q38_fp4_mlp_gemv_env_opt_in_nv_q38_fp4_mlp_1_because_w4a16_matches_but_does_not_beat_the_padded_tc_route_in_graph(
-) -> bool {
-    crate::host_serving_util::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_FP4_MLP")
-}
-
 #[cfg(feature = "cuda")]
 pub fn nv_q38_attn_nvfp4_env_opt_in_double_quants_the_fp8_attn_projections_to_half_byte_paired_with_m1_gemv(
 ) -> bool {
     crate::host_serving_util::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_ATTN_NVFP4")
 }
 
-pub const MLP_TAIL_FIRST_LAYER_56_STARTS_THE_CHECKPOINTS_ONLY_FP8_MLP_RANGE_56_TO_63_EVERY_OTHER_TRUNK_MLP_IS_PACKED_NVFP4:
-    usize = 56;
-
-pub const MLP_TAIL_NVFP4_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_XPPL_QWEN38_TAIL4BIT_AND_THREE_CLASS_CERT_ZERO_RESTORES_FP8:
-    &str = "NV_Q38_MLP_TAIL_NVFP4";
-
 #[cfg(feature = "cuda")]
-pub fn q38_tail_nvfp4_from_raw_user_sign_off_2026_09_11_only_unset_promotes_certified_dense_shapes(
-    raw: Option<&std::ffi::OsStr>,
+pub fn nv_q38_mlp_tail_nvfp4_default_on_user_sign_off_2026_09_11_for_certified_dense_shapes(
     module: &str,
     out_features: usize,
     in_features: usize,
 ) -> bool {
-    if let Some(raw) = raw {
-        return raw == "1" && module_is_a_tail_mlp_projection(module);
-    }
     let Some((prefix, projection)) = module.rsplit_once(".mlp.") else {
         return false;
     };
@@ -995,25 +950,12 @@ pub fn q38_tail_nvfp4_from_raw_user_sign_off_2026_09_11_only_unset_promotes_cert
         }
 }
 
-#[cfg(feature = "cuda")]
-pub fn nv_q38_mlp_tail_nvfp4_default_on_user_sign_off_2026_09_11_for_certified_dense_shapes(
-    module: &str,
-    out_features: usize,
-    in_features: usize,
-) -> bool {
-    q38_tail_nvfp4_from_raw_user_sign_off_2026_09_11_only_unset_promotes_certified_dense_shapes(
-        std::env::var_os(MLP_TAIL_NVFP4_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_XPPL_QWEN38_TAIL4BIT_AND_THREE_CLASS_CERT_ZERO_RESTORES_FP8).as_deref(),
-        module, out_features, in_features,
-    )
-}
-
 #[cfg(all(test, feature = "cuda"))]
 mod q38_tail_user_signed_default_tests {
-    use super::q38_tail_nvfp4_from_raw_user_sign_off_2026_09_11_only_unset_promotes_certified_dense_shapes as selected;
-    use std::ffi::OsStr;
+    use super::nv_q38_mlp_tail_nvfp4_default_on_user_sign_off_2026_09_11_for_certified_dense_shapes as selected;
 
     #[test]
-    fn unset_promotes_only_the_eight_certified_dense_mlp_layers_and_explicit_zero_restores_fp8() {
+    fn only_the_eight_certified_dense_mlp_layers_promote_to_nvfp4() {
         for layer in 56..64 {
             for projection in ["gate_proj", "up_proj", "down_proj"] {
                 let module = format!("model.layers.{layer}.mlp.{projection}");
@@ -1022,12 +964,8 @@ mod q38_tail_user_signed_default_tests {
                 } else {
                     (17408, 5120)
                 };
-                assert!(selected(None, &module, n, k));
-                assert!(selected(Some(OsStr::new("1")), &module, n, k));
-                for raw in ["0", "", "yes", " 1"] {
-                    assert!(!selected(Some(OsStr::new(raw)), &module, n, k));
-                }
-                assert!(!selected(None, &module, 2048, 2048));
+                assert!(selected(&module, n, k));
+                assert!(!selected(&module, 2048, 2048));
             }
         }
         for module in [
@@ -1036,53 +974,28 @@ mod q38_tail_user_signed_default_tests {
             "model.layers.56.mlp.shared_expert.gate_proj",
             "model.layers.56.self_attn.q_proj",
         ] {
-            assert!(!selected(None, module, 17408, 5120));
+            assert!(!selected(module, 17408, 5120));
         }
-        assert!(
-            selected(
-                Some(OsStr::new("1")),
-                "model.layers.64.mlp.gate_proj",
-                2048,
-                2048
-            ),
-            "explicit1 retains the broader pre-flip opt-in scope"
-        );
     }
-}
-
-#[cfg(feature = "cuda")]
-fn module_is_a_tail_mlp_projection(module: &str) -> bool {
-    let Some((prefix, _)) = module.rsplit_once(".mlp.") else {
-        return false;
-    };
-    prefix
-        .rsplit_once("layers.")
-        .and_then(|(_, idx)| idx.parse::<usize>().ok())
-        .is_some_and(|li| {
-            li >= MLP_TAIL_FIRST_LAYER_56_STARTS_THE_CHECKPOINTS_ONLY_FP8_MLP_RANGE_56_TO_63_EVERY_OTHER_TRUNK_MLP_IS_PACKED_NVFP4
-        })
 }
 
 #[cfg(feature = "cuda")]
 pub fn nv_q38_fp4_mlp_gemv_v2_env_opt_in_nv_q38_fp4_mlp_2_selects_the_rows2_uint4_pipelined_w4a16_kernels(
 ) -> bool {
-    std::env::var("NV_Q38_FP4_MLP").ok().as_deref() == Some("2")
+    env::var("NV_Q38_FP4_MLP").ok().as_deref() == Some("2")
 }
 
 #[cfg(feature = "cuda")]
-pub fn nv_q38_fp4_mlp_gemv_v3_gateup_pair_silu_stagefree_down_default_on_beats_a4_tc_in_graph_plus8to13pct_decode_and_ppl_9p879_vs_9p902_flipped_20260903_env_0_restores_the_a4_tc_route_1_and_2_stay_the_other_w4a16_arms(
+pub fn nv_q38_fp4_mlp_gemv_v3_gateup_pair_silu_stagefree_down_default_on_beats_a4_tc_in_graph_plus8to13pct_decode_and_ppl_9p879_vs_9p902_flipped_20260903_1_and_2_select_the_other_w4a16_arms(
 ) -> bool {
     !matches!(
-        std::env::var("NV_Q38_FP4_MLP").ok().as_deref(),
-        Some("0") | Some("1") | Some("2")
+        env::var("NV_Q38_FP4_MLP").ok().as_deref(),
+        Some("1") | Some("2")
     )
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_slice_u8_ptr(
-    slice: &cudarc::driver::CudaSlice<u8>,
-    stream: &Arc<cudarc::driver::CudaStream>,
-) -> u64 {
+fn cuda_slice_u8_ptr(slice: &CudaSlice<u8>, stream: &Arc<CudaStream>) -> u64 {
     use cudarc::driver::DevicePtr;
     let (p, _g) = slice.device_ptr(stream);
     p
@@ -1099,12 +1012,9 @@ fn fused_dense_mlp_nvfp4_w4a16_two_kernels_decode_m1_more_precise_than_the_padde
     let Some(mlp) = ffn.as_dense() else {
         return Ok(None);
     };
-    if std::env::var("NV_Q38_FP4_MLP").ok().as_deref() == Some("0") {
-        return Ok(None);
-    }
     let v2 =
         nv_q38_fp4_mlp_gemv_v2_env_opt_in_nv_q38_fp4_mlp_2_selects_the_rows2_uint4_pipelined_w4a16_kernels();
-    let v3 = nv_q38_fp4_mlp_gemv_v3_gateup_pair_silu_stagefree_down_default_on_beats_a4_tc_in_graph_plus8to13pct_decode_and_ppl_9p879_vs_9p902_flipped_20260903_env_0_restores_the_a4_tc_route_1_and_2_stay_the_other_w4a16_arms();
+    let v3 = nv_q38_fp4_mlp_gemv_v3_gateup_pair_silu_stagefree_down_default_on_beats_a4_tc_in_graph_plus8to13pct_decode_and_ppl_9p879_vs_9p902_flipped_20260903_1_and_2_select_the_other_w4a16_arms();
     let hidden = mlp.gate_proj().in_features();
     let inter = mlp.gate_proj().out_features();
     if x.dims() != [1, 1, hidden] || x.dtype() != DType::BF16 {
@@ -1126,28 +1036,15 @@ fn fused_dense_mlp_nvfp4_w4a16_two_kernels_decode_m1_more_precise_than_the_padde
     {
         return Ok(None);
     }
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = x.device().clone() else {
+        return Ok(None);
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let x_c = x.contiguous()?;
 
-    let mut gate_y = unsafe {
-        stream
-            .alloc::<bf16>(inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut up_y = unsafe {
-        stream
-            .alloc::<bf16>(inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut down_y = unsafe {
-        stream
-            .alloc::<bf16>(hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut gate_y = unsafe { stream.alloc::<bf16>(inter)? };
+    let mut up_y = unsafe { stream.alloc::<bf16>(inter)? };
+    let mut down_y = unsafe { stream.alloc::<bf16>(hidden)? };
 
     let (gw, gs, g_alpha_recip_wg_times_recip_ig, g_ig) = gp;
     let (uw, us, u_alpha_recip_wg_times_recip_ig, u_ig) = up;
@@ -1161,7 +1058,7 @@ fn fused_dense_mlp_nvfp4_w4a16_two_kernels_decode_m1_more_precise_than_the_padde
     {
         let (x_storage, xl) = x_c.storage_and_layout();
         let x_cuda = match &*x_storage {
-            candle_core::Storage::Cuda(s) => s,
+            Storage::Cuda(s) => s,
             _ => return Ok(None),
         };
         let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
@@ -1195,7 +1092,7 @@ fn fused_dense_mlp_nvfp4_w4a16_two_kernels_decode_m1_more_precise_than_the_padde
             if rc == -1 {
                 return Ok(None);
             }
-            anyhow::ensure!(
+            ensure!(
                 rc == 0,
                 "gemv_nvfp4_w4a16_gateup_pair_silu_out_m1_v3 rc={rc}"
             );
@@ -1218,12 +1115,12 @@ fn fused_dense_mlp_nvfp4_w4a16_two_kernels_decode_m1_more_precise_than_the_padde
             if rc == -1 {
                 return Ok(None);
             }
-            anyhow::ensure!(rc == 0, "gemv_nvfp4_w4a16_down_act_in_m1_v3 rc={rc}");
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(down_y, dev);
+            ensure!(rc == 0, "gemv_nvfp4_w4a16_down_act_in_m1_v3 rc={rc}");
+            let storage = CudaStorage::wrap_cuda_slice(down_y, dev);
             return Ok(Some(Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
+                Storage::Cuda(storage),
                 (1usize, 1usize, hidden),
-                candle_core::op::BackpropOp::none(),
+                BackpropOp::none(),
                 false,
             )));
         }
@@ -1255,7 +1152,7 @@ fn fused_dense_mlp_nvfp4_w4a16_two_kernels_decode_m1_more_precise_than_the_padde
         if rc == -1 {
             return Ok(None);
         }
-        anyhow::ensure!(rc == 0, "gemv_nvfp4_w4a16_dual_m1 v2={v2} rc={rc}");
+        ensure!(rc == 0, "gemv_nvfp4_w4a16_dual_m1 v2={v2} rc={rc}");
         let (gy_ptr2, _g3) = gate_y.device_ptr_mut(&stream);
         let (uy_ptr2, _g4) = up_y.device_ptr_mut(&stream);
         let (dy_ptr, _g5) = down_y.device_ptr_mut(&stream);
@@ -1280,16 +1177,16 @@ fn fused_dense_mlp_nvfp4_w4a16_two_kernels_decode_m1_more_precise_than_the_padde
         if rc == -1 {
             return Ok(None);
         }
-        anyhow::ensure!(
+        ensure!(
             rc == 0,
             "gemv_nvfp4_w4a16_silu_gate_up_in_m1 v2={v2} rc={rc}"
         );
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(down_y, dev);
+    let storage = CudaStorage::wrap_cuda_slice(down_y, dev);
     Ok(Some(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         (1usize, 1usize, hidden),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     )))
 }
@@ -1305,7 +1202,7 @@ pub fn nv_q38_siluq_split_env_opt_in_nv_q38_siluq_split_1_multiblock_silu_quant_
     crate::host_serving_util::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_SILUQ_SPLIT")
 }
 
-pub const MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER:
+pub const MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS:
     &str = "NV_Q38_MK_VERIFY_TCTILE";
 
 pub const MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER: &str =
@@ -1330,8 +1227,8 @@ pub const TCTILE_MMA_TILES_CASH_THE_ONE_READ_STRUCTURE_THE_RETIRED_SCALAR_ROWS_C
      16q/2kv) refuses at the launcher with rc -27 because the 50-row half-precision q tile \
      only fits the 48 KiB static smem budget at group 6, and the routing falls through to the \
      mk ladder there. Graph capture chooses the arm at the capture depth and \
-     later rounds replay it even when the context crosses the knee; The arm ships default-gated at the knee (champion-stack sign-off 2026-09-02; \
-     =0 restores the pre-champion mk ladder): mma tiles reassociate the \
+     later rounds replay it even when the context crosses the knee; The arm ships default-gated at the knee (champion-stack sign-off 2026-09-02): \
+     mma tiles reassociate the \
      score sums, so the bf16 attention output sits 1-2 ulp from the mk arm's, and the MoE \
      router amplifies that into confidently different greedy streams -- the emitted-stream \
      tie-class discipline cannot certify a score-reordering arm (the retired scalar rowshared arm \
@@ -1346,14 +1243,13 @@ pub const TCTILE_MMA_TILES_CASH_THE_ONE_READ_STRUCTURE_THE_RETIRED_SCALAR_ROWS_C
      decode 46.3 -> 61.6 tok/s, +33%), so the shipped default gates at the shared 8192 knee \
      and the shallow regression the always-on arm would pay never engages.";
 
-pub fn mk_verify_tctile_min_total_from_raw_default_gates_at_the_knee_signed_off_2026_09_02_zero_off_one_always(
+pub fn mk_verify_tctile_min_total_from_raw_default_gates_at_the_knee_signed_off_2026_09_02_one_always(
     raw: Option<&str>,
     knee_override_raw: Option<&str>,
-) -> Option<usize> {
+) -> usize {
     match raw {
-        Some("0") => None,
-        Some("1") => Some(0),
-        None | Some("") | Some("gate") => Some(match knee_override_raw {
+        Some("1") => 0,
+        None | Some("") | Some("gate") => match knee_override_raw {
             None | Some("") => TCTILE_GATE_KNEE_TOTAL_8192_ITS_LADDER_WINS_FROM_8192_AND_LOSES_AT_256,
             Some(v) => v.parse::<usize>().unwrap_or_else(|_| {
                 panic!(
@@ -1361,16 +1257,15 @@ pub fn mk_verify_tctile_min_total_from_raw_default_gates_at_the_knee_signed_off_
                      set a plain token total"
                 )
             }),
-        }),
+        },
         Some(other) => panic!(
-            "{MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER}\
-             ={other}: set 1 (tctile always), gate or unset (tctile at or past the knee), or 0 \
-             (the pre-champion mk ladder)"
+            "{MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS}\
+             ={other}: set 1 (tctile always), or gate or unset (tctile at or past the knee)"
         ),
     }
 }
 
-pub const MK_VERIFY_FUSED_TC_ENV_USER_SIGN_OFF_2026_09_11_UNSET_GATES_1_ALWAYS_0_RESTORES_TCTILE:
+pub const MK_VERIFY_FUSED_TC_ENV_USER_SIGN_OFF_2026_09_11_UNSET_GATES_1_ALWAYS:
     &str = "NV_Q38_MK_VERIFY_FUSED_TC";
 
 pub const FUSED_TC_OUTRANKS_TCTILE_WHEN_ENGAGED_BECAUSE_ONE_K_TILE_SCORES_ALL_M_BY_GROUP_ROWS_ONCE_AND_PV_RIDES_MMA_TOO:
@@ -1382,7 +1277,7 @@ pub const FUSED_TC_OUTRANKS_TCTILE_WHEN_ENGAGED_BECAUSE_ONE_K_TILE_SCORES_ALL_M_
      staged once as f16 with its per-row scale folded in, and PV rides the same mma with the \
      eight warps split over head_dim; the per-split (m, l, O) triples, the split pick, the \
      scratch cap and the combine are the tctile arm's. User sign-off 2026-09-11: default-gated \
-     at total 2048 for m>=4, 4096 for m<4; =0 restores the tctile ladder exactly. \
+     at total 2048 for m>=4, 4096 for m<4; \
      unset or =gate engages at the knee and keeps the mk arm below it (the suite A/B reads 256: \
      121 -> 111 tok/s vs mk, 8192: flat, 172032: 79.8 -> 94.5), =1 is the always-on escape, \
      NV_Q38_MK_VERIFY_FUSED_TC_MIN_TOTAL overrides the knee; qwen38 \
@@ -1409,15 +1304,14 @@ pub fn fused_tc_gate_knee_for_rows(m: usize) -> usize {
 pub const FUSED_TC_DEFAULT_GATE_USER_SIGN_OFF_2026_09_11_ON_THE_CLASS_GATED_TCTILE_CERT_AT_172032_VWALK_MEAN_NLL_DELTA_MINUS_0_00050_ALL_THREE_CLASSES_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_06_THREE_CLASS_CERT_HOSTA_SESSION_1151_1232_TAIL_KNEE_8192_FROM_THE_SUITE_AB_256_LOSES_8192_FLAT_172032_PLUS_18_PCT:
     &str = "temp/q38-coord/reports/host-runs/fusedtc-06-three-class-cert.hostA-session-1151-1232.tail";
 
-pub fn mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign_off_2026_09_11_zero_off_one_always(
+pub fn mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign_off_2026_09_11_one_always(
     raw: Option<&str>,
     knee_override_raw: Option<&str>,
     rows: usize,
-) -> Option<usize> {
+) -> usize {
     match raw {
-        Some("") | Some("0") => None,
-        Some("1") => Some(0),
-        None | Some("gate") => Some(match knee_override_raw {
+        Some("1") => 0,
+        None | Some("") | Some("gate") => match knee_override_raw {
             None | Some("") => fused_tc_gate_knee_for_rows(rows),
             Some(v) => v.parse::<usize>().unwrap_or_else(|_| {
                 panic!(
@@ -1425,52 +1319,42 @@ pub fn mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign
                      set a plain token total"
                 )
             }),
-        }),
+        },
         Some(other) => panic!(
-            "{MK_VERIFY_FUSED_TC_ENV_USER_SIGN_OFF_2026_09_11_UNSET_GATES_1_ALWAYS_0_RESTORES_TCTILE}\
-             ={other}: set 1 (fused tc always), gate or unset (at or past the knee), or 0 \
-             (the tctile ladder)"
+            "{MK_VERIFY_FUSED_TC_ENV_USER_SIGN_OFF_2026_09_11_UNSET_GATES_1_ALWAYS}\
+             ={other}: set 1 (fused tc always), or gate or unset (at or past the knee)"
         ),
     }
 }
 
 pub fn nv_q38_mk_verify_fused_tc_env_opt_in_single_pass_mma_qk_and_pv_reads_kv_once_for_all_m_by_group_rows(
     rows: usize,
-) -> Option<usize> {
-    let raw = std::env::var_os(
-        MK_VERIFY_FUSED_TC_ENV_USER_SIGN_OFF_2026_09_11_UNSET_GATES_1_ALWAYS_0_RESTORES_TCTILE,
-    );
-    mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign_off_2026_09_11_zero_off_one_always(
-        mk_verify_fused_tc_raw_user_sign_off_2026_09_11_non_unicode_keeps_preflip_off(raw.as_deref()),
-        std::env::var(MK_VERIFY_FUSED_TC_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER)
+) -> usize {
+    mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign_off_2026_09_11_one_always(
+        env::var(MK_VERIFY_FUSED_TC_ENV_USER_SIGN_OFF_2026_09_11_UNSET_GATES_1_ALWAYS).ok().as_deref(),
+        env::var(MK_VERIFY_FUSED_TC_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER)
             .ok()
             .as_deref(),
         rows,
     )
 }
 
-fn mk_verify_fused_tc_raw_user_sign_off_2026_09_11_non_unicode_keeps_preflip_off(
-    raw: Option<&std::ffi::OsStr>,
-) -> Option<&str> {
-    raw.map(|value| value.to_str().unwrap_or("0"))
-}
-
 pub const MK_VERIFY_DUMP_DIR_ENV_WRITES_EACH_SLOTS_QKV_ONCE_SO_A_PARITY_GATE_CAN_REPLAY_LIVE_SERVING_TENSORS_THROUGH_BOTH_ARMS:
     &str = "NV_Q38_MK_VERIFY_DUMP";
 
 pub fn nv_q38_mk_verify_tctile_default_gate_signed_off_2026_09_02_one_launch_mma_qk_tiles_read_kv_once_for_all_m_by_group_rows(
-) -> Option<usize> {
-    mk_verify_tctile_min_total_from_raw_default_gates_at_the_knee_signed_off_2026_09_02_zero_off_one_always(
-        std::env::var(MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER)
+) -> usize {
+    mk_verify_tctile_min_total_from_raw_default_gates_at_the_knee_signed_off_2026_09_02_one_always(
+        env::var(MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS)
             .ok()
             .as_deref(),
-        std::env::var(MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER)
+        env::var(MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER)
             .ok()
             .as_deref(),
     )
 }
 
-pub const M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_FUSED_ARM:
+pub const M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS:
     &str = "NV_Q38_DECODE_KVSHARE";
 
 pub const M1_DECODE_KVSHARE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER: &str =
@@ -1491,11 +1375,9 @@ pub const M1_DECODE_KVSHARE_GATE_SELECTS_AT_DECODE_GRAPH_CAPTURE_SO_A_GRAPHED_SE
      arm from its capture depth and keeps it even if decode grows the context across the \
      knee; the eager path re-evaluates per call. =1 is the \
      unconditional kvshare arm, unset or =gate gates at the knee (the default, champion-stack \
-     sign-off 2026-09-02), =0 restores the fused arm, and \
+     sign-off 2026-09-02), and \
      NV_Q38_DECODE_KVSHARE_MIN_TOTAL overrides the knee. The arm rides the splitk scratch \
-     NV_Q36_GRAPHED_DECODE_FIX allocates and is inert without that fix, and the constructor \
-     sizes that scratch for the kernel's 128-split cap only when this env resolves on at \
-     cache construction (on unless =0 since the 2026-09-03 default sign-off). The knee comes from the q38_flash_depth_floor kernel-only rows \
+     the cache constructor sizes for the kernel's 128-split cap. The knee comes from the q38_flash_depth_floor kernel-only rows \
      (24q/4kv hd256 fp8, warm L2): fused 331 GB/s vs kvshare 224 at 8192, kvshare 556 vs \
      fused 347 at 32768, and 806 vs 301 at 196608 (2.68x); linear interpolation of the \
      measured microseconds between the 8192 and 32768 rows crosses near 14.3k tokens, hence \
@@ -1503,14 +1385,13 @@ pub const M1_DECODE_KVSHARE_GATE_SELECTS_AT_DECODE_GRAPH_CAPTURE_SO_A_GRAPHED_SE
      power-of-two rung past the interpolated crossover, not at the verify side's 8192 where \
      the fused m=1 arm still wins.";
 
-pub fn m1_decode_kvshare_min_total_from_raw_none_off_zero_always_gate_reads_the_knee(
+pub fn m1_decode_kvshare_min_total_from_raw_one_always_gate_or_unset_reads_the_knee(
     raw: Option<&str>,
     knee_override_raw: Option<&str>,
-) -> Option<usize> {
+) -> usize {
     match raw {
-        Some("0") => None,
-        Some("1") => Some(0),
-        None | Some("") | Some("gate") => Some(match knee_override_raw {
+        Some("1") => 0,
+        None | Some("") | Some("gate") => match knee_override_raw {
             None | Some("") => KVSHARE_ENGAGES_PAST_THE_MEASURED_M1_DECODE_CROSSOVER_TOTAL,
             Some(v) => v.parse::<usize>().unwrap_or_else(|_| {
                 panic!(
@@ -1518,22 +1399,21 @@ pub fn m1_decode_kvshare_min_total_from_raw_none_off_zero_always_gate_reads_the_
                      set a plain token total"
                 )
             }),
-        }),
+        },
         Some(other) => panic!(
-            "{M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_FUSED_ARM}\
-             ={other}: set 1 (kvshare always), gate or unset (kvshare at or past the knee), or 0 \
-             (the fused arm)"
+            "{M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS}\
+             ={other}: set 1 (kvshare always), or gate or unset (kvshare at or past the knee)"
         ),
     }
 }
 
 pub fn nv_q38_decode_kvshare_default_gate_signed_off_2026_09_02_group_fold_reads_kv_once_per_kv_head_not_once_per_q_head(
-) -> Option<usize> {
-    m1_decode_kvshare_min_total_from_raw_none_off_zero_always_gate_reads_the_knee(
-        std::env::var(M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_FUSED_ARM)
+) -> usize {
+    m1_decode_kvshare_min_total_from_raw_one_always_gate_or_unset_reads_the_knee(
+        env::var(M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS)
             .ok()
             .as_deref(),
-        std::env::var(M1_DECODE_KVSHARE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER)
+        env::var(M1_DECODE_KVSHARE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER)
             .ok()
             .as_deref(),
     )
@@ -1564,7 +1444,7 @@ pub fn q38_prefill_chunk_tokens(raw: Option<&str>) -> Option<usize> {
 
 pub fn q38_prefill_chunk_tokens_from_env() -> Option<usize> {
     q38_prefill_chunk_tokens(
-        std::env::var(NV_Q38_PREFILL_CHUNK_ENV_DEFAULT_4096_SET_0_FOR_THE_ONE_SHOT_FORWARD_WHOSE_TRANSIENTS_MEASURED_0_21_MIB_PER_TOKEN)
+        env::var(NV_Q38_PREFILL_CHUNK_ENV_DEFAULT_4096_SET_0_FOR_THE_ONE_SHOT_FORWARD_WHOSE_TRANSIENTS_MEASURED_0_21_MIB_PER_TOKEN)
             .ok()
             .as_deref(),
     )
@@ -1574,7 +1454,7 @@ pub const NV_Q38_PREFILL_GRAPH_ENV_OPT_IN_1_REPLAYS_GDN_MLP_LAYER_RUNS_AS_CUDA_G
     &str = "NV_Q38_PREFILL_GRAPH";
 
 pub fn nv_q38_prefill_graph_env_opt_in() -> bool {
-    std::env::var(NV_Q38_PREFILL_GRAPH_ENV_OPT_IN_1_REPLAYS_GDN_MLP_LAYER_RUNS_AS_CUDA_GRAPH_SEGMENTS_FULL_ATTENTION_STAYS_EAGER_BECAUSE_CANDLE_FLASH_ATTN_LAUNCHES_ON_THE_LEGACY_NULL_STREAM)
+    env::var(NV_Q38_PREFILL_GRAPH_ENV_OPT_IN_1_REPLAYS_GDN_MLP_LAYER_RUNS_AS_CUDA_GRAPH_SEGMENTS_FULL_ATTENTION_STAYS_EAGER_BECAUSE_CANDLE_FLASH_ATTN_LAUNCHES_ON_THE_LEGACY_NULL_STREAM)
         .ok()
         .as_deref()
         == Some("1")
@@ -1589,7 +1469,7 @@ fn prefill_graph_capture_hostile_env_because_the_inner_gdn_graph_arm_nests_a_cap
 ) -> Option<&'static str> {
     ["NV_Q38_GDN_CHUNK_GEMM_GRAPH", "NV_PROF_LINATTN"]
         .into_iter()
-        .find(|env| std::env::var(env).is_ok())
+        .find(|env| env::var(env).is_ok())
 }
 
 #[cfg(feature = "cuda")]
@@ -1604,19 +1484,18 @@ pub struct Qwen38PrefillGraphSession {
         Vec<Option<LinAttnState>>,
     cfx_route_decision_baked_into_captured_segments: Option<bool>,
     capture_failed: bool,
-    eager_fallback_reported_once: std::sync::Once,
+    eager_fallback_reported_once: Once,
 }
 
 #[cfg(feature = "cuda")]
 impl Qwen38PrefillGraphSession {
     fn new(model: &Qwen3Moe, chunk: usize) -> Result<Self> {
-        anyhow::ensure!(chunk >= 1, "Qwen38PrefillGraphSession: chunk must be >= 1");
-        let dev = match &model.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("Qwen38PrefillGraphSession requires a CUDA device"),
+        ensure!(chunk >= 1, "Qwen38PrefillGraphSession: chunk must be >= 1");
+        let Device::Cuda(dev) = model.device.clone() else {
+            bail!("Qwen38PrefillGraphSession requires a CUDA device")
         };
         let stream = dev.cuda_stream();
-        anyhow::ensure!(
+        ensure!(
             !stream.cu_stream().is_null(),
             "Qwen38PrefillGraphSession: the legacy NULL stream cannot begin capture; build the \
              device with Device::new_cuda_with_stream"
@@ -1644,7 +1523,7 @@ impl Qwen38PrefillGraphSession {
                 vec![None; n_lin],
             cfx_route_decision_baked_into_captured_segments: None,
             capture_failed: false,
-            eager_fallback_reported_once: std::sync::Once::new(),
+            eager_fallback_reported_once: Once::new(),
         })
     }
 
@@ -1682,7 +1561,7 @@ impl Qwen38PrefillGraphSession {
             return Ok(());
         }
         let Device::Cuda(dev) = self.tok_stage.device() else {
-            anyhow::bail!("Qwen38PrefillGraphSession route transition lost its CUDA device")
+            bail!("Qwen38PrefillGraphSession route transition lost its CUDA device")
         };
         let stream = nv_layers::cuda_stream::current_stream(dev);
         stream
@@ -1726,7 +1605,7 @@ impl Qwen38PrefillGraphSession {
             let cur = cache.lin_attn_states[slot].as_ref().ok_or_else(|| {
                 anyhow::anyhow!("pin_lin_states: slot {slot} has no state after the warm chunk")
             })?;
-            anyhow::ensure!(
+            ensure!(
                 !cur.is_fused(),
                 "pin_lin_states: slot {slot} is a fused decode state; the chunk prefill path \
                  must have produced a non-fused state"
@@ -1753,7 +1632,7 @@ impl Qwen38PrefillGraphSession {
             match &cache.lin_attn_states[slot] {
                 Some(cur) if cur.recurrent_state().id() == pinned.recurrent_state().id() => {}
                 Some(cur) => {
-                    anyhow::ensure!(
+                    ensure!(
                         !cur.is_fused(),
                         "install_pinned_lin_states: slot {slot} holds a fused decode state whose \
                          layout the pinned prefill state cannot absorb; run this prefill eager"
@@ -1774,14 +1653,14 @@ impl Qwen38PrefillGraphSession {
 #[cfg(feature = "cuda")]
 fn cuda_tensor_device_ptr<T: candle_core::cuda_backend::CudaDType>(
     t: &Tensor,
-    stream: &Arc<cudarc::driver::CudaStream>,
+    stream: &Arc<CudaStream>,
 ) -> Result<u64> {
     use cudarc::driver::DevicePtr;
-    anyhow::ensure!(t.is_contiguous(), "stage tensor must be contiguous");
+    ensure!(t.is_contiguous(), "stage tensor must be contiguous");
     let (storage, layout) = t.storage_and_layout();
     let cuda = match &*storage {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("stage tensor must be on CUDA"),
+        Storage::Cuda(s) => s,
+        _ => bail!("stage tensor must be on CUDA"),
     };
     let slice = cuda.as_cuda_slice::<T>()?;
     let (ptr, _g) = slice.device_ptr(stream);
@@ -1789,19 +1668,15 @@ fn cuda_tensor_device_ptr<T: candle_core::cuda_backend::CudaDType>(
 }
 
 #[cfg(feature = "cuda")]
-fn dtod_bf16_tensor_into_stage(
-    t: &Tensor,
-    stage: &Tensor,
-    stream: &Arc<cudarc::driver::CudaStream>,
-) -> Result<()> {
+fn dtod_bf16_tensor_into_stage(t: &Tensor, stage: &Tensor, stream: &Arc<CudaStream>) -> Result<()> {
     let contig = t.contiguous()?;
-    anyhow::ensure!(
+    ensure!(
         contig.dtype() == DType::BF16 && stage.dtype() == DType::BF16,
         "stage copy expects bf16, got {:?} -> {:?}",
         contig.dtype(),
         stage.dtype()
     );
-    anyhow::ensure!(
+    ensure!(
         contig.elem_count() == stage.elem_count(),
         "stage copy size mismatch: tensor {} elems vs stage {}",
         contig.elem_count(),
@@ -1824,12 +1699,12 @@ fn dtod_bf16_tensor_into_stage(
 #[cfg(feature = "cuda")]
 thread_local! {
     static GDN_PRENORM_RSTD_PACK_PERSISTENT_SO_CAPTURED_GRAPHS_BAKE_ONE_POINTER:
-        std::cell::RefCell<Option<Tensor>> = const { std::cell::RefCell::new(None) };
+        RefCell<Option<Tensor>> = const { RefCell::new(None) };
 }
 
 #[cfg(feature = "cuda")]
 fn gdn_prenorm_rstd_pack_tensor_rstd_ssq_count_zeroed_once_then_kernel_maintained(
-    dev: &candle_core::CudaDevice,
+    dev: &CudaDevice,
 ) -> Result<Tensor> {
     GDN_PRENORM_RSTD_PACK_PERSISTENT_SO_CAPTURED_GRAPHS_BAKE_ONE_POINTER.with(|c| {
         let mut slot = c.borrow_mut();
@@ -1837,16 +1712,11 @@ fn gdn_prenorm_rstd_pack_tensor_rstd_ssq_count_zeroed_once_then_kernel_maintaine
             return Ok(t.clone());
         }
         let stream = nv_layers::cuda_stream::current_stream(dev);
-        let pack: cudarc::driver::CudaSlice<f32> = stream
+        let pack: CudaSlice<f32> = stream
             .alloc_zeros::<f32>(4)
             .map_err(|e| anyhow::anyhow!("alloc gdn prenorm rstd pack: {e:?}"))?;
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(pack, dev.clone());
-        let t = Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
-            (4usize,),
-            candle_core::op::BackpropOp::none(),
-            false,
-        );
+        let storage = CudaStorage::wrap_cuda_slice(pack, dev.clone());
+        let t = Tensor::from_storage(Storage::Cuda(storage), (4usize,), BackpropOp::none(), false);
         *slot = Some(t.clone());
         Ok(t)
     })
@@ -1888,8 +1758,8 @@ fn dense_mlp_w4a8_shapes_env_free_because_the_verify_route_self_selects(
 #[cfg(feature = "cuda")]
 struct W4a8FoldedPostNormQuant {
     res_out: Tensor,
-    x_q8: cudarc::driver::CudaSlice<i8>,
-    x_scale: cudarc::driver::CudaSlice<f32>,
+    x_q8: CudaSlice<i8>,
+    x_scale: CudaSlice<f32>,
     hidden: usize,
     inter: usize,
 }
@@ -1898,18 +1768,18 @@ struct W4a8FoldedPostNormQuant {
 struct W4a8DecodeScratch {
     inter: usize,
     plen: i32,
-    gate_y: cudarc::driver::CudaSlice<half::bf16>,
-    up_y: cudarc::driver::CudaSlice<half::bf16>,
-    staged: cudarc::driver::CudaSlice<half::bf16>,
-    partials: cudarc::driver::CudaSlice<f32>,
-    act_q8: cudarc::driver::CudaSlice<i8>,
-    act_scale: cudarc::driver::CudaSlice<f32>,
+    gate_y: CudaSlice<half::bf16>,
+    up_y: CudaSlice<half::bf16>,
+    staged: CudaSlice<half::bf16>,
+    partials: CudaSlice<f32>,
+    act_q8: CudaSlice<i8>,
+    act_scale: CudaSlice<f32>,
 }
 
 #[cfg(feature = "cuda")]
 thread_local! {
     static W4A8_DECODE_SCRATCH_POOL_KEYED_BY_INTER_AND_NEVER_FREED_BECAUSE_CAPTURED_GRAPHS_BAKE_ITS_POINTERS:
-        std::cell::RefCell<Vec<W4a8DecodeScratch>> = const { std::cell::RefCell::new(Vec::new()) };
+        RefCell<Vec<W4a8DecodeScratch>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(feature = "cuda")]
@@ -1944,7 +1814,7 @@ impl Drop for W4a8ScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPoint
 
 #[cfg(feature = "cuda")]
 fn w4a8_decode_scratch_take_or_build(
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    stream: &std::sync::Arc<CudaStream>,
     inter: usize,
 ) -> Result<W4a8ScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers> {
     use half::bf16;
@@ -1959,32 +1829,16 @@ fn w4a8_decode_scratch_take_or_build(
         return Ok(W4a8ScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers(Some(s)));
     }
     let plen = nv_kernels::cuda::silu_mul_rowquant_i8_mk_partials_len(1, inter as i32);
-    anyhow::ensure!(
+    ensure!(
         plen > 0,
         "silu_mul_rowquant_i8_mk_partials_len refused inter={inter}"
     );
-    let gate_y = unsafe {
-        stream
-            .alloc::<bf16>(inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let up_y = unsafe {
-        stream
-            .alloc::<bf16>(inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let staged = unsafe {
-        stream
-            .alloc::<bf16>(inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let partials = unsafe {
-        stream
-            .alloc::<f32>(plen as usize)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let act_q8 = unsafe { stream.alloc::<i8>(inter).map_err(|e| anyhow::anyhow!(e))? };
-    let act_scale = unsafe { stream.alloc::<f32>(1).map_err(|e| anyhow::anyhow!(e))? };
+    let gate_y = unsafe { stream.alloc::<bf16>(inter)? };
+    let up_y = unsafe { stream.alloc::<bf16>(inter)? };
+    let staged = unsafe { stream.alloc::<bf16>(inter)? };
+    let partials = unsafe { stream.alloc::<f32>(plen as usize)? };
+    let act_q8 = unsafe { stream.alloc::<i8>(inter)? };
+    let act_scale = unsafe { stream.alloc::<f32>(1)? };
     Ok(
         W4a8ScratchLeaseReturnsToThePoolOnDropSoNoPathFreesGraphBakedPointers(Some(
             W4a8DecodeScratch {
@@ -2004,8 +1858,8 @@ fn w4a8_decode_scratch_take_or_build(
 #[cfg(feature = "cuda")]
 fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
     mlp: &Mlp,
-    x_q8: &cudarc::driver::CudaSlice<i8>,
-    x_scale: &cudarc::driver::CudaSlice<f32>,
+    x_q8: &CudaSlice<i8>,
+    x_scale: &CudaSlice<f32>,
     residual: &Tensor,
     hidden: usize,
     inter: usize,
@@ -2014,9 +1868,8 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
 
-    let dev = match residual.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("w4a8 chain: residual not on cuda"),
+    let Device::Cuda(dev) = residual.device().clone() else {
+        bail!("w4a8 chain: residual not on cuda")
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let mut prof = nv_layers::linear_attn::gdn_step_prof::SyncLaps::begin_if_armed(&dev);
@@ -2027,7 +1880,7 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
         mlp.down_proj().nvfp4_parts(),
     );
     let (Some(gp), Some(up), Some(dp)) = (gp, up, dp) else {
-        anyhow::bail!("w4a8 chain: nvfp4 parts vanished after eligibility");
+        bail!("w4a8 chain: nvfp4 parts vanished after eligibility");
     };
     let (gw, gs, g_alpha_recip_wg_times_recip_ig, g_ig) = gp;
     let (uw, us, u_alpha_recip_wg_times_recip_ig, u_ig) = up;
@@ -2039,11 +1892,7 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
     let da_weight_global_only_because_the_q8_row_scale_rides_separately =
         d_alpha_recip_wg_times_recip_ig * d_ig;
 
-    let mut down_y = unsafe {
-        stream
-            .alloc::<bf16>(hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut down_y = unsafe { stream.alloc::<bf16>(hidden)? };
     let down_qfold =
         nv_q38_down_qfold_env_opt_in_nv_q38_down_qfold_1_act_quant_in_down_gemv_prologue();
     let siluq_split =
@@ -2058,8 +1907,8 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
     {
         let (r_storage, rl) = res_c.storage_and_layout();
         let r_cuda = match &*r_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w4a8 chain: residual storage not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("w4a8 chain: residual storage not cuda"),
         };
         let r_slice = r_cuda.as_cuda_slice::<bf16>()?;
         let r_view = r_slice.slice(rl.start_offset()..);
@@ -2085,7 +1934,7 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
                 hidden as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "gemv_nvfp4_w4a8_dual_m1 rc={rc}");
+        ensure!(rc == 0, "gemv_nvfp4_w4a8_dual_m1 rc={rc}");
         trunk_events::ffn_sub_mark(0);
         if let Some(p) = prof.as_mut() {
             p.lap("mlp_dual");
@@ -2104,7 +1953,7 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
                     inter as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "silu_mul_stage_partial_absmax_m1 rc={rc}");
+            ensure!(rc == 0, "silu_mul_stage_partial_absmax_m1 rc={rc}");
             let rc = unsafe {
                 nv_kernels::cuda::gemv_nvfp4_w4a8_down_residual_quant_prologue_m1(
                     stream.cu_stream() as *mut c_void,
@@ -2120,7 +1969,7 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
                     inter as i32,
                 )
             };
-            anyhow::ensure!(
+            ensure!(
                 rc == 0,
                 "gemv_nvfp4_w4a8_down_residual_quant_prologue_m1 rc={rc}"
             );
@@ -2157,7 +2006,7 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
                     )
                 }
             };
-            anyhow::ensure!(rc == 0, "silu quant producer rc={rc} split={siluq_split}");
+            ensure!(rc == 0, "silu quant producer rc={rc} split={siluq_split}");
             trunk_events::ffn_sub_mark(1);
             if let Some(p) = prof.as_mut() {
                 p.lap("mlp_siluq");
@@ -2166,8 +2015,8 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
                 Some((pack, eps)) => {
                     let (ps, pl) = pack.storage_and_layout();
                     let p_cuda = match &*ps {
-                        candle_core::Storage::Cuda(s) => s,
-                        _ => anyhow::bail!("rstd pack not cuda"),
+                        Storage::Cuda(s) => s,
+                        _ => bail!("rstd pack not cuda"),
                     };
                     let p_slice = p_cuda.as_cuda_slice::<f32>()?;
                     let p_view = p_slice.slice(pl.start_offset()..);
@@ -2205,19 +2054,19 @@ fn w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
                     )
                 },
             };
-            anyhow::ensure!(rc == 0, "gemv_nvfp4_w4a8_down_residual_m1 rc={rc}");
+            ensure!(rc == 0, "gemv_nvfp4_w4a8_down_residual_m1 rc={rc}");
         }
         if let Some(p) = prof.as_mut() {
             p.lap("mlp_down");
         }
     }
     drop(scratch_lease);
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(down_y, dev);
+    let storage = CudaStorage::wrap_cuda_slice(down_y, dev);
     Ok((
         Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, 1usize, hidden),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         ),
         rstd_emitted,
@@ -2248,9 +2097,8 @@ fn fused_post_norm_residual_rowquant_decode_m1(
     {
         return Ok(None);
     }
-    let dev = match mixed.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = mixed.device().clone() else {
+        return Ok(None);
     };
     let w = post_norm.weight_bf16().clone();
     if w.dtype() != DType::BF16 {
@@ -2259,27 +2107,23 @@ fn fused_post_norm_residual_rowquant_decode_m1(
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let x_c = mixed.contiguous()?;
     let res_c = residual.contiguous()?;
-    let mut res_out = unsafe {
-        stream
-            .alloc::<bf16>(hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut x_q8 = unsafe { stream.alloc::<i8>(hidden).map_err(|e| anyhow::anyhow!(e))? };
-    let mut x_scale = unsafe { stream.alloc::<f32>(1).map_err(|e| anyhow::anyhow!(e))? };
+    let mut res_out = unsafe { stream.alloc::<bf16>(hidden)? };
+    let mut x_q8 = unsafe { stream.alloc::<i8>(hidden)? };
+    let mut x_scale = unsafe { stream.alloc::<f32>(1)? };
     {
         let (xs, xl) = x_c.storage_and_layout();
         let (rs, rl) = res_c.storage_and_layout();
         let (ws, wl) = w.storage_and_layout();
         let x_cuda = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
+            Storage::Cuda(s) => s,
             _ => return Ok(None),
         };
         let r_cuda = match &*rs {
-            candle_core::Storage::Cuda(s) => s,
+            Storage::Cuda(s) => s,
             _ => return Ok(None),
         };
         let w_cuda = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
+            Storage::Cuda(s) => s,
             _ => return Ok(None),
         };
         let x_view = x_cuda.as_cuda_slice::<bf16>()?.slice(xl.start_offset()..);
@@ -2309,7 +2153,7 @@ fn fused_post_norm_residual_rowquant_decode_m1(
         }
     }
     {
-        static ONCE: std::sync::Once = std::sync::Once::new();
+        static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             eprintln!(
                 "[qwen3_5_moe] NV_Q38_NORM_QUANT_FOLD decode path active \
@@ -2317,11 +2161,11 @@ fn fused_post_norm_residual_rowquant_decode_m1(
             );
         });
     }
-    let res_storage = candle_core::CudaStorage::wrap_cuda_slice(res_out, dev);
+    let res_storage = CudaStorage::wrap_cuda_slice(res_out, dev);
     let res_out_t = Tensor::from_storage(
-        candle_core::Storage::Cuda(res_storage),
+        Storage::Cuda(res_storage),
         (1usize, 1usize, hidden),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     );
     Ok(Some(W4a8FoldedPostNormQuant {
@@ -2353,18 +2197,17 @@ fn fused_dense_mlp_nvfp4_w4a8_one_rowquant_shared_by_gate_up_silu_quant_producer
     {
         return Ok(None);
     }
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = x.device().clone() else {
+        return Ok(None);
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let x_c = x.contiguous()?;
-    let mut x_q8 = unsafe { stream.alloc::<i8>(hidden).map_err(|e| anyhow::anyhow!(e))? };
-    let mut x_scale = unsafe { stream.alloc::<f32>(1).map_err(|e| anyhow::anyhow!(e))? };
+    let mut x_q8 = unsafe { stream.alloc::<i8>(hidden)? };
+    let mut x_scale = unsafe { stream.alloc::<f32>(1)? };
     {
         let (x_storage, xl) = x_c.storage_and_layout();
         let x_cuda = match &*x_storage {
-            candle_core::Storage::Cuda(s) => s,
+            Storage::Cuda(s) => s,
             _ => return Ok(None),
         };
         let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
@@ -2382,7 +2225,7 @@ fn fused_dense_mlp_nvfp4_w4a8_one_rowquant_shared_by_gate_up_silu_quant_producer
                 hidden as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "rowquant_i8 rc={rc}");
+        ensure!(rc == 0, "rowquant_i8 rc={rc}");
     }
     Ok(Some(w4a8_dual_silu_down_chain_after_x_quant_decode_m1(
         mlp,
@@ -2396,14 +2239,6 @@ fn fused_dense_mlp_nvfp4_w4a8_one_rowquant_shared_by_gate_up_silu_quant_producer
 }
 
 #[cfg(feature = "cuda")]
-pub fn nv_q38_norm_writeout_default_on_champion_stack_signed_off_2026_09_02_set_0_for_the_dtod_residual_copy(
-) -> bool {
-    crate::host_serving_util::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_Q38_NORM_WRITEOUT",
-    )
-}
-
-#[cfg(feature = "cuda")]
 fn rmsnorm_residual_decode_m1_writeout_skipping_the_dtod_residual_copy(
     norm: &RmsNorm,
     x: &Tensor,
@@ -2412,15 +2247,11 @@ fn rmsnorm_residual_decode_m1_writeout_skipping_the_dtod_residual_copy(
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
 
-    if !nv_q38_norm_writeout_default_on_champion_stack_signed_off_2026_09_02_set_0_for_the_dtod_residual_copy() {
-        return Ok(None);
-    }
     if x.dtype() != DType::BF16 || residual.dtype() != DType::BF16 || x.dims() != residual.dims() {
         return Ok(None);
     }
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = x.device().clone() else {
+        return Ok(None);
     };
     let x_c = x.contiguous()?;
     let res_c = residual.contiguous()?;
@@ -2432,30 +2263,22 @@ fn rmsnorm_residual_decode_m1_writeout_skipping_the_dtod_residual_copy(
     let hidden = *dims.last().unwrap();
     let batch: usize = dims[..dims.len() - 1].iter().product();
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut out_dev = unsafe {
-        stream
-            .alloc::<bf16>(batch * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut res_out_dev = unsafe {
-        stream
-            .alloc::<bf16>(batch * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut out_dev = unsafe { stream.alloc::<bf16>(batch * hidden)? };
+    let mut res_out_dev = unsafe { stream.alloc::<bf16>(batch * hidden)? };
     let rc = {
         let (xs, xl) = x_c.storage_and_layout();
         let (rs, rl) = res_c.storage_and_layout();
         let (ws, wl) = w.storage_and_layout();
         let x_cuda = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
+            Storage::Cuda(s) => s,
             _ => return Ok(None),
         };
         let r_cuda = match &*rs {
-            candle_core::Storage::Cuda(s) => s,
+            Storage::Cuda(s) => s,
             _ => return Ok(None),
         };
         let w_cuda = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
+            Storage::Cuda(s) => s,
             _ => return Ok(None),
         };
         let x_view = x_cuda.as_cuda_slice::<bf16>()?.slice(xl.start_offset()..);
@@ -2480,31 +2303,27 @@ fn rmsnorm_residual_decode_m1_writeout_skipping_the_dtod_residual_copy(
             )
         }
     };
-    anyhow::ensure!(rc == 0, "rmsnorm_residual_writeout_bf16 rc={rc}");
+    ensure!(rc == 0, "rmsnorm_residual_writeout_bf16 rc={rc}");
     {
-        static ONCE: std::sync::Once = std::sync::Once::new();
+        static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             eprintln!(
-                "[qwen3_5_moe] NV_Q38_NORM_WRITEOUT decode norm path active \
+                "[qwen3_5_moe] decode norm writeout path active \
                  (residual written out, no dtod copy, hidden={hidden})"
             );
         });
     }
     let shape: candle_core::Shape = dims.into();
-    let out_storage = candle_core::CudaStorage::wrap_cuda_slice(out_dev, dev.clone());
+    let out_storage = CudaStorage::wrap_cuda_slice(out_dev, dev.clone());
     let normed = Tensor::from_storage(
-        candle_core::Storage::Cuda(out_storage),
+        Storage::Cuda(out_storage),
         shape.clone(),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     );
-    let res_storage = candle_core::CudaStorage::wrap_cuda_slice(res_out_dev, dev);
-    let new_residual = Tensor::from_storage(
-        candle_core::Storage::Cuda(res_storage),
-        shape,
-        candle_core::op::BackpropOp::none(),
-        false,
-    );
+    let res_storage = CudaStorage::wrap_cuda_slice(res_out_dev, dev);
+    let new_residual =
+        Tensor::from_storage(Storage::Cuda(res_storage), shape, BackpropOp::none(), false);
     Ok(Some((normed, new_residual)))
 }
 
@@ -2541,21 +2360,15 @@ const SMALL_M_W4A8_VERIFY_MAX_TOKENS: usize = 8;
 const MK_DP4A_VERIFY_MLP_WINS_ONLY_AT_M3_INGRAPH_VERIFY_25_54_VS_25_95_MS_LOSES_M4_27_44_VS_27_0_AND_M6_34_26_VS_29_0: usize = 3;
 
 #[cfg(feature = "cuda")]
-pub fn nv_q38_w4a8_mk_env_opt_in_nv_q38_w4a8_mk_1_small_m_dp4a_verify_route() -> bool {
-    crate::host_serving_util::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_W4A8_MK")
-}
-
-#[cfg(feature = "cuda")]
 pub fn verify_mlp_mk_dp4a_selected_for_m_force_1_kill_0_else_auto_under_verify_tc(
     m: usize,
 ) -> bool {
-    match std::env::var("NV_Q38_W4A8_MK").ok().as_deref() {
+    match env::var("NV_Q38_W4A8_MK").ok().as_deref() {
         Some("1") => true,
         Some("mma") => false,
         Some("0") => false,
         _ => {
-            nv_layers::linear_attn::verify_tc_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_tc_0_for_the_pre_champion_verify()
-                && m <= MK_DP4A_VERIFY_MLP_WINS_ONLY_AT_M3_INGRAPH_VERIFY_25_54_VS_25_95_MS_LOSES_M4_27_44_VS_27_0_AND_M6_34_26_VS_29_0
+            m <= MK_DP4A_VERIFY_MLP_WINS_ONLY_AT_M3_INGRAPH_VERIFY_25_54_VS_25_95_MS_LOSES_M4_27_44_VS_27_0_AND_M6_34_26_VS_29_0
         }
     }
 }
@@ -2570,7 +2383,7 @@ fn fused_dense_mlp_nvfp4_w4a16_mma_for_spec_verify(
     use half::bf16;
     use std::ffi::c_void;
 
-    if std::env::var("NV_Q38_W4A8_MK").ok().as_deref() != Some("mma") {
+    if env::var("NV_Q38_W4A8_MK").ok().as_deref() != Some("mma") {
         return Ok(None);
     }
     if !(2..=8).contains(&seq) {
@@ -2584,9 +2397,8 @@ fn fused_dense_mlp_nvfp4_w4a16_mma_for_spec_verify(
     if x.dims() != [1, seq, hidden] || x.dtype() != DType::BF16 {
         return Ok(None);
     }
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = x.device().clone() else {
+        return Ok(None);
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let x_c = x.contiguous()?;
@@ -2604,30 +2416,14 @@ fn fused_dense_mlp_nvfp4_w4a16_mma_for_spec_verify(
     let (dw, ds, d_a, d_ig) = dp;
     let (ga, ua, da) = (g_a * g_ig, u_a * u_ig, d_a * d_ig);
 
-    let mut gate_y: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut up_y: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut act: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut down_y: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut gate_y: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * inter)? };
+    let mut up_y: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * inter)? };
+    let mut act: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * inter)? };
+    let mut down_y: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * hidden)? };
     {
         let (xs_store, xl) = x_c.storage_and_layout();
         let x_cuda = match &*xs_store {
-            candle_core::Storage::Cuda(st) => st,
+            Storage::Cuda(st) => st,
             _ => return Ok(None),
         };
         let x_view = x_cuda.as_cuda_slice::<bf16>()?.slice(xl.start_offset()..);
@@ -2656,7 +2452,7 @@ fn fused_dense_mlp_nvfp4_w4a16_mma_for_spec_verify(
                 hidden as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "w4a16 mma gate/up rc={rc}");
+        ensure!(rc == 0, "w4a16 mma gate/up rc={rc}");
         let (ap, _g7) = act.device_ptr_mut(&stream);
         let rc = unsafe {
             nv_kernels::cuda::silu_mul_bf16_candle(
@@ -2667,7 +2463,7 @@ fn fused_dense_mlp_nvfp4_w4a16_mma_for_spec_verify(
                 m * inter,
             )
         };
-        anyhow::ensure!(rc == 0, "w4a16 mma silu_mul rc={rc}");
+        ensure!(rc == 0, "w4a16 mma silu_mul rc={rc}");
         let (dwp, _g8) = dw.device_ptr(&stream);
         let (dsp, _g9) = ds.device_ptr(&stream);
         let (dyp, _ga2) = down_y.device_ptr_mut(&stream);
@@ -2689,25 +2485,15 @@ fn fused_dense_mlp_nvfp4_w4a16_mma_for_spec_verify(
                 inter as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "w4a16 mma down rc={rc}");
+        ensure!(rc == 0, "w4a16 mma down rc={rc}");
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(down_y, dev);
+    let storage = CudaStorage::wrap_cuda_slice(down_y, dev);
     Ok(Some(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         (1usize, m, hidden),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     )))
-}
-
-pub fn nv_q38_w4a16_marlin_default_on_user_signoff_20260912_unset_is_on_and_0_restores_the_dp4a_verify_mlp(
-) -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q38_W4A16_MARLIN")
-}
-
-pub fn nv_q38_w4a16_marlin_env_opt_in_nv_q38_w4a16_marlin_1_marlin_nvfp4_dense_mlp_verify_route(
-) -> bool {
-    nv_q38_w4a16_marlin_default_on_user_signoff_20260912_unset_is_on_and_0_restores_the_dp4a_verify_mlp()
 }
 
 #[cfg(feature = "cuda")]
@@ -2723,9 +2509,6 @@ fn fused_dense_mlp_nvfp4_w4a16_marlin_for_spec_verify(
     use half::bf16;
     use std::ffi::c_void;
 
-    if !nv_q38_w4a16_marlin_env_opt_in_nv_q38_w4a16_marlin_1_marlin_nvfp4_dense_mlp_verify_route() {
-        return Ok(None);
-    }
     if !(1..=MARLIN_VERIFY_ROWS_MAX_16_IS_THE_INSTANTIATED_THREAD_M_BLOCKS_1).contains(&seq) {
         return Ok(None);
     }
@@ -2741,9 +2524,8 @@ fn fused_dense_mlp_nvfp4_w4a16_marlin_for_spec_verify(
     {
         return Ok(None);
     }
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = x.device().clone() else {
+        return Ok(None);
     };
     let (Some(gate), Some(up), Some(down)) = (
         mlp.gate_proj().marlin_nvfp4_w4a16_twin(),
@@ -2757,42 +2539,20 @@ fn fused_dense_mlp_nvfp4_w4a16_marlin_for_spec_verify(
     let m = seq;
     let mut elems = 0i32;
     let rc = unsafe { nv_kernels::cuda::marlin_workspace_elems(&mut elems as *mut i32) };
-    anyhow::ensure!(rc == 0 && elems > 0, "marlin workspace elems rc={rc}");
-    let workspace: cudarc::driver::CudaSlice<i32> = stream
-        .alloc_zeros::<i32>(elems as usize)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    ensure!(rc == 0 && elems > 0, "marlin workspace elems rc={rc}");
+    let workspace: CudaSlice<i32> = stream.alloc_zeros::<i32>(elems as usize)?;
     let mut c_tmp_floats = 0i64;
     let rc = unsafe { nv_kernels::cuda::marlin_nvfp4_c_tmp_floats(&mut c_tmp_floats as *mut i64) };
-    anyhow::ensure!(rc == 0 && c_tmp_floats > 0, "marlin c_tmp floats rc={rc}");
-    let mut gate_y: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut up_y: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut act: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut down_y: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(m * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut c_tmp: cudarc::driver::CudaSlice<f32> = unsafe {
-        stream
-            .alloc::<f32>(c_tmp_floats as usize)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    ensure!(rc == 0 && c_tmp_floats > 0, "marlin c_tmp floats rc={rc}");
+    let mut gate_y: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * inter)? };
+    let mut up_y: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * inter)? };
+    let mut act: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * inter)? };
+    let mut down_y: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * hidden)? };
+    let mut c_tmp: CudaSlice<f32> = unsafe { stream.alloc::<f32>(c_tmp_floats as usize)? };
     {
         let (xs_store, xl) = x_c.storage_and_layout();
         let x_cuda = match &*xs_store {
-            candle_core::Storage::Cuda(st) => st,
+            Storage::Cuda(st) => st,
             _ => return Ok(None),
         };
         let x_view = x_cuda.as_cuda_slice::<bf16>()?.slice(xl.start_offset()..);
@@ -2809,7 +2569,7 @@ fn fused_dense_mlp_nvfp4_w4a16_marlin_for_spec_verify(
             let (pb, _g1) = w.b_q_marlin.device_ptr(&stream);
             let (ps, _g2) = w.scales_e5m3.device_ptr(&stream);
             let (pg, _g3) = w.global_scale_dev.device_ptr(&stream);
-            anyhow::ensure!(
+            ensure!(
                 w.n == n && w.k == k,
                 "marlin twin shape {}x{} vs {n}x{k} for {what}",
                 w.n,
@@ -2831,7 +2591,7 @@ fn fused_dense_mlp_nvfp4_w4a16_marlin_for_spec_verify(
                     k as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "marlin nvfp4 {what} rc={rc}");
+            ensure!(rc == 0, "marlin nvfp4 {what} rc={rc}");
             Ok(())
         };
         let (gyp, _g5) = gate_y.device_ptr_mut(&stream);
@@ -2849,19 +2609,19 @@ fn fused_dense_mlp_nvfp4_w4a16_marlin_for_spec_verify(
                 m * inter,
             )
         };
-        anyhow::ensure!(rc == 0, "marlin route silu_mul rc={rc}");
+        ensure!(rc == 0, "marlin route silu_mul rc={rc}");
         let (dyp, _g9) = down_y.device_ptr_mut(&stream);
         gemm(&down, ap, dyp, tip, hidden, inter, "down")?;
     }
-    static MARLIN_ROUTE_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+    static MARLIN_ROUTE_FIRED_ONCE: Once = Once::new();
     MARLIN_ROUTE_FIRED_ONCE.call_once(|| {
-        eprintln!("[qwen3_5_moe] NV_Q38_W4A16_MARLIN dense-mlp verify route active rows={seq} hidden={hidden} inter={inter} (bf16 activations, Marlin nvfp4 W4A16, fp32 reduce)");
+        eprintln!("[qwen3_5_moe] Marlin W4A16 dense-mlp verify route active rows={seq} hidden={hidden} inter={inter} (bf16 activations, Marlin nvfp4 W4A16, fp32 reduce)");
     });
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(down_y, dev);
+    let storage = CudaStorage::wrap_cuda_slice(down_y, dev);
     Ok(Some(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         (1usize, m, hidden),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     )))
 }
@@ -2892,9 +2652,8 @@ fn fused_dense_mlp_nvfp4_w4a8_small_m_dp4a_for_spec_verify(
     if x.dims() != [1, seq, hidden] || x.dtype() != DType::BF16 {
         return Ok(None);
     }
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = x.device().clone() else {
+        return Ok(None);
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let x_c = x.contiguous()?;
@@ -2919,47 +2678,19 @@ fn fused_dense_mlp_nvfp4_w4a8_small_m_dp4a_for_spec_verify(
         return Ok(None);
     }
     let mut prof = nv_layers::linear_attn::gdn_step_prof::SyncLaps::begin_if_armed(&dev);
-    let mut x_q8 = unsafe {
-        stream
-            .alloc::<i8>(m * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut x_scales = unsafe { stream.alloc::<f32>(m).map_err(|e| anyhow::anyhow!(e))? };
-    let mut gate_y = unsafe {
-        stream
-            .alloc::<bf16>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut up_y = unsafe {
-        stream
-            .alloc::<bf16>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut act_staged = unsafe {
-        stream
-            .alloc::<bf16>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut partials = unsafe {
-        stream
-            .alloc::<f32>(plen as usize)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut act_q8 = unsafe {
-        stream
-            .alloc::<i8>(m * inter)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut act_scales = unsafe { stream.alloc::<f32>(m).map_err(|e| anyhow::anyhow!(e))? };
-    let mut down_y = unsafe {
-        stream
-            .alloc::<bf16>(m * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut x_q8 = unsafe { stream.alloc::<i8>(m * hidden)? };
+    let mut x_scales = unsafe { stream.alloc::<f32>(m)? };
+    let mut gate_y = unsafe { stream.alloc::<bf16>(m * inter)? };
+    let mut up_y = unsafe { stream.alloc::<bf16>(m * inter)? };
+    let mut act_staged = unsafe { stream.alloc::<bf16>(m * inter)? };
+    let mut partials = unsafe { stream.alloc::<f32>(plen as usize)? };
+    let mut act_q8 = unsafe { stream.alloc::<i8>(m * inter)? };
+    let mut act_scales = unsafe { stream.alloc::<f32>(m)? };
+    let mut down_y = unsafe { stream.alloc::<bf16>(m * hidden)? };
     {
         let (x_storage, xl) = x_c.storage_and_layout();
         let x_cuda = match &*x_storage {
-            candle_core::Storage::Cuda(s) => s,
+            Storage::Cuda(s) => s,
             _ => return Ok(None),
         };
         let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
@@ -2977,7 +2708,7 @@ fn fused_dense_mlp_nvfp4_w4a8_small_m_dp4a_for_spec_verify(
                 hidden as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "rowquant_i8 m={m} rc={rc}");
+        ensure!(rc == 0, "rowquant_i8 m={m} rc={rc}");
         if let Some(p) = prof.as_mut() {
             p.lap("mk_rowquant");
         }
@@ -3002,7 +2733,7 @@ fn fused_dense_mlp_nvfp4_w4a8_small_m_dp4a_for_spec_verify(
                 hidden as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "gemv_nvfp4_w4a8_dual_mk m={m} rc={rc}");
+        ensure!(rc == 0, "gemv_nvfp4_w4a8_dual_mk m={m} rc={rc}");
         trunk_events::ffn_sub_mark(0);
         if let Some(p) = prof.as_mut() {
             p.lap("mk_mlp_dual");
@@ -3024,7 +2755,7 @@ fn fused_dense_mlp_nvfp4_w4a8_small_m_dp4a_for_spec_verify(
                 inter as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "silu_mul_rowquant_i8_mk m={m} rc={rc}");
+        ensure!(rc == 0, "silu_mul_rowquant_i8_mk m={m} rc={rc}");
         trunk_events::ffn_sub_mark(1);
         if let Some(p) = prof.as_mut() {
             p.lap("mk_mlp_siluq");
@@ -3045,13 +2776,13 @@ fn fused_dense_mlp_nvfp4_w4a8_small_m_dp4a_for_spec_verify(
                 inter as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "gemv_nvfp4_w4a8_down_residual_mk m={m} rc={rc}");
+        ensure!(rc == 0, "gemv_nvfp4_w4a8_down_residual_mk m={m} rc={rc}");
         if let Some(p) = prof.as_mut() {
             p.lap("mk_mlp_down");
         }
     }
     {
-        static ONCE: std::sync::Once = std::sync::Once::new();
+        static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             eprintln!(
                 "[qwen3_5_moe] NV_Q38_W4A8_MK small-m dp4a verify route active \
@@ -3059,11 +2790,11 @@ fn fused_dense_mlp_nvfp4_w4a8_small_m_dp4a_for_spec_verify(
             );
         });
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(down_y, dev);
+    let storage = CudaStorage::wrap_cuda_slice(down_y, dev);
     Ok(Some(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         (1usize, m, hidden),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     )))
 }
@@ -3088,9 +2819,8 @@ impl Qwen3MoeKvCache {
         device: &Device,
         _dtype: DType,
     ) -> Result<Self> {
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("Qwen3MoeKvCache (FP8) requires CUDA device"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("Qwen3MoeKvCache (FP8) requires CUDA device")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let mut full_slot_for_layer = Vec::with_capacity(config.num_hidden_layers);
@@ -3121,18 +2851,10 @@ impl Qwen3MoeKvCache {
         let scale_count = max_seq_len * n_kv;
         let mut layers = Vec::with_capacity(n_full);
         for _ in 0..n_full {
-            let k_fp8 = stream
-                .alloc_zeros::<u8>(elem_count)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let v_fp8 = stream
-                .alloc_zeros::<u8>(elem_count)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let k_scales = stream
-                .alloc_zeros::<f32>(scale_count)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let v_scales = stream
-                .alloc_zeros::<f32>(scale_count)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let k_fp8 = stream.alloc_zeros::<u8>(elem_count)?;
+            let v_fp8 = stream.alloc_zeros::<u8>(elem_count)?;
+            let k_scales = stream.alloc_zeros::<f32>(scale_count)?;
+            let v_scales = stream.alloc_zeros::<f32>(scale_count)?;
             layers.push(Qwen3MoeKvSlotFp8 {
                 k_fp8,
                 v_fp8,
@@ -3140,64 +2862,26 @@ impl Qwen3MoeKvCache {
                 v_scales,
             });
         }
-        let write_pos_dev = stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let n_total_dev = stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let fp8_smem_cap_positions =
-            crate::laguna_fp8::LagunaKvCacheFp8::max_seq_len_for_fp8_decode(hd);
-        let scratch_heads = if max_seq_len > fp8_smem_cap_positions {
+        let write_pos_dev = stream.alloc_zeros::<i32>(1)?;
+        let n_total_dev = stream.alloc_zeros::<i32>(1)?;
+        let splitk_elems = nv_kernels::cuda::flash_splitk_scratch_elems(
+            config.num_attention_heads as i32,
+            hd as i32,
+        );
+        ensure!(
+            splitk_elems > 0,
+            "flash_splitk_scratch_elems returned {splitk_elems} for nh {} hd {hd}",
             config.num_attention_heads
-        } else {
-            0
-        };
-        let scores_scratch_because_smem_decode_caps_at_12k_positions_at_48kb = if scratch_heads > 0
-        {
-            Some(
-                stream
-                    .alloc_zeros::<f32>(scratch_heads * max_seq_len)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-            )
-        } else {
-            None
-        };
-        let splitk_scratch_and_fan_in =
-            if nv_q36_graphed_decode_fix_default_on_signed_off_2026_09_03_gemma4_proven_splitk_flash_reads_21_219_and_22_173_ms_tok_at_256_and_8192_vs_serial_smem_26_408_and_158_905_set_nv_q36_graphed_decode_fix_0_for_the_serial_smem_route() {
-                let elems = nv_kernels::cuda::flash_splitk_scratch_elems(
-                    config.num_attention_heads as i32,
-                    hd as i32,
-                );
-                anyhow::ensure!(
-                    elems > 0,
-                    "flash_splitk_scratch_elems returned {elems} for nh {} hd {hd}",
-                    config.num_attention_heads
-                );
-                let elems = if nv_q38_decode_kvshare_default_gate_signed_off_2026_09_02_group_fold_reads_kv_once_per_kv_head_not_once_per_q_head()
-                    .is_some()
-                {
-                    elems.max(
-                        config.num_attention_heads
-                            * M1_DECODE_KVSHARE_SCRATCH_SPLITS_128_THE_KERNELS_KKVSHAREMAXSPLITS
-                            * (hd + 2),
-                    )
-                } else {
-                    elems
-                };
-                let scratch = stream
-                    .alloc_zeros::<f32>(elems)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                let fan_in = stream
-                    .alloc_zeros::<u32>(config.num_attention_heads)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                Some((scratch, fan_in))
-            } else {
-                None
-            };
-        let mk_verify_scratch_and_fan_in = if crate::host_serving_util::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            "NV_Q38_MK_VERIFY",
-        ) && hd <= MK_VERIFY_MAX_HEAD_DIM_512_THE_SPLITK_MK_KERNEL_TEMPLATE_CAP
+        );
+        let splitk_scratch_and_fan_in = (
+            stream.alloc_zeros::<f32>(splitk_elems.max(
+                config.num_attention_heads
+                    * M1_DECODE_KVSHARE_SCRATCH_SPLITS_128_THE_KERNELS_KKVSHAREMAXSPLITS
+                    * (hd + 2),
+            ))?,
+            stream.alloc_zeros::<u32>(config.num_attention_heads)?,
+        );
+        let mk_verify_scratch_and_fan_in = if hd <= MK_VERIFY_MAX_HEAD_DIM_512_THE_SPLITK_MK_KERNEL_TEMPLATE_CAP
         {
             let elems = config.num_attention_heads
                 * MK_VERIFY_CONTIGUOUS_ROWS_8_THE_ONE_LAUNCH_SMEM_CAP_AND_SCRATCH_POOL_ROW_BUDGET_SPARSE_MK_RUNGS_CONTINUE_PAST_IT
@@ -3205,11 +2889,9 @@ impl Qwen3MoeKvCache {
                 * (hd + 2);
             Some((
                 stream
-                    .alloc_zeros::<f32>(elems)
-                    .map_err(|e| anyhow::anyhow!(e))?,
+                    .alloc_zeros::<f32>(elems)?,
                 stream
-                    .alloc_zeros::<u32>(config.num_attention_heads)
-                    .map_err(|e| anyhow::anyhow!(e))?,
+                    .alloc_zeros::<u32>(config.num_attention_heads)?,
             ))
         } else {
             None
@@ -3223,7 +2905,7 @@ impl Qwen3MoeKvCache {
             fused_lin_verify_ckpts_preallocated_so_a_captured_verify_graph_owns_no_ckpt_memory: fused_lin_verify_ckpts,
             fused_lin_verify_rows_pending_rollback: 0,
             capture_lin_ckpts: false,
-            fused_lin_attn: nv_layers::linear_attn::fused_decode_env() == Some(true),
+            fused_lin_attn: false,
             current_len: 0,
             max_seq_len,
             n_kv_heads: n_kv,
@@ -3233,10 +2915,8 @@ impl Qwen3MoeKvCache {
             n_total_dev,
             host_write_pos: Box::new([0i32; 1]),
             host_n_total: Box::new([0i32; 1]),
-            scores_scratch_because_smem_decode_caps_at_12k_positions_at_48kb,
-            scratch_heads,
-            splitk_scratch_and_fan_in_gated_by_nv_q36_graphed_decode_fix_because_the_smem_kernel_serializes_a_block_reduce_per_kv_position_costing_82ms_at_8k: splitk_scratch_and_fan_in,
-            mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view_kill_switch_nv_q38_mk_verify_0: mk_verify_scratch_and_fan_in,
+            splitk_scratch_and_fan_in,
+            mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view: mk_verify_scratch_and_fan_in,
             verify_tree_parents_dev_written_once_because_the_two_branch_shape_is_fixed: None,
             verify_tree_rows_active: None,
         })
@@ -3281,15 +2961,14 @@ impl Qwen3MoeKvCache {
     }
 
     pub fn rollback_lin_to(&mut self, consumed: usize) -> Result<()> {
-        anyhow::ensure!(consumed >= 1, "rollback_lin_to: consumed must be >= 1");
+        ensure!(consumed >= 1, "rollback_lin_to: consumed must be >= 1");
         if self.fused_lin_verify_rows_pending_rollback > 0 {
-            anyhow::ensure!(
+            ensure!(
                 consumed <= self.fused_lin_verify_rows_pending_rollback,
                 "rollback_lin_to: consumed {} > fused verify rows {}",
                 consumed,
                 self.fused_lin_verify_rows_pending_rollback
             );
-            let batch = nv_layers::linear_attn::gdn_rollback_batch_default_on_unless_0();
             let mut pairs: Vec<(
                 &nv_layers::linear_attn::LinAttnState,
                 &nv_layers::linear_attn::LinAttnState,
@@ -3305,21 +2984,15 @@ impl Qwen3MoeKvCache {
                 let live = self.lin_attn_states[slot].as_ref().ok_or_else(|| {
                     anyhow::anyhow!("rollback_lin_to: fused verify slot {slot} has no live state")
                 })?;
-                anyhow::ensure!(
+                ensure!(
                     live.is_fused(),
                     "rollback_lin_to: fused verify ckpts present but live state of slot {slot} \
                      is not fused; the captured graph would be updating buffers this state no \
                      longer aliases"
                 );
-                if batch {
-                    pairs.push((live, &ckpts[consumed - 1]));
-                } else {
-                    live.copy_data_from(&ckpts[consumed - 1])?;
-                }
+                pairs.push((live, &ckpts[consumed - 1]));
             }
-            if batch {
-                nv_layers::linear_attn::batched_rollback_copy(&pairs)?;
-            }
+            nv_layers::linear_attn::batched_rollback_copy(&pairs)?;
             self.fused_lin_verify_rows_pending_rollback = 0;
             return Ok(());
         }
@@ -3327,7 +3000,7 @@ impl Qwen3MoeKvCache {
             if self.lin_ckpts[slot].is_empty() {
                 continue;
             }
-            anyhow::ensure!(
+            ensure!(
                 consumed <= self.lin_ckpts[slot].len(),
                 "rollback_lin_to: consumed {} > captured {} for slot {}",
                 consumed,
@@ -3363,10 +3036,7 @@ impl Qwen3MoeKvCache {
                 .map(|s| s.is_fused())
                 .unwrap_or(false);
         let tree_rows_this_pass = self.verify_tree_rows_active.filter(|&r| r == t_len);
-        if fused_verify_ready
-            && (nv_layers::linear_attn::mrow_verify_env_read_per_call_so_one_process_can_ab_both_verify_paths()
-                || nv_layers::linear_attn::verify_tc_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_tc_0_for_the_pre_champion_verify())
-        {
+        if fused_verify_ready {
             let st = self.lin_attn_states[slot].as_ref().unwrap();
             let ckpts = &self.fused_lin_verify_ckpts_preallocated_so_a_captured_verify_graph_owns_no_ckpt_memory[slot];
             let tree_parents = match tree_rows_this_pass {
@@ -3393,7 +3063,7 @@ impl Qwen3MoeKvCache {
                 return Ok(out);
             }
         }
-        anyhow::ensure!(
+        ensure!(
             tree_rows_this_pass.is_none(),
             "lin_attn_step: a tree verify reached the row-sequential GDN fallback (slot {slot}); \
              every non-mrow arm advances state row-by-row and a sibling row would read the other \
@@ -3430,7 +3100,7 @@ impl Qwen3MoeKvCache {
         }
         if self.fused_lin_attn
             && t_len == 1
-            && matches!(self.device, Device::Cuda(_))
+            && self.device.is_cuda()
             && la.fused_decode_supported()
         {
             let already_fused = self.lin_attn_states[slot]
@@ -3480,7 +3150,7 @@ impl Qwen3MoeKvCache {
         rstd_pack: &Tensor,
     ) -> Result<Option<Tensor>> {
         if !(self.fused_lin_attn
-            && matches!(self.device, Device::Cuda(_))
+            && self.device.is_cuda()
             && la.fused_decode_supported())
         {
             return Ok(None);
@@ -3535,7 +3205,7 @@ impl Qwen3MoeKvCache {
             .ok_or_else(|| {
                 anyhow::anyhow!("lin_attn_step pinned: slot {slot} has no installed pinned state")
             })?;
-        anyhow::ensure!(
+        ensure!(
             !pinned.is_fused(),
             "lin_attn_step pinned: slot {slot} holds a fused state; segment graphs bake the \
              non-fused chunk-prefill layout"
@@ -3552,14 +3222,7 @@ impl Qwen3MoeKvCache {
     }
 
     pub fn set_fused_lin_attn(&mut self, on: bool) {
-        self.fused_lin_attn = match nv_layers::linear_attn::fused_decode_env() {
-            Some(v) => v,
-            None => on,
-        };
-    }
-
-    pub fn fused_lin_attn(&self) -> bool {
-        self.fused_lin_attn
+        self.fused_lin_attn = on;
     }
 
     pub fn has_lin_attn_layers(&self) -> bool {
@@ -3578,7 +3241,7 @@ impl Qwen3MoeKvCache {
     }
 
     pub fn restore_lin_states(&mut self, snaps: &[Option<LinAttnState>]) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             snaps.len() == self.lin_attn_states.len(),
             "lin state snapshot length mismatch"
         );
@@ -3604,13 +3267,13 @@ impl Qwen3MoeKvCache {
         la: &LinearAttention,
         rows: usize,
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             slot < self
                 .fused_lin_verify_ckpts_preallocated_so_a_captured_verify_graph_owns_no_ckpt_memory
                 .len(),
             "ensure_fused_verify_ckpt_slot: slot {slot} out of range"
         );
-        anyhow::ensure!(
+        ensure!(
             la.fused_decode_supported(),
             "ensure_fused_verify_ckpt_slot: fused decode unsupported for slot {slot}; a captured \
              verify would fall into the host-checkpoint path mid-capture"
@@ -3636,20 +3299,20 @@ impl Qwen3MoeKvCache {
             && mk_verify_rows_case_instantiated(rows)
             && self.head_dim <= MK_VERIFY_MAX_HEAD_DIM_512_THE_SPLITK_MK_KERNEL_TEMPLATE_CAP
             && self
-                .mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view_kill_switch_nv_q38_mk_verify_0
+                .mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view
                 .is_some()
     }
 
     pub fn ensure_verify_tree_two_branch_m6(&mut self) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.head_dim == 256,
             "verify tree: the kvshare hole-mask attention route serves head_dim 256, this cache \
              holds {}",
             self.head_dim
         );
-        anyhow::ensure!(
+        ensure!(
             self.mk_verify_route_available(VERIFY_TREE_TWO_BRANCH_M6_ROWS),
-            "verify tree: the mk verify scratch is unavailable (NV_Q38_MK_VERIFY=0 or geometry); \
+            "verify tree: the mk verify scratch is unavailable for this geometry; \
              tree rows have no lossless attention route without it"
         );
         if self
@@ -3658,9 +3321,8 @@ impl Qwen3MoeKvCache {
         {
             return Ok(());
         }
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("verify tree: CUDA only"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("verify tree: CUDA only")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let mut parents = stream
@@ -3682,11 +3344,11 @@ impl Qwen3MoeKvCache {
 
     pub fn set_verify_tree_rows_active(&mut self, rows: Option<usize>) -> Result<()> {
         if let Some(r) = rows {
-            anyhow::ensure!(
+            ensure!(
                 r == VERIFY_TREE_TWO_BRANCH_M6_ROWS,
                 "verify tree: only the two-branch m=6 shape exists, got rows={r}"
             );
-            anyhow::ensure!(
+            ensure!(
                 self.verify_tree_parents_dev_written_once_because_the_two_branch_shape_is_fixed
                     .is_some(),
                 "verify tree: call ensure_verify_tree_two_branch_m6 before activating tree rows"
@@ -3706,22 +3368,21 @@ impl Qwen3MoeKvCache {
         accepted_rows: usize,
     ) -> Result<()> {
         use cudarc::driver::DevicePtr;
-        anyhow::ensure!(
+        ensure!(
             (1..=VERIFY_TREE_TWO_BRANCH_M6_ROWS - VERIFY_TREE_TWO_BRANCH_M6_BRANCH_B_FIRST_ROW)
                 .contains(&accepted_rows),
             "verify tree compaction: accepted_rows {accepted_rows} outside the branch-B span"
         );
         let src_slot = pos + VERIFY_TREE_TWO_BRANCH_M6_BRANCH_B_FIRST_ROW;
         let dst_slot = pos + 1;
-        anyhow::ensure!(
+        ensure!(
             src_slot + accepted_rows <= self.max_seq_len,
             "verify tree compaction: rows [{src_slot}, {}) beyond max_seq {}",
             src_slot + accepted_rows,
             self.max_seq_len
         );
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("verify tree compaction: CUDA only"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("verify tree compaction: CUDA only")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let row_kv_bytes = self.n_kv_heads * self.head_dim;
@@ -3766,7 +3427,7 @@ impl Qwen3MoeKvCache {
     }
 
     pub(crate) fn ensure_fused_slot(&mut self, slot: usize, la: &LinearAttention) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             slot < self.lin_attn_states.len(),
             "ensure_fused_slot: slot {slot} out of range"
         );
@@ -3777,7 +3438,7 @@ impl Qwen3MoeKvCache {
         {
             return Ok(());
         }
-        anyhow::ensure!(
+        ensure!(
             la.fused_decode_supported(),
             "ensure_fused_slot: fused decode unsupported for slot {slot}"
         );
@@ -3800,16 +3461,15 @@ impl Qwen3MoeKvCache {
 
     fn prepare_for_step(&mut self, write_start: usize, new_total: usize) -> Result<()> {
         if new_total > self.max_seq_len {
-            anyhow::bail!(
+            bail!(
                 "Qwen3MoeKvCache: new_total {} > max_seq_len {}",
                 new_total,
                 self.max_seq_len
             );
         }
         self.set_pending_pos_host_only(write_start, new_total);
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         stream
@@ -3832,12 +3492,12 @@ impl Qwen3MoeKvCache {
         use half::bf16;
 
         if slot >= self.layers.len() {
-            anyhow::bail!("Qwen3MoeKvCache.write_at: slot {} out of range", slot);
+            bail!("Qwen3MoeKvCache.write_at: slot {} out of range", slot);
         }
         let dims = k_new.dims();
         if dims.len() != 4 || dims[0] != 1 || dims[2] != self.n_kv_heads || dims[3] != self.head_dim
         {
-            anyhow::bail!(
+            bail!(
                 "Qwen3MoeKvCache.write_at: expected [1, t, {}, {}], got {:?}",
                 self.n_kv_heads,
                 self.head_dim,
@@ -3845,16 +3505,15 @@ impl Qwen3MoeKvCache {
             );
         }
         if v_new.dims() != dims {
-            anyhow::bail!(
+            bail!(
                 "Qwen3MoeKvCache.write_at: k/v shape mismatch k={:?} v={:?}",
                 dims,
                 v_new.dims()
             );
         }
         let t = dims[1];
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
 
@@ -3864,12 +3523,12 @@ impl Qwen3MoeKvCache {
         let (k_storage, _kl) = k_new.storage_and_layout();
         let (v_storage, _vl) = v_new.storage_and_layout();
         let k_cuda = match &*k_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("k_new must be on CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("k_new must be on CUDA"),
         };
         let v_cuda = match &*v_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("v_new must be on CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("v_new must be on CUDA"),
         };
         let k_slice = k_cuda.as_cuda_slice::<bf16>()?;
         let v_slice = v_cuda.as_cuda_slice::<bf16>()?;
@@ -3896,7 +3555,7 @@ impl Qwen3MoeKvCache {
             )
         };
         if rc_k != 0 {
-            anyhow::bail!("quantize_kv_fp8(k) rc={rc_k}");
+            bail!("quantize_kv_fp8(k) rc={rc_k}");
         }
         let rc_v = unsafe {
             nv_kernels::cuda::quantize_kv_fp8(
@@ -3912,12 +3571,11 @@ impl Qwen3MoeKvCache {
             )
         };
         if rc_v != 0 {
-            anyhow::bail!("quantize_kv_fp8(v) rc={rc_v}");
+            bail!("quantize_kv_fp8(v) rc={rc_v}");
         }
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn fused_qkv_norm_rope_store_decode_rope_pos_reads_write_pos_dev_because_decode_positions_equal_write_start(
         &mut self,
         slot: usize,
@@ -3935,14 +3593,14 @@ impl Qwen3MoeKvCache {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         use half::bf16;
 
-        anyhow::ensure!(
+        ensure!(
             slot < self.layers.len(),
             "fused_qkv_norm_rope_store_decode: slot {slot} out of range"
         );
         let n_kv = self.n_kv_heads;
         let hd = self.head_dim;
         let q_stride = if gated { 2 * hd } else { hd };
-        anyhow::ensure!(
+        ensure!(
             q_raw.elem_count() == n_q * q_stride
                 && k_raw.elem_count() == n_kv * hd
                 && v_raw.elem_count() == n_kv * hd,
@@ -3952,7 +3610,7 @@ impl Qwen3MoeKvCache {
             k_raw.elem_count(),
             v_raw.elem_count()
         );
-        anyhow::ensure!(
+        ensure!(
             q_raw.dtype() == DType::BF16
                 && k_raw.dtype() == DType::BF16
                 && v_raw.dtype() == DType::BF16
@@ -3963,23 +3621,14 @@ impl Qwen3MoeKvCache {
             "fused_qkv_norm_rope_store_decode: dtype contract broken; the caller gate must \
              refuse before projecting"
         );
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
 
-        let mut q_out = unsafe {
-            stream
-                .alloc::<bf16>(n_q * hd)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut q_out = unsafe { stream.alloc::<bf16>(n_q * hd)? };
         let mut q_sig = if gated {
-            Some(unsafe {
-                stream
-                    .alloc::<bf16>(n_q * hd)
-                    .map_err(|e| anyhow::anyhow!(e))?
-            })
+            Some(unsafe { stream.alloc::<bf16>(n_q * hd)? })
         } else {
             None
         };
@@ -3996,8 +3645,8 @@ impl Qwen3MoeKvCache {
             let get = |t: &Tensor| -> Result<u64> {
                 let (storage, layout) = t.storage_and_layout();
                 let cuda = match &*storage {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("fused_qkv_norm_rope_store_decode: tensor not on CUDA"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("fused_qkv_norm_rope_store_decode: tensor not on CUDA"),
                 };
                 let ptr = match t.dtype() {
                     DType::BF16 => {
@@ -4012,9 +3661,7 @@ impl Qwen3MoeKvCache {
                         let (p, _g) = view.device_ptr(&stream);
                         p
                     }
-                    other => anyhow::bail!(
-                        "fused_qkv_norm_rope_store_decode: unsupported dtype {other:?}"
-                    ),
+                    other => bail!("fused_qkv_norm_rope_store_decode: unsupported dtype {other:?}"),
                 };
                 Ok(ptr)
             };
@@ -4065,33 +3712,32 @@ impl Qwen3MoeKvCache {
                 )
             }
         };
-        anyhow::ensure!(
+        ensure!(
             rc == 0,
             "qkv_norm_rope_kvstore_fp8_decode rc={rc}; the caller gate checked geometry so a \
              refusal here is a contract bug, not a fallback"
         );
         let q_tensor = {
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(q_out, dev.clone());
+            let storage = CudaStorage::wrap_cuda_slice(q_out, dev.clone());
             Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
+                Storage::Cuda(storage),
                 (1usize, 1usize, n_q, hd),
-                candle_core::op::BackpropOp::none(),
+                BackpropOp::none(),
                 false,
             )
         };
         let sig_tensor = q_sig.map(|s| {
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(s, dev.clone());
+            let storage = CudaStorage::wrap_cuda_slice(s, dev.clone());
             Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
+                Storage::Cuda(storage),
                 (1usize, 1usize, n_q * hd),
-                candle_core::op::BackpropOp::none(),
+                BackpropOp::none(),
                 false,
             )
         });
         Ok((q_tensor, sig_tensor))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn fused_qkv_norm_rope_store_verify_rows_positions_read_from_the_lane_pos_buf_the_graph_updates(
         &mut self,
         slot: usize,
@@ -4111,14 +3757,14 @@ impl Qwen3MoeKvCache {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         use half::bf16;
 
-        anyhow::ensure!(
+        ensure!(
             slot < self.layers.len(),
             "fused_qkv_norm_rope_store_verify_rows: slot {slot} out of range"
         );
         let n_kv = self.n_kv_heads;
         let hd = self.head_dim;
         let q_stride = if gated { 2 * hd } else { hd };
-        anyhow::ensure!(
+        ensure!(
             q_raw.elem_count() == rows * n_q * q_stride
                 && k_raw.elem_count() == rows * n_kv * hd
                 && v_raw.elem_count() == rows * n_kv * hd
@@ -4130,7 +3776,7 @@ impl Qwen3MoeKvCache {
             v_raw.elem_count(),
             positions.elem_count()
         );
-        anyhow::ensure!(
+        ensure!(
             q_raw.dtype() == DType::BF16
                 && k_raw.dtype() == DType::BF16
                 && v_raw.dtype() == DType::BF16
@@ -4142,23 +3788,14 @@ impl Qwen3MoeKvCache {
             "fused_qkv_norm_rope_store_verify_rows: dtype contract broken; the caller gate must \
              refuse before projecting"
         );
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
 
-        let mut q_out = unsafe {
-            stream
-                .alloc::<bf16>(rows * n_q * hd)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut q_out = unsafe { stream.alloc::<bf16>(rows * n_q * hd)? };
         let mut q_sig = if gated {
-            Some(unsafe {
-                stream
-                    .alloc::<bf16>(rows * n_q * hd)
-                    .map_err(|e| anyhow::anyhow!(e))?
-            })
+            Some(unsafe { stream.alloc::<bf16>(rows * n_q * hd)? })
         } else {
             None
         };
@@ -4176,8 +3813,8 @@ impl Qwen3MoeKvCache {
             let get_bf16 = |t: &Tensor| -> Result<u64> {
                 let (storage, layout) = t.storage_and_layout();
                 let cuda = match &*storage {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("fused_qkv_norm_rope_store_verify_rows: tensor not on CUDA"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("fused_qkv_norm_rope_store_verify_rows: tensor not on CUDA"),
                 };
                 let ptr = match t.dtype() {
                     DType::BF16 => {
@@ -4198,9 +3835,9 @@ impl Qwen3MoeKvCache {
                         let (p, _g) = view.device_ptr(&stream);
                         p
                     }
-                    other => anyhow::bail!(
-                        "fused_qkv_norm_rope_store_verify_rows: unsupported dtype {other:?}"
-                    ),
+                    other => {
+                        bail!("fused_qkv_norm_rope_store_verify_rows: unsupported dtype {other:?}")
+                    }
                 };
                 Ok(ptr)
             };
@@ -4252,26 +3889,26 @@ impl Qwen3MoeKvCache {
                 )
             }
         };
-        anyhow::ensure!(
+        ensure!(
             rc == 0,
             "qkv_norm_rope_kvstore_fp8_rows rc={rc}; the caller gate checked geometry so a \
              refusal here is a contract bug, not a fallback"
         );
         let q_tensor = {
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(q_out, dev.clone());
+            let storage = CudaStorage::wrap_cuda_slice(q_out, dev.clone());
             Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
+                Storage::Cuda(storage),
                 (1usize, rows, n_q, hd),
-                candle_core::op::BackpropOp::none(),
+                BackpropOp::none(),
                 false,
             )
         };
         let sig_tensor = q_sig.map(|s| {
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(s, dev.clone());
+            let storage = CudaStorage::wrap_cuda_slice(s, dev.clone());
             Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
+                Storage::Cuda(storage),
                 (1usize, rows, n_q * hd),
-                candle_core::op::BackpropOp::none(),
+                BackpropOp::none(),
                 false,
             )
         });
@@ -4283,10 +3920,10 @@ impl Qwen3MoeKvCache {
         use half::bf16;
 
         if slot >= self.layers.len() {
-            anyhow::bail!("Qwen3MoeKvCache.view: slot {} out of range", slot);
+            bail!("Qwen3MoeKvCache.view: slot {} out of range", slot);
         }
         if len > self.max_seq_len {
-            anyhow::bail!(
+            bail!(
                 "Qwen3MoeKvCache.view: len {} > max {}",
                 len,
                 self.max_seq_len
@@ -4294,14 +3931,13 @@ impl Qwen3MoeKvCache {
         }
         let n_kv = self.n_kv_heads;
         let hd = self.head_dim;
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let need = len * n_kv * hd;
-        let mut k_out = unsafe { stream.alloc::<bf16>(need).map_err(|e| anyhow::anyhow!(e))? };
-        let mut v_out = unsafe { stream.alloc::<bf16>(need).map_err(|e| anyhow::anyhow!(e))? };
+        let mut k_out = unsafe { stream.alloc::<bf16>(need)? };
+        let mut v_out = unsafe { stream.alloc::<bf16>(need)? };
         let slot_ref = &self.layers[slot];
         {
             let (k_fp8_ptr, _gk) = slot_ref.k_fp8.device_ptr(&stream);
@@ -4325,7 +3961,7 @@ impl Qwen3MoeKvCache {
                 )
             };
             if rc_k != 0 {
-                anyhow::bail!("dequantize_kv_fp8(k) rc={rc_k}");
+                bail!("dequantize_kv_fp8(k) rc={rc_k}");
             }
             let rc_v = unsafe {
                 nv_kernels::cuda::dequantize_kv_fp8(
@@ -4341,21 +3977,21 @@ impl Qwen3MoeKvCache {
                 )
             };
             if rc_v != 0 {
-                anyhow::bail!("dequantize_kv_fp8(v) rc={rc_v}");
+                bail!("dequantize_kv_fp8(v) rc={rc_v}");
             }
         }
-        let k_storage = candle_core::CudaStorage::wrap_cuda_slice(k_out, dev.clone());
-        let v_storage = candle_core::CudaStorage::wrap_cuda_slice(v_out, dev);
+        let k_storage = CudaStorage::wrap_cuda_slice(k_out, dev.clone());
+        let v_storage = CudaStorage::wrap_cuda_slice(v_out, dev);
         let k = candle_core::Tensor::from_storage(
-            candle_core::Storage::Cuda(k_storage),
+            Storage::Cuda(k_storage),
             (1usize, len, n_kv, hd),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         let v = candle_core::Tensor::from_storage(
-            candle_core::Storage::Cuda(v_storage),
+            Storage::Cuda(v_storage),
             (1usize, len, n_kv, hd),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         Ok((k, v))
@@ -4393,28 +4029,23 @@ impl Qwen3MoeKvCache {
         let expected = n_q * hd;
         let total: usize = q_rot.dims().iter().product();
         if total != expected {
-            anyhow::bail!(
+            bail!(
                 "decode_attention_fp8: expected total {expected}, got dims {:?}",
                 q_rot.dims()
             );
         }
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
 
-        let mut out = unsafe {
-            stream
-                .alloc::<bf16>(expected)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut out = unsafe { stream.alloc::<bf16>(expected)? };
 
         let q_c = q_rot.contiguous()?;
         let (q_storage, _ql) = q_c.storage_and_layout();
         let q_cuda = match &*q_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("q_rot must be on CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("q_rot must be on CUDA"),
         };
         let q_slice = q_cuda.as_cuda_slice::<bf16>()?;
 
@@ -4428,128 +4059,29 @@ impl Qwen3MoeKvCache {
         let (vs_ptr, _gvs) = slot_ref.v_scales.device_ptr(&stream);
         let (out_ptr, _go) = out.device_ptr_mut(&stream);
 
-        let max_total = self.max_seq_len as i32;
         let s_raw = stream.cu_stream() as *mut c_void;
         let kvshare_m1_engaged = lanes_in_flight
             == SOLO_AND_EVERY_FAMILY_OUTSIDE_THE_QWEN38_LANE_GROUP_ENTERS_AT_ONE_LANE_IN_FLIGHT_SO_THE_SPLIT_PICK_IS_THE_ONE_THE_RECORD_WAS_MEASURED_ON
             && hd == 256
             && n_q.is_multiple_of(n_kv)
             && matches!(n_q / n_kv, 6 | 8)
-            && nv_q38_decode_kvshare_default_gate_signed_off_2026_09_02_group_fold_reads_kv_once_per_kv_head_not_once_per_q_head()
-                .is_some_and(|min_total| self.host_n_total[0] as usize >= min_total);
-        if let Some((splitk_scratch, splitk_fan_in)) = &mut self.splitk_scratch_and_fan_in_gated_by_nv_q36_graphed_decode_fix_because_the_smem_kernel_serializes_a_block_reduce_per_kv_position_costing_82ms_at_8k {
-            let kvshare_scratch_floor_elems =
-                n_q * M1_DECODE_KVSHARE_SCRATCH_SPLITS_128_THE_KERNELS_KKVSHAREMAXSPLITS * (hd + 2);
-            anyhow::ensure!(
-                !kvshare_m1_engaged || splitk_scratch.len() >= kvshare_scratch_floor_elems,
-                "{M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_FUSED_ARM} \
-                 engaged over a splitk scratch of {} f32 elems, below the {kvshare_scratch_floor_elems} \
-                 the kvshare 128-split grid can address: the env was set after cache construction, \
-                 and the constructor sizes the scratch for the kvshare cap only when the env is \
-                 present there",
-                splitk_scratch.len()
-            );
-            let (sc_ptr, _gscp) = splitk_scratch.device_ptr_mut(&stream);
-            let (fi_ptr, _gfip) = splitk_fan_in.device_ptr_mut(&stream);
-            let rc = if kvshare_m1_engaged {
-                unsafe {
-                    nv_kernels::cuda::flash_decode_kvshare_fp8kv_paged(
-                        s_raw,
-                        q_ptr as *const u16,
-                        k_ptr as *const u8,
-                        v_ptr as *const u8,
-                        ks_ptr as *const f32,
-                        vs_ptr as *const f32,
-                        out_ptr as *mut u16,
-                        n_total_ptr as *const i32,
-                        sc_ptr as *mut f32,
-                        fi_ptr as *mut u32,
-                        n_q as i32,
-                        n_kv as i32,
-                        hd as i32,
-                        0,
-                        0,
-                        0,
-                        scaling,
-                        std::ptr::null(),
-                        0,
-                        0,
-                        0,
-                        0,
-                    )
-                }
-            } else if lanes_in_flight
-                > SOLO_AND_EVERY_FAMILY_OUTSIDE_THE_QWEN38_LANE_GROUP_ENTERS_AT_ONE_LANE_IN_FLIGHT_SO_THE_SPLIT_PICK_IS_THE_ONE_THE_RECORD_WAS_MEASURED_ON
-            {
-                unsafe {
-                    nv_kernels::cuda::flash_decode_fused_fp8kv_lane_group(
-                        s_raw,
-                        q_ptr as *const u16,
-                        k_ptr as *const u8,
-                        v_ptr as *const u8,
-                        ks_ptr as *const f32,
-                        vs_ptr as *const f32,
-                        out_ptr as *mut u16,
-                        n_total_ptr as *const i32,
-                        sc_ptr as *mut f32,
-                        fi_ptr as *mut u32,
-                        n_q as i32,
-                        n_kv as i32,
-                        hd as i32,
-                        0,
-                        0,
-                        scaling,
-                        lanes_in_flight as i32,
-                    )
-                }
-            } else {
-                unsafe {
-                    nv_kernels::cuda::flash_decode_fused_fp8kv(
-                        s_raw,
-                        q_ptr as *const u16,
-                        k_ptr as *const u8,
-                        v_ptr as *const u8,
-                        ks_ptr as *const f32,
-                        vs_ptr as *const f32,
-                        out_ptr as *mut u16,
-                        n_total_ptr as *const i32,
-                        sc_ptr as *mut f32,
-                        fi_ptr as *mut u32,
-                        n_q as i32,
-                        n_kv as i32,
-                        hd as i32,
-                        0,
-                        0,
-                        scaling,
-                    )
-                }
-            };
-            anyhow::ensure!(
-                rc == 0,
-                "m1 decode attention rc={rc} kvshare_m1_engaged={kvshare_m1_engaged}"
-            );
-            drop(_gscp);
-            drop(_gfip);
-            drop(_go);
-            drop(_gq);
-            drop(_gk);
-            drop(_gv);
-            drop(_gks);
-            drop(_gvs);
-            drop(_gnt);
-            drop(q_storage);
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
-            let tensor = candle_core::Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
-                (1usize, 1usize, n_q, hd),
-                candle_core::op::BackpropOp::none(),
-                false,
-            );
-            return Ok(tensor);
-        }
-        let rc = match &self.scores_scratch_because_smem_decode_caps_at_12k_positions_at_48kb {
-            None => unsafe {
-                nv_kernels::cuda::attention_fp8_decode(
+            && self.host_n_total[0] as usize
+                >= nv_q38_decode_kvshare_default_gate_signed_off_2026_09_02_group_fold_reads_kv_once_per_kv_head_not_once_per_q_head();
+        let (splitk_scratch, splitk_fan_in) = &mut self.splitk_scratch_and_fan_in;
+        let kvshare_scratch_floor_elems =
+            n_q * M1_DECODE_KVSHARE_SCRATCH_SPLITS_128_THE_KERNELS_KKVSHAREMAXSPLITS * (hd + 2);
+        ensure!(
+            !kvshare_m1_engaged || splitk_scratch.len() >= kvshare_scratch_floor_elems,
+            "{M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS} \
+             engaged over a splitk scratch of {} f32 elems, below the {kvshare_scratch_floor_elems} \
+             the kvshare 128-split grid can address for {n_q} q heads",
+            splitk_scratch.len()
+        );
+        let (sc_ptr, _gscp) = splitk_scratch.device_ptr_mut(&stream);
+        let (fi_ptr, _gfip) = splitk_fan_in.device_ptr_mut(&stream);
+        let rc = if kvshare_m1_engaged {
+            unsafe {
+                nv_kernels::cuda::flash_decode_kvshare_fp8kv_paged(
                     s_raw,
                     q_ptr as *const u16,
                     k_ptr as *const u8,
@@ -4557,47 +4089,75 @@ impl Qwen3MoeKvCache {
                     ks_ptr as *const f32,
                     vs_ptr as *const f32,
                     out_ptr as *mut u16,
+                    n_total_ptr as *const i32,
+                    sc_ptr as *mut f32,
+                    fi_ptr as *mut u32,
                     n_q as i32,
                     n_kv as i32,
                     hd as i32,
+                    0,
+                    0,
+                    0,
+                    scaling,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            }
+        } else if lanes_in_flight
+            > SOLO_AND_EVERY_FAMILY_OUTSIDE_THE_QWEN38_LANE_GROUP_ENTERS_AT_ONE_LANE_IN_FLIGHT_SO_THE_SPLIT_PICK_IS_THE_ONE_THE_RECORD_WAS_MEASURED_ON
+        {
+            unsafe {
+                nv_kernels::cuda::flash_decode_fused_fp8kv_lane_group(
+                    s_raw,
+                    q_ptr as *const u16,
+                    k_ptr as *const u8,
+                    v_ptr as *const u8,
+                    ks_ptr as *const f32,
+                    vs_ptr as *const f32,
+                    out_ptr as *mut u16,
                     n_total_ptr as *const i32,
-                    max_total,
+                    sc_ptr as *mut f32,
+                    fi_ptr as *mut u32,
+                    n_q as i32,
+                    n_kv as i32,
+                    hd as i32,
+                    0,
+                    0,
+                    scaling,
+                    lanes_in_flight as i32,
+                )
+            }
+        } else {
+            unsafe {
+                nv_kernels::cuda::flash_decode_fused_fp8kv(
+                    s_raw,
+                    q_ptr as *const u16,
+                    k_ptr as *const u8,
+                    v_ptr as *const u8,
+                    ks_ptr as *const f32,
+                    vs_ptr as *const f32,
+                    out_ptr as *mut u16,
+                    n_total_ptr as *const i32,
+                    sc_ptr as *mut f32,
+                    fi_ptr as *mut u32,
+                    n_q as i32,
+                    n_kv as i32,
+                    hd as i32,
+                    0,
                     0,
                     scaling,
                 )
-            },
-            Some(scratch) => {
-                anyhow::ensure!(
-                    n_q <= self.scratch_heads,
-                    "Qwen3MoeKvCache.decode: n_q {n_q} exceeds scores scratch heads {}",
-                    self.scratch_heads
-                );
-                let (sc_ptr, _gsc) = scratch.device_ptr(&stream);
-                unsafe {
-                    nv_kernels::cuda::attention_fp8_decode_gscores(
-                        s_raw,
-                        q_ptr as *const u16,
-                        k_ptr as *const u8,
-                        v_ptr as *const u8,
-                        ks_ptr as *const f32,
-                        vs_ptr as *const f32,
-                        out_ptr as *mut u16,
-                        n_q as i32,
-                        n_kv as i32,
-                        hd as i32,
-                        n_total_ptr as *const i32,
-                        max_total,
-                        0,
-                        scaling,
-                        sc_ptr as *mut f32,
-                    )
-                }
             }
         };
-        if rc != 0 {
-            anyhow::bail!("attention_fp8_decode rc={rc}");
-        }
-
+        ensure!(
+            rc == 0,
+            "m1 decode attention rc={rc} kvshare_m1_engaged={kvshare_m1_engaged}"
+        );
+        drop(_gscp);
+        drop(_gfip);
         drop(_go);
         drop(_gq);
         drop(_gk);
@@ -4606,12 +4166,11 @@ impl Qwen3MoeKvCache {
         drop(_gvs);
         drop(_gnt);
         drop(q_storage);
-
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+        let storage = CudaStorage::wrap_cuda_slice(out, dev);
         let tensor = candle_core::Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, 1usize, n_q, hd),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         Ok(tensor)
@@ -4632,10 +4191,10 @@ impl Qwen3MoeKvCache {
             || !mk_verify_rows_case_instantiated(m)
             || self.head_dim > MK_VERIFY_MAX_HEAD_DIM_512_THE_SPLITK_MK_KERNEL_TEMPLATE_CAP
             || self
-                .mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view_kill_switch_nv_q38_mk_verify_0
+                .mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view
                 .is_none()
         {
-            anyhow::ensure!(
+            ensure!(
                 self.verify_tree_rows_active != Some(m),
                 "verify tree: the mk verify route refused rows={m} and every fallback attention \
                  masks by row order, which is lossy for sibling rows"
@@ -4646,26 +4205,21 @@ impl Qwen3MoeKvCache {
         let hd = self.head_dim;
         let expected = m * n_q * hd;
         let total: usize = q_rot.dims().iter().product();
-        anyhow::ensure!(
+        ensure!(
             total == expected,
             "verify_attention_fp8_mk: expected total {expected} for m={m}, got dims {:?}",
             q_rot.dims()
         );
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
-        let mut out = unsafe {
-            stream
-                .alloc::<bf16>(expected)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut out = unsafe { stream.alloc::<bf16>(expected)? };
         let q_c = q_rot.contiguous()?;
         let (q_storage, _ql) = q_c.storage_and_layout();
         let q_cuda = match &*q_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("q_rot must be on CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("q_rot must be on CUDA"),
         };
         let q_slice = q_cuda.as_cuda_slice::<bf16>()?;
         let (n_total_ptr, _gnt) = self.n_total_dev.device_ptr(&stream);
@@ -4677,7 +4231,7 @@ impl Qwen3MoeKvCache {
         let (vs_ptr, _gvs) = slot_ref.v_scales.device_ptr(&stream);
         let (out_ptr, _go) = out.device_ptr_mut(&stream);
         let (scratch, fan_in) = self
-            .mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view_kill_switch_nv_q38_mk_verify_0
+            .mk_verify_scratch_and_fan_in_routing_2_to_8_row_chains_off_the_full_kv_dequant_view
             .as_mut()
             .unwrap();
         let (sc_ptr, _gsc) = scratch.device_ptr_mut(&stream);
@@ -4685,27 +4239,23 @@ impl Qwen3MoeKvCache {
         let delta_0_because_this_caches_n_total_dev_already_counts_the_m_appended_rows_and_the_kernel_reads_total_as_n_total_minus_delta =
             0i32;
         let tree_active = self.verify_tree_rows_active == Some(m);
-        anyhow::ensure!(
+        ensure!(
             !tree_active || m == VERIFY_TREE_TWO_BRANCH_M6_ROWS,
             "verify tree: active rows {m} != the two-branch shape"
         );
-        if let Ok(dump_dir) = std::env::var(MK_VERIFY_DUMP_DIR_ENV_WRITES_EACH_SLOTS_QKV_ONCE_SO_A_PARITY_GATE_CAN_REPLAY_LIVE_SERVING_TENSORS_THROUGH_BOTH_ARMS) {
+        if let Ok(dump_dir) = env::var(MK_VERIFY_DUMP_DIR_ENV_WRITES_EACH_SLOTS_QKV_ONCE_SO_A_PARITY_GATE_CAN_REPLAY_LIVE_SERVING_TENSORS_THROUGH_BOTH_ARMS) {
             let marker = std::path::Path::new(&dump_dir).join(format!("slot{slot}.done"));
             if !marker.exists() {
-                stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
-                let hq = stream.clone_dtoh(q_slice).map_err(|e| anyhow::anyhow!(e))?;
+                stream.synchronize()?;
+                let hq = stream.clone_dtoh(q_slice)?;
                 let hk = stream
-                    .clone_dtoh(&self.layers[slot].k_fp8)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                    .clone_dtoh(&self.layers[slot].k_fp8)?;
                 let hv = stream
-                    .clone_dtoh(&self.layers[slot].v_fp8)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                    .clone_dtoh(&self.layers[slot].v_fp8)?;
                 let hks = stream
-                    .clone_dtoh(&self.layers[slot].k_scales)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                    .clone_dtoh(&self.layers[slot].k_scales)?;
                 let hvs = stream
-                    .clone_dtoh(&self.layers[slot].v_scales)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                    .clone_dtoh(&self.layers[slot].v_scales)?;
                 let d = std::path::Path::new(&dump_dir);
                 let total = self.host_n_total[0] as usize;
                 let qb: Vec<u8> = hq.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
@@ -4740,13 +4290,13 @@ impl Qwen3MoeKvCache {
         let tctile_geometry =
             one_launch_rows_fit && hd == 256 && n_q.is_multiple_of(n_kv) && n_q / n_kv == 6;
         let fused_tc_one_launch =
-            nv_q38_mk_verify_fused_tc_env_opt_in_single_pass_mma_qk_and_pv_reads_kv_once_for_all_m_by_group_rows(m)
-                .is_some_and(|min_total| self.host_n_total[0] as usize >= min_total)
+            self.host_n_total[0] as usize
+                >= nv_q38_mk_verify_fused_tc_env_opt_in_single_pass_mma_qk_and_pv_reads_kv_once_for_all_m_by_group_rows(m)
                 && tctile_geometry
                 && m <= FUSED_TC_ROWS_CAP_8_MATCHES_THE_KERNELS_KMAXROWS_ROWS_6_TO_8_RUN_THE_SIXTEEN_WARP_VARIANTS;
         let tctile_one_launch = !fused_tc_one_launch
-            && nv_q38_mk_verify_tctile_default_gate_signed_off_2026_09_02_one_launch_mma_qk_tiles_read_kv_once_for_all_m_by_group_rows()
-                .is_some_and(|min_total| self.host_n_total[0] as usize >= min_total)
+            && self.host_n_total[0] as usize
+                >= nv_q38_mk_verify_tctile_default_gate_signed_off_2026_09_02_one_launch_mma_qk_tiles_read_kv_once_for_all_m_by_group_rows()
             && tctile_geometry;
         let rc = if fused_tc_one_launch || tctile_one_launch {
             let (hole_from_row, hole_lo_delta, hole_hi_delta) = if tree_active {
@@ -4788,7 +4338,7 @@ impl Qwen3MoeKvCache {
                     0,
                     0,
                     if deep_two_wave
-                        && std::env::var("NV_KVSHARE_SPLITS").is_err()
+                        && !nv_config::env_arm_present_at_all_reread_every_call("NV_KVSHARE_SPLITS")
                         && (self.host_n_total[0] as usize)
                             < MK_VERIFY_DEEP_TOTAL_65536_KEEPS_THE_TWO_WAVE_PICK_BECAUSE_64_SPLITS_LEFT_256_BLOCKS_1P4_WAVES_AND_1MS_ON_THE_172K_TABLE_WHILE_128_OVERSPLITS_TO_35MS
                     {
@@ -4861,7 +4411,7 @@ impl Qwen3MoeKvCache {
                 )
             }
         };
-        anyhow::ensure!(
+        ensure!(
             rc == 0,
             "mk verify attention rc={rc} fused_tc_one_launch={fused_tc_one_launch} tctile_one_launch={tctile_one_launch}"
         );
@@ -4875,11 +4425,11 @@ impl Qwen3MoeKvCache {
         drop(_gvs);
         drop(_gnt);
         drop(q_storage);
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+        let storage = CudaStorage::wrap_cuda_slice(out, dev);
         let tensor = candle_core::Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, m, n_q, hd),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         Ok(Some(tensor))
@@ -4896,7 +4446,7 @@ impl Qwen3MoeKvCache {
         v_new: &Tensor,
     ) -> Result<()> {
         let dims = k_new.dims();
-        anyhow::ensure!(
+        ensure!(
             dims.len() == 4 && dims[1] > 0,
             "synthetic kv fill expects [1, t, n_kv, head_dim] with t > 0, got {dims:?}"
         );
@@ -4914,9 +4464,8 @@ impl Qwen3MoeKvCache {
         fingerprint: &str,
         out: &mut dyn std::io::Write,
     ) -> Result<()> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         stream
@@ -4978,14 +4527,14 @@ impl Qwen3MoeKvCache {
     ) -> Result<()> {
         let mut magic = [0u8; 8];
         input.read_exact(&mut magic)?;
-        anyhow::ensure!(
+        ensure!(
             &magic == PRIME_CKPT_MAGIC_NVPRIMEK,
             "{PRIME_CKPT_BAD_HEADER}: magic {magic:?} is not a prime checkpoint"
         );
         let mut b4 = [0u8; 4];
         input.read_exact(&mut b4)?;
         let ver = u32::from_le_bytes(b4);
-        anyhow::ensure!(
+        ensure!(
             ver == PRIME_CKPT_CACHE_LAYOUT_VERSION_1_BUMP_WHEN_FP8_ROW_SCALE_OR_LIN_STATE_LAYOUT_CHANGES,
             "{PRIME_CKPT_BAD_HEADER}: cache layout version {ver} != {}, the checkpoint predates or postdates this cache code",
             PRIME_CKPT_CACHE_LAYOUT_VERSION_1_BUMP_WHEN_FP8_ROW_SCALE_OR_LIN_STATE_LAYOUT_CHANGES
@@ -4993,14 +4542,14 @@ impl Qwen3MoeKvCache {
         let mut b8 = [0u8; 8];
         input.read_exact(&mut b8)?;
         let fp_len = u64::from_le_bytes(b8) as usize;
-        anyhow::ensure!(
+        ensure!(
             fp_len <= 4096,
             "{PRIME_CKPT_BAD_HEADER}: fingerprint length {fp_len} is not a fingerprint"
         );
         let mut fp = vec![0u8; fp_len];
         input.read_exact(&mut fp)?;
         let found = String::from_utf8_lossy(&fp).into_owned();
-        anyhow::ensure!(
+        ensure!(
             found == fingerprint,
             "{PRIME_CKPT_FINGERPRINT_MISMATCH}: checkpoint carries {found:?}, this run expects {fingerprint:?}"
         );
@@ -5010,7 +4559,7 @@ impl Qwen3MoeKvCache {
             *h = u64::from_le_bytes(b8);
         }
         let [rows, n_layers, n_kv, hd, n_lin] = hdr.map(|v| v as usize);
-        anyhow::ensure!(
+        ensure!(
             n_layers == self.layers.len()
                 && n_kv == self.n_kv_heads
                 && hd == self.head_dim
@@ -5021,7 +4570,7 @@ impl Qwen3MoeKvCache {
             self.head_dim,
             self.lin_attn_states.len()
         );
-        anyhow::ensure!(
+        ensure!(
             rows <= self.max_seq_len,
             "{PRIME_CKPT_GEOMETRY_MISMATCH}: primed depth {rows} > cache max_seq_len {}",
             self.max_seq_len
@@ -5035,14 +4584,11 @@ impl Qwen3MoeKvCache {
                     input,
                     &self.device,
                 )?),
-                tag => anyhow::bail!(
-                    "{PRIME_CKPT_BAD_HEADER}: lin state presence tag {tag} at slot {i}"
-                ),
+                tag => bail!("{PRIME_CKPT_BAD_HEADER}: lin state presence tag {tag} at slot {i}"),
             };
         }
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let kv_elems = rows * n_kv * hd;
@@ -5191,10 +4737,6 @@ impl Qwen3Moe {
         &self.config
     }
 
-    pub fn moe_block_for_dispatch_parity_tests(&self, layer_idx: usize) -> Option<&LayerFfn> {
-        self.layers.get(layer_idx).map(|l| &l.ffn)
-    }
-
     #[cfg(feature = "cuda")]
     pub fn dump_trunk_phase_ladder_after_replay_when_nv_q36_trunk_events_1(&self) {
         if !trunk_events::armed_env_opt_in_nv_q36_trunk_events_1_in_capture_globaltimer_ladder_perturbs_by_its_own_nodes()
@@ -5265,7 +4807,7 @@ impl Qwen3Moe {
         cache: &mut Qwen3MoeKvCache,
         rows: usize,
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             rows >= 1,
             "ensure_fused_lin_verify_ckpts: rows must be >= 1"
         );
@@ -5347,26 +4889,17 @@ impl Qwen3Moe {
         device: &Device,
     ) -> Result<Self> {
         let gdn_ab_fp8 = nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_AB_FP8");
-        anyhow::ensure!(
+        ensure!(
             !gdn_ab_fp8 || dense_intermediate.is_some(),
             "NV_Q38_GDN_AB_FP8=1 requires the dense CUDA model"
         );
-        anyhow::ensure!(
-            !gdn_ab_fp8 || !q38_fp8_dequant_bf16_env_restores_the_4_byte_prequant_arm(),
-            "NV_Q38_GDN_AB_FP8=1 cannot be combined with NV_Q38_FP8_DEQUANT_BF16"
-        );
         let dtype = DType::BF16;
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("Qwen3Moe requires CUDA device"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("Qwen3Moe requires CUDA device")
         };
         let stream = dev.cuda_stream();
-        let runner = Arc::new(Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
-            stream.clone(),
-        )?));
-        let fp8_runner = Arc::new(Mutex::new(nv_quant::fp8::Fp8GemmRunner::new(
-            stream.clone(),
-        )?));
+        let runner = Arc::new(Mutex::new(Nvfp4GemmRunner::new(stream.clone())?));
+        let fp8_runner = Arc::new(Mutex::new(Fp8GemmRunner::new(stream.clone())?));
 
         let embed_weight = load_named(
             weights,
@@ -5378,7 +4911,7 @@ impl Qwen3Moe {
         )?;
         let ed = embed_weight.dims();
         if ed.len() != 2 || ed[0] != config.vocab_size || ed[1] != config.hidden_size {
-            anyhow::bail!(
+            bail!(
                 "embed shape mismatch: got {:?} expected [{}, {}]",
                 ed,
                 config.vocab_size,
@@ -5422,28 +4955,18 @@ impl Qwen3Moe {
         } else if nv_layers::linear::checkpoint_module_is_fp8_e4m3_weight_with_scale(
             weights, "lm_head",
         ) {
-            if q38_fp8_dequant_bf16_env_restores_the_4_byte_prequant_arm() {
-                nv_layers::linear::fp8_e4m3_rowscale_checkpoint_dequant_linear(
-                    weights,
-                    "lm_head",
-                    config.vocab_size,
-                    config.hidden_size,
-                    dtype,
-                )?
-            } else {
-                nv_layers::linear::fp8_e4m3_rowscale_checkpoint_resident_linear(
-                    weights,
-                    "lm_head",
-                    config.vocab_size,
-                    config.hidden_size,
-                    device,
-                    fp8_runner.clone(),
-                )?
-            }
+            nv_layers::linear::fp8_e4m3_rowscale_checkpoint_resident_linear(
+                weights,
+                "lm_head",
+                config.vocab_size,
+                config.hidden_size,
+                device,
+                fp8_runner.clone(),
+            )?
         } else if nv_q36_lm_head_fp8_env_opt_in_quantizes_a_bf16_checkpoint_lm_head_to_fp8_resident(
         ) {
             let w = load_named(weights, &["lm_head.weight"], DType::BF16)?;
-            anyhow::ensure!(
+            ensure!(
                 w.dims() == [config.vocab_size, config.hidden_size],
                 "lm_head.weight: expected [{}, {}], got {:?}",
                 config.vocab_size,
@@ -5458,10 +4981,7 @@ impl Qwen3Moe {
                 None,
                 nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
             )?;
-            #[allow(deprecated)]
-            let weight_u8 = stream
-                .clone_htod(&weight_bytes)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let weight_u8 = stream.clone_htod(&weight_bytes)?;
             Linear::new_fp8_e4m3_row_scales_without_the_cublaslt_probe(
                 weight_u8,
                 row_scales,
@@ -5487,9 +5007,7 @@ impl Qwen3Moe {
         )?;
 
         #[cfg(feature = "cuda")]
-        if dense_intermediate.is_some()
-            && nv_q38_w4a16_marlin_default_on_user_signoff_20260912_unset_is_on_and_0_restores_the_dp4a_verify_mlp()
-        {
+        if dense_intermediate.is_some() {
             let mut built = 0usize;
             for layer in layers.iter() {
                 if let Some(mlp) = layer.ffn.as_dense() {
@@ -5500,7 +5018,7 @@ impl Qwen3Moe {
                     }
                 }
             }
-            eprintln!("[qwen3_5_moe] NV_Q38_W4A16_MARLIN default: {built} Marlin nvfp4 twins built at load beside the cutlass nvfp4 residents the prefill GEMM keeps");
+            eprintln!("[qwen3_5_moe] {built} Marlin nvfp4 twins built at load beside the cutlass nvfp4 residents the prefill GEMM keeps");
         }
         Ok(Self {
             config,
@@ -5523,7 +5041,7 @@ impl Qwen3Moe {
         _qconfig: &QuantizationConfig,
         _device: &Device,
     ) -> Result<Self> {
-        anyhow::bail!("Qwen3Moe::from_loader requires --features cuda")
+        bail!("Qwen3Moe::from_loader requires --features cuda")
     }
 
     #[cfg(feature = "cuda")]
@@ -5539,11 +5057,11 @@ impl Qwen3Moe {
     pub fn forward(&self, tokens: &Tensor, positions: &Tensor) -> Result<Tensor> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!("Qwen3Moe.forward: tokens must be [1, seq], got {:?}", dims);
+            bail!("Qwen3Moe.forward: tokens must be [1, seq], got {:?}", dims);
         }
         let seq = dims[1];
         if positions.dims() != [seq] {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward: positions shape {:?} != [{}]",
                 positions.dims(),
                 seq
@@ -5551,7 +5069,7 @@ impl Qwen3Moe {
         }
 
         let prof_enabled = nv_config::env_arm_present_at_all_reread_every_call("NV_PROF_DECODE");
-        let prof_dev: Option<candle_core::CudaDevice> = if prof_enabled {
+        let prof_dev: Option<CudaDevice> = if prof_enabled {
             match tokens.device() {
                 Device::Cuda(d) => Some(d.clone()),
                 _ => None,
@@ -5559,9 +5077,8 @@ impl Qwen3Moe {
         } else {
             None
         };
-        let mut prof: std::collections::BTreeMap<&'static str, f64> =
-            std::collections::BTreeMap::new();
-        let prof_sync = |d: &Option<candle_core::CudaDevice>| {
+        let mut prof: BTreeMap<&'static str, f64> = BTreeMap::new();
+        let prof_sync = |d: &Option<CudaDevice>| {
             #[cfg(feature = "cuda")]
             if let Some(dev) = d {
                 let _ = dev.cuda_stream().synchronize();
@@ -5572,7 +5089,7 @@ impl Qwen3Moe {
         };
 
         prof_sync(&prof_dev);
-        let t_embed = std::time::Instant::now();
+        let t_embed = Instant::now();
         let tokens_flat = tokens.flatten_all()?.to_dtype(DType::U32)?;
         let x = self
             .embed_weight
@@ -5590,7 +5107,7 @@ impl Qwen3Moe {
         }
 
         prof_sync(&prof_dev);
-        let t_pre_norm0 = std::time::Instant::now();
+        let t_pre_norm0 = Instant::now();
         let mut residual = x.clone();
         let mut normed = self.layers[0].pre_norm.forward(&x)?;
         prof_sync(&prof_dev);
@@ -5600,7 +5117,7 @@ impl Qwen3Moe {
         }
         for (li, layer) in self.layers.iter().enumerate() {
             prof_sync(&prof_dev);
-            let t_mix = std::time::Instant::now();
+            let t_mix = Instant::now();
             let (mixed, mix_label): (Tensor, &'static str) = match &layer.mixer {
                 LayerMixer::Full(attn) => (
                     attn.forward(&normed, &self.rope, positions)?,
@@ -5616,7 +5133,7 @@ impl Qwen3Moe {
                 dump_stats(&format!("L{li}.attn_out"), &mixed)?;
             }
             prof_sync(&prof_dev);
-            let t_post = std::time::Instant::now();
+            let t_post = Instant::now();
             let (normed_post, residual_after_attn) =
                 layer.post_norm.forward_residual(&mixed, &residual)?;
             prof_sync(&prof_dev);
@@ -5624,7 +5141,7 @@ impl Qwen3Moe {
                 *prof.entry("post_norm").or_default() += t_post.elapsed().as_secs_f64() * 1000.0;
             }
             prof_sync(&prof_dev);
-            let t_moe = std::time::Instant::now();
+            let t_moe = Instant::now();
             let moe_out = layer.ffn.forward(&normed_post)?;
             prof_sync(&prof_dev);
             if prof_enabled {
@@ -5636,7 +5153,7 @@ impl Qwen3Moe {
             }
             if li + 1 < self.layers.len() {
                 prof_sync(&prof_dev);
-                let t_next = std::time::Instant::now();
+                let t_next = Instant::now();
                 let (normed_next, residual_after_moe) = self.layers[li + 1]
                     .pre_norm
                     .forward_residual(&moe_out, &residual_after_attn)?;
@@ -5649,7 +5166,7 @@ impl Qwen3Moe {
                 }
             } else {
                 prof_sync(&prof_dev);
-                let t_add = std::time::Instant::now();
+                let t_add = Instant::now();
                 residual = residual_after_attn.add(&moe_out)?;
                 prof_sync(&prof_dev);
                 if prof_enabled {
@@ -5664,7 +5181,7 @@ impl Qwen3Moe {
         let x = residual;
 
         prof_sync(&prof_dev);
-        let t_final = std::time::Instant::now();
+        let t_final = Instant::now();
         let x = self.final_norm.forward(&x)?;
         prof_sync(&prof_dev);
         if prof_enabled {
@@ -5674,7 +5191,7 @@ impl Qwen3Moe {
             dump_stats("final_norm", &x)?;
         }
         prof_sync(&prof_dev);
-        let t_lm = std::time::Instant::now();
+        let t_lm = Instant::now();
         let logits = self.lm_head.forward(&x)?;
         prof_sync(&prof_dev);
         if prof_enabled {
@@ -5719,17 +5236,17 @@ impl Qwen3Moe {
         Ok(logits)
     }
 
-    pub fn forward_hidden(&self, tokens: &Tensor, positions: &Tensor) -> Result<(Tensor, Tensor)> {
+    pub fn forward_hidden(&self, tokens: &Tensor, positions: &Tensor) -> Result<Tensor> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_hidden: tokens must be [1, seq], got {:?}",
                 dims
             );
         }
         let seq = dims[1];
         if positions.dims() != [seq] {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_hidden: positions shape {:?} != [{}]",
                 positions.dims(),
                 seq
@@ -5762,10 +5279,7 @@ impl Qwen3Moe {
                 residual = residual_after_attn.add(&moe_out)?;
             }
         }
-        let hidden = residual;
-        let x = self.final_norm.forward(&hidden)?;
-        let logits = self.lm_head.forward(&x)?;
-        Ok((logits, hidden))
+        self.final_norm.forward(&residual)
     }
 
     #[cfg(feature = "cuda")]
@@ -5810,14 +5324,14 @@ impl Qwen3Moe {
     ) -> Result<Tensor> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_with_cache: tokens must be [1, seq], got {:?}",
                 dims
             );
         }
         let seq = dims[1];
         if positions.dims() != [seq] {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_with_cache: positions shape {:?} != [{}]",
                 positions.dims(),
                 seq
@@ -5826,7 +5340,7 @@ impl Qwen3Moe {
         let write_start = cache.current_len();
         let new_total = write_start + seq;
         if new_total > cache.max_seq_len() {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_with_cache: new_total {} > max_seq_len {}",
                 new_total,
                 cache.max_seq_len()
@@ -5861,8 +5375,8 @@ impl Qwen3Moe {
         cache: &mut Qwen3MoeKvCache,
         moe_dispatch: Option<&dyn MoeDispatch>,
     ) -> Result<Tensor> {
-        anyhow::ensure!(chunk >= 1, "prefill_chunks: chunk must be >= 1");
-        anyhow::ensure!(!prompt.is_empty(), "prefill_chunks: empty prompt");
+        ensure!(chunk >= 1, "prefill_chunks: chunk must be >= 1");
+        ensure!(!prompt.is_empty(), "prefill_chunks: empty prompt");
         let mut fed = 0usize;
         let mut last: Option<Tensor> = None;
         while fed < prompt.len() {
@@ -5917,9 +5431,9 @@ impl Qwen3Moe {
     where
         F: FnMut(&Qwen3Moe, &[u32], &Tensor) -> Result<()>,
     {
-        anyhow::ensure!(chunk >= 1, "prefill_chunks_graphed: chunk must be >= 1");
-        anyhow::ensure!(!prompt.is_empty(), "prefill_chunks_graphed: empty prompt");
-        anyhow::ensure!(
+        ensure!(chunk >= 1, "prefill_chunks_graphed: chunk must be >= 1");
+        ensure!(!prompt.is_empty(), "prefill_chunks_graphed: empty prompt");
+        ensure!(
             sess.chunk == chunk,
             "prefill_chunks_graphed: session built for chunk {} but called with {}",
             sess.chunk,
@@ -6002,16 +5516,15 @@ impl Qwen3Moe {
         let hidden = self.config.hidden_size;
         let write_start = cache.current_len();
         let new_total = write_start + seq;
-        anyhow::ensure!(
+        ensure!(
             new_total <= cache.max_seq_len(),
             "prefill_full_chunk_graphed: new_total {} > max_seq_len {}",
             new_total,
             cache.max_seq_len()
         );
         cache.prepare_for_step(write_start, new_total)?;
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("prefill_full_chunk_graphed requires CUDA"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("prefill_full_chunk_graphed requires CUDA")
         };
         crate::graph_engine::disable_event_tracking_no_earlier_than_the_first_capture(&dev);
         let stream = nv_layers::cuda_stream::current_stream(&dev);
@@ -6201,18 +5714,18 @@ impl Qwen3Moe {
     ) -> Result<Tensor> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.prefill_image_rows: tokens must be [1, seq], got {:?}",
                 dims
             );
         }
         let seq = dims[1];
-        anyhow::ensure!(
+        ensure!(
             mrope.len() == seq,
             "Qwen3Moe.prefill_image_rows: {} mrope positions for {seq} tokens",
             mrope.len()
         );
-        anyhow::ensure!(
+        ensure!(
             cache.current_len() == 0,
             "Qwen3Moe.prefill_image_rows: the per-call mrope rope table indexes rows 0..seq, \
              so image prefill must start from an empty cache (current_len {})",
@@ -6221,7 +5734,7 @@ impl Qwen3Moe {
         let write_start = 0usize;
         let new_total = seq;
         if new_total > cache.max_seq_len() {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.prefill_image_rows: new_total {} > max_seq_len {}",
                 new_total,
                 cache.max_seq_len()
@@ -6282,7 +5795,6 @@ impl Qwen3Moe {
     }
 
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn forward_embedded_with_cache_dispatched_rows(
         &self,
         x: Tensor,
@@ -6302,7 +5814,7 @@ impl Qwen3Moe {
                 x.device(),
             );
         }
-        let mut t_lap = std::time::Instant::now();
+        let mut t_lap = Instant::now();
         let mut residual = x.clone();
         let mut normed = self.layers[0].pre_norm.forward(&x)?;
         let mut gdn_fold_rstd: Option<Tensor> = None;
@@ -6480,7 +5992,7 @@ impl Qwen3Moe {
             }
             t_lap = splits.lap("norms_and_residual", t_lap);
             decode_prof::lap("norms_and_residual");
-            if std::env::var("NV_DEBUG_NAN_SCAN").as_deref() == Ok("1") {
+            if env::var("NV_DEBUG_NAN_SCAN").as_deref() == Ok("1") {
                 let v: Vec<f32> = residual
                     .to_dtype(candle_core::DType::F32)?
                     .flatten_all()?
@@ -6497,7 +6009,7 @@ impl Qwen3Moe {
                         _ => "gdn",
                     }
                 );
-                anyhow::ensure!(
+                ensure!(
                     bad == 0,
                     "NV_DEBUG_NAN_SCAN first non-finite residual at layer {li}"
                 );
@@ -6506,7 +6018,7 @@ impl Qwen3Moe {
         let x = residual;
         let x = match logit_rows {
             Some(rows) => {
-                anyhow::ensure!(
+                ensure!(
                     rows >= 1 && rows <= seq,
                     "Qwen3Moe.forward_with_cache: logit_rows {rows} out of 1..={seq}"
                 );
@@ -6567,13 +6079,13 @@ impl Qwen3Moe {
         target_layer_ids: &[usize],
     ) -> Result<Vec<usize>> {
         for (i, &li) in target_layer_ids.iter().enumerate() {
-            anyhow::ensure!(
+            ensure!(
                 li < self.layers.len(),
                 "aux layer id {li} is out of range for a {}-layer target; a DFlash/DSpark drafter \
                  trained against a different depth cannot be fed by this trunk",
                 self.layers.len()
             );
-            anyhow::ensure!(
+            ensure!(
                 i == 0 || li > target_layer_ids[i - 1],
                 "aux layer ids must be strictly increasing, got {target_layer_ids:?}; the trunk \
                  collects in trunk order and the drafter's fc weight is laid out in \
@@ -6595,14 +6107,14 @@ impl Qwen3Moe {
     ) -> Result<(Tensor, Tensor, Vec<Tensor>)> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_with_cache_dispatched_hidden: tokens must be [1, seq], got {:?}",
                 dims
             );
         }
         let seq = dims[1];
         if positions.dims() != [seq] {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_with_cache_dispatched_hidden: positions shape {:?} != [{}]",
                 positions.dims(),
                 seq
@@ -6611,7 +6123,7 @@ impl Qwen3Moe {
         let write_start = cache.current_len();
         let new_total = write_start + seq;
         if new_total > cache.max_seq_len() {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_with_cache_dispatched_hidden: new_total {} > max_seq_len {}",
                 new_total,
                 cache.max_seq_len()
@@ -6737,7 +6249,7 @@ impl Qwen3Moe {
         let hidden = residual;
         let normed_rows = match logit_rows {
             Some(rows) => {
-                anyhow::ensure!(
+                ensure!(
                     rows >= 1 && rows <= seq,
                     "Qwen3Moe.forward_with_cache_dispatched_hidden: logit_rows {rows} out of 1..={seq}"
                 );
@@ -6758,7 +6270,7 @@ impl Qwen3Moe {
         tm.tail(1);
         decode_prof::report_and_end(write_start);
         cache.advance(seq);
-        anyhow::ensure!(
+        ensure!(
             aux.len() == aux_layers.len(),
             "aux tap collected {} of {} requested layers; a duplicate or out-of-range aux layer id \
              would silently shrink the drafter's fc input and mis-slice every projection",
@@ -6766,6 +6278,92 @@ impl Qwen3Moe {
             aux_layers.len()
         );
         Ok((logits, hidden, aux))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn residual_rows_after_layer(
+        &self,
+        tokens: &Tensor,
+        positions: &Tensor,
+        cache: &mut Qwen3MoeKvCache,
+        moe_dispatch: Option<&dyn MoeDispatch>,
+        layer: usize,
+    ) -> Result<Tensor> {
+        ensure!(
+            layer < self.layers.len(),
+            "capture layer {layer} out of range for {} blocks",
+            self.layers.len()
+        );
+        let dims = tokens.dims();
+        ensure!(
+            dims.len() == 2 && dims[0] == 1,
+            "Qwen3Moe capture: tokens must be [1, seq], got {dims:?}"
+        );
+        let seq = dims[1];
+        let write_start = cache.current_len();
+        let new_total = write_start + seq;
+        ensure!(
+            new_total <= cache.max_seq_len(),
+            "Qwen3Moe capture: new_total {new_total} > max_seq_len {}",
+            cache.max_seq_len()
+        );
+        cache.prepare_for_step(write_start, new_total)?;
+        let tokens_flat = tokens.flatten_all()?.to_dtype(DType::U32)?;
+        let x = match embed_lookup_bf16(&self.embed_weight, &tokens_flat)? {
+            Some(rows) => rows,
+            None => self.embed_weight.index_select(&tokens_flat, 0)?,
+        }
+        .reshape((1usize, seq, self.config.hidden_size))?
+        .to_dtype(self.dtype)?;
+        let mut residual = x.clone();
+        let mut normed = self.layers[0].pre_norm.forward(&x)?;
+        for (li, layer_ref) in self.layers.iter().enumerate().take(layer + 1) {
+            let mixed = match &layer_ref.mixer {
+                LayerMixer::Full(attn) => {
+                    let slot = cache.full_slot_for_layer(li).ok_or_else(|| {
+                        anyhow::anyhow!("capture: layer {li} has no attention slot")
+                    })?;
+                    attn.forward_with_cache(
+                        &normed,
+                        &self.rope,
+                        positions,
+                        cache,
+                        slot,
+                        write_start,
+                        new_total,
+                    )?
+                }
+                LayerMixer::Linear(la) => {
+                    let lin_slot = cache.lin_attn_slot_for_layer(li).ok_or_else(|| {
+                        anyhow::anyhow!("capture: layer {li} has no linear-attention slot")
+                    })?;
+                    cache.lin_attn_step(lin_slot, la, &normed)?
+                }
+            };
+            let (normed_post, residual_after_attn) =
+                layer_ref.post_norm.forward_residual(&mixed, &residual)?;
+            let ffn_out = match (moe_dispatch, layer_ref.ffn.as_moe()) {
+                (Some(d), Some(moe)) => d.forward(li, moe, &normed_post)?,
+                _ => dense_ffn_decode_forward_m1_nvfp4_gemv_else_layer_default(
+                    &layer_ref.ffn,
+                    &normed_post,
+                    seq,
+                )?,
+            };
+            if li < layer {
+                let (normed_next, residual_after_ffn) = self.layers[li + 1]
+                    .pre_norm
+                    .forward_residual(&ffn_out, &residual_after_attn)?;
+                normed = normed_next;
+                residual = residual_after_ffn;
+            } else {
+                residual = residual_after_attn.add(&ffn_out)?;
+            }
+        }
+        cache.advance(seq);
+        Ok(residual
+            .reshape((seq, self.config.hidden_size))?
+            .to_dtype(DType::F32)?)
     }
 
     #[cfg(feature = "cuda")]
@@ -6777,14 +6375,14 @@ impl Qwen3Moe {
     ) -> Result<(Tensor, Tensor)> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_with_cache_hidden: tokens must be [1, seq], got {:?}",
                 dims
             );
         }
         let seq = dims[1];
         if positions.dims() != [seq] {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_with_cache_hidden: positions shape {:?} != [{}]",
                 positions.dims(),
                 seq
@@ -6793,7 +6391,7 @@ impl Qwen3Moe {
         let write_start = cache.current_len();
         let new_total = write_start + seq;
         if new_total > cache.max_seq_len() {
-            anyhow::bail!(
+            bail!(
                 "Qwen3Moe.forward_with_cache_hidden: new_total {} > max_seq_len {}",
                 new_total,
                 cache.max_seq_len()
@@ -7351,8 +6949,7 @@ pub mod trunk_events {
                 eprintln!("[q36-trunk-events] sync failed: {e:?}");
                 return;
             }
-            #[allow(deprecated)]
-            match l.stream.memcpy_dtov(&l.stamps) {
+            match l.stream.clone_dtoh(&l.stamps) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("[q36-trunk-events] readback failed: {e:?}");
@@ -7407,8 +7004,8 @@ pub mod trunk_events {
 
 #[cfg(feature = "cuda")]
 struct PrefillWallSplits {
-    dev: Option<candle_core::CudaDevice>,
-    acc: std::collections::BTreeMap<&'static str, f64>,
+    dev: Option<CudaDevice>,
+    acc: BTreeMap<&'static str, f64>,
 }
 
 #[cfg(feature = "cuda")]
@@ -7422,16 +7019,16 @@ impl PrefillWallSplits {
         };
         Self {
             dev,
-            acc: std::collections::BTreeMap::new(),
+            acc: BTreeMap::new(),
         }
     }
 
-    fn lap(&mut self, label: &'static str, t0: std::time::Instant) -> std::time::Instant {
+    fn lap(&mut self, label: &'static str, t0: Instant) -> Instant {
         if let Some(d) = &self.dev {
             let _ = d.cuda_stream().synchronize();
             *self.acc.entry(label).or_default() += t0.elapsed().as_secs_f64() * 1000.0;
         }
-        std::time::Instant::now()
+        Instant::now()
     }
 
     fn report(&self, seq: usize, logit_rows: Option<usize>) {
@@ -7462,13 +7059,11 @@ pub const MAX_VERIFY_MOE_TOKENS: usize = 32;
 #[cfg(feature = "cuda")]
 pub struct GroupedMoeDispatch {
     weights: Vec<Arc<nv_layers::moe_grouped::MoeGroupedWeights>>,
-    ctx: Mutex<nv_layers::moe_grouped::GroupedDecodeContext>,
+    ctx: Mutex<GroupedDecodeContext>,
 
-    verify_ctx:
-        Mutex<std::collections::HashMap<usize, nv_layers::moe_grouped::GroupedDecodeContext>>,
+    verify_ctx: Mutex<HashMap<usize, GroupedDecodeContext>>,
 
-    verify_chain_ctx:
-        Mutex<std::collections::HashMap<usize, nv_layers::moe_grouped::GroupedDecodeContext>>,
+    verify_chain_ctx: Mutex<HashMap<usize, GroupedDecodeContext>>,
     hidden_size: usize,
     moe_intermediate_size: usize,
     num_experts_per_tok: usize,
@@ -7488,21 +7083,16 @@ const MOE_CHAIN_PHASE_SLOTS_ENTRY_GATE_SHARED_GROUPED_TAIL: usize = 5;
 
 #[cfg(feature = "cuda")]
 struct MoeChainPhaseLadder {
-    stamps: Mutex<cudarc::driver::CudaSlice<u64>>,
-    stream: Arc<cudarc::driver::CudaStream>,
+    stamps: Mutex<CudaSlice<u64>>,
+    stream: Arc<CudaStream>,
     n_layers: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl MoeChainPhaseLadder {
-    fn mark(
-        &self,
-        layer_idx: usize,
-        slot: usize,
-        stream: &Arc<cudarc::driver::CudaStream>,
-    ) -> Result<()> {
+    fn mark(&self, layer_idx: usize, slot: usize, stream: &Arc<CudaStream>) -> Result<()> {
         use cudarc::driver::DevicePtrMut;
-        anyhow::ensure!(
+        ensure!(
             layer_idx < self.n_layers
                 && slot < MOE_CHAIN_PHASE_SLOTS_ENTRY_GATE_SHARED_GROUPED_TAIL,
             "phase ladder mark out of range: layer {layer_idx} slot {slot}"
@@ -7518,7 +7108,7 @@ impl MoeChainPhaseLadder {
         let rc = unsafe {
             nv_kernels::cuda::prof_timestamp(stream.cu_stream() as *mut c_void, dst as *mut u64)
         };
-        anyhow::ensure!(rc == 0, "phase ladder prof_timestamp rc={rc}");
+        ensure!(rc == 0, "phase ladder prof_timestamp rc={rc}");
         Ok(())
     }
 
@@ -7535,8 +7125,7 @@ impl MoeChainPhaseLadder {
                 eprintln!("[q36-moe-events] sync failed: {e:?}");
                 return;
             }
-            #[allow(deprecated)]
-            match self.stream.memcpy_dtov(&*stamps) {
+            match self.stream.clone_dtoh(&*stamps) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("[q36-moe-events] readback failed: {e:?}");
@@ -7572,9 +7161,8 @@ impl MoeChainPhaseLadder {
 impl GroupedMoeDispatch {
     pub fn from_model(model: &Qwen3Moe) -> Result<Self> {
         let device = model.device().clone();
-        let dev = match &device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("GroupedMoeDispatch requires a CUDA device"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("GroupedMoeDispatch requires a CUDA device")
         };
         let cfg = model.config();
         let fused_chain_m1 =
@@ -7639,7 +7227,7 @@ impl GroupedMoeDispatch {
                 let moe = layer.ffn.as_moe().ok_or_else(|| {
                     anyhow::anyhow!("router gemv arm: layer {i} has no MoE block")
                 })?;
-                anyhow::ensure!(
+                ensure!(
                     moe.gate().bias().is_none() && moe.shared_expert_gate().bias().is_none(),
                     "router gemv arm: layer {i} router/shared-gate carries a bias the fused \
                      kernel does not apply"
@@ -7653,7 +7241,7 @@ impl GroupedMoeDispatch {
                         )
                     })?
                     .contiguous()?;
-                anyhow::ensure!(
+                ensure!(
                     gw.dtype() == DType::BF16 && gw.dims() == [cfg.num_experts, cfg.hidden_size],
                     "router gemv arm: layer {i} router weight {:?} {:?}",
                     gw.dims(),
@@ -7668,7 +7256,7 @@ impl GroupedMoeDispatch {
                         )
                     })?
                     .contiguous()?;
-                anyhow::ensure!(
+                ensure!(
                     sgw.dtype() == DType::BF16 && sgw.elem_count() == cfg.hidden_size,
                     "router gemv arm: layer {i} shared gate weight {:?} {:?}",
                     sgw.dims(),
@@ -7681,7 +7269,7 @@ impl GroupedMoeDispatch {
             None
         };
         let ctx = if shared_folded {
-            nv_layers::moe_grouped::GroupedDecodeContext::new_folded_shared(
+            GroupedDecodeContext::new_folded_shared(
                 cfg.hidden_size,
                 cfg.moe_intermediate_size,
                 cfg.num_experts_per_tok,
@@ -7690,7 +7278,7 @@ impl GroupedMoeDispatch {
                 &stream,
             )?
         } else {
-            nv_layers::moe_grouped::GroupedDecodeContext::new(
+            GroupedDecodeContext::new(
                 cfg.hidden_size,
                 cfg.moe_intermediate_size,
                 cfg.num_experts_per_tok,
@@ -7702,14 +7290,6 @@ impl GroupedMoeDispatch {
             .synchronize()
             .map_err(|e| anyhow::anyhow!("GroupedMoeDispatch: post-build sync: {e:?}"))?;
         let max_verify_tokens = MAX_VERIFY_MOE_TOKENS.min(256 / cfg.num_experts_per_tok.max(1));
-        crate::host_serving_util::env_arm_dependency_assert_enabled_arm_requires_prerequisite(
-            "NV_Q36_MOE_FUSED_CHAIN",
-            fused_chain_m1,
-            "NV_MOE_ROUTE_FUSE",
-            nv_layers::moe_grouped::route_fuse_enabled(),
-            "without it the shared GroupedDecodeContext chain runs the unfused route and the \
-             arm measures nothing",
-        )?;
         let phase_ladder =
             if nv_q36_moe_events_env_opt_in_nv_q36_moe_events_1_in_capture_globaltimer_ladder_perturbs_by_its_own_nodes() {
                 let stamps = stream.alloc_zeros::<u64>(
@@ -7726,8 +7306,8 @@ impl GroupedMoeDispatch {
         Ok(Self {
             weights,
             ctx: Mutex::new(ctx),
-            verify_ctx: Mutex::new(std::collections::HashMap::new()),
-            verify_chain_ctx: Mutex::new(std::collections::HashMap::new()),
+            verify_ctx: Mutex::new(HashMap::new()),
+            verify_chain_ctx: Mutex::new(HashMap::new()),
             hidden_size: cfg.hidden_size,
             moe_intermediate_size: cfg.moe_intermediate_size,
             num_experts_per_tok: cfg.num_experts_per_tok,
@@ -7744,20 +7324,6 @@ impl GroupedMoeDispatch {
         })
     }
 
-    pub fn ab_toggle_verify_chain_small_m_for_parity_tests(&mut self, on: bool) {
-        self.verify_chain_small_m = on;
-    }
-
-    pub fn ab_swap_router_gemv_weights_for_parity_tests(
-        &mut self,
-        w: Option<Vec<(Tensor, Tensor)>>,
-    ) -> Option<Vec<(Tensor, Tensor)>> {
-        std::mem::replace(
-            &mut self.router_and_sg_weights_kept_contiguous_bf16_for_the_router_gemv_arm,
-            w,
-        )
-    }
-
     fn forward_verify(
         &self,
         layer_idx: usize,
@@ -7769,9 +7335,8 @@ impl GroupedMoeDispatch {
             return Ok(None);
         }
         let device = x_flat.device().clone();
-        let dev = match &device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = device.clone() else {
+            return Ok(None);
         };
         let w = self.weights.get(layer_idx).ok_or_else(|| {
             anyhow::anyhow!(
@@ -7780,7 +7345,7 @@ impl GroupedMoeDispatch {
                 self.weights.len()
             )
         })?;
-        let nan_scan = std::env::var("NV_DEBUG_NAN_SCAN").as_deref() == Ok("1");
+        let nan_scan = env::var("NV_DEBUG_NAN_SCAN").as_deref() == Ok("1");
         let scan = |label: &str, t: &Tensor| -> Result<()> {
             if !nan_scan {
                 return Ok(());
@@ -7792,7 +7357,7 @@ impl GroupedMoeDispatch {
                     .iter()
                     .filter(|x| x.is_finite())
                     .fold(0f32, |m, x| m.max(x.abs()));
-                anyhow::bail!(
+                bail!(
                     "NV_DEBUG_NAN_SCAN first non-finite at layer {layer_idx} stage {label}: \
                      {bad}/{} non-finite, finite_amax={amax}",
                     v.len()
@@ -7802,7 +7367,7 @@ impl GroupedMoeDispatch {
         };
         let mark_stream = nv_layers::cuda_stream::current_stream(&dev);
         self.ladder_last_stamp_path_0_m1_1_generic_verify_2_fused_verify
-            .store(1, std::sync::atomic::Ordering::Relaxed);
+            .store(1, Ordering::Relaxed);
         self.mark(layer_idx, 0, &mark_stream);
         scan("input", x_flat)?;
         let logits = moe.gate().forward(x_flat)?;
@@ -7814,10 +7379,10 @@ impl GroupedMoeDispatch {
                 .lock()
                 .map_err(|e| anyhow::anyhow!("GroupedMoeDispatch verify_ctx poisoned: {e}"))?;
             let ctx = match map.entry(n_tokens) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(v) => {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(v) => {
                     let stream = nv_layers::cuda_stream::current_stream(&dev);
-                    v.insert(nv_layers::moe_grouped::GroupedDecodeContext::new_multi(
+                    v.insert(GroupedDecodeContext::new_multi(
                         self.hidden_size,
                         self.moe_intermediate_size,
                         self.num_experts_per_tok,
@@ -7841,7 +7406,7 @@ impl GroupedMoeDispatch {
         Ok(Some(y))
     }
 
-    fn mark(&self, layer_idx: usize, slot: usize, stream: &Arc<cudarc::driver::CudaStream>) {
+    fn mark(&self, layer_idx: usize, slot: usize, stream: &Arc<CudaStream>) {
         if let Some(ladder) = &self.phase_ladder {
             if let Err(e) = ladder.mark(layer_idx, slot, stream) {
                 eprintln!("[q36-moe-events] mark failed: {e:#}");
@@ -7859,7 +7424,7 @@ impl GroupedMoeDispatch {
             .ctx
             .lock()
             .map_err(|e| anyhow::anyhow!("GroupedMoeDispatch ctx mutex poisoned: {e}"))?;
-        anyhow::ensure!(
+        ensure!(
             ctx.n_tokens() == 1,
             "fused chain m1 needs the single-token GroupedDecodeContext"
         );
@@ -7873,20 +7438,19 @@ impl GroupedMoeDispatch {
         x: &Tensor,
         n_tokens: usize,
     ) -> Result<Tensor> {
-        let dev = match x.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("GroupedMoeDispatch fused chain requires a CUDA device"),
+        let Device::Cuda(dev) = x.device().clone() else {
+            bail!("GroupedMoeDispatch fused chain requires a CUDA device")
         };
         let mut map = self
             .verify_chain_ctx
             .lock()
             .map_err(|e| anyhow::anyhow!("GroupedMoeDispatch verify_chain_ctx poisoned: {e}"))?;
         let ctx = match map.entry(n_tokens) {
-            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-            std::collections::hash_map::Entry::Vacant(v) => {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
                 let stream = nv_layers::cuda_stream::current_stream(&dev);
                 let built = if self.shared_folded {
-                    nv_layers::moe_grouped::GroupedDecodeContext::new_folded_shared(
+                    GroupedDecodeContext::new_folded_shared(
                         self.hidden_size,
                         self.moe_intermediate_size,
                         self.num_experts_per_tok,
@@ -7895,7 +7459,7 @@ impl GroupedMoeDispatch {
                         &stream,
                     )?
                 } else {
-                    nv_layers::moe_grouped::GroupedDecodeContext::new_multi(
+                    GroupedDecodeContext::new_multi(
                         self.hidden_size,
                         self.moe_intermediate_size,
                         self.num_experts_per_tok,
@@ -7915,30 +7479,29 @@ impl GroupedMoeDispatch {
         layer_idx: usize,
         moe: &MoeBlock,
         x: &Tensor,
-        ctx: &mut nv_layers::moe_grouped::GroupedDecodeContext,
+        ctx: &mut GroupedDecodeContext,
     ) -> Result<Tensor> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let in_dims = x.dims().to_vec();
         let hidden = *in_dims.last().unwrap();
         let n_tokens = ctx.n_tokens();
-        anyhow::ensure!(
+        ensure!(
             hidden == self.hidden_size,
             "fused chain: hidden {hidden} != {}",
             self.hidden_size
         );
-        anyhow::ensure!(
+        ensure!(
             x.dtype() == DType::BF16,
             "fused chain expects BF16 activations, got {:?}",
             x.dtype()
         );
-        anyhow::ensure!(
+        ensure!(
             in_dims[..in_dims.len() - 1].iter().product::<usize>() == n_tokens,
             "fused chain: x dims {in_dims:?} do not carry the context's {n_tokens} rows"
         );
         let device = x.device().clone();
-        let dev = match &device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("GroupedMoeDispatch fused chain requires a CUDA device"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("GroupedMoeDispatch fused chain requires a CUDA device")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let w = self.weights.get(layer_idx).ok_or_else(|| {
@@ -7949,13 +7512,10 @@ impl GroupedMoeDispatch {
             )
         })?;
         self.ladder_last_stamp_path_0_m1_1_generic_verify_2_fused_verify
-            .store(
-                if n_tokens == 1 { 0 } else { 2 },
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            .store(if n_tokens == 1 { 0 } else { 2 }, Ordering::Relaxed);
         self.mark(layer_idx, 0, &stream);
         let x_flat = x.reshape((n_tokens, hidden))?.contiguous()?;
-        anyhow::ensure!(
+        ensure!(
             ctx.folds_shared() == self.shared_folded,
             "fused chain needs a GroupedDecodeContext whose fold state matches \
              NV_Q36_MOE_SHARED_FOLD"
@@ -7969,24 +7529,24 @@ impl GroupedMoeDispatch {
             {
                 let (xs, xl) = x_flat.storage_and_layout();
                 let x_cuda = match &*xs {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("fused chain: x must be CUDA"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("fused chain: x must be CUDA"),
                 };
                 let x_slice = x_cuda.as_cuda_slice::<half::bf16>()?;
                 let (xp, _g1) = x_slice.device_ptr(&stream);
                 let xp = xp + (xl.start_offset() * std::mem::size_of::<half::bf16>()) as u64;
                 let (gs, gl) = gw.storage_and_layout();
                 let g_cuda = match &*gs {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("router gemv arm: router weight must be CUDA"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("router gemv arm: router weight must be CUDA"),
                 };
                 let g_slice = g_cuda.as_cuda_slice::<half::bf16>()?;
                 let (gp, _g2) = g_slice.device_ptr(&stream);
                 let gp = gp + (gl.start_offset() * std::mem::size_of::<half::bf16>()) as u64;
                 let (ss, sl) = sgw.storage_and_layout();
                 let s_cuda = match &*ss {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("router gemv arm: shared gate weight must be CUDA"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("router gemv arm: shared gate weight must be CUDA"),
                 };
                 let s_slice = s_cuda.as_cuda_slice::<half::bf16>()?;
                 let (sp, _g3) = s_slice.device_ptr(&stream);
@@ -8003,7 +7563,7 @@ impl GroupedMoeDispatch {
                 None
             } else {
                 let shared = moe.shared_contribution_device(&x_flat)?;
-                anyhow::ensure!(
+                ensure!(
                     shared.dtype() == DType::F32 && shared.elem_count() == n_tokens * hidden,
                     "fused chain: unexpected shared contribution {:?} {:?}",
                     shared.dims(),
@@ -8015,7 +7575,7 @@ impl GroupedMoeDispatch {
             out
         } else {
             let logits = moe.gate().forward(&x_flat)?;
-            anyhow::ensure!(
+            ensure!(
                 logits.dtype() == DType::BF16 && logits.elem_count() == n_tokens * self.num_experts,
                 "fused chain: unexpected router logits {:?} {:?}",
                 logits.dims(),
@@ -8024,8 +7584,8 @@ impl GroupedMoeDispatch {
             {
                 let (ls, ll) = logits.storage_and_layout();
                 let l_cuda = match &*ls {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("fused chain: router logits must be CUDA"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("fused chain: router logits must be CUDA"),
                 };
                 let l_slice = l_cuda.as_cuda_slice::<half::bf16>()?;
                 let (lp, _g1) = l_slice.device_ptr(&stream);
@@ -8037,8 +7597,8 @@ impl GroupedMoeDispatch {
             {
                 let (xs, xl) = x_flat.storage_and_layout();
                 let x_cuda = match &*xs {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("fused chain: x must be CUDA"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("fused chain: x must be CUDA"),
                 };
                 let x_slice = x_cuda.as_cuda_slice::<half::bf16>()?;
                 let (xp, _g1) = x_slice.device_ptr(&stream);
@@ -8048,7 +7608,7 @@ impl GroupedMoeDispatch {
             self.mark(layer_idx, 1, &stream);
             let out = if self.shared_folded {
                 let sg_logit = moe.shared_expert_gate().forward(&x_flat)?;
-                anyhow::ensure!(
+                ensure!(
                     sg_logit.dtype() == DType::BF16 && sg_logit.elem_count() == n_tokens,
                     "fused chain: unexpected shared gate logit {:?} {:?}",
                     sg_logit.dims(),
@@ -8057,7 +7617,7 @@ impl GroupedMoeDispatch {
                 Some(sg_logit)
             } else {
                 let shared = moe.shared_contribution_device(&x_flat)?;
-                anyhow::ensure!(
+                ensure!(
                     shared.dtype() == DType::F32 && shared.elem_count() == n_tokens * hidden,
                     "fused chain: unexpected shared contribution {:?} {:?}",
                     shared.dims(),
@@ -8072,9 +7632,8 @@ impl GroupedMoeDispatch {
             w, ctx, 0, 0, 0.0, false, 1.0, false, &stream, None, None,
         )?;
         self.mark(layer_idx, 3, &stream);
-        let mut out_slice: cudarc::driver::CudaSlice<half::bf16> =
-            unsafe { stream.alloc(n_tokens * hidden) }
-                .map_err(|e| anyhow::anyhow!("fused chain: out alloc: {e:?}"))?;
+        let mut out_slice: CudaSlice<half::bf16> = unsafe { stream.alloc(n_tokens * hidden) }
+            .map_err(|e| anyhow::anyhow!("fused chain: out alloc: {e:?}"))?;
         if self.shared_folded {
             match &shared_or_gate {
                 None => {
@@ -8086,8 +7645,8 @@ impl GroupedMoeDispatch {
                 Some(sg_logit) => {
                     let (gs, gl) = sg_logit.storage_and_layout();
                     let g_cuda = match &*gs {
-                        candle_core::Storage::Cuda(s) => s,
-                        _ => anyhow::bail!("fused chain: shared gate logit must be CUDA"),
+                        Storage::Cuda(s) => s,
+                        _ => bail!("fused chain: shared gate logit must be CUDA"),
                     };
                     let g_slice = g_cuda.as_cuda_slice::<half::bf16>()?;
                     let (gp, _g1) = g_slice.device_ptr(&stream);
@@ -8104,8 +7663,8 @@ impl GroupedMoeDispatch {
                 .expect("the non-fold chain always computes the dense shared contribution");
             let (ss, sl) = shared_or_gate.storage_and_layout();
             let s_cuda = match &*ss {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("fused chain: shared must be CUDA"),
+                Storage::Cuda(s) => s,
+                _ => bail!("fused chain: shared must be CUDA"),
             };
             let s_slice = s_cuda.as_cuda_slice::<f32>()?;
             let (sp, _g1) = s_slice.device_ptr(&stream);
@@ -8115,11 +7674,11 @@ impl GroupedMoeDispatch {
             ctx.unpermute_scatter_tail_adding_shared_f32_then_resid_bf16(&stream, sp, rp, op)?;
         }
         self.mark(layer_idx, 4, &stream);
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(out_slice, dev);
+        let storage = CudaStorage::wrap_cuda_slice(out_slice, dev);
         let out = Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (n_tokens, hidden),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         let mut out_dims = in_dims[..in_dims.len() - 1].to_vec();
@@ -8141,7 +7700,7 @@ impl MoeDispatch for GroupedMoeDispatch {
                 && n_tokens
                     <= nv_layers::moe_grouped::ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
                 && in_dtype == DType::BF16
-                && matches!(x.device(), Device::Cuda(_))
+                && x.device().is_cuda()
             {
                 return self.forward_fused_chain_verify_small_m(layer_idx, moe, x, n_tokens);
             }
@@ -8177,7 +7736,7 @@ impl MoeDispatch for GroupedMoeDispatch {
             }
         };
         self.ladder_last_stamp_path_0_m1_1_generic_verify_2_fused_verify
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+            .store(0, Ordering::Relaxed);
         mark(0);
         let x_flat = x.reshape((1usize, hidden))?.contiguous()?;
         let logits = moe.gate().forward(&x_flat)?;
@@ -8206,7 +7765,7 @@ impl MoeDispatch for GroupedMoeDispatch {
         if let Some(ladder) = &self.phase_ladder {
             match self
                 .ladder_last_stamp_path_0_m1_1_generic_verify_2_fused_verify
-                .load(std::sync::atomic::Ordering::Relaxed)
+                .load(Ordering::Relaxed)
             {
                 1 => {
                     ladder.dump("verify(p0=gate_logits,p1=grouped_decode,p2=shared,p3=add_cast)");
@@ -8266,61 +7825,26 @@ pub const MOE_ONLY_KEYS: [&str; 4] = [
 
 impl Qwen3_5DenseConfig {
     pub fn from_hf_json_str(s: &str) -> Result<Self> {
-        let v: serde_json::Value =
-            serde_json::from_str(s).context("parse qwen3_5 dense config json")?;
-        let text = v
-            .get("text_config")
-            .ok_or_else(|| anyhow::anyhow!("missing text_config"))?;
+        let v: Value = serde_json::from_str(s).context("parse qwen3_5 dense config json")?;
+        let text = hf_text_config(&v)?;
         for key in MOE_ONLY_KEYS {
-            anyhow::ensure!(
+            ensure!(
                 text.get(key).is_none(),
                 "config declares {key}: this is a MoE checkpoint, use Qwen3MoeConfig"
             );
         }
-        let get_u = |k: &str| -> Result<usize> {
-            text.get(k)
-                .and_then(|x| x.as_u64())
-                .map(|x| x as usize)
-                .ok_or_else(|| anyhow::anyhow!("missing/invalid {k}"))
-        };
-        let get_f = |k: &str| -> Result<f64> {
-            text.get(k)
-                .and_then(|x| x.as_f64())
-                .ok_or_else(|| anyhow::anyhow!("missing/invalid {k}"))
-        };
-        let layer_types_raw = text
-            .get("layer_types")
-            .and_then(|x| x.as_array())
-            .ok_or_else(|| anyhow::anyhow!("missing layer_types"))?;
-        let layer_types: Vec<LayerType> = layer_types_raw
-            .iter()
-            .map(|x| match x.as_str() {
-                Some("linear_attention") => Ok(LayerType::LinearAttention),
-                Some("full_attention") => Ok(LayerType::FullAttention),
-                other => Err(anyhow::anyhow!("unknown layer type {:?}", other)),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let rope_params = text
-            .get("rope_parameters")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let rope_theta = rope_params
-            .get("rope_theta")
-            .and_then(|x| x.as_f64())
-            .or_else(|| text.get("rope_theta").and_then(|x| x.as_f64()))
-            .unwrap_or(10_000_000.0) as f32;
-        let partial_rotary_factor = rope_params
-            .get("partial_rotary_factor")
-            .and_then(|x| x.as_f64())
-            .or_else(|| text.get("partial_rotary_factor").and_then(|x| x.as_f64()))
-            .unwrap_or(1.0) as f32;
+        let get_u = |k: &str| hf_json_usize(text, k);
+        let get_f = |k: &str| hf_json_f64(text, k);
+        let layer_types = hf_layer_types(text)?;
+        let rope_theta = hf_rope_param(text, "rope_theta", 10_000_000.0);
+        let partial_rotary_factor = hf_rope_param(text, "partial_rotary_factor", 1.0);
         let eos = scoped_token_id([text, &v], "eos_token_id")
             .ok_or_else(|| anyhow::anyhow!("missing eos_token_id"))?;
         let tie = scoped_bool([text, &v], "tie_word_embeddings").unwrap_or(false);
         let intermediate_size = get_u("intermediate_size")?;
-        anyhow::ensure!(intermediate_size > 0, "intermediate_size must be > 0");
+        ensure!(intermediate_size > 0, "intermediate_size must be > 0");
         let num_hidden_layers = get_u("num_hidden_layers")?;
-        anyhow::ensure!(
+        ensure!(
             layer_types.len() == num_hidden_layers,
             "layer_types has {} entries but num_hidden_layers is {}",
             layer_types.len(),
@@ -8418,8 +7942,8 @@ fn build_layer(
     idx: usize,
     weights: &WeightLoader,
     qconfig: &QuantizationConfig,
-    runner: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
-    fp8_runner: &Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>,
+    runner: Arc<Mutex<Nvfp4GemmRunner>>,
+    fp8_runner: &Arc<Mutex<Fp8GemmRunner>>,
     device: &Device,
     dtype: DType,
 ) -> Result<Qwen3MoeLayer> {
@@ -8462,14 +7986,7 @@ fn build_layer(
         }
         LayerType::LinearAttention => {
             let la_cfg = config.linear_attn_config();
-            let mut la = if q38_fp8_dequant_bf16_env_restores_the_4_byte_prequant_arm() {
-                LinearAttention::from_loader(
-                    la_cfg,
-                    &format!("{prefix}.linear_attn"),
-                    weights,
-                    dtype,
-                )?
-            } else if nv_layers::linear_attn::gdn_nvfp4_env_opt_in_double_quants_the_fp8_gdn_projections_to_half_byte_resident_needs_a_ppl_gate_before_any_flip() {
+            let mut la = if nv_layers::linear_attn::gdn_nvfp4_env_opt_in_double_quants_the_fp8_gdn_projections_to_half_byte_resident_needs_a_ppl_gate_before_any_flip() {
                 LinearAttention::from_loader_nvfp4_projections_resident_half_byte_per_param_double_quant_from_the_fp8_checkpoint(
                     la_cfg,
                     &format!("{prefix}.linear_attn"),
@@ -8543,15 +8060,14 @@ fn build_layer(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 fn build_dense_mlp(
     config: &Qwen3MoeConfig,
     intermediate: usize,
     prefix: &str,
     weights: &WeightLoader,
     qconfig: &QuantizationConfig,
-    runner: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
-    fp8_runner: &Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>,
+    runner: Arc<Mutex<Nvfp4GemmRunner>>,
+    fp8_runner: &Arc<Mutex<Fp8GemmRunner>>,
     device: &Device,
     dtype: DType,
 ) -> Result<Mlp> {
@@ -8613,11 +8129,9 @@ pub const Q38_NVFP4_DIAGFOLD_ARM_REQUANT_NULL_ISOLATES_THE_DEQUANT_REQUANT_ROUND
 
 #[cfg(feature = "cuda")]
 fn q38_diagfold_arm_reread_every_load_none_off_some_fold_flag() -> Option<bool> {
-    match std::env::var(
-        Q38_NVFP4_DIAGFOLD_ENV_OPT_IN_1_FOLDS_REQUANT_NULL_ROUND_TRIPS_WITHOUT_FOLDING,
-    )
-    .ok()
-    .as_deref()
+    match env::var(Q38_NVFP4_DIAGFOLD_ENV_OPT_IN_1_FOLDS_REQUANT_NULL_ROUND_TRIPS_WITHOUT_FOLDING)
+        .ok()
+        .as_deref()
     {
         Some(Q38_NVFP4_DIAGFOLD_ARM_FOLD) => Some(true),
         Some(
@@ -8645,7 +8159,7 @@ fn load_dense_mlp_up_down_diagfolded_if_opted_in(
     hidden: usize,
     weights: &WeightLoader,
     qconfig: &QuantizationConfig,
-    runner: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
+    runner: Arc<Mutex<Nvfp4GemmRunner>>,
     device: &Device,
 ) -> Result<Option<(Linear, Linear)>> {
     let Some(fold) = q38_diagfold_arm_reread_every_load_none_off_some_fold_flag() else {
@@ -8722,8 +8236,8 @@ fn build_attention(
     prefix: &str,
     weights: &WeightLoader,
     qconfig: &QuantizationConfig,
-    runner: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
-    fp8_runner: &Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>,
+    runner: Arc<Mutex<Nvfp4GemmRunner>>,
+    fp8_runner: &Arc<Mutex<Fp8GemmRunner>>,
     device: &Device,
     dtype: DType,
 ) -> Result<AttentionLayer> {
@@ -8811,19 +8325,14 @@ fn build_attention(
 }
 
 #[cfg(feature = "cuda")]
-fn q38_fp8_dequant_bf16_env_restores_the_4_byte_prequant_arm() -> bool {
-    crate::host_serving_util::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_FP8_DEQUANT_BF16")
-}
-
-#[cfg(feature = "cuda")]
 fn load_attn_proj(
     weights: &WeightLoader,
     module: &str,
     out_features: usize,
     in_features: usize,
     qconfig: &QuantizationConfig,
-    runner: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
-    fp8_runner: &Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>,
+    runner: Arc<Mutex<Nvfp4GemmRunner>>,
+    fp8_runner: &Arc<Mutex<Fp8GemmRunner>>,
     device: &Device,
     dtype: DType,
 ) -> Result<Linear> {
@@ -8835,15 +8344,6 @@ fn load_attn_proj(
     }
     if weights.has(&weight_name) {
         if nv_layers::linear::checkpoint_module_is_fp8_e4m3_weight_with_scale(weights, module) {
-            if q38_fp8_dequant_bf16_env_restores_the_4_byte_prequant_arm() {
-                return nv_layers::linear::fp8_e4m3_rowscale_checkpoint_dequant_linear(
-                    weights,
-                    module,
-                    out_features,
-                    in_features,
-                    dtype,
-                );
-            }
             let tail_mlp_arm =
                 nv_q38_mlp_tail_nvfp4_default_on_user_sign_off_2026_09_11_for_certified_dense_shapes(
                     module, out_features, in_features,
@@ -8880,7 +8380,7 @@ fn load_attn_proj(
     }
     let packed_name = format!("{module}.weight_packed");
     if !weights.has(&packed_name) {
-        anyhow::bail!("neither {weight_name} nor {packed_name} found");
+        bail!("neither {weight_name} nor {packed_name} found");
     }
     if crate::host_serving_util::env_arm_opt_in_eq_some_1_reread_every_call(
         "NV_Q38_MLP_DEQUANT_BF16",
@@ -8912,7 +8412,7 @@ fn load_named(weights: &WeightLoader, candidates: &[&str], dtype: DType) -> Resu
                 .with_context(|| format!("load {name}"));
         }
     }
-    anyhow::bail!("none of {candidates:?} found in weights")
+    bail!("none of {candidates:?} found in weights")
 }
 
 #[cfg(feature = "cuda")]
@@ -8926,7 +8426,7 @@ fn load_rmsnorm_plus_one(
     let raw = load_named(weights, candidates, dtype)?;
     let d = raw.dims();
     if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("rmsnorm expected [{}], got {:?}", dim, d);
+        bail!("rmsnorm expected [{}], got {:?}", dim, d);
     }
     let raw_f32 = raw.to_dtype(DType::F32)?;
     let plus = raw_f32.affine(1.0, 1.0)?;
@@ -8957,16 +8457,15 @@ fn slice_cols_bf16(
     if src.dtype() != DType::BF16 || !src.is_contiguous() {
         return Ok(None);
     }
-    let dev = match src.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = src.device().clone() else {
+        return Ok(None);
     };
-    anyhow::ensure!(
+    ensure!(
         src.elem_count() == rows * src_width && start + width <= src_width,
         "slice_cols_bf16: shape mismatch"
     );
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut out: cudarc::driver::CudaSlice<half::bf16> = unsafe {
+    let mut out: CudaSlice<half::bf16> = unsafe {
         stream
             .alloc(rows * width)
             .map_err(|e| anyhow::anyhow!("slice_cols alloc: {e:?}"))?
@@ -8974,7 +8473,7 @@ fn slice_cols_bf16(
     {
         let (s, l) = src.storage_and_layout();
         let cu = match &*s {
-            candle_core::Storage::Cuda(c) => c,
+            Storage::Cuda(c) => c,
             _ => return Ok(None),
         };
         let sl = cu.as_cuda_slice::<half::bf16>()?;
@@ -8994,13 +8493,13 @@ fn slice_cols_bf16(
                 0,
             )
         };
-        anyhow::ensure!(rc == 0, "copy_cols_bf16 rc={rc}");
+        ensure!(rc == 0, "copy_cols_bf16 rc={rc}");
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+    let storage = CudaStorage::wrap_cuda_slice(out, dev);
     Ok(Some(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         (rows, width),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     )))
 }
@@ -9011,9 +8510,8 @@ fn embed_lookup_bf16(embed: &Tensor, tokens: &Tensor) -> Result<Option<Tensor>> 
     if embed.dtype() != DType::BF16 || !embed.is_contiguous() || tokens.dtype() != DType::U32 {
         return Ok(None);
     }
-    let dev = match embed.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = embed.device().clone() else {
+        return Ok(None);
     };
     if !tokens.device().same_device(embed.device()) || !tokens.is_contiguous() {
         return Ok(None);
@@ -9021,7 +8519,7 @@ fn embed_lookup_bf16(embed: &Tensor, tokens: &Tensor) -> Result<Option<Tensor>> 
     let (vocab, hidden) = embed.dims2()?;
     let seq = tokens.elem_count();
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut out: cudarc::driver::CudaSlice<half::bf16> = unsafe {
+    let mut out: CudaSlice<half::bf16> = unsafe {
         stream
             .alloc(seq * hidden)
             .map_err(|e| anyhow::anyhow!("embed_lookup alloc: {e:?}"))?
@@ -9029,7 +8527,7 @@ fn embed_lookup_bf16(embed: &Tensor, tokens: &Tensor) -> Result<Option<Tensor>> 
     {
         let (es, el) = embed.storage_and_layout();
         let e_cu = match &*es {
-            candle_core::Storage::Cuda(c) => c,
+            Storage::Cuda(c) => c,
             _ => return Ok(None),
         };
         let e_sl = e_cu.as_cuda_slice::<half::bf16>()?;
@@ -9037,7 +8535,7 @@ fn embed_lookup_bf16(embed: &Tensor, tokens: &Tensor) -> Result<Option<Tensor>> 
         let ep = ep + (el.start_offset() * std::mem::size_of::<half::bf16>()) as u64;
         let (ts, tl) = tokens.storage_and_layout();
         let t_cu = match &*ts {
-            candle_core::Storage::Cuda(c) => c,
+            Storage::Cuda(c) => c,
             _ => return Ok(None),
         };
         let t_sl = t_cu.as_cuda_slice::<u32>()?;
@@ -9055,13 +8553,13 @@ fn embed_lookup_bf16(embed: &Tensor, tokens: &Tensor) -> Result<Option<Tensor>> 
                 vocab as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "gather_rows_bf16 (embed) rc={rc}");
+        ensure!(rc == 0, "gather_rows_bf16 (embed) rc={rc}");
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+    let storage = CudaStorage::wrap_cuda_slice(out, dev);
     Ok(Some(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         (seq, hidden),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     )))
 }
@@ -9076,28 +8574,23 @@ fn fused_attn_gate_sigmoid_mul(
 ) -> Result<Tensor> {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
-    anyhow::ensure!(
+    ensure!(
         attn_out.dtype() == DType::BF16 && q_view_value_gate_interleaved.dtype() == DType::BF16,
         "fused attn gate is bf16-only"
     );
-    let dev = match attn_out.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("fused attn gate needs CUDA"),
+    let Device::Cuda(dev) = attn_out.device().clone() else {
+        bail!("fused attn gate needs CUDA")
     };
     let attn_c = attn_out.contiguous()?;
     let q_c = q_view_value_gate_interleaved.contiguous()?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut out: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(rows * n_heads * head_dim)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut out: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(rows * n_heads * head_dim)? };
     let rc = {
         let (astor, al) = attn_c.storage_and_layout();
         let (qstor, ql) = q_c.storage_and_layout();
         let (a_cuda, q_cuda) = match (&*astor, &*qstor) {
-            (candle_core::Storage::Cuda(a), candle_core::Storage::Cuda(q)) => (a, q),
-            _ => anyhow::bail!("expected cuda storage"),
+            (Storage::Cuda(a), Storage::Cuda(q)) => (a, q),
+            _ => bail!("expected cuda storage"),
         };
         let a_view = a_cuda.as_cuda_slice::<bf16>()?.slice(al.start_offset()..);
         let q_view = q_cuda.as_cuda_slice::<bf16>()?.slice(ql.start_offset()..);
@@ -9116,12 +8609,12 @@ fn fused_attn_gate_sigmoid_mul(
             )
         }
     };
-    anyhow::ensure!(rc == 0, "attn_gate_sigmoid_mul_bf16 rc={rc}");
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+    ensure!(rc == 0, "attn_gate_sigmoid_mul_bf16 rc={rc}");
+    let storage = CudaStorage::wrap_cuda_slice(out, dev);
     Ok(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         attn_out.dims().to_vec(),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
@@ -9140,13 +8633,13 @@ fn apply_partial_rope(
         let positions_2d = positions_for_rope(positions, q.dims()[0], q.dims()[1], q.device())?;
         return rope.apply(&q_f, &k_f, &positions_2d);
     }
-    let dims_q = q.dims().to_vec();
     #[cfg(feature = "cuda")]
     {
+        let dims_q = q.dims();
         let rope_fused_one_launch_the_narrow_cast_rope_cast_cat_chain_serves_only_non_cuda_or_non_bf16_since_its_escape_crashed_at_32k_and_was_deleted_2026_09_14 =
             q.dtype() == DType::BF16
                 && k.dtype() == DType::BF16
-                && matches!(q.device(), Device::Cuda(_));
+                && q.device().is_cuda();
         if rope_fused_one_launch_the_narrow_cast_rope_cast_cat_chain_serves_only_non_cuda_or_non_bf16_since_its_escape_crashed_at_32k_and_was_deleted_2026_09_14
         {
             let positions_2d = positions_for_rope(positions, dims_q[0], dims_q[1], q.device())?;
@@ -9203,6 +8696,54 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "cuda")]
+    fn cuda0_for(gate: &str) -> Device {
+        Device::new_cuda(0).unwrap_or_else(|e| {
+            panic!(
+                "no CUDA device 0: this is the {gate} and must not report success having \
+                 executed nothing: {e}"
+            )
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    fn rand_bf16_on(device: &Device, dims: (usize, usize, usize, usize)) -> Tensor {
+        Tensor::rand(-1.0f32, 1.0f32, dims, device)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn one_full_attention_layer(n_q: usize, n_kv: usize, hd: usize) -> Qwen3MoeConfig {
+        Qwen3MoeConfig {
+            hidden_size: n_q * hd,
+            num_hidden_layers: 1,
+            num_attention_heads: n_q,
+            num_key_value_heads: n_kv,
+            head_dim: hd,
+            moe_intermediate_size: 8,
+            shared_expert_intermediate_size: 8,
+            num_experts: 2,
+            num_experts_per_tok: 1,
+            vocab_size: 16,
+            max_position_embeddings: 4096,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-6,
+            partial_rotary_factor: 1.0,
+            bos_token_id: 0,
+            eos_token_id: 1,
+            layer_types: vec![LayerType::FullAttention],
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            linear_key_head_dim: 4,
+            linear_value_head_dim: 4,
+            linear_conv_kernel_dim: 2,
+            attn_output_gate: false,
+            tie_word_embeddings: true,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
     static KVSHARE_ENV_IS_PROCESS_GLOBAL_SO_TESTS_TOUCHING_OR_READING_IT_SERIALIZE:
         std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -9214,13 +8755,7 @@ mod tests {
         let _env = KVSHARE_ENV_IS_PROCESS_GLOBAL_SO_TESTS_TOUCHING_OR_READING_IT_SERIALIZE
             .lock()
             .unwrap();
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => panic!(
-                "no CUDA device 0: this is the attn-gate bitwise gate and must not report \
-                 success having compared nothing"
-            ),
-        };
+        let device = cuda0_for("attn-gate bitwise gate");
         for (rows, n_heads, head_dim) in [(4usize, 16usize, 128usize), (169, 8, 96), (5, 3, 64)] {
             let mut seed = 0x243f6a8885a308d3u64;
             let mut next = || {
@@ -9276,24 +8811,15 @@ mod tests {
                 cv.len()
             );
         }
+        rope_fused_partial_kernel_is_bitwise_vs_the_slice_cast_rope_cast_concat_chain();
     }
 
     #[cfg(feature = "cuda")]
-    #[test]
     fn rope_fused_partial_kernel_is_bitwise_vs_the_slice_cast_rope_cast_concat_chain() {
         use half::bf16;
         use nv_layers::rope::{Rope, RopeConfig, RopeKind};
 
-        let _env = KVSHARE_ENV_IS_PROCESS_GLOBAL_SO_TESTS_TOUCHING_OR_READING_IT_SERIALIZE
-            .lock()
-            .unwrap();
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => panic!(
-                "no CUDA device 0: this is the rope-fused bitwise gate and must not report \
-                 success having compared nothing"
-            ),
-        };
+        let device = cuda0_for("rope-fused bitwise gate");
         for (tokens, n_heads, n_kv_heads, head_dim, rotary_dim) in [
             (4usize, 16usize, 4usize, 128usize, 64usize),
             (4, 16, 4, 256, 64),
@@ -9451,64 +8977,16 @@ mod tests {
         let (n_q, n_kv, hd) = NQ_12_NKV_2_HD_256_THE_SMALLEST_SHAPE_THE_KVSHARE_ROUTE_ACCEPTS;
         let total =
             TOTAL_2048_DEEP_ENOUGH_THAT_THE_ARMS_SPLIT_DIFFERENTLY_AND_STOP_AGREEING_BITWISE;
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => panic!(
-                "no CUDA device 0: this is the m=1 decode kvshare gate routing gate and must not \
-                 report success having executed nothing: {e}"
-            ),
-        };
-        let config = Qwen3MoeConfig {
-            hidden_size: n_q * hd,
-            num_hidden_layers: 1,
-            num_attention_heads: n_q,
-            num_key_value_heads: n_kv,
-            head_dim: hd,
-            moe_intermediate_size: 8,
-            shared_expert_intermediate_size: 8,
-            num_experts: 2,
-            num_experts_per_tok: 1,
-            vocab_size: 16,
-            max_position_embeddings: 4096,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            partial_rotary_factor: 1.0,
-            bos_token_id: 0,
-            eos_token_id: 1,
-            layer_types: vec![LayerType::FullAttention],
-            linear_num_key_heads: 1,
-            linear_num_value_heads: 1,
-            linear_key_head_dim: 4,
-            linear_value_head_dim: 4,
-            linear_conv_kernel_dim: 2,
-            attn_output_gate: false,
-            tie_word_embeddings: true,
-        };
-        std::env::set_var("NV_Q36_GRAPHED_DECODE_FIX", "1");
-        std::env::set_var(
-            M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_FUSED_ARM,
-            "1",
-        );
-        let cache_built = Qwen3MoeKvCache::new(&config, 4096, &device, DType::BF16);
-        std::env::remove_var(
-            M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_FUSED_ARM,
-        );
-        let mut cache = cache_built.unwrap();
+        let device = cuda0_for("m=1 decode kvshare gate routing gate");
+        let config = one_full_attention_layer(n_q, n_kv, hd);
+        let mut cache = Qwen3MoeKvCache::new(&config, 4096, &device, DType::BF16).unwrap();
         assert!(
-            cache
-                .splitk_scratch_and_fan_in_gated_by_nv_q36_graphed_decode_fix_because_the_smem_kernel_serializes_a_block_reduce_per_kv_position_costing_82ms_at_8k
-                .as_ref()
-                .is_some_and(|(scratch, _)| scratch.len()
-                    >= n_q * M1_DECODE_KVSHARE_SCRATCH_SPLITS_128_THE_KERNELS_KKVSHAREMAXSPLITS * (hd + 2)),
-            "the constructor saw NV_Q38_DECODE_KVSHARE engaged and must size the splitk scratch \
-             for the kvshare 128-split cap, or the routed kernel scribbles past its scratch"
+            cache.splitk_scratch_and_fan_in.0.len()
+                >= n_q * M1_DECODE_KVSHARE_SCRATCH_SPLITS_128_THE_KERNELS_KKVSHAREMAXSPLITS * (hd + 2),
+            "the constructor must size the splitk scratch for the kvshare 128-split cap, or the \
+             routed kernel scribbles past its scratch"
         );
-        let rand_bf16 = |dims: (usize, usize, usize, usize)| {
-            Tensor::rand(-1.0f32, 1.0f32, dims, &device)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap()
-        };
+        let rand_bf16 = |dims| rand_bf16_on(&device, dims);
         let kv = (
             rand_bf16((1, total, n_kv, hd)),
             rand_bf16((1, total, n_kv, hd)),
@@ -9521,32 +8999,44 @@ mod tests {
         let q = rand_bf16((1, 1, n_q, hd));
         let run = |cache: &mut Qwen3MoeKvCache, arm: Option<&str>, min_total: Option<String>| {
             match arm {
-                Some(v) => std::env::set_var(
-                    M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_FUSED_ARM,
-                    v,
-                ),
-                None => std::env::remove_var(
-                    M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_FUSED_ARM,
-                ),
+                Some(v) => unsafe {
+                    std::env::set_var(
+                        M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+                        v,
+                    )
+                },
+                None => unsafe {
+                    std::env::remove_var(
+                        M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+                    )
+                },
             }
             match min_total {
-                Some(v) => std::env::set_var(
-                    M1_DECODE_KVSHARE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
-                    v,
-                ),
-                None => std::env::remove_var(
-                    M1_DECODE_KVSHARE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
-                ),
+                Some(v) => unsafe {
+                    std::env::set_var(
+                        M1_DECODE_KVSHARE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+                        v,
+                    )
+                },
+                None => unsafe {
+                    std::env::remove_var(
+                        M1_DECODE_KVSHARE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+                    )
+                },
             }
             let out = cache
                 .decode_attention_fp8(0, &q, n_q, 1.0 / (hd as f32).sqrt())
                 .unwrap();
-            std::env::remove_var(
-                M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_FUSED_ARM,
-            );
-            std::env::remove_var(
-                M1_DECODE_KVSHARE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
-            );
+            unsafe {
+                std::env::remove_var(
+                    M1_DECODE_KVSHARE_ENV_UNSET_OR_GATE_GATES_AT_THE_MEASURED_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+                )
+            };
+            unsafe {
+                std::env::remove_var(
+                    M1_DECODE_KVSHARE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+                )
+            };
             out.to_dtype(DType::F32)
                 .unwrap()
                 .flatten_all()
@@ -9554,17 +9044,15 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap()
         };
-        let fused = run(&mut cache, Some("0"), None);
+        let fused = run(&mut cache, Some("gate"), Some((total + 1).to_string()));
         let unset_below_the_default_knee_must_still_route_fused = run(&mut cache, None, None);
         assert_eq!(
             unset_below_the_default_knee_must_still_route_fused, fused,
             "unset gates at the signed-off 16384 knee, so total={total} must route bitwise to \
-             the fused arm exactly as the =0 escape does"
+             the fused arm exactly as a min_total above the total does"
         );
         let kvshare = run(&mut cache, Some("1"), None);
-        let gate_below = run(&mut cache, Some("gate"), Some((total + 1).to_string()));
         let gate_at = run(&mut cache, Some("gate"), Some(total.to_string()));
-        std::env::remove_var("NV_Q36_GRAPHED_DECODE_FIX");
         assert!(
             fused.iter().all(|x| x.is_finite()) && kvshare.iter().all(|x| x.is_finite()),
             "non-finite m=1 decode attention output on a pure arm"
@@ -9589,12 +9077,6 @@ mod tests {
              means an indexing bug"
         );
         assert_eq!(
-            gate_below,
-            fused,
-            "gate with min_total {} above total {total} must route bitwise to the fused arm",
-            total + 1
-        );
-        assert_eq!(
             gate_at, kvshare,
             "gate with min_total {total} at total {total} must route bitwise to the kvshare arm \
              (the gate engages at, not past, the knee)"
@@ -9602,58 +9084,18 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    #[test]
     fn tctile_forced_row0_m_invariance_2_to_8_stays_in_the_cross_arm_band_because_the_warp_to_row_map_depends_on_m(
     ) {
         const NQ_24_NKV_4_HD_256_THE_QWEN38_FULL_ATTENTION_SHAPE: (usize, usize, usize) =
             (24, 4, 256);
         const BASE_1024_MATCHES_THE_MK_ROW0_INVARIANCE_GATE: usize = 1024;
-        let _env_guard = KVSHARE_ENV_IS_PROCESS_GLOBAL_SO_TESTS_TOUCHING_OR_READING_IT_SERIALIZE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         let (n_q, n_kv, hd) = NQ_24_NKV_4_HD_256_THE_QWEN38_FULL_ATTENTION_SHAPE;
         let base = BASE_1024_MATCHES_THE_MK_ROW0_INVARIANCE_GATE;
         let m_max = MK_VERIFY_CONTIGUOUS_ROWS_8_THE_ONE_LAUNCH_SMEM_CAP_AND_SCRATCH_POOL_ROW_BUDGET_SPARSE_MK_RUNGS_CONTINUE_PAST_IT;
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => panic!(
-                "no CUDA device 0: this is the tctile row0 m-invariance gate and must not \
-                 report success having executed nothing: {e}"
-            ),
-        };
-        let config = Qwen3MoeConfig {
-            hidden_size: n_q * hd,
-            num_hidden_layers: 1,
-            num_attention_heads: n_q,
-            num_key_value_heads: n_kv,
-            head_dim: hd,
-            moe_intermediate_size: 8,
-            shared_expert_intermediate_size: 8,
-            num_experts: 2,
-            num_experts_per_tok: 1,
-            vocab_size: 16,
-            max_position_embeddings: 4096,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            partial_rotary_factor: 1.0,
-            bos_token_id: 0,
-            eos_token_id: 1,
-            layer_types: vec![LayerType::FullAttention],
-            linear_num_key_heads: 1,
-            linear_num_value_heads: 1,
-            linear_key_head_dim: 4,
-            linear_value_head_dim: 4,
-            linear_conv_kernel_dim: 2,
-            attn_output_gate: false,
-            tie_word_embeddings: true,
-        };
+        let device = cuda0_for("tctile row0 m-invariance gate");
+        let config = one_full_attention_layer(n_q, n_kv, hd);
         let mut cache = Qwen3MoeKvCache::new(&config, 2048, &device, DType::BF16).unwrap();
-        let rand_bf16 = |dims: (usize, usize, usize, usize)| {
-            Tensor::rand(-1.0f32, 1.0f32, dims, &device)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap()
-        };
+        let rand_bf16 = |dims| rand_bf16_on(&device, dims);
         let kv_base = (
             rand_bf16((1, base, n_kv, hd)),
             rand_bf16((1, base, n_kv, hd)),
@@ -9669,10 +9111,12 @@ mod tests {
         );
         let q_all = rand_bf16((1, m_max, n_q, hd));
         let scale = 1.0 / (hd as f32).sqrt();
-        std::env::set_var(
-            MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER,
-            "1",
-        );
+        unsafe {
+            std::env::set_var(
+                MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+                "1",
+            )
+        };
         let mut row0: Vec<(usize, Vec<f32>)> = Vec::new();
         for m in 2..=m_max {
             cache.set_current_len(base);
@@ -9697,9 +9141,11 @@ mod tests {
                 .unwrap();
             row0.push((m, flat[..n_q * hd].to_vec()));
         }
-        std::env::remove_var(
-            MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER,
-        );
+        unsafe {
+            std::env::remove_var(
+                MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+            )
+        };
         let (_, base_row) = &row0[0];
         let max_mag = base_row.iter().fold(0f32, |a, x| a.max(x.abs()));
         for (m, r) in &row0 {
@@ -9723,66 +9169,63 @@ mod tests {
     }
 
     #[test]
-    fn fused_tc_env_grammar_unset_empty_0_off_1_always_gate_knee_min_total_overrides_gate_only() {
-        let f = mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign_off_2026_09_11_zero_off_one_always;
+    fn fused_tc_env_grammar_unset_empty_gate_knee_1_always_min_total_overrides_gate_only() {
+        let f = mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign_off_2026_09_11_one_always;
         assert_eq!(
             f(None, None, 4),
-            Some(2048),
+            2048,
             "unset gates m>=4 at the 2048 knee the per-slot parity gate cleared"
         );
-        assert_eq!(
-            f(Some(""), None, 8),
-            None,
-            "explicit empty retains the pre-flip off meaning"
-        );
+        assert_eq!(f(Some(""), None, 8), 2048);
         assert_eq!(
             f(None, None, 2),
-            Some(4096),
+            4096,
             "m<4 keeps 4096: the fused arm loses to mk at m=2,3 at 2048 (fusedtc-56)"
         );
-        assert_eq!(f(None, None, 3), Some(4096));
-        assert_eq!(f(None, Some("12288"), 4), Some(12288));
-        assert_eq!(f(Some("0"), None, 4), None);
-        assert_eq!(f(Some("0"), Some("4096"), 4), None);
-        assert_eq!(f(Some("1"), None, 2), Some(0));
-        assert_eq!(f(Some("1"), Some("4096"), 4), Some(0));
-        assert_eq!(f(Some("gate"), None, 4), Some(2048));
+        assert_eq!(f(None, None, 3), 4096);
+        assert_eq!(f(None, Some("12288"), 4), 12288);
+        assert_eq!(f(Some("1"), None, 2), 0);
+        assert_eq!(f(Some("1"), Some("4096"), 4), 0);
+        assert_eq!(f(Some("gate"), None, 4), 2048);
         assert_eq!(fused_tc_gate_knee_for_rows(4), 2048);
         assert_eq!(fused_tc_gate_knee_for_rows(2), 4096);
-        assert_eq!(f(Some("gate"), Some("12288"), 4), Some(12288));
+        assert_eq!(f(Some("gate"), Some("12288"), 4), 12288);
+        tctile_env_grammar_unset_empty_gate_default_to_the_knee_signed_off_2026_09_02_1_always_min_total_overrides_gate_only();
+        m1_decode_kvshare_env_grammar_unset_empty_gate_default_to_the_knee_signed_off_2026_09_02_1_always();
     }
 
     #[test]
-    #[should_panic(expected = "NV_Q38_MK_VERIFY_FUSED_TC")]
-    fn fused_tc_env_grammar_rejects_values_outside_1_gate_0_so_a_typo_cannot_silently_pick_an_arm()
-    {
-        mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign_off_2026_09_11_zero_off_one_always(
-            Some("yes"),
-            None,
-            4,
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fused_tc_env_grammar_non_unicode_is_explicit_preflip_off_not_unset_gate() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-        let normalize =
-            mk_verify_fused_tc_raw_user_sign_off_2026_09_11_non_unicode_keeps_preflip_off;
-        let select = mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign_off_2026_09_11_zero_off_one_always;
-        assert_eq!(normalize(None), None);
-        assert_eq!(select(normalize(None), None, 4), Some(2048));
-        for value in ["", "0", "1", "gate", "yes", " 1"] {
-            assert_eq!(normalize(Some(OsStr::new(value))), Some(value));
+    fn env_grammars_reject_values_outside_1_gate_0_so_a_typo_cannot_silently_pick_an_arm() {
+        let fused_tc = || {
+            mk_verify_fused_tc_min_total_from_raw_default_gates_at_the_knee_user_sign_off_2026_09_11_one_always(
+                Some("yes"),
+                None,
+                4,
+            );
+        };
+        let tctile = || {
+            mk_verify_tctile_min_total_from_raw_default_gates_at_the_knee_signed_off_2026_09_02_one_always(
+                Some("yes"),
+                None,
+            );
+        };
+        let arms: [(&str, &dyn Fn()); 2] = [
+            ("NV_Q38_MK_VERIFY_FUSED_TC", &fused_tc),
+            ("NV_Q38_MK_VERIFY_TCTILE", &tctile),
+        ];
+        for (var, arm) in arms {
+            let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(arm))
+                .expect_err(var);
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains(var),
+                "{var}: the refusal must name the variable, got {msg:?}"
+            );
         }
-        let invalid = OsStr::from_bytes(b"\xff");
-        assert_eq!(normalize(Some(invalid)), Some("0"));
-        assert_eq!(select(normalize(Some(invalid)), None, 4), None);
-        assert_eq!(
-            select(normalize(Some(invalid)), Some("not-an-integer"), 4),
-            None
-        );
     }
 
     #[cfg(feature = "cuda")]
@@ -9795,46 +9238,10 @@ mod tests {
         let (n_q, n_kv, hd) = (12usize, 2usize, 256usize);
         let (base, m) = (2044usize, 4usize);
         let total = base + m;
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => panic!(
-                "no CUDA device 0: this is the fused tc gate routing gate and must not report \
-                 success having executed nothing: {e}"
-            ),
-        };
-        let config = Qwen3MoeConfig {
-            hidden_size: n_q * hd,
-            num_hidden_layers: 1,
-            num_attention_heads: n_q,
-            num_key_value_heads: n_kv,
-            head_dim: hd,
-            moe_intermediate_size: 8,
-            shared_expert_intermediate_size: 8,
-            num_experts: 2,
-            num_experts_per_tok: 1,
-            vocab_size: 16,
-            max_position_embeddings: 4096,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            partial_rotary_factor: 1.0,
-            bos_token_id: 0,
-            eos_token_id: 1,
-            layer_types: vec![LayerType::FullAttention],
-            linear_num_key_heads: 1,
-            linear_num_value_heads: 1,
-            linear_key_head_dim: 4,
-            linear_value_head_dim: 4,
-            linear_conv_kernel_dim: 2,
-            attn_output_gate: false,
-            tie_word_embeddings: true,
-        };
+        let device = cuda0_for("fused tc gate routing gate");
+        let config = one_full_attention_layer(n_q, n_kv, hd);
         let mut cache = Qwen3MoeKvCache::new(&config, 4096, &device, DType::BF16).unwrap();
-        let rand_bf16 = |dims: (usize, usize, usize, usize)| {
-            Tensor::rand(-1.0f32, 1.0f32, dims, &device)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap()
-        };
+        let rand_bf16 = |dims| rand_bf16_on(&device, dims);
         let kv_base = (
             rand_bf16((1, base, n_kv, hd)),
             rand_bf16((1, base, n_kv, hd)),
@@ -9852,29 +9259,32 @@ mod tests {
             .unwrap();
         let q = rand_bf16((1, m, n_q, hd));
         let fused_env =
-            MK_VERIFY_FUSED_TC_ENV_USER_SIGN_OFF_2026_09_11_UNSET_GATES_1_ALWAYS_0_RESTORES_TCTILE;
+            MK_VERIFY_FUSED_TC_ENV_USER_SIGN_OFF_2026_09_11_UNSET_GATES_1_ALWAYS;
         let fused_min = MK_VERIFY_FUSED_TC_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER;
-        let tctile_env = MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER;
+        let tctile_env = MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS;
         let run = |cache: &mut Qwen3MoeKvCache,
                    fused: Option<&str>,
                    min_total: Option<String>,
-                   tctile: &str| {
+                   tctile: Option<&str>| {
             match fused {
-                Some(v) => std::env::set_var(fused_env, v),
-                None => std::env::remove_var(fused_env),
+                Some(v) => unsafe { std::env::set_var(fused_env, v) },
+                None => unsafe { std::env::remove_var(fused_env) },
             }
             match min_total {
-                Some(v) => std::env::set_var(fused_min, v),
-                None => std::env::remove_var(fused_min),
+                Some(v) => unsafe { std::env::set_var(fused_min, v) },
+                None => unsafe { std::env::remove_var(fused_min) },
             }
-            std::env::set_var(tctile_env, tctile);
+            match tctile {
+                Some(v) => unsafe { std::env::set_var(tctile_env, v) },
+                None => unsafe { std::env::remove_var(tctile_env) },
+            }
             let out = cache
                 .verify_attention_fp8_mk(0, &q, n_q, m, 1.0 / (hd as f32).sqrt())
                 .unwrap()
                 .expect("mk verify route must be available for this shape");
-            std::env::remove_var(fused_env);
-            std::env::remove_var(fused_min);
-            std::env::remove_var(tctile_env);
+            unsafe { std::env::remove_var(fused_env) };
+            unsafe { std::env::remove_var(fused_min) };
+            unsafe { std::env::remove_var(tctile_env) };
             out.to_dtype(DType::F32)
                 .unwrap()
                 .flatten_all()
@@ -9882,17 +9292,12 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap()
         };
-        let mk = run(&mut cache, Some("0"), None, "0");
-        let unset = run(&mut cache, None, None, "0");
-        assert_eq!(
-            unset, mk,
-            "unset gates at the staged 8192 knee, so total={total} must route bitwise to the mk arm"
-        );
-        let fused = run(&mut cache, Some("1"), None, "0");
-        let gate_default_knee = run(&mut cache, Some("gate"), None, "0");
-        let gate_below = run(&mut cache, Some("gate"), Some((total + 1).to_string()), "0");
-        let gate_at = run(&mut cache, Some("gate"), Some(total.to_string()), "0");
-        let fused_over_tctile = run(&mut cache, Some("1"), None, "1");
+        let mk = run(&mut cache, Some("gate"), Some((total + 1).to_string()), None);
+        let fused = run(&mut cache, Some("1"), None, None);
+        let unset = run(&mut cache, None, None, None);
+        let gate_default_knee = run(&mut cache, Some("gate"), None, None);
+        let gate_at = run(&mut cache, Some("gate"), Some(total.to_string()), None);
+        let fused_over_tctile = run(&mut cache, Some("1"), None, Some("1"));
         assert!(
             mk.iter().all(|x| x.is_finite()) && fused.iter().all(|x| x.is_finite()),
             "non-finite verify attention output on a pure arm"
@@ -9903,14 +9308,13 @@ mod tests {
              assertions below would pass with the gate wired to either arm"
         );
         assert_eq!(
-            gate_default_knee, mk,
-            "gate at the default 8192 knee must route total={total} bitwise to the mk arm"
+            unset, fused,
+            "unset gates m={m} at the signed-off 2048 knee, so total={total} must route bitwise \
+             to the fused arm"
         );
         assert_eq!(
-            gate_below,
-            mk,
-            "gate with min_total {} above total {total} must route bitwise to the mk arm",
-            total + 1
+            gate_default_knee, fused,
+            "gate at the default 2048 knee must route total={total} bitwise to the fused arm"
         );
         assert_eq!(
             gate_at, fused,
@@ -9932,71 +9336,55 @@ mod tests {
             "fused vs mk max diff {cross} (max|mk|={max_mag}) exceeds the bf16 \
              reduction-order band; the arms disagree beyond accumulation order"
         );
+        tctile_gate_below_min_total_routes_bitwise_to_the_mk_arm_at_or_above_it_to_the_tctile_arm();
+        tctile_env_on_the_q36_group8_shape_falls_through_to_the_scalar_arms_because_the_launcher_refuses_group8();
     }
 
-    #[test]
-    fn tctile_env_grammar_unset_empty_gate_default_to_the_knee_signed_off_2026_09_02_0_off_1_always_min_total_overrides_gate_only(
+    fn tctile_env_grammar_unset_empty_gate_default_to_the_knee_signed_off_2026_09_02_1_always_min_total_overrides_gate_only(
     ) {
-        let f = mk_verify_tctile_min_total_from_raw_default_gates_at_the_knee_signed_off_2026_09_02_zero_off_one_always;
+        let f = mk_verify_tctile_min_total_from_raw_default_gates_at_the_knee_signed_off_2026_09_02_one_always;
         assert_eq!(
             f(None, None),
-            Some(TCTILE_GATE_KNEE_TOTAL_8192_ITS_LADDER_WINS_FROM_8192_AND_LOSES_AT_256),
+            TCTILE_GATE_KNEE_TOTAL_8192_ITS_LADDER_WINS_FROM_8192_AND_LOSES_AT_256,
             "unset must resolve to the signed-off gate default"
         );
         assert_eq!(
             f(Some(""), None),
-            Some(TCTILE_GATE_KNEE_TOTAL_8192_ITS_LADDER_WINS_FROM_8192_AND_LOSES_AT_256)
+            TCTILE_GATE_KNEE_TOTAL_8192_ITS_LADDER_WINS_FROM_8192_AND_LOSES_AT_256
         );
-        assert_eq!(f(None, Some("12288")), Some(12288));
-        assert_eq!(f(Some("0"), None), None, "=0 is the pre-champion escape");
-        assert_eq!(f(Some("0"), Some("4096")), None);
-        assert_eq!(f(Some("1"), None), Some(0));
-        assert_eq!(f(Some("1"), Some("4096")), Some(0));
+        assert_eq!(f(None, Some("12288")), 12288);
+        assert_eq!(f(Some("1"), None), 0);
+        assert_eq!(f(Some("1"), Some("4096")), 0);
         assert_eq!(
             f(Some("gate"), None),
-            Some(TCTILE_GATE_KNEE_TOTAL_8192_ITS_LADDER_WINS_FROM_8192_AND_LOSES_AT_256)
+            TCTILE_GATE_KNEE_TOTAL_8192_ITS_LADDER_WINS_FROM_8192_AND_LOSES_AT_256
         );
-        assert_eq!(f(Some("gate"), Some("12288")), Some(12288));
+        assert_eq!(f(Some("gate"), Some("12288")), 12288);
     }
 
-    #[test]
-    fn m1_decode_kvshare_env_grammar_unset_empty_gate_default_to_the_knee_signed_off_2026_09_02_0_restores_the_fused_arm(
+    fn m1_decode_kvshare_env_grammar_unset_empty_gate_default_to_the_knee_signed_off_2026_09_02_1_always(
     ) {
-        let f = m1_decode_kvshare_min_total_from_raw_none_off_zero_always_gate_reads_the_knee;
+        let f = m1_decode_kvshare_min_total_from_raw_one_always_gate_or_unset_reads_the_knee;
         assert_eq!(
             f(None, None),
-            Some(KVSHARE_ENGAGES_PAST_THE_MEASURED_M1_DECODE_CROSSOVER_TOTAL),
+            KVSHARE_ENGAGES_PAST_THE_MEASURED_M1_DECODE_CROSSOVER_TOTAL,
             "unset must resolve to the signed-off gate default"
         );
         assert_eq!(
             f(Some(""), None),
-            Some(KVSHARE_ENGAGES_PAST_THE_MEASURED_M1_DECODE_CROSSOVER_TOTAL)
+            KVSHARE_ENGAGES_PAST_THE_MEASURED_M1_DECODE_CROSSOVER_TOTAL
         );
-        assert_eq!(f(None, Some("12288")), Some(12288));
-        assert_eq!(f(Some("0"), None), None, "=0 restores the fused arm");
-        assert_eq!(f(Some("1"), None), Some(0));
+        assert_eq!(f(None, Some("12288")), 12288);
+        assert_eq!(f(Some("1"), None), 0);
         assert_eq!(
             f(Some("gate"), None),
-            Some(KVSHARE_ENGAGES_PAST_THE_MEASURED_M1_DECODE_CROSSOVER_TOTAL)
+            KVSHARE_ENGAGES_PAST_THE_MEASURED_M1_DECODE_CROSSOVER_TOTAL
         );
-        assert_eq!(f(Some("gate"), Some("4096")), Some(4096));
-    }
-
-    #[test]
-    #[should_panic(expected = "NV_Q38_MK_VERIFY_TCTILE")]
-    fn tctile_env_grammar_rejects_values_outside_1_gate_0_so_a_typo_cannot_silently_pick_an_arm() {
-        mk_verify_tctile_min_total_from_raw_default_gates_at_the_knee_signed_off_2026_09_02_zero_off_one_always(
-            Some("yes"),
-            None,
-        );
+        assert_eq!(f(Some("gate"), Some("4096")), 4096);
     }
 
     #[cfg(feature = "cuda")]
-    #[test]
     fn tctile_gate_below_min_total_routes_bitwise_to_the_mk_arm_at_or_above_it_to_the_tctile_arm() {
-        let _env_guard = KVSHARE_ENV_IS_PROCESS_GLOBAL_SO_TESTS_TOUCHING_OR_READING_IT_SERIALIZE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         const NQ_12_NKV_2_HD_256_THE_SMALLEST_SHAPE_THE_TCTILE_ROUTE_ACCEPTS: (
             usize,
             usize,
@@ -10008,46 +9396,10 @@ mod tests {
         let (base, m) =
             BASE_2044_PLUS_M_4_MAKES_TOTAL_2048_DEEP_ENOUGH_THAT_THE_ARMS_PARTITION_DIFFERENTLY_AND_STOP_AGREEING_BITWISE;
         let total = base + m;
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => panic!(
-                "no CUDA device 0: this is the tctile gate routing gate and must not report \
-                 success having executed nothing: {e}"
-            ),
-        };
-        let config = Qwen3MoeConfig {
-            hidden_size: n_q * hd,
-            num_hidden_layers: 1,
-            num_attention_heads: n_q,
-            num_key_value_heads: n_kv,
-            head_dim: hd,
-            moe_intermediate_size: 8,
-            shared_expert_intermediate_size: 8,
-            num_experts: 2,
-            num_experts_per_tok: 1,
-            vocab_size: 16,
-            max_position_embeddings: 4096,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            partial_rotary_factor: 1.0,
-            bos_token_id: 0,
-            eos_token_id: 1,
-            layer_types: vec![LayerType::FullAttention],
-            linear_num_key_heads: 1,
-            linear_num_value_heads: 1,
-            linear_key_head_dim: 4,
-            linear_value_head_dim: 4,
-            linear_conv_kernel_dim: 2,
-            attn_output_gate: false,
-            tie_word_embeddings: true,
-        };
+        let device = cuda0_for("tctile gate routing gate");
+        let config = one_full_attention_layer(n_q, n_kv, hd);
         let mut cache = Qwen3MoeKvCache::new(&config, 4096, &device, DType::BF16).unwrap();
-        let rand_bf16 = |dims: (usize, usize, usize, usize)| {
-            Tensor::rand(-1.0f32, 1.0f32, dims, &device)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap()
-        };
+        let rand_bf16 = |dims| rand_bf16_on(&device, dims);
         let kv_base = (
             rand_bf16((1, base, n_kv, hd)),
             rand_bf16((1, base, n_kv, hd)),
@@ -10065,34 +9417,57 @@ mod tests {
             .unwrap();
         let q = rand_bf16((1, m, n_q, hd));
         let run = |cache: &mut Qwen3MoeKvCache, arm: Option<&str>, min_total: Option<String>| {
+            unsafe {
+                std::env::set_var(
+                    MK_VERIFY_FUSED_TC_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+                    (total + 1).to_string(),
+                )
+            };
             match arm {
-                Some(v) => std::env::set_var(
-                    MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER,
-                    v,
-                ),
-                None => std::env::remove_var(
-                    MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER,
-                ),
+                Some(v) => unsafe {
+                    std::env::set_var(
+                        MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+                        v,
+                    )
+                },
+                None => unsafe {
+                    std::env::remove_var(
+                        MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+                    )
+                },
             }
             match min_total {
-                Some(v) => std::env::set_var(
-                    MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
-                    v,
-                ),
-                None => std::env::remove_var(
-                    MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
-                ),
+                Some(v) => unsafe {
+                    std::env::set_var(
+                        MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+                        v,
+                    )
+                },
+                None => unsafe {
+                    std::env::remove_var(
+                        MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+                    )
+                },
             }
             let out = cache
                 .verify_attention_fp8_mk(0, &q, n_q, m, 1.0 / (hd as f32).sqrt())
                 .unwrap()
                 .expect("mk verify route must be available for this shape");
-            std::env::remove_var(
-                MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER,
-            );
-            std::env::remove_var(
-                MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
-            );
+            unsafe {
+                std::env::remove_var(
+                    MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+                )
+            };
+            unsafe {
+                std::env::remove_var(
+                    MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+                )
+            };
+            unsafe {
+                std::env::remove_var(
+                    MK_VERIFY_FUSED_TC_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+                )
+            };
             out.to_dtype(DType::F32)
                 .unwrap()
                 .flatten_all()
@@ -10100,15 +9475,14 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap()
         };
-        let mk = run(&mut cache, Some("0"), None);
+        let mk = run(&mut cache, Some("gate"), Some((total + 1).to_string()));
         let unset_below_the_default_knee_must_still_route_mk = run(&mut cache, None, None);
         assert_eq!(
             unset_below_the_default_knee_must_still_route_mk, mk,
             "unset gates tctile at the signed-off 8192 knee, so total={total} must route \
-             bitwise to the mk arm exactly as the =0 escape does"
+             bitwise to the mk arm exactly as a min_total above the total does"
         );
         let tctile = run(&mut cache, Some("1"), None);
-        let gate_below = run(&mut cache, Some("gate"), Some((total + 1).to_string()));
         let gate_at = run(&mut cache, Some("gate"), Some(total.to_string()));
         assert!(
             mk.iter().all(|x| x.is_finite()) && tctile.iter().all(|x| x.is_finite()),
@@ -10119,12 +9493,6 @@ mod tests {
             "the two arms produced bitwise-identical outputs over random fp8 kv; the routing \
              assertions below would then pass with the gate wired to either arm, so this test \
              would cover nothing"
-        );
-        assert_eq!(
-            gate_below,
-            mk,
-            "gate with min_total {} above total {total} must route bitwise to the mk arm",
-            total + 1
         );
         assert_eq!(
             gate_at, tctile,
@@ -10146,12 +9514,8 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    #[test]
     fn tctile_env_on_the_q36_group8_shape_falls_through_to_the_scalar_arms_because_the_launcher_refuses_group8(
     ) {
-        let _env_guard = KVSHARE_ENV_IS_PROCESS_GLOBAL_SO_TESTS_TOUCHING_OR_READING_IT_SERIALIZE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         const NQ_16_NKV_2_HD_256_THE_Q36_GROUP8_SHAPE_TCTILE_REFUSES: (usize, usize, usize) =
             (16, 2, 256);
         const BASE_508_PLUS_M_4_KEEPS_THE_ARM_CHEAP_THE_SUBJECT_IS_ROUTING_NOT_DEPTH: (
@@ -10160,46 +9524,10 @@ mod tests {
         ) = (508, 4);
         let (n_q, n_kv, hd) = NQ_16_NKV_2_HD_256_THE_Q36_GROUP8_SHAPE_TCTILE_REFUSES;
         let (base, m) = BASE_508_PLUS_M_4_KEEPS_THE_ARM_CHEAP_THE_SUBJECT_IS_ROUTING_NOT_DEPTH;
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => panic!(
-                "no CUDA device 0: this is the tctile group-8 fallthrough gate and must not \
-                 report success having executed nothing: {e}"
-            ),
-        };
-        let config = Qwen3MoeConfig {
-            hidden_size: n_q * hd,
-            num_hidden_layers: 1,
-            num_attention_heads: n_q,
-            num_key_value_heads: n_kv,
-            head_dim: hd,
-            moe_intermediate_size: 8,
-            shared_expert_intermediate_size: 8,
-            num_experts: 2,
-            num_experts_per_tok: 1,
-            vocab_size: 16,
-            max_position_embeddings: 4096,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            partial_rotary_factor: 1.0,
-            bos_token_id: 0,
-            eos_token_id: 1,
-            layer_types: vec![LayerType::FullAttention],
-            linear_num_key_heads: 1,
-            linear_num_value_heads: 1,
-            linear_key_head_dim: 4,
-            linear_value_head_dim: 4,
-            linear_conv_kernel_dim: 2,
-            attn_output_gate: false,
-            tie_word_embeddings: true,
-        };
+        let device = cuda0_for("tctile group-8 fallthrough gate");
+        let config = one_full_attention_layer(n_q, n_kv, hd);
         let mut cache = Qwen3MoeKvCache::new(&config, 1024, &device, DType::BF16).unwrap();
-        let rand_bf16 = |dims: (usize, usize, usize, usize)| {
-            Tensor::rand(-1.0f32, 1.0f32, dims, &device)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap()
-        };
+        let rand_bf16 = |dims| rand_bf16_on(&device, dims);
         let kv_all = (
             rand_bf16((1, base + m, n_kv, hd)),
             rand_bf16((1, base + m, n_kv, hd)),
@@ -10221,10 +9549,12 @@ mod tests {
             .unwrap()
             .to_vec1::<f32>()
             .unwrap();
-        std::env::set_var(
-            MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER,
-            "1",
-        );
+        unsafe {
+            std::env::set_var(
+                MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+                "1",
+            )
+        };
         let with_tctile_env = cache
             .verify_attention_fp8_mk(0, &q, n_q, m, scale)
             .unwrap()
@@ -10235,9 +9565,11 @@ mod tests {
             .unwrap()
             .to_vec1::<f32>()
             .unwrap();
-        std::env::remove_var(
-            MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER,
-        );
+        unsafe {
+            std::env::remove_var(
+                MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS,
+            )
+        };
         assert_eq!(
             with_tctile_env, mk,
             "NV_Q38_MK_VERIFY_TCTILE=1 on the 16q/2kv group-8 shape must route bitwise to the \
@@ -10256,16 +9588,19 @@ mod tests {
         let _env_guard = KVSHARE_ENV_IS_PROCESS_GLOBAL_SO_TESTS_TOUCHING_OR_READING_IT_SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        std::env::set_var(
-            MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER,
-            "0",
-        );
         let (n_q, n_kv, hd) = NQ_24_NKV_4_HD_256_THE_QWEN38_FULL_ATTENTION_SHAPE;
         let base = BASE_1024_THE_SERVING_DEPTH_THE_SUFSPEC_CAMPAIGN_SAW_THE_M7_ROW0_FLIP_AT;
         let rung_ladder: Vec<usize> = (2..=MK_VERIFY_CONTIGUOUS_ROWS_8_THE_ONE_LAUNCH_SMEM_CAP_AND_SCRATCH_POOL_ROW_BUDGET_SPARSE_MK_RUNGS_CONTINUE_PAST_IT)
             .chain(MK_VERIFY_DEEP_ROW_RUNGS_12_16_24_THE_LADDER_AND_GATES_SAMPLE_FROM_THE_CONTIGUOUS_2_TO_24_RANGE)
             .collect();
         let m_max = *rung_ladder.last().unwrap();
+        let min_total_above_every_rung_forces_the_mk_ladder = (base + m_max + 1).to_string();
+        for knob in [
+            MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+            MK_VERIFY_FUSED_TC_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+        ] {
+            unsafe { std::env::set_var(knob, &min_total_above_every_rung_forces_the_mk_ladder) };
+        }
         for m in &rung_ladder {
             assert!(
                 mk_verify_rows_case_instantiated(*m),
@@ -10273,46 +9608,10 @@ mod tests {
                  and mk_verify_rows_case_instantiated must list the same rungs"
             );
         }
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => panic!(
-                "no CUDA device 0: this is the mk verify row m-invariance gate and must not \
-                 report success having executed nothing: {e}"
-            ),
-        };
-        let config = Qwen3MoeConfig {
-            hidden_size: n_q * hd,
-            num_hidden_layers: 1,
-            num_attention_heads: n_q,
-            num_key_value_heads: n_kv,
-            head_dim: hd,
-            moe_intermediate_size: 8,
-            shared_expert_intermediate_size: 8,
-            num_experts: 2,
-            num_experts_per_tok: 1,
-            vocab_size: 16,
-            max_position_embeddings: 4096,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            partial_rotary_factor: 1.0,
-            bos_token_id: 0,
-            eos_token_id: 1,
-            layer_types: vec![LayerType::FullAttention],
-            linear_num_key_heads: 1,
-            linear_num_value_heads: 1,
-            linear_key_head_dim: 4,
-            linear_value_head_dim: 4,
-            linear_conv_kernel_dim: 2,
-            attn_output_gate: false,
-            tie_word_embeddings: true,
-        };
+        let device = cuda0_for("mk verify row m-invariance gate");
+        let config = one_full_attention_layer(n_q, n_kv, hd);
         let mut cache = Qwen3MoeKvCache::new(&config, 2048, &device, DType::BF16).unwrap();
-        let rand_bf16 = |dims: (usize, usize, usize, usize)| {
-            Tensor::rand(-1.0f32, 1.0f32, dims, &device)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap()
-        };
+        let rand_bf16 = |dims| rand_bf16_on(&device, dims);
         let kv_base = (
             rand_bf16((1, base, n_kv, hd)),
             rand_bf16((1, base, n_kv, hd)),
@@ -10352,9 +9651,12 @@ mod tests {
                 .unwrap();
             arms.push((m, flat));
         }
-        std::env::remove_var(
-            MK_VERIFY_TCTILE_ENV_UNSET_OR_GATE_GATES_AT_THE_KNEE_DEFAULT_SIGNED_OFF_2026_09_02_1_ALWAYS_0_RESTORES_THE_PRE_CHAMPION_MK_LADDER,
-        );
+        for knob in [
+            MK_VERIFY_TCTILE_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+            MK_VERIFY_FUSED_TC_MIN_TOTAL_ENV_OVERRIDES_THE_GATE_KNEE_PLAIN_INTEGER,
+        ] {
+            unsafe { std::env::remove_var(knob) };
+        }
         let row_width = n_q * hd;
         for pair in arms.windows(2) {
             let (m_lo, lo) = &pair[0];
@@ -10382,71 +9684,7 @@ mod tests {
             "the ladder gate must exercise every instantiated rung, or a green here left a \
              template case unvalidated"
         );
+        tctile_forced_row0_m_invariance_2_to_8_stays_in_the_cross_arm_band_because_the_warp_to_row_map_depends_on_m();
     }
 
-    #[test]
-    fn positions_for_rope_passes_through_b1_and_tiles_b2() {
-        let dev = Device::Cpu;
-        let p = Tensor::from_vec(vec![0i32, 1, 2], 3usize, &dev).unwrap();
-        let out = positions_for_rope(&p, 1, 3, &dev).unwrap();
-        assert_eq!(out.elem_count(), 3);
-        assert_eq!(
-            out.flatten_all().unwrap().to_vec1::<i32>().unwrap(),
-            vec![0, 1, 2]
-        );
-        let tiled = positions_for_rope(&p, 2, 3, &dev).unwrap();
-        assert_eq!(tiled.dims(), &[2, 3]);
-        assert_eq!(
-            tiled.flatten_all().unwrap().to_vec1::<i32>().unwrap(),
-            vec![0, 1, 2, 0, 1, 2]
-        );
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    #[test]
-    fn cpu_cache_slot_mapping_tracks_layer_types() {
-        let config = Qwen3MoeConfig {
-            hidden_size: 8,
-            num_hidden_layers: 4,
-            num_attention_heads: 2,
-            num_key_value_heads: 1,
-            head_dim: 4,
-            moe_intermediate_size: 8,
-            shared_expert_intermediate_size: 8,
-            num_experts: 2,
-            num_experts_per_tok: 1,
-            vocab_size: 16,
-            max_position_embeddings: 32,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-6,
-            partial_rotary_factor: 1.0,
-            bos_token_id: 0,
-            eos_token_id: 1,
-            layer_types: vec![
-                LayerType::LinearAttention,
-                LayerType::FullAttention,
-                LayerType::LinearAttention,
-                LayerType::FullAttention,
-            ],
-            linear_num_key_heads: 1,
-            linear_num_value_heads: 1,
-            linear_key_head_dim: 4,
-            linear_value_head_dim: 4,
-            linear_conv_kernel_dim: 2,
-            attn_output_gate: false,
-            tie_word_embeddings: true,
-        };
-        let mut cache = Qwen3MoeKvCache::new(&config, 16, &Device::Cpu, DType::F32).unwrap();
-        assert_eq!(cache.full_slot_for_layer(0), None);
-        assert_eq!(cache.full_slot_for_layer(1), Some(0));
-        assert_eq!(cache.full_slot_for_layer(3), Some(1));
-        assert_eq!(cache.lin_attn_slot_for_layer(0), Some(0));
-        assert_eq!(cache.lin_attn_slot_for_layer(2), Some(1));
-        cache.advance(5);
-        assert_eq!(cache.current_len(), 5);
-        cache.set_current_len(2);
-        assert_eq!(cache.current_len(), 2);
-        cache.reset();
-        assert_eq!(cache.current_len(), 0);
-    }
 }

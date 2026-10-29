@@ -6,7 +6,13 @@ pub mod lora;
 pub mod moe;
 pub mod weights;
 
-use anyhow::Result;
+use crate::dispatch_pass;
+use anyhow::{anyhow, bail, ensure, Result};
+use bytemuck::bytes_of;
+use nv_weights::WeightLoader;
+use pollster::block_on;
+use std::env;
+use wgpu::{Buffer, ErrorFilter};
 
 use nv_kernels::wgpu_backend::dispatch;
 use nv_kernels::wgpu_backend::WgpuContext;
@@ -27,7 +33,7 @@ pub use weights::{
 use attn::RopeTablesGpu;
 use config::rope_tables_from_inv_freq as rope_tables;
 use gpu::{
-    alloc_mrows, mprefill_enabled, mprefill_forced, push_residual_add, push_rmsnorm,
+    alloc_mrows, push_residual_add, push_rmsnorm,
     push_rmsnorm_residual, push_rmsnorm_residual_rows, push_rmsnorm_rows, ArgmaxParams, Builder,
     GatherParams, GemvBf16Params, Pass, Sources, StepBuffers, StepUniform,
 };
@@ -36,14 +42,11 @@ use weights::{pack_pairs, HostBf16Lin as Bf16Lin};
 pub const PREFILL_M_MAX: usize = 64;
 
 pub fn prefill_m() -> usize {
-    match std::env::var("NV_LAGUNA_WGPU_PREFILL_M")
-        .or_else(|_| std::env::var("NV_WGPU_PREFILL_M"))
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-    {
+    let rows = |k| env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    match rows("NV_LAGUNA_WGPU_PREFILL_M") {
         Some(0) => 0,
         Some(m) => m.clamp(2, PREFILL_M_MAX),
-        None => PREFILL_M_MAX,
+        None => rows("NV_WGPU_PREFILL_M").map_or(PREFILL_M_MAX, |m| m.clamp(2, PREFILL_M_MAX)),
     }
 }
 
@@ -61,16 +64,16 @@ pub struct LagunaWgpu {
     prefix_validated: bool,
     passes: Vec<Pass>,
     head_start: usize,
-    _buffers: Vec<wgpu::Buffer>,
+    _buffers: Vec<Buffer>,
     step: StepBuffers,
-    token_out: wgpu::Buffer,
-    logits: wgpu::Buffer,
-    state_buffers: Vec<(wgpu::Buffer, u64)>,
+    token_out: Buffer,
+    logits: Buffer,
+    state_buffers: Vec<(Buffer, u64)>,
     vocab: usize,
     vram: VramReport,
-    pf_list: Option<wgpu::Buffer>,
+    pf_list: Option<Buffer>,
     pf_m: usize,
-    v_tokens: Option<wgpu::Buffer>,
+    v_tokens: Option<Buffer>,
     pf_validated: bool,
     mpf_passes: Vec<Pass>,
     mpf_validated: bool,
@@ -95,7 +98,7 @@ impl LagunaWgpu {
 
     pub fn from_loader(
         config: LagunaConfig,
-        weights: &nv_weights::WeightLoader,
+        weights: &WeightLoader,
         max_seq_tokens: usize,
     ) -> Result<Self> {
         Self::build(config, WeightSource::Loader(weights), max_seq_tokens, None)
@@ -103,7 +106,7 @@ impl LagunaWgpu {
 
     pub fn from_loader_with_lora(
         config: LagunaConfig,
-        weights: &nv_weights::WeightLoader,
+        weights: &WeightLoader,
         max_seq_tokens: usize,
         lora: Option<&lora::LagunaLora>,
     ) -> Result<Self> {
@@ -157,11 +160,11 @@ impl LagunaWgpu {
         max_seq_tokens: usize,
         lora: Option<&lora::LagunaLora>,
     ) -> Result<Self> {
-        let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
         let shapes = LagunaShapes::derive(&config, max_seq_tokens)?;
         let s = Sources::new();
         if let Some(l) = lora {
-            anyhow::ensure!(
+            ensure!(
                 l.layer_count() == shapes.num_layers,
                 "lora adapter carries {} layers for {} config layers",
                 l.layer_count(),
@@ -201,11 +204,7 @@ impl LagunaWgpu {
         });
         let v_tokens = (pf_m >= 2)
             .then(|| dispatch::storage_zeroed(ctx, "lgw-verify-tokens", (pf_m * 4) as u64));
-        anyhow::ensure!(
-            !(mprefill_forced() && lora.is_some()),
-            "NV_LAGUNA_WGPU_MPREFILL=1 has no LoRA rows path; unset it or drop the adapter"
-        );
-        let mrows = match (&pf_list, mprefill_enabled() && lora.is_none()) {
+        let mrows = match (&pf_list, lora.is_none()) {
             (Some(list), true) => Some(alloc_mrows(&mut b, pf_m, list.clone())),
             _ => None,
         };
@@ -239,7 +238,7 @@ impl LagunaWgpu {
         };
 
         let embed = src.embed(&shapes)?;
-        anyhow::ensure!(
+        ensure!(
             embed.len() == vocab * hidden,
             "embed has {} values, want {}",
             embed.len(),
@@ -485,7 +484,7 @@ impl LagunaWgpu {
         let head_start = b.passes.len();
         let logits = b.zeros("lgw-logits", (vocab * 4) as u64);
         let lm = src.lm_head(&shapes)?;
-        anyhow::ensure!(
+        ensure!(
             lm.len() == vocab * hidden,
             "lm_head has {} values, want {}",
             lm.len(),
@@ -599,8 +598,8 @@ impl LagunaWgpu {
     }
 
     fn step_inner(&mut self, token: u32, full: bool) -> Result<()> {
-        anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
-        anyhow::ensure!(
+        ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+        ensure!(
             self.pos < self.max_seq_tokens,
             "kv cache full at {} (max_seq_tokens {})",
             self.pos,
@@ -622,11 +621,7 @@ impl LagunaWgpu {
             !self.validated && !self.prefix_validated
         };
         let scope = if need_scope {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         } else {
             None
         };
@@ -647,8 +642,8 @@ impl LagunaWgpu {
         );
         self.ctx.queue.submit([cb]);
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("laguna_wgpu decode step validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("laguna_wgpu decode step validation: {e}");
             }
             if full {
                 self.validated = true;
@@ -690,7 +685,7 @@ impl LagunaWgpu {
         let mut host: Vec<u8> = Vec::with_capacity(chunk.len() * rec);
         for (i, &t) in chunk.iter().enumerate() {
             let total = self.pos + i + 1;
-            host.extend_from_slice(bytemuck::bytes_of(&StepUniform {
+            host.extend_from_slice(bytes_of(&StepUniform {
                 tok: t,
                 pos: (self.pos + i) as u32,
                 total: total as u32,
@@ -706,30 +701,26 @@ impl LagunaWgpu {
 
     fn prefill_chunk_rows(&mut self, chunk: &[u32]) -> Result<()> {
         let m = self.mpf_chunk_len();
-        anyhow::ensure!(
+        ensure!(
             m >= 2 && chunk.len() == m,
             "rows prefill takes exactly full {m}-token chunks, got {}; partial chunks stay on \
              the chunked-serial path",
             chunk.len()
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + m <= self.max_seq_tokens,
             "kv cache full at {} + {m} (max_seq_tokens {})",
             self.pos,
             self.max_seq_tokens
         );
         for &t in chunk {
-            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+            ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
         self.write_pf_records(chunk);
         let scope = if self.mpf_validated {
             None
         } else {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         let labels: Vec<&str> = if dispatch::profile::enabled() {
             self.mpf_passes.iter().map(|p| p.entry.as_str()).collect()
@@ -745,8 +736,8 @@ impl LagunaWgpu {
         );
         self.ctx.queue.submit([cb]);
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("laguna_wgpu rows prefill validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("laguna_wgpu rows prefill validation: {e}");
             }
             self.mpf_validated = true;
         }
@@ -757,7 +748,7 @@ impl LagunaWgpu {
 
     fn prefill_chunk_one_submission_of_per_token_passes(&mut self, chunk: &[u32]) -> Result<()> {
         let n = chunk.len();
-        anyhow::ensure!(
+        ensure!(
             (2..=self.pf_m).contains(&n),
             "prefill chunk is {n} tokens, want 2..={}; a 1-token chunk is the per-token path \
              wearing the chunked path's name",
@@ -770,19 +761,19 @@ impl LagunaWgpu {
 
     fn one_submission_of_per_token_passes(&mut self, chunk: &[u32], with_head: bool) -> Result<()> {
         let n = chunk.len();
-        anyhow::ensure!(
+        ensure!(
             (1..=self.pf_m).contains(&n),
             "batched submission is {n} tokens, want 1..={}",
             self.pf_m
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + n <= self.max_seq_tokens,
             "kv cache full at {} + {n} (max_seq_tokens {})",
             self.pos,
             self.max_seq_tokens
         );
         for &t in chunk {
-            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+            ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
         self.write_pf_records(chunk);
         let rec = std::mem::size_of::<StepUniform>();
@@ -790,11 +781,7 @@ impl LagunaWgpu {
         let scope = if self.pf_validated {
             None
         } else {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         let end = if with_head {
             self.passes.len()
@@ -809,9 +796,7 @@ impl LagunaWgpu {
             enc.copy_buffer_to_buffer(&list, base, &self.step.uni, 0, rec as u64);
             let mut pass = enc.begin_compute_pass(&Default::default());
             for p in &self.passes[..end] {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                dispatch_pass!(pass, p);
             }
             drop(pass);
             if let Some(out) = self.v_tokens.as_ref().filter(|_| with_head) {
@@ -820,8 +805,8 @@ impl LagunaWgpu {
         }
         self.ctx.queue.submit([enc.finish()]);
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("laguna_wgpu batched submission validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("laguna_wgpu batched submission validation: {e}");
             }
             self.pf_validated = true;
             self.prefix_validated = true;
@@ -842,12 +827,12 @@ impl LagunaWgpu {
 
     pub fn verify_chain(&mut self, batch: &[u32]) -> Result<Vec<u32>> {
         let rows = self.verify_max_rows();
-        anyhow::ensure!(
+        ensure!(
             rows > 0,
             "verify_chain needs the batched prefill submission: NV_LAGUNA_WGPU_PREFILL_M >= 2"
         );
         let n = batch.len();
-        anyhow::ensure!(
+        ensure!(
             (1..=rows).contains(&n),
             "verify_chain batch of {n} out of 1..={rows}"
         );
@@ -857,11 +842,11 @@ impl LagunaWgpu {
             .as_ref()
             .expect("verify rows imply the buffer");
         dispatch::read_back::<u32>(self.ctx, out, n)
-            .map_err(|e| anyhow::anyhow!("verify token readback: {e}"))
+            .map_err(|e| anyhow!("verify token readback: {e}"))
     }
 
     pub fn advance(&mut self, n: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.pos + n <= self.max_seq_tokens,
             "advance {n} from {} past max_seq_tokens {}",
             self.pos,
@@ -898,7 +883,7 @@ impl LagunaWgpu {
     }
 
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<u32> {
-        anyhow::ensure!(!tokens.is_empty(), "prefill needs at least one token");
+        ensure!(!tokens.is_empty(), "prefill needs at least one token");
         let (last, rest) = tokens.split_last().expect("non-empty");
         let done = self.prefill_tokens(rest)?;
         for t in &rest[done..] {
@@ -909,11 +894,11 @@ impl LagunaWgpu {
 }
 
 struct MpfState {
-    res: wgpu::Buffer,
-    normed: wgpu::Buffer,
-    normed_post: wgpu::Buffer,
-    attn_out: wgpu::Buffer,
-    ffn_out: wgpu::Buffer,
+    res: Buffer,
+    normed: Buffer,
+    normed_post: Buffer,
+    attn_out: Buffer,
+    ffn_out: Buffer,
 }
 
 pub struct RefState {

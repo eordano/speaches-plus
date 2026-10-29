@@ -23,8 +23,11 @@ nv-train = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
 cudarc = { workspace = true, optional = true }
 half = { workspace = true }
+base64 = "0.23"
+realfft = "3"
+regex = "1"
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "vulkan", "metal", "dx12"], optional = true }
-pollster = { version = "0.4", optional = true }
+pollster = { version = "1", optional = true }
 bytemuck = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -54,7 +57,7 @@ required-features = ["wgpu"]
 
 
 [dev-dependencies]
-log = "0.4"
+nv-grammar = { workspace = true }
 libc = "0.2"
 naga = { version = "=30.0.0", features = ["wgsl-in", "msl-out"] }
 nv-omni = { workspace = true }

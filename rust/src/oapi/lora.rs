@@ -424,28 +424,6 @@ pub fn model_rows() -> Vec<crate::oapi::Model> {
         .collect()
 }
 
-pub fn annotate_models(models: &mut [crate::oapi::Model], cat: &AdapterCatalog) {
-    for m in models.iter_mut() {
-        let Some(entry) = cat.get(&m.id) else {
-            continue;
-        };
-        if let Some(base) = &entry.base_model {
-            m.extras
-                .insert("parent".into(), serde_json::Value::String(base.clone()));
-        }
-        m.extras.insert(
-            "lora".into(),
-            serde_json::json!({
-                "rank": entry.rank,
-                "alpha": entry.alpha,
-                "scaling": entry.scaling,
-                "target_modules": entry.targets,
-                "path": entry.dir.display().to_string(),
-            }),
-        );
-    }
-}
-
 #[cfg(test)]
 mod unknown_model_env_tests {
     use super::*;
@@ -463,8 +441,8 @@ mod unknown_model_env_tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match self.0.take() {
-                Some(v) => std::env::set_var(ALLOW_UNKNOWN_MODEL_ENV, v),
-                None => std::env::remove_var(ALLOW_UNKNOWN_MODEL_ENV),
+                Some(v) => unsafe { std::env::set_var(ALLOW_UNKNOWN_MODEL_ENV, v) },
+                None => unsafe { std::env::remove_var(ALLOW_UNKNOWN_MODEL_ENV) },
             }
         }
     }
@@ -479,7 +457,7 @@ mod unknown_model_env_tests {
         ])
         .expect("two engines");
         for raw in RAW_VALUES {
-            std::env::set_var(ALLOW_UNKNOWN_MODEL_ENV, raw);
+            unsafe { std::env::set_var(ALLOW_UNKNOWN_MODEL_ENV, raw) };
             for (reg, engine_count) in [(&one, 1usize), (&two, 2usize)] {
                 let swallowed = reg
                     .resolve(Some(TYPO_ID))
@@ -531,17 +509,7 @@ mod rolling_symlink_tests {
     }
 
     #[test]
-    fn rolling_link_name_requires_the_ft_model_suffix_shape() {
-        assert_eq!(
-            rolling_link_name("ft:e4b:traj:abcd1234"),
-            Some("ft:e4b:traj")
-        );
-        assert_eq!(rolling_link_name("no-colons"), None);
-        assert_eq!(rolling_link_name("one:colon"), None);
-    }
-
-    #[test]
-    fn rolling_twice_leaves_one_link_and_boot_scan_finds_only_the_newest_stamped_id() {
+    fn rolling_links_require_the_ft_suffix_shape_keep_one_link_per_suffix_and_roll_independently() {
         let root = scratch("roll");
         let current = root.join("current");
         let v1 = root.join("job1").join("adapter");
@@ -568,28 +536,35 @@ mod rolling_symlink_tests {
         assert_eq!(ids, vec!["ft:e4b:traj:bbbb2222".to_string()]);
 
         std::fs::remove_dir_all(&root).unwrap();
+        {
+            assert_eq!(
+                rolling_link_name("ft:e4b:traj:abcd1234"),
+                Some("ft:e4b:traj")
+            );
+            assert_eq!(rolling_link_name("no-colons"), None);
+            assert_eq!(rolling_link_name("one:colon"), None);
+        }
+        {
+            let root = scratch("multi");
+            let current = root.join("current");
+            let a = root.join("ja").join("adapter");
+            let b = root.join("jb").join("adapter");
+            write_min_adapter(&a, "ft:e4b:traj:aaaa1111");
+            write_min_adapter(&b, "ft:e4b:voice:cccc3333");
+            roll_current_adapter_symlink(&current, "ft:e4b:traj:aaaa1111", &a).unwrap();
+            roll_current_adapter_symlink(&current, "ft:e4b:voice:cccc3333", &b).unwrap();
+            let cat = catalog_from_specs(&[(None, current.clone())]);
+            let mut ids: Vec<_> = cat.entries().iter().map(|e| e.id.clone()).collect();
+            ids.sort();
+            assert_eq!(
+                ids,
+                vec![
+                    "ft:e4b:traj:aaaa1111".to_string(),
+                    "ft:e4b:voice:cccc3333".to_string()
+                ]
+            );
+            std::fs::remove_dir_all(&root).unwrap();
+        }
     }
 
-    #[test]
-    fn a_weekly_round_pair_of_suffixes_rolls_independently() {
-        let root = scratch("multi");
-        let current = root.join("current");
-        let a = root.join("ja").join("adapter");
-        let b = root.join("jb").join("adapter");
-        write_min_adapter(&a, "ft:e4b:traj:aaaa1111");
-        write_min_adapter(&b, "ft:e4b:voice:cccc3333");
-        roll_current_adapter_symlink(&current, "ft:e4b:traj:aaaa1111", &a).unwrap();
-        roll_current_adapter_symlink(&current, "ft:e4b:voice:cccc3333", &b).unwrap();
-        let cat = catalog_from_specs(&[(None, current.clone())]);
-        let mut ids: Vec<_> = cat.entries().iter().map(|e| e.id.clone()).collect();
-        ids.sort();
-        assert_eq!(
-            ids,
-            vec![
-                "ft:e4b:traj:aaaa1111".to_string(),
-                "ft:e4b:voice:cccc3333".to_string()
-            ]
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-    }
 }

@@ -57,9 +57,6 @@ impl EmbeddingModel {
     }
 
     fn warmup(&self) {
-        if !super::ep::warmup_enabled() {
-            return;
-        }
         let window = window_frames_for(self.provider);
         if window == 0 {
             return;
@@ -76,11 +73,6 @@ impl EmbeddingModel {
             ),
             Err(e) => tracing::warn!(error = %e, "speaker embedding warmup failed"),
         }
-    }
-
-    pub fn run_counters(&self) -> (u64, u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        (self.runs.load(Relaxed), self.rows.load(Relaxed))
     }
 
     #[inline]
@@ -129,18 +121,6 @@ impl EmbeddingModel {
     pub fn embed(&self, samples: &[f32]) -> Result<Vec<f32>> {
         let feats = self.compute_feats(samples)?;
         self.embed_feats(&feats)
-    }
-
-    pub fn embed_batch(&self, spans: &[&[f32]], max_batch: usize) -> Result<Vec<Vec<f32>>> {
-        if spans.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut feats: Vec<Vec<f32>> = Vec::with_capacity(spans.len());
-        for s in spans {
-            feats.push(self.compute_feats(s)?);
-        }
-        self.embed_feats_batch(&feats, max_batch)
     }
 
     pub fn embed_feats_batch(&self, feats: &[Vec<f32>], max_batch: usize) -> Result<Vec<Vec<f32>>> {

@@ -271,7 +271,6 @@ impl MoeWgpuWeights {
         hidden_size: usize,
         intermediate_size: usize,
     ) -> Result<Self> {
-        #[allow(clippy::type_complexity)]
         let mut raw: Vec<(
             Vec<u8>,
             Vec<u8>,
@@ -450,7 +449,6 @@ fn plan_routing(topk_ids: &[u32], n_tokens: usize, k: usize, num_experts: usize)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gemm_bindings<'a>(
     variant: ScalarVariant,
     a: &'a dyn GpuBind,
@@ -519,7 +517,6 @@ fn gemm_stage<'a>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemm(
     chain: &mut Chain<'_>,
     ctx: &WgpuContext,
@@ -567,7 +564,6 @@ fn push_gemm(
     Ok(params_buf)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_quantize(
     chain: &mut Chain<'_>,
     ctx: &WgpuContext,

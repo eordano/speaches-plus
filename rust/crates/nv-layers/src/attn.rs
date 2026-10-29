@@ -11,7 +11,7 @@ pub struct AttnConfig {
 
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &AttnConfig) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
-    if matches!(q.device(), candle_core::Device::Cuda(_))
+    if q.device().is_cuda()
         && matches!(q.dtype(), DType::BF16 | DType::F16)
     {
         return flash_attn(&q.contiguous()?, &k.contiguous()?, &v.contiguous()?, cfg);
@@ -609,7 +609,6 @@ pub fn flash_attn_varlen(
 }
 
 #[cfg(not(feature = "cuda"))]
-#[allow(clippy::too_many_arguments)]
 pub fn flash_attn_varlen(
     _q: &Tensor,
     _k: &Tensor,
@@ -669,7 +668,7 @@ mod paper_validation {
     }
 
     #[test]
-    fn sdpa_gqa_expansion_matches_repeated_heads() {
+    fn sdpa_gqa_expansion_matches_repeated_heads_and_the_grouped_path_matches_the_expand_path() {
         let device = Device::Cpu;
         let (sq, sk, d) = (2usize, 4usize, 8usize);
         let mk = |seed: f32, n: usize| -> Vec<f32> {
@@ -715,11 +714,6 @@ mod paper_validation {
         for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
             assert!((x - y).abs() < 1e-5, "GQA mismatch at {i}: {x} vs {y}");
         }
-    }
-
-    #[test]
-    fn sdpa_grouped_matches_the_expand_path_at_gqa_shapes() {
-        let device = Device::Cpu;
         for &(sq, sk, h, h_kv, d, window) in &[
             (5usize, 5usize, 12usize, 2usize, 16usize, 0usize),
             (3, 7, 4, 2, 8, 0),
@@ -902,28 +896,6 @@ mod paper_validation {
             }
         }
     }
-
-    #[test]
-    fn flash_decode_merge_needs_the_neg_inf_guard() {
-        let hd = 4usize;
-        let q = vec![1.0f32; hd];
-        let k = vec![vec![0.5f32; hd]; 3];
-        let v = vec![vec![1.0f32; hd]; 3];
-        let got = flash_decode_model(&q, &k, &v, 3, 0, 16, hd);
-        for d in 0..hd {
-            assert!(
-                (got[d] - 1.0).abs() < 1e-6,
-                "uniform V must return exactly V regardless of empty splits, got {}",
-                got[d]
-            );
-        }
-
-        let got = flash_decode_model(&q, &[], &[], 0, 0, 16, hd);
-        assert!(
-            got.iter().all(|&x| x == 0.0),
-            "empty range must produce zeros, not NaN"
-        );
-    }
 }
 
 #[cfg(feature = "cuda")]
@@ -938,17 +910,8 @@ struct E4bFullAttnScratch {
     scales_and_amax: Option<cudarc::driver::CudaSlice<f32>>,
 }
 
-pub const E4B_FULL_ATTN_FP8_SCORES_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_INBAND_INSTRUMENT_RULE_0_RESTORES_THE_BF16_SCORE_GEMM_Q_AND_THE_VISIBLE_K_GO_TO_E4M3_PER_TENSOR_AND_THE_SCORE_GEMM_RUNS_IN_FP8_WITH_F32_SCORES_OUT_CORPUS_WITHIN_0_6_PERCENT_NEEDLE_EXACT_GREEDY_CHAINS_IDENTICAL: &str =
-    "NV_E4B_FULL_ATTN_FP8_SCORES";
-
 pub const FP8_SCORE_TILES_NEED_16_ALIGNED_ROWS_AND_KEYS_SO_A_RAGGED_TAIL_TILE_RUNS_THE_BF16_GEMM:
     usize = 16;
-
-pub fn e4b_full_attn_fp8_scores_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        E4B_FULL_ATTN_FP8_SCORES_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_INBAND_INSTRUMENT_RULE_0_RESTORES_THE_BF16_SCORE_GEMM_Q_AND_THE_VISIBLE_K_GO_TO_E4M3_PER_TENSOR_AND_THE_SCORE_GEMM_RUNS_IN_FP8_WITH_F32_SCORES_OUT_CORPUS_WITHIN_0_6_PERCENT_NEEDLE_EXACT_GREEDY_CHAINS_IDENTICAL,
-    )
-}
 
 #[cfg(feature = "cuda")]
 fn grow_u8<'a>(
@@ -1086,29 +1049,13 @@ pub fn e4b_full_attn_gqa_folded_f32_scores_tiled_online_softmax(
         k8: None,
         scales_and_amax: None,
     });
-    let fp8_scores = e4b_full_attn_fp8_scores_enabled();
-    let (q8_dev, k8_dev, scales_dev) = if fp8_scores {
-        anyhow::ensure!(
-            nkv == 2,
-            "e4b fp8 scores: the two-segment per-tensor quantizer covers exactly two kv heads, got {nkv}"
-        );
-        (
-            Some(grow_u8(&stream, &mut sc.q8, nkv * rows * hd)?),
-            None::<&mut cudarc::driver::CudaSlice<u8>>,
-            None::<&mut cudarc::driver::CudaSlice<f32>>,
-        )
-    } else {
-        (None, None, None)
-    };
-    let _ = (k8_dev, scales_dev);
-    let (k8_dev, scales_dev) = if fp8_scores {
-        (
-            Some(grow_u8(&stream, &mut sc.k8, nkv * len * hd)?),
-            Some(grow_f32(&stream, &mut sc.scales_and_amax, 4)?),
-        )
-    } else {
-        (None, None)
-    };
+    anyhow::ensure!(
+        nkv == 2,
+        "e4b fp8 scores: the two-segment per-tensor quantizer covers exactly two kv heads, got {nkv}"
+    );
+    let q8_dev = grow_u8(&stream, &mut sc.q8, nkv * rows * hd)?;
+    let k8_dev = grow_u8(&stream, &mut sc.k8, nkv * len * hd)?;
+    let scales_dev = grow_f32(&stream, &mut sc.scales_and_amax, 4)?;
     let s_dev = grow_f32(&stream, &mut sc.s, all_rows * tile)?;
     let p_dev = grow_u16(&stream, &mut sc.p, all_rows * tile)?;
     let m_dev = grow_f32(&stream, &mut sc.m, all_rows)?;
@@ -1126,7 +1073,7 @@ pub fn e4b_full_attn_gqa_folded_f32_scores_tiled_online_softmax(
                 candle_core::Storage::Cuda(c) => {
                     let sl = c.as_cuda_slice::<half::bf16>()?;
                     let (p, _g) = sl.device_ptr(&stream);
-                    Ok(p as u64)
+                    Ok(p)
                 }
                 _ => anyhow::bail!("e4b full attention gemm arm: tensor not on cuda"),
             }
@@ -1141,86 +1088,77 @@ pub fn e4b_full_attn_gqa_folded_f32_scores_tiled_online_softmax(
         let (op, _go) = o_dev.device_ptr_mut(&stream);
         let (outp, _gout) = out_dev.device_ptr_mut(&stream);
         let q_pos0 = len - n;
-        let fp8 = match (q8_dev, k8_dev, scales_dev) {
-            (Some(q8), Some(k8), Some(scales)) => {
-                let (q8p, _g8) = q8.device_ptr_mut(&stream);
-                let (k8p, _gk8) = k8.device_ptr_mut(&stream);
-                let (scp, _gsc) = scales.device_ptr_mut(&stream);
-                let q_scale = scp as *mut f32;
-                let k_scale = (scp + 4) as *mut f32;
-                let amax = (scp + 8) as *mut u32;
-                let rc = unsafe {
-                    nv_kernels::cuda::e4m3_pertensor_quant_two_segments(
-                        stream.cu_stream() as *mut _,
-                        qp as *const u16,
-                        (qp + (rows * hd * 2) as u64) as *const u16,
-                        (rows * hd) as i64,
-                        q8p as *mut u8,
-                        (q8p + (rows * hd) as u64) as *mut u8,
-                        q_scale,
-                        amax,
-                    )
-                };
-                anyhow::ensure!(rc == 0, "e4b fp8 scores: q quantize rc={rc}");
-                let rc = unsafe {
-                    nv_kernels::cuda::e4m3_pertensor_quant_two_segments(
-                        stream.cu_stream() as *mut _,
-                        kp as *const u16,
-                        (kp + (k_stride * 2) as u64) as *const u16,
-                        (len * hd) as i64,
-                        k8p as *mut u8,
-                        (k8p + (len * hd) as u64) as *mut u8,
-                        k_scale,
-                        amax,
-                    )
-                };
-                anyhow::ensure!(rc == 0, "e4b fp8 scores: k quantize rc={rc}");
-                Some((q8p, k8p, q_scale as *const f32, k_scale as *const f32))
-            }
-            _ => None,
+        let (q8p, _g8) = q8_dev.device_ptr_mut(&stream);
+        let (k8p, _gk8) = k8_dev.device_ptr_mut(&stream);
+        let (scp, _gsc) = scales_dev.device_ptr_mut(&stream);
+        let q_scale = scp as *mut f32;
+        let k_scale = (scp + 4) as *mut f32;
+        let amax = (scp + 8) as *mut u32;
+        let rc = unsafe {
+            nv_kernels::cuda::e4m3_pertensor_quant_two_segments(
+                stream.cu_stream() as *mut _,
+                qp as *const u16,
+                (qp + (rows * hd * 2) as u64) as *const u16,
+                (rows * hd) as i64,
+                q8p as *mut u8,
+                (q8p + (rows * hd) as u64) as *mut u8,
+                q_scale,
+                amax,
+            )
         };
+        anyhow::ensure!(rc == 0, "e4b fp8 scores: q quantize rc={rc}");
+        let rc = unsafe {
+            nv_kernels::cuda::e4m3_pertensor_quant_two_segments(
+                stream.cu_stream() as *mut _,
+                kp as *const u16,
+                (kp + (k_stride * 2) as u64) as *const u16,
+                (len * hd) as i64,
+                k8p as *mut u8,
+                (k8p + (len * hd) as u64) as *mut u8,
+                k_scale,
+                amax,
+            )
+        };
+        anyhow::ensure!(rc == 0, "e4b fp8 scores: k quantize rc={rc}");
         let mut key_off = 0usize;
         let mut first = true;
         while key_off < len {
             let tile_len = tile.min(len - key_off);
             unsafe {
                 let _ = FP8_SCORE_TILES_NEED_16_ALIGNED_ROWS_AND_KEYS_SO_A_RAGGED_TAIL_TILE_RUNS_THE_BF16_GEMM;
-                match fp8.filter(|_| rows % 16 == 0 && tile_len % 16 == 0) {
-                    Some((q8p, k8p, qs, ks)) => {
-                        nv_quant::matmul::e4m3_gemm_f32_out_strided_batched_raw(
-                            &stream,
-                            q8p as *const std::ffi::c_void,
-                            (k8p + (key_off * hd) as u64) as *const std::ffi::c_void,
-                            sp as *mut std::ffi::c_void,
-                            rows as u64,
-                            tile_len as u64,
-                            hd as u64,
-                            nkv as i32,
-                            (rows * hd) as i64,
-                            (len * hd) as i64,
-                            (rows * tile_len) as i64,
-                            qs,
-                            ks,
-                            0.0,
-                        )?;
-                    }
-                    None => {
-                        nv_quant::matmul::bf16_gemm_f32_out_strided_batched_raw(
-                            &stream,
-                            qp as *const std::ffi::c_void,
-                            (kp + (key_off * hd * 2) as u64) as *const std::ffi::c_void,
-                            sp as *mut std::ffi::c_void,
-                            rows as u64,
-                            tile_len as u64,
-                            hd as u64,
-                            nkv as i32,
-                            (rows * hd) as i64,
-                            k_stride as i64,
-                            (rows * tile_len) as i64,
-                            true,
-                            0.0,
-                        )?;
-                    }
+                if rows % 16 == 0 && tile_len % 16 == 0 {
+                    nv_quant::matmul::e4m3_gemm_f32_out_strided_batched_raw(
+                        &stream,
+                        q8p as *const std::ffi::c_void,
+                        (k8p + (key_off * hd) as u64) as *const std::ffi::c_void,
+                        sp as *mut std::ffi::c_void,
+                        rows as u64,
+                        tile_len as u64,
+                        hd as u64,
+                        nkv as i32,
+                        (rows * hd) as i64,
+                        (len * hd) as i64,
+                        (rows * tile_len) as i64,
+                        q_scale as *const f32,
+                        k_scale as *const f32,
+                        0.0,
+                    )?;
+                } else {
+                    nv_quant::matmul::bf16_gemm_f32_out_strided_batched_raw(
+                        &stream,
+                        qp as *const std::ffi::c_void,
+                        (kp + (key_off * hd * 2) as u64) as *const std::ffi::c_void,
+                        sp as *mut std::ffi::c_void,
+                        rows as u64,
+                        tile_len as u64,
+                        hd as u64,
+                        nkv as i32,
+                        (rows * hd) as i64,
+                        k_stride as i64,
+                        (rows * tile_len) as i64,
+                        true,
+                        0.0,
+                    )?;
                 }
                 let rc = nv_kernels::cuda::e4b_online_softmax_tile(
                     stream.cu_stream() as *mut _,

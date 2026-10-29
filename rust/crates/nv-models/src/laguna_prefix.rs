@@ -411,7 +411,8 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn sliding_layout_small_chunks_preserve_every_checkpoint_stage() {
+    fn sliding_layout_eligibility_covers_small_and_large_chunks_168k_invalid_shapes_and_ineligible_lru_hits(
+    ) {
         for (chunk, positions) in [
             (256, [256, 512, 768, 1024, 167936]),
             (512, [512, 1024, 1536, 2048, 167936]),
@@ -425,10 +426,7 @@ mod tests {
                 }
             }
         }
-    }
 
-    #[test]
-    fn sliding_layout_first_large_chunk_rejects_through_768_remaining_tokens() {
         for chunk in [1024, 2048] {
             for remaining in 1..=768 {
                 let next_m = match remaining {
@@ -448,10 +446,7 @@ mod tests {
                 ));
             }
         }
-    }
 
-    #[test]
-    fn sliding_layout_later_and_168k_checkpoints_preserve_next_preparation() {
         for chunk in [1024, 2048] {
             for (pos, next_m) in [(2 * chunk, 1), (3 * chunk, 256), (167936, 64)] {
                 assert!(checkpoint_preserves_sliding_layout(
@@ -463,10 +458,7 @@ mod tests {
             1024, 1024, 512, 1280, 256
         ));
         assert!(checkpoint_preserves_sliding_layout(512, 256, 512, 768, 256));
-    }
 
-    #[test]
-    fn sliding_layout_invalid_shapes_and_overflows_refuse_without_panicking() {
         for args in [
             (0, 256, 512, 262144, 1),
             (1024, 0, 512, 262144, 1),
@@ -485,10 +477,7 @@ mod tests {
                 "{args:?}"
             );
         }
-    }
 
-    #[test]
-    fn sliding_layout_ineligible_hit_is_a_nonmutating_lru_miss() {
         let mut lru = CheckpointLru::new(2, 16384);
         let id = lru.insert(vec![7; 1024], 1024, 0, ()).unwrap();
         assert!(lru
@@ -519,7 +508,8 @@ mod tests {
     }
 
     #[test]
-    fn the_checkpoint_sits_at_the_last_cold_boundary_inside_the_prompt() {
+    fn the_checkpoint_sits_at_the_last_cold_boundary_and_selection_backtracks_past_edits_and_unavailable_snapshots(
+    ) {
         assert_eq!(checkpoint_position(0, 256), 0);
         assert_eq!(checkpoint_position(1, 256), 0);
         assert_eq!(checkpoint_position(256, 256), 0);
@@ -528,10 +518,6 @@ mod tests {
         assert_eq!(checkpoint_position(1024, 256), 768);
         assert_eq!(checkpoint_position(1500, 512), 1024);
         assert_eq!(checkpoint_position(usize::MAX, 0), 0);
-    }
-
-    #[test]
-    fn selection_backtracks_after_thinking_removal_and_ignores_unavailable_snapshots() {
         let mut l = CheckpointLru::new(8, 1 << 30);
         let history: Vec<u32> = (0..2000).collect();
         let a = l.insert(history[..768].to_vec(), 768, 10, true).unwrap();
@@ -559,7 +545,8 @@ mod tests {
     }
 
     #[test]
-    fn shared_allocation_stays_charged_after_its_first_owner_is_evicted() {
+    fn shared_allocations_stay_charged_across_owner_eviction_reinsertion_partial_fits_and_copy_failure(
+    ) {
         let mut l = shared_lru(2, 128);
         let a = l.insert(vec![1], 1, 8, None).unwrap();
         let b = l.insert(vec![2], 1, 8, None).unwrap();
@@ -584,10 +571,7 @@ mod tests {
         drop(l.remove(b));
         assert_eq!(l.bytes(), 12);
         assert!(weak.upgrade().is_none());
-    }
 
-    #[test]
-    fn inserting_an_existing_shared_allocation_does_not_evict_its_other_owner() {
         let mut l = shared_lru(2, 88);
         let allocation = Arc::new(vec![0; 64]);
         let a = l
@@ -596,10 +580,56 @@ mod tests {
         let b = l.insert(vec![2], 1, 8, Some(allocation)).unwrap();
         assert_eq!(l.bytes(), 88);
         assert!(l.get(a).is_some() && l.get(b).is_some());
+
+        let mut l = shared_lru(2, 100);
+        let a = l.insert(vec![1], 1, 8, None).unwrap();
+        let b = l.insert(vec![1, 2], 2, 8, None).unwrap();
+        assert!(!l.can_admit(0, 85, &[a, b]));
+        assert!(!l.can_admit(0, 85, &[b]));
+        assert!(l.can_admit(0, 80, &[a]));
+        assert!(l
+            .attach_with(
+                &[a],
+                80,
+                || { Ok::<_, ()>((Arc::new(vec![0; 80]), 80)) },
+                |_, s, a| *s = Some(Arc::clone(a))
+            )
+            .unwrap());
+        assert!(l.get(b).is_none());
+        assert_eq!(l.bytes(), 92);
+
+        let mut l = shared_lru(2, 100);
+        let id = l.insert(vec![1], 1, 8, None).unwrap();
+        let failed: Result<bool, &str> = l.attach_with::<Arc<Vec<u8>>, _>(
+            &[id],
+            64,
+            || Err("copy failed"),
+            |_, s, a| *s = Some(Arc::clone(a)),
+        );
+        assert_eq!(failed, Err("copy failed"));
+        assert_eq!(l.bytes(), 12);
+        assert!(l.get(id).unwrap().state.is_none());
+        let unrelated = l.insert(vec![2], 1, 8, None).unwrap();
+        assert!(l
+            .attach_with(
+                &[id, unrelated],
+                64,
+                || { Ok::<_, ()>((Arc::new(vec![0; 64]), 64)) },
+                |candidate, s, a| {
+                    if candidate == id {
+                        *s = Some(Arc::clone(a));
+                    }
+                }
+            )
+            .unwrap());
+        assert!(l.get(id).unwrap().state.is_some());
+        assert!(l.get(unrelated).unwrap().state.is_none());
+        assert_eq!(l.bytes(), 88);
     }
 
     #[test]
-    fn admission_rejects_impossible_copies_without_materializing_or_evicting() {
+    fn admission_rejects_impossible_copies_and_inconsistent_metadata_without_materializing_or_evicting(
+    ) {
         let mut l = shared_lru(2, 100);
         let id = l.insert(vec![1], 1, 8, None).unwrap();
         let calls = Cell::new(0);
@@ -625,30 +655,36 @@ mod tests {
             .is_none());
         assert_eq!(calls.get(), 0);
         assert!(l.get(id).is_some());
-    }
 
-    #[test]
-    fn smaller_checkpoint_can_fit_when_the_latest_full_snapshot_cannot() {
         let mut l = shared_lru(2, 100);
-        let a = l.insert(vec![1], 1, 8, None).unwrap();
-        let b = l.insert(vec![1, 2], 2, 8, None).unwrap();
-        assert!(!l.can_admit(0, 85, &[a, b]));
-        assert!(!l.can_admit(0, 85, &[b]));
-        assert!(l.can_admit(0, 80, &[a]));
         assert!(l
+            .insert_with(&[1], 1, 8, &[], || Ok::<_, ()>((None, 9)))
+            .unwrap()
+            .is_none());
+        let id = l.insert(vec![1], 1, 8, None).unwrap();
+        assert!(!l
             .attach_with(
-                &[a],
-                80,
-                || { Ok::<_, ()>((Arc::new(vec![0; 80]), 80)) },
+                &[id],
+                64,
+                || { Ok::<_, ()>((Arc::new(vec![0; 65]), 65)) },
                 |_, s, a| *s = Some(Arc::clone(a))
             )
             .unwrap());
-        assert!(l.get(b).is_none());
-        assert_eq!(l.bytes(), 92);
+        assert!(l.get(id).unwrap().state.is_none());
+        assert!(!l
+            .attach_with(
+                &[id],
+                64,
+                || { Ok::<_, ()>((Arc::new(vec![0; 65]), 64)) },
+                |_, s, a| *s = Some(Arc::clone(a))
+            )
+            .unwrap());
+        assert!(l.is_empty());
+        assert_eq!(l.bytes(), 0);
     }
 
     #[test]
-    fn zero_entry_or_byte_cap_prevents_deferred_allocation() {
+    fn zero_caps_invalid_positions_overflows_and_missing_protection_never_copy() {
         for (entries, bytes) in [(0, 100), (2, 0)] {
             let mut l: CheckpointLru<()> = CheckpointLru::new(entries, bytes);
             assert!(l
@@ -661,50 +697,7 @@ mod tests {
             assert_eq!(l.bytes(), 0);
             assert_eq!(l.entries.capacity(), 0);
         }
-    }
 
-    #[test]
-    fn real_lru_order_survives_byte_pressure_and_protected_candidates() {
-        let mut l = CheckpointLru::new(2, 100);
-        let a = l.insert(vec![1], 1, 36, "a").unwrap();
-        let b = l.insert(vec![2], 1, 36, "b").unwrap();
-        l.touch(a);
-        let c = l.insert(vec![3], 1, 36, "c").unwrap();
-        assert!(l.get(b).is_none());
-        assert!(l.grow(c, 30));
-        assert!(l.get(a).is_none());
-        assert_eq!(l.bytes(), 70);
-        assert!(!l.grow(c, 31));
-        assert!(l.is_empty());
-        let a = l.insert(vec![4], 1, 36, "protected oldest").unwrap();
-        let b = l.insert(vec![5], 1, 36, "newer").unwrap();
-        assert!(l
-            .insert_with(&[6], 1, 36, &[a], || Ok::<_, ()>(("new", 36)))
-            .unwrap()
-            .is_some());
-        assert!(l.get(a).is_some());
-        assert!(l.get(b).is_none());
-    }
-
-    #[test]
-    fn token_capacity_is_charged_and_duplicate_positions_replace() {
-        let mut l = CheckpointLru::new(4, 1000);
-        let mut tokens = Vec::with_capacity(32);
-        tokens.extend_from_slice(&[1, 2, 3]);
-        let expected = 10 + tokens.capacity() * 4;
-        l.insert(tokens, 2, 10, "first").unwrap();
-        assert_eq!(l.bytes(), expected);
-        let id = l
-            .insert_with(&[1, 2, 3], 2, 20, &[], || Ok::<_, ()>(("second", 20)))
-            .unwrap()
-            .unwrap();
-        assert_eq!(l.len(), 1);
-        assert_eq!(l.bytes(), 32);
-        assert_eq!(l.get(id).unwrap().state, "second");
-    }
-
-    #[test]
-    fn invalid_positions_overflows_and_missing_protection_do_not_copy() {
         let mut l: CheckpointLru<()> = CheckpointLru::new(2, usize::MAX);
         for (tokens, pos, bytes, protected) in [
             (&[][..], 0, 0, &[][..]),
@@ -741,62 +734,40 @@ mod tests {
     }
 
     #[test]
-    fn underestimated_or_inconsistent_metadata_is_not_retained() {
-        let mut l = shared_lru(2, 100);
-        assert!(l
-            .insert_with(&[1], 1, 8, &[], || Ok::<_, ()>((None, 9)))
-            .unwrap()
-            .is_none());
-        let id = l.insert(vec![1], 1, 8, None).unwrap();
-        assert!(!l
-            .attach_with(
-                &[id],
-                64,
-                || { Ok::<_, ()>((Arc::new(vec![0; 65]), 65)) },
-                |_, s, a| *s = Some(Arc::clone(a))
-            )
-            .unwrap());
-        assert!(l.get(id).unwrap().state.is_none());
-        assert!(!l
-            .attach_with(
-                &[id],
-                64,
-                || { Ok::<_, ()>((Arc::new(vec![0; 65]), 64)) },
-                |_, s, a| *s = Some(Arc::clone(a))
-            )
-            .unwrap());
+    fn real_lru_order_survives_byte_pressure_protected_candidates_and_token_charges_with_duplicate_positions_replacing(
+    ) {
+        let mut l = CheckpointLru::new(2, 100);
+        let a = l.insert(vec![1], 1, 36, "a").unwrap();
+        let b = l.insert(vec![2], 1, 36, "b").unwrap();
+        l.touch(a);
+        let c = l.insert(vec![3], 1, 36, "c").unwrap();
+        assert!(l.get(b).is_none());
+        assert!(l.grow(c, 30));
+        assert!(l.get(a).is_none());
+        assert_eq!(l.bytes(), 70);
+        assert!(!l.grow(c, 31));
         assert!(l.is_empty());
-        assert_eq!(l.bytes(), 0);
-    }
-
-    #[test]
-    fn copy_failure_leaves_protected_candidates_usable() {
-        let mut l = shared_lru(2, 100);
-        let id = l.insert(vec![1], 1, 8, None).unwrap();
-        let failed: Result<bool, &str> = l.attach_with::<Arc<Vec<u8>>, _>(
-            &[id],
-            64,
-            || Err("copy failed"),
-            |_, s, a| *s = Some(Arc::clone(a)),
-        );
-        assert_eq!(failed, Err("copy failed"));
-        assert_eq!(l.bytes(), 12);
-        assert!(l.get(id).unwrap().state.is_none());
-        let unrelated = l.insert(vec![2], 1, 8, None).unwrap();
+        let a = l.insert(vec![4], 1, 36, "protected oldest").unwrap();
+        let b = l.insert(vec![5], 1, 36, "newer").unwrap();
         assert!(l
-            .attach_with(
-                &[id, unrelated],
-                64,
-                || { Ok::<_, ()>((Arc::new(vec![0; 64]), 64)) },
-                |candidate, s, a| {
-                    if candidate == id {
-                        *s = Some(Arc::clone(a));
-                    }
-                }
-            )
-            .unwrap());
-        assert!(l.get(id).unwrap().state.is_some());
-        assert!(l.get(unrelated).unwrap().state.is_none());
-        assert_eq!(l.bytes(), 88);
+            .insert_with(&[6], 1, 36, &[a], || Ok::<_, ()>(("new", 36)))
+            .unwrap()
+            .is_some());
+        assert!(l.get(a).is_some());
+        assert!(l.get(b).is_none());
+
+        let mut l = CheckpointLru::new(4, 1000);
+        let mut tokens = Vec::with_capacity(32);
+        tokens.extend_from_slice(&[1, 2, 3]);
+        let expected = 10 + tokens.capacity() * 4;
+        l.insert(tokens, 2, 10, "first").unwrap();
+        assert_eq!(l.bytes(), expected);
+        let id = l
+            .insert_with(&[1, 2, 3], 2, 20, &[], || Ok::<_, ()>(("second", 20)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l.bytes(), 32);
+        assert_eq!(l.get(id).unwrap().state, "second");
     }
 }

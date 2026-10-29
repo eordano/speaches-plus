@@ -88,52 +88,45 @@ mod tests {
                              gemma-4-E4B-it-qat-w4a16-ct-6cd26aaa2357fb2bad8c51699a7558a4d1a965bb";
 
     #[test]
-    fn nix_store_hf_model_path_decodes_to_org_slash_name() {
+    fn model_id_for_dir_decodes_store_hub_and_plain_paths() {
         assert_eq!(
             model_id_for_dir(Path::new(E4B_STORE)),
             "google/gemma-4-E4B-it-qat-w4a16-ct"
         );
+        {
+            let p = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hf-model-Qwen-Qwen3-Embedding-0.6B";
+            assert_eq!(model_id_for_dir(Path::new(p)), "Qwen/Qwen3-Embedding-0.6B");
+        }
+        {
+            let p = "/x/hub/models--nvidia--Gemma-4-31B-IT-NVFP4/snapshots/e5ef03af";
+            assert_eq!(
+                model_id_for_dir(Path::new(p)),
+                "nvidia/Gemma-4-31B-IT-NVFP4"
+            );
+        }
+        {
+            assert_eq!(
+                model_id_for_dir(Path::new("/models/my-local-gemma")),
+                "my-local-gemma"
+            );
+        }
     }
 
     #[test]
-    fn nix_store_path_without_rev_suffix_keeps_full_name() {
-        let p = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-hf-model-Qwen-Qwen3-Embedding-0.6B";
-        assert_eq!(model_id_for_dir(Path::new(p)), "Qwen/Qwen3-Embedding-0.6B");
-    }
-
-    #[test]
-    fn hub_snapshot_path_decodes_to_org_slash_name() {
-        let p = "/x/hub/models--nvidia--Gemma-4-31B-IT-NVFP4/snapshots/e5ef03af";
-        assert_eq!(
-            model_id_for_dir(Path::new(p)),
-            "nvidia/Gemma-4-31B-IT-NVFP4"
-        );
-    }
-
-    #[test]
-    fn plain_local_dir_keeps_its_basename() {
-        assert_eq!(
-            model_id_for_dir(Path::new("/models/my-local-gemma")),
-            "my-local-gemma"
-        );
-    }
-
-    #[test]
-    fn canonical_model_id_accepts_full_path_and_bare_store_basename() {
+    fn canonical_model_id_accepts_store_paths_and_rejects_ordinary_ids() {
         let want = Some("google/gemma-4-E4B-it-qat-w4a16-ct".to_string());
         assert_eq!(canonical_model_id(E4B_STORE), want);
         let base = Path::new(E4B_STORE).file_name().unwrap().to_str().unwrap();
         assert_eq!(canonical_model_id(base), want);
+        {
+            assert_eq!(
+                canonical_model_id("google/gemma-4-E4B-it-qat-w4a16-ct"),
+                None
+            );
+            assert_eq!(canonical_model_id("gpt-oss-20b"), None);
+            assert_eq!(canonical_model_id("my-local-gemma"), None);
+            assert_eq!(canonical_model_id(""), None);
+        }
     }
 
-    #[test]
-    fn canonical_model_id_rejects_ordinary_ids() {
-        assert_eq!(
-            canonical_model_id("google/gemma-4-E4B-it-qat-w4a16-ct"),
-            None
-        );
-        assert_eq!(canonical_model_id("gpt-oss-20b"), None);
-        assert_eq!(canonical_model_id("my-local-gemma"), None);
-        assert_eq!(canonical_model_id(""), None);
-    }
 }

@@ -1,3 +1,5 @@
+use anyhow::anyhow;
+use half::bf16;
 use nv_kernels::wgpu_backend::WgpuError;
 
 pub const GEMV_PK_ENTRY: &str = "g4w_gemv_bf16_vec8_pk";
@@ -12,7 +14,11 @@ pub const ROPE_F32_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4shared_rop
 pub const FLASH2_PK_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4shared_flash2_pk.wgsl");
 
 pub fn bf16_bits(x: f32) -> u16 {
-    (half::bf16::from_f32(x)).to_bits()
+    (bf16::from_f32(x)).to_bits()
+}
+
+pub fn bf16_val(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
 }
 
 pub fn pack_pairs(src: &[u16]) -> Vec<u32> {
@@ -57,5 +63,5 @@ pub fn rope_tables_from_inv_freq(inv_freq: &[f32], rows: usize) -> (Vec<f32>, Ve
 }
 
 pub fn err(e: WgpuError) -> anyhow::Error {
-    anyhow::anyhow!("{e}")
+    anyhow!("{e}")
 }

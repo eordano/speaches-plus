@@ -1,0 +1,643 @@
+diff -ruN a/src/kernel.rs b/src/kernel.rs
+--- a/src/kernel.rs	2006-07-24 03:21:28.000000000 +0200
++++ b/src/kernel.rs	2026-09-21 15:36:10.117415177 +0200
+@@ -59,7 +59,7 @@
+ }
+ 
+ type Libraries = HashMap<Source, Library>;
+-type Pipelines = HashMap<(KernelName, Option<ConstantValues>), ComputePipeline>;
++type Pipelines = HashMap<(Source, KernelName, Option<ConstantValues>), ComputePipeline>;
+ 
+ #[derive(Debug)]
+ pub struct Kernels {
+@@ -111,7 +111,12 @@
+         device: &Device,
+         source: Source,
+     ) -> Result<Library, MetalKernelError> {
++        if let Some(lib) = self.libraries.read()?.get(&source) {
++            return Ok(lib.clone());
++        }
++
+         let mut libraries = self.libraries.write()?;
++        // Recheck after acquiring the write lock in case another thread inserted it.
+         if let Some(lib) = libraries.get(&source) {
+             Ok(lib.clone())
+         } else {
+@@ -150,17 +155,22 @@
+         name: impl Into<KernelName>,
+         constants: Option<ConstantValues>,
+     ) -> Result<ComputePipeline, MetalKernelError> {
++        let key = (source, name.into(), constants);
++        if let Some(pipeline) = self.pipelines.read()?.get(&key) {
++            return Ok(pipeline.clone());
++        }
++
+         let mut pipelines = self.pipelines.write()?;
+-        let key = (name.into(), constants);
++        // Recheck after acquiring the write lock in case another thread inserted it.
+         if let Some(pipeline) = pipelines.get(&key) {
+             Ok(pipeline.clone())
+         } else {
+-            let (name, constants) = key;
++            let (source, name, constants) = key;
+             let func = self.load_function(device, source, name.as_ref(), constants.as_ref())?;
+             let pipeline = device
+                 .new_compute_pipeline_state_with_function(&func)
+                 .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
+-            pipelines.insert((name, constants), pipeline.clone());
++            pipelines.insert((source, name, constants), pipeline.clone());
+ 
+             Ok(pipeline)
+         }
+@@ -201,3 +211,50 @@
+     }
+     compile_options
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::Barrier;
++
++    #[test]
++    fn concurrent_cache_loads_insert_once() {
++        const THREADS: usize = 8;
++        const WARM_HITS: usize = 100;
++
++        let device = Device::system_default().unwrap();
++        let kernels = Kernels::new();
++        let barrier = Barrier::new(THREADS);
++
++        let pipelines = std::thread::scope(|scope| {
++            let handles = (0..THREADS)
++                .map(|_| {
++                    scope.spawn(|| {
++                        barrier.wait();
++                        let pipeline = kernels
++                            .load_pipeline(&device, Source::Unary, "cos_f32")
++                            .unwrap();
++                        for _ in 0..WARM_HITS {
++                            let cached = kernels
++                                .load_pipeline(&device, Source::Unary, "cos_f32")
++                                .unwrap();
++                            assert!(std::ptr::eq(pipeline.as_ref(), cached.as_ref()));
++                            kernels.load_library(&device, Source::Unary).unwrap();
++                        }
++                        pipeline
++                    })
++                })
++                .collect::<Vec<_>>();
++            handles
++                .into_iter()
++                .map(|handle| handle.join().unwrap())
++                .collect::<Vec<_>>()
++        });
++
++        assert!(pipelines
++            .iter()
++            .all(|pipeline| std::ptr::eq(pipelines[0].as_ref(), pipeline.as_ref())));
++        assert_eq!(kernels.libraries.read().unwrap().len(), 1);
++        assert_eq!(kernels.pipelines.read().unwrap().len(), 1);
++    }
++}
+diff -ruN a/src/kernels/mlx_gemm.rs b/src/kernels/mlx_gemm.rs
+--- a/src/kernels/mlx_gemm.rs	2006-07-24 03:21:28.000000000 +0200
++++ b/src/kernels/mlx_gemm.rs	2026-09-21 17:35:02.693766548 +0200
+@@ -543,9 +543,24 @@
+     let m = effective_m;
+     let b = effective_batch;
+ 
++    let device_type = device.device_type();
++    if split_k_is_enabled() && split_k_routes(device_type, b, m, n, k) {
++        return call_mlx_gemm_split_k(
++            device,
++            ep,
++            kernels,
++            dtype,
++            (m, n, k),
++            (if batch_collapsed { k as i32 } else { lda }, ldb),
++            (a_trans, b_trans),
++            (lhs_buffer, lhs_offset),
++            (rhs_buffer, rhs_offset),
++            output,
++        );
++    }
++
+     // Dynamic tile selection based on matrix dimensions, dtype, transpose mode, and device type
+     // Reference: MLX GEMM_TPARAM_MACRO in matmul.cpp
+-    let device_type = device.device_type();
+     let tile = select_tile_config(dtype, m, n, k, b, a_trans, b_trans, device_type);
+     let (bm, bn, bk, wm, wn) = (tile.bm, tile.bn, tile.bk, tile.wm, tile.wn);
+ 
+@@ -666,3 +681,189 @@
+     encoder.dispatch_thread_groups(grid_size, group_size);
+     Ok(())
+ }
++
++const SPLIT_K_TILE: usize = 32;
++const SPLIT_K_BK: usize = 16;
++const SPLIT_K_IS_OPT_IN_BECAUSE_SUMMING_PARTIALS_REASSOCIATES_THE_K_SUM: &str =
++    "CANDLE_METAL_GEMM_SPLITK";
++
++thread_local! {
++    static SPLIT_K_SCOPES_THIS_THREAD_IS_INSIDE: std::cell::Cell<usize> =
++        const { std::cell::Cell::new(0) };
++}
++
++pub fn with_split_k_on_this_thread_unless_the_environment_decides<T>(
++    encode: impl FnOnce() -> T,
++) -> T {
++    struct Leave;
++    impl Drop for Leave {
++        fn drop(&mut self) {
++            SPLIT_K_SCOPES_THIS_THREAD_IS_INSIDE.with(|scopes| scopes.set(scopes.get() - 1));
++        }
++    }
++    SPLIT_K_SCOPES_THIS_THREAD_IS_INSIDE.with(|scopes| scopes.set(scopes.get() + 1));
++    let _leave = Leave;
++    encode()
++}
++
++fn split_k_is_enabled() -> bool {
++    static ENVIRONMENT_DECIDES: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
++    ENVIRONMENT_DECIDES
++        .get_or_init(|| {
++            std::env::var_os(SPLIT_K_IS_OPT_IN_BECAUSE_SUMMING_PARTIALS_REASSOCIATES_THE_K_SUM)
++                .map(|_| {
++                    crate::utils::get_env_bool(
++                        SPLIT_K_IS_OPT_IN_BECAUSE_SUMMING_PARTIALS_REASSOCIATES_THE_K_SUM,
++                        false,
++                    )
++                })
++        })
++        .unwrap_or_else(|| SPLIT_K_SCOPES_THIS_THREAD_IS_INSIDE.with(|scopes| scopes.get() > 0))
++}
++
++fn split_k_routes(device_type: MetalDeviceType, b: usize, m: usize, n: usize, k: usize) -> bool {
++    let grid_starved_below_tiles = match device_type {
++        MetalDeviceType::Max | MetalDeviceType::Ultra => 2048,
++        _ => 1024,
++    };
++    b == 1
++        && m.min(n) >= 40
++        && m.div_ceil(16) * n.div_ceil(16) <= grid_starved_below_tiles
++        && k / SPLIT_K_BK >= 8
++        && k >= m.max(n)
++}
++
++fn split_k_partials(device: &Device, bytes: usize) -> Result<Buffer, MetalKernelError> {
++    thread_local! {
++        static PARTIALS: std::cell::RefCell<Option<(u64, Buffer)>> =
++            const { std::cell::RefCell::new(None) };
++    }
++    PARTIALS.with(|held| {
++        let mut held = held.borrow_mut();
++        let id = device.registry_id();
++        if !matches!(&*held, Some((owner, buffer)) if *owner == id && buffer.length() >= bytes) {
++            *held = Some((id, device.new_buffer(bytes, crate::RESOURCE_OPTIONS)?));
++        }
++        Ok(held.as_ref().unwrap().1.clone())
++    })
++}
++
++#[allow(clippy::too_many_arguments)]
++fn call_mlx_gemm_split_k(
++    device: &Device,
++    ep: impl EncoderProvider,
++    kernels: &Kernels,
++    dtype: GemmDType,
++    (m, n, k): (usize, usize, usize),
++    (lda, ldb): (i32, i32),
++    (a_trans, b_trans): (bool, bool),
++    (lhs_buffer, lhs_offset): (&Buffer, usize),
++    (rhs_buffer, rhs_offset): (&Buffer, usize),
++    output: &Buffer,
++) -> Result<(), MetalKernelError> {
++    #[repr(C)]
++    struct SplitKParams {
++        m: i32,
++        n: i32,
++        k: i32,
++        lda: i32,
++        ldb: i32,
++        ldc: i32,
++        tiles_n: i32,
++        tiles_m: i32,
++        partitions: i32,
++        partition_stride: i32,
++        partition_size: i32,
++        gemm_k_iterations_aligned: i32,
++    }
++    impl EncoderParam for SplitKParams {
++        fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
++            encoder.set_bytes(position, &data);
++        }
++    }
++    let (tiles_m, tiles_n) = (m.div_ceil(SPLIT_K_TILE), n.div_ceil(SPLIT_K_TILE));
++    let partitions = ((k / SPLIT_K_BK) / (tiles_m * tiles_n))
++        .next_power_of_two()
++        .clamp(2, 32);
++    let iterations = (k / SPLIT_K_BK) / partitions;
++    let partials = split_k_partials(device, partitions * m * n * 4)?;
++    let dtype_str = match dtype {
++        GemmDType::F32 => "f32",
++        GemmDType::F16 => "f16",
++        GemmDType::BF16 => "bf16",
++    };
++    let trans_str = match (a_trans, b_trans) {
++        (false, false) => "nn",
++        (true, false) => "tn",
++        (false, true) => "nt",
++        (true, true) => "tt",
++    };
++    let k_str = if k % SPLIT_K_BK == 0 { "kt" } else { "kn" };
++    let encoder = ep.encoder();
++    let encoder: &ComputeCommandEncoder = encoder.as_ref();
++    let pipeline = kernels.load_pipeline(
++        device,
++        Source::Gemm,
++        format!("gemm_splitk_{trans_str}_{dtype_str}_{k_str}"),
++    )?;
++    encoder.set_compute_pipeline_state(&pipeline);
++    set_params!(
++        encoder,
++        (
++            (lhs_buffer, lhs_offset),
++            (rhs_buffer, rhs_offset),
++            Output::new(&partials),
++            SplitKParams {
++                m: m as i32,
++                n: n as i32,
++                k: k as i32,
++                lda,
++                ldb,
++                ldc: n as i32,
++                tiles_n: tiles_n as i32,
++                tiles_m: tiles_m as i32,
++                partitions: partitions as i32,
++                partition_stride: (m * n) as i32,
++                partition_size: (iterations * SPLIT_K_BK) as i32,
++                gemm_k_iterations_aligned: iterations as i32,
++            }
++        )
++    );
++    encoder.dispatch_thread_groups(
++        MTLSize {
++            width: tiles_n,
++            height: tiles_m,
++            depth: partitions,
++        },
++        MTLSize {
++            width: 32,
++            height: 2,
++            depth: 2,
++        },
++    );
++    let pipeline = kernels.load_pipeline(
++        device,
++        Source::Gemm,
++        format!("gemm_splitk_accum_{dtype_str}"),
++    )?;
++    encoder.set_compute_pipeline_state(&pipeline);
++    set_params!(
++        encoder,
++        (
++            &partials,
++            Output::new(output),
++            partitions as i32,
++            (m * n) as i32,
++            n as i32
++        )
++    );
++    encoder.dispatch_threads(
++        MTLSize {
++            width: n,
++            height: m,
++            depth: 1,
++        },
++        crate::utils::get_block_dims(n, m, 1),
++    );
++    Ok(())
++}
+diff -ruN a/src/metal/commands.rs b/src/metal/commands.rs
+--- a/src/metal/commands.rs	2006-07-24 03:21:28.000000000 +0200
++++ b/src/metal/commands.rs	2026-09-21 15:36:10.119415216 +0200
+@@ -324,19 +324,25 @@
+                 cb.wait_until_completed();
+             }
+             MTLCommandBufferStatus::Completed => {}
+-            MTLCommandBufferStatus::Error => {
+-                let msg = cb
+-                    .error()
+-                    .map(|e| e.to_string())
+-                    .unwrap_or_else(|| "unknown error".to_string());
+-                return Err(MetalKernelError::CommandBufferError(msg));
+-            }
++            MTLCommandBufferStatus::Error => return Err(Self::cb_error(cb)),
+             _ => unreachable!(),
+         }
+ 
++        if cb.status() == MTLCommandBufferStatus::Error {
++            return Err(Self::cb_error(cb));
++        }
++
+         Ok(())
+     }
+ 
++    fn cb_error(cb: &CommandBuffer) -> MetalKernelError {
++        let msg = cb
++            .error()
++            .map(|e| e.to_string())
++            .unwrap_or_else(|| "unknown error".to_string());
++        MetalKernelError::CommandBufferError(msg)
++    }
++
+     fn end_encoding(&self, encoder: ComputeCommandEncoder) {
+         use objc2_metal::MTLCommandEncoder as _;
+         use objc2_metal::MTLComputeCommandEncoder as _;
+diff -ruN a/src/metal/residency_set.rs b/src/metal/residency_set.rs
+--- a/src/metal/residency_set.rs	2006-07-24 03:21:28.000000000 +0200
++++ b/src/metal/residency_set.rs	2026-09-21 15:36:10.120415236 +0200
+@@ -29,18 +29,40 @@
+     }
+ 
+     pub fn insert(&self, buf: &Buffer) {
++        self.insert_batch(std::iter::once(buf));
++    }
++
++    /// Adds multiple buffers in a single commit.
++    pub fn insert_batch<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) {
+         if let Some(set) = &self.raw {
+-            set.addAllocation(as_allocation(buf));
+-            set.commit();
++            let mut any = false;
++            for buf in bufs {
++                set.addAllocation(as_allocation(buf));
++                any = true;
++            }
++            if any {
++                set.commit();
++            }
+         }
+     }
+ 
+-    pub fn remove(&self, buf: &Buffer) {
++    /// Removes multiple buffers in a single commit.
++    pub fn remove_batch<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) {
+         if let Some(set) = &self.raw {
+-            set.removeAllocation(as_allocation(buf));
+-            set.commit();
++            let mut any = false;
++            for buf in bufs {
++                set.removeAllocation(as_allocation(buf));
++                any = true;
++            }
++            if any {
++                set.commit();
++            }
+         }
+     }
++
++    pub fn remove(&self, buf: &Buffer) {
++        self.remove_batch(std::iter::once(buf));
++    }
+ }
+ 
+ /// Cast a `&Buffer` to `&ProtocolObject<dyn MTLAllocation>`.
+diff -ruN a/src/metal_src/mlx_gemm.metal b/src/metal_src/mlx_gemm.metal
+--- a/src/metal_src/mlx_gemm.metal	2006-07-24 03:21:28.000000000 +0200
++++ b/src/metal_src/mlx_gemm.metal	2026-09-21 15:36:10.138415587 +0200
+@@ -1481,3 +1481,167 @@
+ #if defined(__HAVE_BFLOAT__)
+ instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 32, 64, 16, 1, 2)
+ #endif
++
++template <
++    typename T,
++    int BM,
++    int BN,
++    int BK,
++    int WM,
++    int WN,
++    bool transpose_a,
++    bool transpose_b,
++    bool K_aligned>
++[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void gemm_splitk(
++    const device T* A [[buffer(0)]],
++    const device T* B [[buffer(1)]],
++    device float* C [[buffer(2)]],
++    const constant GEMMSpiltKParams* params [[buffer(3)]],
++    uint simd_lane_id [[thread_index_in_simdgroup]],
++    uint simd_group_id [[simdgroup_index_in_threadgroup]],
++    uint3 tid [[threadgroup_position_in_grid]]) {
++  using gemm_kernel = GEMMKernel<
++      T,
++      float,
++      BM,
++      BN,
++      BK,
++      WM,
++      WN,
++      transpose_a,
++      transpose_b,
++      false,
++      K_aligned>;
++  using loader_a_t = typename gemm_kernel::loader_a_t;
++  using loader_b_t = typename gemm_kernel::loader_b_t;
++  using mma_t = typename gemm_kernel::mma_t;
++
++  threadgroup T As[gemm_kernel::tgp_mem_size_a];
++  threadgroup T Bs[gemm_kernel::tgp_mem_size_b];
++
++  const int tid_x = tid.x;
++  const int tid_y = tid.y;
++  const int tid_z = tid.z;
++
++  if (params->tiles_n <= tid_x || params->tiles_m <= tid_y) {
++    return;
++  }
++
++  const int c_row = tid_y * BM;
++  const int c_col = tid_x * BN;
++  const int k_start = params->split_k_partition_size * tid_z;
++
++  const size_t c_row_long = size_t(c_row);
++  const size_t c_col_long = size_t(c_col);
++  const size_t k_start_long = size_t(k_start);
++
++  A += transpose_a ? (c_row_long + k_start_long * params->lda)
++                   : (k_start_long + c_row_long * params->lda);
++  B += transpose_b ? (k_start_long + c_col_long * params->ldb)
++                   : (c_col_long + k_start_long * params->ldb);
++  C += (size_t(params->split_k_partition_stride) * tid_z) +
++      (c_row_long * params->ldc + c_col_long);
++
++  thread loader_a_t loader_a(A, params->lda, As, simd_group_id, simd_lane_id);
++  thread loader_b_t loader_b(B, params->ldb, Bs, simd_group_id, simd_lane_id);
++
++  thread mma_t mma_op(simd_group_id, simd_lane_id);
++
++  int gemm_k_iterations = params->gemm_k_iterations_aligned;
++
++  short tgp_bm = min(BM, params->M - c_row);
++  short tgp_bn = min(BN, params->N - c_col);
++  short leftover_bk = params->K % BK;
++
++  if (tgp_bm == BM && tgp_bn == BN) {
++    gemm_kernel::gemm_loop(
++        As, Bs, gemm_k_iterations, loader_a, loader_b, mma_op, tgp_bm, tgp_bn,
++        leftover_bk, LoopAlignment<true, true, true>{});
++  } else if (tgp_bn == BN) {
++    gemm_kernel::gemm_loop(
++        As, Bs, gemm_k_iterations, loader_a, loader_b, mma_op, tgp_bm, tgp_bn,
++        leftover_bk, LoopAlignment<false, true, true>{});
++  } else if (tgp_bm == BM) {
++    gemm_kernel::gemm_loop(
++        As, Bs, gemm_k_iterations, loader_a, loader_b, mma_op, tgp_bm, tgp_bn,
++        leftover_bk, LoopAlignment<true, false, true>{});
++  } else {
++    gemm_kernel::gemm_loop(
++        As, Bs, gemm_k_iterations, loader_a, loader_b, mma_op, tgp_bm, tgp_bn,
++        leftover_bk, LoopAlignment<false, false, true>{});
++  }
++
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++
++  if ((tid_z + 1) == (params->split_k_partitions)) {
++    int gemm_k_iter_remaining =
++        (params->K - (k_start + params->split_k_partition_size)) / BK;
++    if (!K_aligned || gemm_k_iter_remaining > 0)
++      gemm_kernel::gemm_loop(
++          As, Bs, gemm_k_iter_remaining, loader_a, loader_b, mma_op, tgp_bm,
++          tgp_bn, leftover_bk, LoopAlignment<false, false, K_aligned>{});
++  }
++
++  if (tgp_bm == BM && tgp_bn == BN) {
++    mma_op.store_result(C, params->ldc);
++  } else {
++    mma_op.store_result_safe(C, params->ldc, short2(tgp_bn, tgp_bm));
++  }
++}
++
++template <typename OutT>
++[[kernel]] void gemm_splitk_accum(
++    const device float* C_split [[buffer(0)]],
++    device OutT* D [[buffer(1)]],
++    const constant int& k_partitions [[buffer(2)]],
++    const constant int& partition_stride [[buffer(3)]],
++    const constant int& ldd [[buffer(4)]],
++    uint2 gid [[thread_position_in_grid]]) {
++  D += gid.x + gid.y * size_t(ldd);
++  C_split += gid.x + gid.y * size_t(ldd);
++
++  size_t offset = 0;
++  float out = 0;
++
++  for (int i = 0; i < k_partitions; i++) {
++    out += C_split[offset];
++    offset += partition_stride;
++  }
++
++  D[0] = static_cast<OutT>(out);
++}
++
++#define instantiate_gemm_splitk(tname, trans_a, trans_b, iname, itype, kname, k_aligned) \
++  template [[host_name("gemm_splitk_" #tname "_" #iname "_" #kname)]] \
++  [[kernel]] void gemm_splitk<itype, 32, 32, 16, 2, 2, trans_a, trans_b, k_aligned>( \
++      const device itype *A [[buffer(0)]], \
++      const device itype *B [[buffer(1)]], \
++      device float *C [[buffer(2)]], \
++      const constant GEMMSpiltKParams* params [[buffer(3)]], \
++      uint simd_lane_id [[thread_index_in_simdgroup]], \
++      uint simd_group_id [[simdgroup_index_in_threadgroup]], \
++      uint3 tid [[threadgroup_position_in_grid]]);
++
++#define instantiate_gemm_splitk_dtype(iname, itype) \
++    instantiate_gemm_splitk(nn, false, false, iname, itype, kt, true) \
++    instantiate_gemm_splitk(nn, false, false, iname, itype, kn, false) \
++    instantiate_gemm_splitk(nt, false, true , iname, itype, kt, true) \
++    instantiate_gemm_splitk(nt, false, true , iname, itype, kn, false) \
++    instantiate_gemm_splitk(tn, true , false, iname, itype, kt, true) \
++    instantiate_gemm_splitk(tn, true , false, iname, itype, kn, false) \
++    instantiate_gemm_splitk(tt, true , true , iname, itype, kt, true) \
++    instantiate_gemm_splitk(tt, true , true , iname, itype, kn, false) \
++  template [[host_name("gemm_splitk_accum_" #iname)]] \
++  [[kernel]] void gemm_splitk_accum<itype>( \
++      const device float* C_split [[buffer(0)]], \
++      device itype* D [[buffer(1)]], \
++      const constant int& k_partitions [[buffer(2)]], \
++      const constant int& partition_stride [[buffer(3)]], \
++      const constant int& ldd [[buffer(4)]], \
++      uint2 gid [[thread_position_in_grid]]);
++
++instantiate_gemm_splitk_dtype(f32, float)
++instantiate_gemm_splitk_dtype(f16, half)
++#if defined(__HAVE_BFLOAT__)
++instantiate_gemm_splitk_dtype(bf16, bfloat)
++#endif
+diff -ruN a/src/metal_src/reduce.metal b/src/metal_src/reduce.metal
+--- a/src/metal_src/reduce.metal	2006-07-24 03:21:28.000000000 +0200
++++ b/src/metal_src/reduce.metal	2026-09-21 15:36:10.121415255 +0200
+@@ -82,7 +82,7 @@
+ 
+     IndexT strided_i = 0;
+     for (IndexT d = D; d < num_dims; d++) {
+-        IndexT dim_idx = num_dims - 1 - d;
++        IndexT dim_idx = num_dims - 1 - (d - D);
+         IndexT dim = dims[dim_idx];
+         strided_i += (idx % dim) * strides[dim_idx];
+         idx /= dim;
+diff -ruN a/src/tests.rs b/src/tests.rs
+--- a/src/tests.rs	2006-07-24 03:21:28.000000000 +0200
++++ b/src/tests.rs	2026-09-21 15:36:10.121415255 +0200
+@@ -31,6 +31,21 @@
+     Device::system_default().unwrap()
+ }
+ 
++#[test]
++fn pipeline_cache_distinguishes_sources() {
++    let device = device();
++    let kernels = Kernels::new();
++
++    // Prime the cache with a name that is not present in the binary library.
++    kernels
++        .load_pipeline(&device, Source::Unary, "cos_f32")
++        .unwrap();
++    assert!(matches!(
++        kernels.load_pipeline(&device, Source::Binary, "cos_f32"),
++        Err(MetalKernelError::LoadFunctionError(_))
++    ));
++}
++
+ fn approx(v: Vec<f32>, digits: i32) -> Vec<f32> {
+     let b = 10f32.powi(digits);
+     v.iter().map(|t| f32::round(t * b) / b).collect()
+@@ -2451,3 +2466,28 @@
+ 
+     commands.wait_until_completed().unwrap();
+ }
++
++#[test]
++fn residency_set_batch_insert_remove() {
++    use objc2_metal::MTLResidencySet;
++
++    let device = device();
++    let set = ResidencySet::new(&device);
++    let Some(raw) = set.raw() else {
++        // Residency sets are unsupported on this device/OS; the set no-ops.
++        return;
++    };
++
++    let bufs: Vec<Buffer> = (0..3).map(|i| new_buffer(&device, &[i as f32])).collect();
++    let base = raw.allocationCount();
++
++    set.insert_batch(&bufs);
++    assert_eq!(raw.allocationCount(), base + bufs.len());
++    set.remove_batch(&bufs);
++    assert_eq!(raw.allocationCount(), base);
++
++    // Empty batches are valid and leave the set untouched.
++    set.insert_batch(std::iter::empty());
++    set.remove_batch(std::iter::empty());
++    assert_eq!(raw.allocationCount(), base);
++}

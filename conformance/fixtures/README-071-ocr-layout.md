@@ -49,9 +49,10 @@ model that emits markdown scores badly on raw CER while being correct.
   re-measure table (`report_layout_fixture_cers`).
 - `rust/crates/nv-models/tests/deepseek_ocr_graph_batch.rs`,
   `dots_ocr_bench.rs`, `got_ocr_real.rs` — these walk the same five-fixture list
-  but assert graphed==eager token identity or measure speed. **`cer_max_model`
-  and `cer_max_model_neutral` have no runner**: nothing scores a generative
-  backend against `expected_text`.
+  but assert graphed==eager token identity or measure speed.
+- `scripts/ocr_fixture_cer.py` — the `cer_max_model` /
+  `cer_max_model_neutral` runner: scores any generative backend of a live
+  `/v1/ocr` against `expected_text` and fails on a neutral gate.
 
 ## Regenerating
 

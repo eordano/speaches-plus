@@ -40,7 +40,7 @@ Python stdlib `inspect` module. All upstream symbol names (`SessionMeta`,
   `_replay_buffer`, `_subscribers`, `_sub_loops`, `_dropped_count`,
   `_turn_count`, `_last_event_ts`, the `_*_id` correlation fields, and
   `_ndjson` writes. Hot path: `publish()` snapshots
-  `list(zip(_subscribers, _sub_loops))` under lock and fans out *outside*
+  `list(zip(_subscribers, _sub_loops))` under lock and fans out outside
   the lock so a slow subscriber cannot block other publishers.
 * `InspectorRelay.subscribe(loop=None)` -- must run in an async context.
   The loop is captured via `asyncio.get_running_loop()` (or passed

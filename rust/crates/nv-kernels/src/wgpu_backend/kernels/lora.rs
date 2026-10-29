@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
 use crate::wgpu_backend::pack::pack_u16_odd_tail_zeroed_min_one_word as pack_u16;
@@ -606,57 +604,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn meta_prepare_matches_vllm_semantics() {
-        let meta = LoraMeta::prepare(&[2, -1, 0, 2, -1, 2], 4);
-        assert_eq!(meta.token_indices_sorted, vec![1, 4, 2, 0, 3, 5]);
-        assert_eq!(meta.active_lora_ids, vec![-1, 0, 2, -1, -1]);
-        assert_eq!(meta.num_tokens_per_lora, vec![2, 1, 3, 0, 0]);
-        assert_eq!(meta.lora_token_start_loc, vec![0, 2, 3, 6, 0, 0]);
-        assert_eq!(meta.num_active_loras, 3);
-        assert!(!meta.no_lora);
+    fn meta_prepare_matches_vllm_semantics_and_the_layout_sections_are_contiguous() {
+        {
+            let meta = LoraMeta::prepare(&[2, -1, 0, 2, -1, 2], 4);
+            assert_eq!(meta.token_indices_sorted, vec![1, 4, 2, 0, 3, 5]);
+            assert_eq!(meta.active_lora_ids, vec![-1, 0, 2, -1, -1]);
+            assert_eq!(meta.num_tokens_per_lora, vec![2, 1, 3, 0, 0]);
+            assert_eq!(meta.lora_token_start_loc, vec![0, 2, 3, 6, 0, 0]);
+            assert_eq!(meta.num_active_loras, 3);
+            assert!(!meta.no_lora);
 
-        let meta = LoraMeta::prepare(&[-1, -1], 2);
-        assert!(meta.no_lora);
+            let meta = LoraMeta::prepare(&[-1, -1], 2);
+            assert!(meta.no_lora);
 
-        let meta = LoraMeta::prepare(&[1, 1, 1], 2);
-        assert!(!meta.no_lora);
-        assert_eq!(meta.active_lora_ids, vec![1, -1, -1]);
-        assert_eq!(meta.num_tokens_per_lora, vec![3, 0, 0]);
+            let meta = LoraMeta::prepare(&[1, 1, 1], 2);
+            assert!(!meta.no_lora);
+            assert_eq!(meta.active_lora_ids, vec![1, -1, -1]);
+            assert_eq!(meta.num_tokens_per_lora, vec![3, 0, 0]);
+        }
+        {
+            let meta = LoraMeta::prepare(&[0, 1, -1, 0], 2);
+            let ml = build_meta(&meta, 4, &[6, 2], 8).unwrap();
+            assert_eq!(ml.off_counts, 4);
+            assert_eq!(ml.off_start, 7);
+            assert_eq!(ml.off_active, 11);
+            assert_eq!(ml.off_slice_n, 14);
+            assert_eq!(ml.off_slice_start, 16);
+            assert_eq!(ml.off_b_off, 18);
+            assert_eq!(ml.off_b_d0, 20);
+            assert_eq!(ml.data.len(), 22);
+            assert_eq!(&ml.data[14..16], &[6, 2]);
+            assert_eq!(&ml.data[16..18], &[0, 6]);
+            assert_eq!(&ml.data[18..20], &[0, 2 * 6 * 8]);
+            assert_eq!(&ml.data[20..22], &[48, 16]);
+        }
     }
 
     #[test]
-    fn meta_layout_sections_are_contiguous() {
-        let meta = LoraMeta::prepare(&[0, 1, -1, 0], 2);
-        let ml = build_meta(&meta, 4, &[6, 2], 8).unwrap();
-        assert_eq!(ml.off_counts, 4);
-        assert_eq!(ml.off_start, 7);
-        assert_eq!(ml.off_active, 11);
-        assert_eq!(ml.off_slice_n, 14);
-        assert_eq!(ml.off_slice_start, 16);
-        assert_eq!(ml.off_b_off, 18);
-        assert_eq!(ml.off_b_d0, 20);
-        assert_eq!(ml.data.len(), 22);
-        assert_eq!(&ml.data[14..16], &[6, 2]);
-        assert_eq!(&ml.data[16..18], &[0, 6]);
-        assert_eq!(&ml.data[18..20], &[0, 2 * 6 * 8]);
-        assert_eq!(&ml.data[20..22], &[48, 16]);
-    }
-
-    #[test]
-    fn u16_packing_matches_the_shader_word_layout() {
-        assert_eq!(
-            pack_u16(&[0x1234, 0xabcd, 0x0001]),
-            vec![0xabcd_1234u32, 0x0000_0001]
-        );
-        assert_eq!(pack_u16(&[]), vec![0u32]);
-    }
-
-    #[test]
-    fn wgsl_declares_the_entry_points() {
-        assert!(GROUPED_WGSL.contains(SHRINK_ENTRY));
-        assert!(GROUPED_WGSL.contains(EXPAND_ENTRY));
-        assert!(FUSED_WGSL.contains(FUSED_ENTRY));
-        assert!(compose(GROUPED_WGSL).contains("fn bf16_encode("));
-        assert!(compose(FUSED_WGSL).contains("fn u16_at("));
+    fn u16_packing_and_entry_points_match_the_shaders() {
+        {
+            assert_eq!(
+                pack_u16(&[0x1234, 0xabcd, 0x0001]),
+                vec![0xabcd_1234u32, 0x0000_0001]
+            );
+            assert_eq!(pack_u16(&[]), vec![0u32]);
+        }
+        {
+            assert!(GROUPED_WGSL.contains(SHRINK_ENTRY));
+            assert!(GROUPED_WGSL.contains(EXPAND_ENTRY));
+            assert!(FUSED_WGSL.contains(FUSED_ENTRY));
+            assert!(compose(GROUPED_WGSL).contains("fn bf16_encode("));
+            assert!(compose(FUSED_WGSL).contains("fn u16_at("));
+        }
     }
 }

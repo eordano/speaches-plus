@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 pub mod audio_store;
 pub mod constants;

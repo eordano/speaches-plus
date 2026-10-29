@@ -35,6 +35,13 @@ esac
 }
 
 cp "$RUST_DIR/crates/nv-ocr-web/harness/q38_layer_parity.html" "$WORK/q38_layer_parity.html"
+cp "$RUST_DIR/crates/nv-ocr-web/harness/voxtral_tts.html" "$RUST_DIR/crates/nv-ocr-web/harness/voxtral_tts_worker.js" "$WORK/"
+case " $ARMS " in
+  *" tts "*)
+    [ -e "$WORK/tts-model" ] || ln -s "${VOXTRAL_TTS_MODEL_DIR:?tts arm: set VOXTRAL_TTS_MODEL_DIR to the Voxtral-4B-TTS-2603 snapshot or link it at $WORK/tts-model}" "$WORK/tts-model"
+    [ -e "$WORK/tts-fixtures" ] || ln -s "$RUST_DIR/tests/data" "$WORK/tts-fixtures"
+    [ -f "$WORK/tts-model/consolidated.safetensors" ] || { echo "q38-browser-parity: $WORK/tts-model holds no consolidated.safetensors" >&2; exit 1; } ;;
+esac
 
 python3 "$RUST_DIR/crates/nv-ocr-web/harness/serve.py" "$PORT" "$WORK" &>"$WORK/http.log" &
 SRV=$!
@@ -72,10 +79,12 @@ for arm in $ARMS; do
   GPU_FLAGS="${Q38WEB_CHROME_FLAGS:---ignore-gpu-blocklist --use-gl=angle --use-angle=vulkan --enable-features=Vulkan,DefaultANGLEVulkan,VulkanFromANGLE}"
   HEADLESS_FLAG="--headless=new"
   [ "${Q38WEB_HEADLESS:-1}" = 0 ] && HEADLESS_FLAG=""
+  PAGE=q38_layer_parity.html
+  [ "$arm" = tts ] && PAGE=voxtral_tts.html
   # shellcheck disable=SC2086
   "$CHROME" $HEADLESS_FLAG --no-first-run --user-data-dir="$prof" \
     --enable-unsafe-webgpu --enable-logging=stderr --v=0 $GPU_FLAGS \
-    "http://127.0.0.1:$PORT/q38_layer_parity.html?arm=$arm${Q38WEB_QUERY:+&$Q38WEB_QUERY}" &>"$log" &
+    "http://127.0.0.1:$PORT/$PAGE?arm=$arm${Q38WEB_QUERY:+&$Q38WEB_QUERY}" &>"$log" &
   CPID=$!
   waited=0
   until [ -s "$WORK/q38-result-$arm.json" ]; do
@@ -121,9 +130,16 @@ if j.get('init') is not None and j.get('style') is not None:
     print(f"  kokoro init={json.dumps(j['init'])} init_ms={round(j.get('init_ms') or 0)} synth_ms={round(j.get('synth_ms') or 0)} synth_samples={j.get('synth_samples')}")
     print(f"  style={json.dumps(j['style'])} style_ms={round(j.get('style_ms') or 0)}")
     print(f"  adapter={json.dumps({k: v for k, v in (j.get('adapter') or {}).items() if k != 'epochs'})} adapter_ms={round(j.get('adapter_ms') or 0)} adapter_bytes={j.get('adapter_safetensors_bytes')} verdict={j.get('verdict')}")
+if j.get('tts'):
+    print(f"  adapter={json.dumps(j.get('adapter'))}")
+    print(f"  wasm_init_ms={round(j.get('wasm_init_ms') or 0)} open_ms={round(j.get('open_ms') or 0)} verdict={j.get('verdict')}")
+    for tier, t in j['tts'].items():
+        print(f"  {tier}: boot_ms={round(t.get('boot_ms') or 0)} verdict={t.get('verdict')}")
+        for case, r in (t.get('cases') or {}).items():
+            print(f"    {case}: {json.dumps(r)}")
 if j.get('probe_adapter'):
     print(f"  probe adapter={json.dumps(j['probe_adapter'])[:400]}")
-ok = j.get('done') in ('sg-bit-equal', 'sg-characterized', 'nosg-refusal-matched', 'tint-clean', 'probe-ok', 'train-ok', 'e4b-ok', 'kokoro-ok')
+ok = j.get('done') in ('sg-bit-equal', 'sg-characterized', 'nosg-refusal-matched', 'tint-clean', 'probe-ok', 'train-ok', 'e4b-ok', 'kokoro-ok', 'tts-ok')
 sys.exit(0 if ok else 3)
 EOF
   then fail=1; fi

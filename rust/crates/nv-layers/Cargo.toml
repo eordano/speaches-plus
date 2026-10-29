@@ -17,6 +17,7 @@ nv-config = { workspace = true }
 nv-kernels = { workspace = true }
 nv-quant = { workspace = true }
 nv-weights = { workspace = true }
+rayon = "1"
 
 [features]
 default = []

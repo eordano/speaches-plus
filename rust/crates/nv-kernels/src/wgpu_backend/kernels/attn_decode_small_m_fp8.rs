@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::dequant::bytes_to_words;
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
@@ -192,46 +190,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn head_dim_selects_the_matching_entry_point() {
-        assert_eq!(entry_for(64).unwrap(), "attn_decode_small_m_fp8_hd64");
-        assert_eq!(entry_for(512).unwrap(), "attn_decode_small_m_fp8_hd512");
-        assert!(entry_for(96).is_err());
-        assert!(entry_for(1024).is_err());
-    }
-
-    #[test]
-    fn wgsl_declares_every_entry_point() {
-        for hd in SUPPORTED_HEAD_DIMS {
-            assert!(WGSL.contains(entry_for(hd).unwrap()));
+    fn head_dim_selects_an_entry_the_wgsl_declares_within_the_scratch_budget() {
+        {
+            assert_eq!(entry_for(64).unwrap(), "attn_decode_small_m_fp8_hd64");
+            assert_eq!(entry_for(512).unwrap(), "attn_decode_small_m_fp8_hd512");
+            assert!(entry_for(96).is_err());
+            assert!(entry_for(1024).is_err());
         }
-        assert!(compose(WGSL).contains("fn e4m3_decode("));
-    }
-
-    #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert_eq!(std::mem::size_of::<Sm8Params>() % 16, 0);
-    }
-
-    #[test]
-    fn m_rows_out_of_range_is_rejected() {
-        assert!(check_m_rows(0).is_err());
-        assert!(check_m_rows(MAX_M + 1).is_err());
-        for m in 1..=MAX_M {
-            assert!(check_m_rows(m).is_ok());
+        {
+            for hd in SUPPORTED_HEAD_DIMS {
+                assert!(WGSL.contains(entry_for(hd).unwrap()));
+            }
+            assert!(compose(WGSL).contains("fn e4m3_decode("));
+        }
+        {
+            assert!(WGSL.contains("array<f32, 5120>"));
+            assert_eq!(SCRATCH_BYTES, 5120 * 4 + 512 * 4 + 32 * 4);
+            assert!(WGSL.contains(&format!("const SM8_MAX_M: u32 = {MAX_M}u;")));
         }
     }
 
     #[test]
-    fn byte_widening_pads_the_tail_word() {
-        assert_eq!(bytes_to_words(&[1, 2, 3, 4, 5]), vec![0x04030201u32, 5]);
-        assert_eq!(widen_u16(&[]), vec![0]);
-        assert_eq!(bytes_to_words(&[]), vec![0]);
-    }
-
-    #[test]
-    fn wgsl_scratch_matches_the_declared_budget() {
-        assert!(WGSL.contains("array<f32, 5120>"));
-        assert_eq!(SCRATCH_BYTES, 5120 * 4 + 512 * 4 + 32 * 4);
-        assert!(WGSL.contains(&format!("const SM8_MAX_M: u32 = {MAX_M}u;")));
+    fn params_m_rows_and_byte_widening_follow_the_shader_contract() {
+        {
+            assert_eq!(std::mem::size_of::<Sm8Params>() % 16, 0);
+        }
+        {
+            assert!(check_m_rows(0).is_err());
+            assert!(check_m_rows(MAX_M + 1).is_err());
+            for m in 1..=MAX_M {
+                assert!(check_m_rows(m).is_ok());
+            }
+        }
+        {
+            assert_eq!(bytes_to_words(&[1, 2, 3, 4, 5]), vec![0x04030201u32, 5]);
+            assert_eq!(widen_u16(&[]), vec![0]);
+            assert_eq!(bytes_to_words(&[]), vec![0]);
+        }
     }
 }

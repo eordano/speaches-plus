@@ -4,11 +4,12 @@ exclude = [
     "third-party/wgpu-hal-30.0.0",
     "third-party/wgpu-30.0.0",
     "third-party/candle-core-0.11.0",
+    "third-party/candle-metal-kernels-0.11.0",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 publish = false
 
 [workspace.lints.clippy]
@@ -46,9 +47,10 @@ nv-tts = { path = "crates/nv-tts" }
 nv-punkt = { path = "crates/nv-punkt" }
 nv-aligner = { path = "crates/nv-aligner" }
 nv-grammar = { path = "crates/nv-grammar" }
+nv-laya = { path = "crates/nv-laya" }
 
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ts-rs = { version = "12", features = ["serde-json-impl"] }
@@ -58,8 +60,8 @@ half = "2"
 bytemuck = { version = "1", features = ["derive"] }
 rand_pcg = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-minijinja = { version = "2", features = ["json", "loop_controls"] }
-minijinja-contrib = { version = "2", features = ["pycompat"] }
+minijinja = { version = "3", features = ["json", "loop_controls", "serde"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
 safetensors = "0.8"
 memmap2 = "0.9"
 tokenizers = "0.23"
@@ -69,7 +71,7 @@ candle-flash-attn = "0.11"
 cudarc = { version = "0.19", default-features = false, features = ["std", "cublas", "cublaslt", "cudnn", "curand", "nccl", "driver", "runtime", "nvrtc", "f16", "dynamic-linking", "cuda-12090"] }
 tokio = { version = "1", default-features = false }
 futures-util = "0.3"
-bindgen = "0.72"
+bindgen = "0.73"
 cc = "1"
 
 [package]
@@ -99,15 +101,16 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 nv-imgdec = { workspace = true }
 ogg = "0.9"
 leptess = { version = "0.14", optional = true }
-symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "isomp4", "aac", "alac", "wav", "pcm"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart"] }
+symphonia = { version = "0.6", default-features = false, features = ["mp3", "flac", "vorbis", "ogg", "mkv", "isomp4", "aac", "alac", "wav", "pcm"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "multipart"] }
 futures-util = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.10"
+sha2 = "0.11"
+hex = "0.4"
 typeshare = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "io-util", "net", "test-util", "process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -116,20 +119,21 @@ tower = "0.5"
 async-trait = "0.1"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.32"
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.34"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "grpc-tonic", "trace"] }
 uuid = { version = "1", features = ["v4"] }
-webrtc = "0.17"
-opus = "0.3"
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-24"] }
-ndarray = "0.16"
-rubato = "0.16"
+webrtc = "0.21"
+rtc = "0.21"
+opus = "0.4"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-24", "cuda", "rocm", "migraphx", "coreml", "webgpu", "directml", "openvino"] }
+ndarray = "0.17"
+rubato = "5"
 realfft = "3"
-ct2rs = { version = "0.9", default-features = false, features = ["whisper", "ruy"] }
+ct2rs = { version = "0.10", default-features = false, features = ["whisper", "ruy"] }
 whisper-rs = { version = "0.16", default-features = false }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 regex = "1"
 libc = "0.2"
 
@@ -148,6 +152,7 @@ nv-tts = { workspace = true }
 nv-punkt = { workspace = true }
 nv-aligner = { workspace = true }
 nv-grammar = { workspace = true }
+nv-laya = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 tokenizers = { workspace = true }
@@ -167,6 +172,7 @@ metal = [
     "nv-tts/metal",
     "nv-aligner/metal",
     "nv-train/metal",
+    "nv-laya/metal",
     "candle-core/metal",
     "candle-nn/metal",
 ]
@@ -181,6 +187,7 @@ cuda = [
     "nv-tts/cuda",
     "nv-aligner/cuda",
     "nv-train/cuda",
+    "nv-laya/flash-attn",
     "candle-core/cuda",
     "candle-nn/cuda",
 ]
@@ -196,7 +203,7 @@ tesseract = ["leptess"]
 cc = { workspace = true, features = ["parallel"] }
 
 [dev-dependencies]
-pyo3 = { version = "0.29", features = ["auto-initialize"] }
+pyo3 = { version = "0.30", features = ["auto-initialize"] }
 http-body-util = "0.1"
 async-trait = "0.1"
 tower = { version = "0.5", features = ["util"] }
@@ -213,4 +220,4 @@ workspace = true
 wgpu-hal = { path = "third-party/wgpu-hal-30.0.0" }
 wgpu = { path = "third-party/wgpu-30.0.0" }
 candle-core = { path = "third-party/candle-core-0.11.0" }
-candle-metal-kernels = { git = "https://github.com/huggingface/candle", rev = "4761e00bfb687cc2666e30be7726077f9e2c4456" }
+candle-metal-kernels = { path = "third-party/candle-metal-kernels-0.11.0" }

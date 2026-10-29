@@ -14,6 +14,12 @@ pub const GROUPED_EXPERT_TRAINING_RUNS_FOUR_MARLIN_MOE_LAUNCHES_PER_LAYER_PER_DI
      down as Marlin w4a16 MoE launches over the stacked experts and its backward runs the two \
      transposed stacks the same way, so the expert path is launch-count-flat in the token count";
 
+pub struct PackedNvfp4Rows<'a> {
+    pub packed: &'a [u8],
+    pub scales_linear: &'a [u8],
+    pub global: f32,
+}
+
 pub struct MarlinMoeTrainStacks {
     gate_up: MarlinMoeStack,
     down: MarlinMoeStack,
@@ -226,6 +232,89 @@ impl MarlinMoeTrainStacks {
         let gate_transposed = transposed_stack_on_the_device(stream, &gate_parts, inter, hidden)?;
         let up_transposed = transposed_stack_on_the_device(stream, &up_parts, inter, hidden)?;
         let down_transposed = transposed_stack_on_the_device(stream, &down_parts, hidden, inter)?;
+        Self::assemble(
+            [gate_up, down, gate_transposed, up_transposed, down_transposed],
+            e_total,
+            hidden,
+            inter,
+        )
+    }
+
+    pub fn build_from_checkpoint_rows(
+        experts: &[[PackedNvfp4Rows<'_>; 3]],
+        hidden: usize,
+        inter: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<Self> {
+        let e_total = experts.len();
+        anyhow::ensure!(
+            e_total > 0 && hidden % 128 == 0 && inter % 64 == 0,
+            "moe train stacks: shape hidden {hidden} inter {inter} does not tile marlin"
+        );
+        let shapes = [(inter, hidden), (inter, hidden), (hidden, inter)];
+        for (e, projs) in experts.iter().enumerate() {
+            for (p, (rows, cols)) in projs.iter().zip(shapes) {
+                anyhow::ensure!(
+                    p.packed.len() == rows * cols / 2 && p.scales_linear.len() == rows * cols / 16,
+                    "expert {e}: packed {} / scale {} bytes do not match [{rows}, {cols}]",
+                    p.packed.len(),
+                    p.scales_linear.len()
+                );
+            }
+            anyhow::ensure!(
+                projs[0].global == projs[1].global,
+                "expert {e}: gate and up weight_scale_2 differ ({} vs {}), the concat gate_up stack needs one",
+                projs[0].global,
+                projs[1].global
+            );
+        }
+        let mut gu_packed = Vec::with_capacity(e_total * inter * hidden);
+        let mut gu_scales = Vec::with_capacity(e_total);
+        let mut dn_packed = Vec::with_capacity(e_total * hidden * inter / 2);
+        let mut dn_scales = Vec::with_capacity(e_total);
+        for [g, u, d] in experts {
+            gu_packed.extend_from_slice(g.packed);
+            gu_packed.extend_from_slice(u.packed);
+            gu_scales.push([g.scales_linear, u.scales_linear].concat());
+            dn_packed.extend_from_slice(d.packed);
+            dn_scales.push(d.scales_linear.to_vec());
+        }
+        let globals = |i: usize| experts.iter().map(|p| p[i].global).collect::<Vec<f32>>();
+        let gate_up = marlin_moe_stack_from_linear(stream, &gu_packed, &gu_scales, &globals(0), e_total, 2 * inter, hidden)?;
+        let down = marlin_moe_stack_from_linear(stream, &dn_packed, &dn_scales, &globals(2), e_total, hidden, inter)?;
+        drop((gu_packed, gu_scales, dn_packed, dn_scales));
+        let transposed = |i: usize, rows: usize, cols: usize| -> Result<MarlinMoeStack> {
+            let mut dev = Vec::with_capacity(e_total);
+            for p in experts {
+                let p = &p[i];
+                let w = stream.clone_htod(p.packed).map_err(|e| anyhow::anyhow!(e))?;
+                let s = stream
+                    .clone_htod(&nv_quant::nvfp4::swizzle_scales(p.scales_linear, rows, cols / 16))
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                dev.push((w, s, p.global));
+            }
+            let parts: Vec<(&CudaSlice<u8>, &CudaSlice<u8>, f32)> = dev.iter().map(|(w, s, g)| (w, s, *g)).collect();
+            transposed_stack_on_the_device(stream, &parts, rows, cols)
+        };
+        let gate_transposed = transposed(0, inter, hidden)?;
+        let up_transposed = transposed(1, inter, hidden)?;
+        let down_transposed = transposed(2, hidden, inter)?;
+        Self::assemble(
+            [gate_up, down, gate_transposed, up_transposed, down_transposed],
+            e_total,
+            hidden,
+            inter,
+        )
+    }
+
+    pub fn device_bytes(&self) -> usize {
+        let s = |m: &MarlinMoeStack| m.b_q.len() * 4 + m.scales.len() + m.globals.len() * 4;
+        s(&self.gate_up) + s(&self.down) + s(&self.gate_transposed) + s(&self.up_transposed) + s(&self.down_transposed)
+    }
+
+    fn assemble(stacks: [MarlinMoeStack; 5], experts: usize, hidden: usize, inter: usize) -> Result<Self> {
+        let [gate_up, down, gate_transposed, up_transposed, down_transposed] = stacks;
+        let e_total = experts;
         let mut workspace_ints = 0i32;
         let rc =
             unsafe { nv_kernels::cuda::marlin_moe_workspace_ints(&mut workspace_ints as *mut i32) };
@@ -253,6 +342,56 @@ impl MarlinMoeTrainStacks {
             c_tmp_floats,
             workspace_ints,
         })
+    }
+}
+
+pub struct HostMarlinMoeTrainStacks {
+    parts: Vec<[crate::pinned_host::PinnedHostBuf; 3]>,
+    experts: usize,
+    hidden: usize,
+    inter: usize,
+}
+
+impl MarlinMoeTrainStacks {
+    fn stacks(&self) -> [&MarlinMoeStack; 5] {
+        [&self.gate_up, &self.down, &self.gate_transposed, &self.up_transposed, &self.down_transposed]
+    }
+
+    pub fn park_on_host(&self, stream: &Arc<CudaStream>) -> Result<HostMarlinMoeTrainStacks> {
+        use crate::pinned_host::PinnedHostBuf;
+        let parts = self
+            .stacks()
+            .into_iter()
+            .map(|m| {
+                Ok([
+                    PinnedHostBuf::download(stream, &m.b_q, "marlin train stack weights")?,
+                    PinnedHostBuf::download(stream, &m.scales, "marlin train stack scales")?,
+                    PinnedHostBuf::download(stream, &m.globals, "marlin train stack globals")?,
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(HostMarlinMoeTrainStacks { parts, experts: self.experts, hidden: self.hidden, inter: self.inter })
+    }
+}
+
+impl HostMarlinMoeTrainStacks {
+    pub fn bytes(&self) -> usize {
+        self.parts.iter().flat_map(|p| p.iter()).map(|b| b.len()).sum()
+    }
+
+    pub fn upload(&self, compute: &Arc<CudaStream>, copy: &Arc<CudaStream>) -> Result<(MarlinMoeTrainStacks, cudarc::driver::CudaEvent)> {
+        let mut stacks = Vec::with_capacity(5);
+        let mut last = None;
+        for [w, s, g] in &self.parts {
+            let (b_q, _) = w.upload_on::<u32>(compute, copy)?;
+            let (scales, _) = s.upload_on::<u8>(compute, copy)?;
+            let (globals, ev) = g.upload_on::<f32>(compute, copy)?;
+            last = Some(ev);
+            stacks.push(MarlinMoeStack { b_q, scales, globals });
+        }
+        let stacks: [MarlinMoeStack; 5] = stacks.try_into().map_err(|_| anyhow::anyhow!("host marlin stacks hold other than five stacks"))?;
+        let built = MarlinMoeTrainStacks::assemble(stacks, self.experts, self.hidden, self.inter)?;
+        Ok((built, last.context("no stacks uploaded")?))
     }
 }
 
@@ -345,9 +484,15 @@ impl MoeExpertsMarlinTrainOp {
                 ids.dims()
             );
             let blocks_max = rows.div_ceil(8) + experts;
-            let mut sorted: CudaSlice<i32> = stream.alloc_zeros::<i32>(blocks_max * 8).map_err(|e| anyhow::anyhow!(e))?;
-            let mut expert_ids: CudaSlice<i32> = stream.alloc_zeros::<i32>(blocks_max).map_err(|e| anyhow::anyhow!(e))?;
-            let mut padded: CudaSlice<i32> = stream.alloc_zeros::<i32>(1).map_err(|e| anyhow::anyhow!(e))?;
+            let mut sorted: CudaSlice<i32> = stream
+                .alloc_zeros::<i32>(blocks_max * 8)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut expert_ids: CudaSlice<i32> = stream
+                .alloc_zeros::<i32>(blocks_max)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut padded: CudaSlice<i32> = stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| anyhow::anyhow!(e))?;
             let rc = {
                 let (st, l) = ids.storage_and_layout();
                 let candle_core::Storage::Cuda(c) = &*st else {
@@ -371,7 +516,6 @@ impl MoeExpertsMarlinTrainOp {
                 }
             };
             anyhow::ensure!(rc == 0, "moe train op: device block8 alignment rc={rc}");
-            #[allow(deprecated)]
             let unit_weights: CudaSlice<f32> = stream
                 .clone_htod(&vec![1f32; rows])
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -409,17 +553,13 @@ impl MoeExpertsMarlinTrainOp {
             sorted[block_start[e] * 8 + cursor[e]] = i as i32;
             cursor[e] += 1;
         }
-        #[allow(deprecated)]
         let sorted: CudaSlice<i32> = stream.clone_htod(&sorted).map_err(|e| anyhow::anyhow!(e))?;
-        #[allow(deprecated)]
         let expert_ids: CudaSlice<i32> = stream
             .clone_htod(&expert_ids)
             .map_err(|e| anyhow::anyhow!(e))?;
-        #[allow(deprecated)]
         let padded: CudaSlice<i32> = stream
             .clone_htod(&[(blocks * 8) as i32])
             .map_err(|e| anyhow::anyhow!(e))?;
-        #[allow(deprecated)]
         let unit_weights: CudaSlice<f32> = stream
             .clone_htod(&vec![1f32; rows])
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -431,7 +571,6 @@ impl MoeExpertsMarlinTrainOp {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn gemm(
         &self,
         stream: &Arc<CudaStream>,
@@ -493,7 +632,7 @@ impl MoeExpertsMarlinTrainOp {
         Ok(())
     }
 
-    fn forward_rows(&self, stream: &Arc<CudaStream>, x_ptr: u64) -> Result<CudaSlice<bf16>> {
+    fn act_rows(&self, stream: &Arc<CudaStream>, x_ptr: u64) -> Result<(CudaSlice<bf16>, CudaSlice<bf16>, Align, Scratch)> {
         let (rows, hidden, inter) = (self.rows(), self.stacks.hidden, self.stacks.inter);
         let align = self.align(stream)?;
         let mut scratch = self.scratch(stream)?;
@@ -501,8 +640,6 @@ impl MoeExpertsMarlinTrainOp {
             unsafe { stream.alloc::<bf16>(rows * 2 * inter) }.map_err(|e| anyhow::anyhow!(e))?;
         let mut act_rows: CudaSlice<bf16> =
             unsafe { stream.alloc::<bf16>(rows * inter) }.map_err(|e| anyhow::anyhow!(e))?;
-        let mut down_rows: CudaSlice<bf16> =
-            unsafe { stream.alloc::<bf16>(rows * hidden) }.map_err(|e| anyhow::anyhow!(e))?;
         self.gemm(
             stream,
             &self.stacks.gate_up,
@@ -529,6 +666,14 @@ impl MoeExpertsMarlinTrainOp {
             )
         };
         anyhow::ensure!(rc == 0, "marlin moe train silu_mul rc={rc}");
+        Ok((act_rows, gate_up_rows, align, scratch))
+    }
+
+    fn forward_rows(&self, stream: &Arc<CudaStream>, x_ptr: u64) -> Result<CudaSlice<bf16>> {
+        let (rows, hidden, inter) = (self.rows(), self.stacks.hidden, self.stacks.inter);
+        let (act_rows, gate_up_rows, align, mut scratch) = self.act_rows(stream, x_ptr)?;
+        let mut down_rows: CudaSlice<bf16> =
+            unsafe { stream.alloc::<bf16>(rows * hidden) }.map_err(|e| anyhow::anyhow!(e))?;
         let (ap, _ga) = act_rows.device_ptr(stream);
         self.gemm(
             stream,
@@ -590,7 +735,27 @@ impl MoeExpertsMarlinTrainOp {
                 "down_t",
             )?;
         }
-        let device = candle_core::Device::Cuda(dev.clone());
+        let d_act_t = Tensor::from_storage(
+            Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+                d_act,
+                dev.clone(),
+            )),
+            (rows, inter),
+            candle_core::op::BackpropOp::none(),
+            false,
+        );
+        self.dx_from_d_act(stream, dev, saved, &d_act_t)
+    }
+
+    fn dx_from_d_act(
+        &self,
+        stream: &Arc<CudaStream>,
+        dev: &candle_core::CudaDevice,
+        saved: Saved,
+        d_act: &Tensor,
+    ) -> Result<Tensor> {
+        let (rows, hidden, inter) = (self.rows(), self.stacks.hidden, self.stacks.inter);
+        let mut scratch = self.scratch(stream)?;
         let silu_bwd_span = crate::prof_events::span("bwd_moe_silu_mul_candle_f32", stream);
         let gate_up = Tensor::from_storage(
             Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
@@ -602,16 +767,7 @@ impl MoeExpertsMarlinTrainOp {
             false,
         )
         .to_dtype(DType::F32)?;
-        let d_act_t = Tensor::from_storage(
-            Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
-                d_act,
-                dev.clone(),
-            )),
-            (rows, inter),
-            candle_core::op::BackpropOp::none(),
-            false,
-        )
-        .to_dtype(DType::F32)?;
+        let d_act_t = d_act.to_dtype(DType::F32)?;
         let g = gate_up.narrow(1, 0, inter)?;
         let u = gate_up.narrow(1, inter, inter)?;
         let sig = candle_nn::ops::sigmoid(&g)?;
@@ -668,7 +824,6 @@ impl MoeExpertsMarlinTrainOp {
             )
         };
         anyhow::ensure!(rc == 0, "moe_slot_sum_pairs rc={rc}");
-        let _ = device;
         Ok(Tensor::from_storage(
             Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(dx, dev.clone())),
             (self.tokens, hidden),
@@ -713,12 +868,14 @@ fn f32_slice_ptr(
     what: &str,
 ) -> candle_core::Result<u64> {
     let Some((start, _end)) = l.contiguous_offsets() else {
-        return Err(candle_core::Error::Msg(format!("moe train op: {what} must be contiguous")));
+        return Err(candle_core::Error::Msg(format!(
+            "moe train op: {what} must be contiguous"
+        )));
     };
     let x = s.as_cuda_slice::<f32>()?;
     let view = x.slice(start..);
     let (p, _g) = view.device_ptr(stream);
-    Ok(p as u64)
+    Ok(p)
 }
 
 impl CustomOp2 for MoeExpertsMarlinWeightedTrainOp {
@@ -750,7 +907,9 @@ impl CustomOp2 for MoeExpertsMarlinWeightedTrainOp {
         let dev = s1.device().clone();
         let stream = crate::cuda_stream::current_stream(&dev);
         let Some((start, _end)) = l1.contiguous_offsets() else {
-            return Err(candle_core::Error::Msg("moe train op: input must be contiguous".into()));
+            return Err(candle_core::Error::Msg(
+                "moe train op: input must be contiguous".into(),
+            ));
         };
         if l1.shape().dims() != [op.tokens, op.stacks.hidden] {
             return Err(candle_core::Error::Msg(format!(
@@ -773,7 +932,7 @@ impl CustomOp2 for MoeExpertsMarlinWeightedTrainOp {
         let (xp, _g) = x_view.device_ptr(&stream);
         let wp = f32_slice_ptr(s2, l2, &stream, "slot weights")?;
         let down_rows = op
-            .forward_rows(&stream, xp as u64)
+            .forward_rows(&stream, xp)
             .map_err(|e| candle_core::Error::Msg(format!("moe train op forward: {e:#}")))?;
         let hidden = op.stacks.hidden;
         let mut out: CudaSlice<f32> = unsafe { stream.alloc::<f32>(op.tokens * hidden) }
@@ -792,7 +951,9 @@ impl CustomOp2 for MoeExpertsMarlinWeightedTrainOp {
             )
         };
         if rc != 0 {
-            return Err(candle_core::Error::Msg(format!("moe_slot_weighted_sum rc={rc}")));
+            return Err(candle_core::Error::Msg(format!(
+                "moe_slot_weighted_sum rc={rc}"
+            )));
         }
         if let Some(saved) = op.saved.lock().unwrap().as_mut() {
             saved.down_rows_for_the_slot_weight_grad = Some(down_rows);
@@ -811,9 +972,8 @@ impl CustomOp2 for MoeExpertsMarlinWeightedTrainOp {
         grad_res: &Tensor,
     ) -> candle_core::Result<(Option<Tensor>, Option<Tensor>)> {
         let op = &self.inner;
-        let dev = match arg1.device() {
-            candle_core::Device::Cuda(d) => d.clone(),
-            _ => return Err(candle_core::Error::Msg("moe train op bwd: not cuda".into())),
+        let candle_core::Device::Cuda(dev) = arg1.device().clone() else {
+            return Err(candle_core::Error::Msg("moe train op bwd: not cuda".into()));
         };
         let stream = crate::cuda_stream::current_stream(&dev);
         let hidden = op.stacks.hidden;
@@ -837,7 +997,9 @@ impl CustomOp2 for MoeExpertsMarlinWeightedTrainOp {
             let (ds, dl) = d_out.storage_and_layout();
             let (ws, wl) = w.storage_and_layout();
             let (Storage::Cuda(dc), Storage::Cuda(wc)) = (&*ds, &*ws) else {
-                return Err(candle_core::Error::Msg("moe train op bwd: operands not cuda".into()));
+                return Err(candle_core::Error::Msg(
+                    "moe train op bwd: operands not cuda".into(),
+                ));
             };
             let dp = f32_slice_ptr(dc, dl, &stream, "d_out")?;
             let wp = f32_slice_ptr(wc, wl, &stream, "slot weights")?;
@@ -855,7 +1017,9 @@ impl CustomOp2 for MoeExpertsMarlinWeightedTrainOp {
                 )
             };
             if rc != 0 {
-                return Err(candle_core::Error::Msg(format!("moe_slot_weight_grad rc={rc}")));
+                return Err(candle_core::Error::Msg(format!(
+                    "moe_slot_weight_grad rc={rc}"
+                )));
             }
             let rc = unsafe {
                 let (drp, _g3) = d_rows.device_ptr_mut(&stream);
@@ -870,11 +1034,16 @@ impl CustomOp2 for MoeExpertsMarlinWeightedTrainOp {
                 )
             };
             if rc != 0 {
-                return Err(candle_core::Error::Msg(format!("moe_slot_scatter_grad rc={rc}")));
+                return Err(candle_core::Error::Msg(format!(
+                    "moe_slot_scatter_grad rc={rc}"
+                )));
             }
         }
         let d_rows_t = Tensor::from_storage(
-            Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(d_rows, dev.clone())),
+            Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
+                d_rows,
+                dev.clone(),
+            )),
             (rows, hidden),
             candle_core::op::BackpropOp::none(),
             false,
@@ -888,7 +1057,10 @@ impl CustomOp2 for MoeExpertsMarlinWeightedTrainOp {
             candle_core::op::BackpropOp::none(),
             false,
         );
-        Ok((Some(dx.to_dtype(arg1.dtype())?), Some(dw_t.to_dtype(arg2.dtype())?)))
+        Ok((
+            Some(dx.to_dtype(arg1.dtype())?),
+            Some(dw_t.to_dtype(arg2.dtype())?),
+        ))
     }
 }
 
@@ -932,7 +1104,7 @@ impl CustomOp1 for MoeExpertsMarlinTrainOp {
         let x_view = x.slice(start..);
         let (xp, _g) = x_view.device_ptr(&stream);
         let rows_out = self
-            .forward_rows(&stream, xp as u64)
+            .forward_rows(&stream, xp)
             .map_err(|e| candle_core::Error::Msg(format!("moe train op forward: {e:#}")))?;
         Ok((
             candle_core::CudaStorage::wrap_cuda_slice(rows_out, dev),
@@ -946,14 +1118,104 @@ impl CustomOp1 for MoeExpertsMarlinTrainOp {
         _res: &Tensor,
         grad_res: &Tensor,
     ) -> candle_core::Result<Option<Tensor>> {
-        let dev = match arg.device() {
-            candle_core::Device::Cuda(d) => d.clone(),
-            _ => return Err(candle_core::Error::Msg("moe train op bwd: not cuda".into())),
+        let candle_core::Device::Cuda(dev) = arg.device().clone() else {
+            return Err(candle_core::Error::Msg("moe train op bwd: not cuda".into()));
         };
         let stream = crate::cuda_stream::current_stream(&dev);
         let dx = self
             .backward_rows(&stream, &dev, &grad_res.detach())
             .map_err(|e| candle_core::Error::Msg(format!("moe train op backward: {e:#}")))?;
+        Ok(Some(dx.to_dtype(arg.dtype())?))
+    }
+}
+
+pub struct MoeExpertsMarlinActRowsOp {
+    inner: MoeExpertsMarlinTrainOp,
+}
+
+impl MoeExpertsMarlinActRowsOp {
+    pub fn new_with_device_ids(
+        stacks: Arc<MarlinMoeTrainStacks>,
+        ids_u32: Tensor,
+        tokens: usize,
+        top_k: usize,
+    ) -> Self {
+        Self {
+            inner: MoeExpertsMarlinTrainOp::new_with_device_ids(stacks, ids_u32, tokens, top_k),
+        }
+    }
+}
+
+impl CustomOp1 for MoeExpertsMarlinActRowsOp {
+    fn name(&self) -> &'static str {
+        "moe_experts_marlin_act_rows"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s: &candle_core::CpuStorage,
+        _l: &Layout,
+    ) -> candle_core::Result<(candle_core::CpuStorage, Shape)> {
+        Err(candle_core::Error::Msg("moe_experts_marlin_act_rows is CUDA-only".into()))
+    }
+
+    fn cuda_fwd(
+        &self,
+        s: &candle_core::CudaStorage,
+        l: &Layout,
+    ) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        use candle_core::backend::BackendStorage;
+        let op = &self.inner;
+        let dev = s.device().clone();
+        let stream = crate::cuda_stream::current_stream(&dev);
+        let Some((start, _end)) = l.contiguous_offsets() else {
+            return Err(candle_core::Error::Msg("moe act rows op: input must be contiguous".into()));
+        };
+        if l.shape().dims() != [op.tokens, op.stacks.hidden] {
+            return Err(candle_core::Error::Msg(format!(
+                "moe act rows op: input {:?} vs tokens {} hidden {}",
+                l.shape(),
+                op.tokens,
+                op.stacks.hidden
+            )));
+        }
+        let x = s.as_cuda_slice::<bf16>()?;
+        let x_view = x.slice(start..);
+        let (xp, _g) = x_view.device_ptr(&stream);
+        let (act, gate_up_rows, align, _scratch) = op
+            .act_rows(&stream, xp)
+            .map_err(|e| candle_core::Error::Msg(format!("moe act rows op forward: {e:#}")))?;
+        *op.saved.lock().unwrap() = Some(Saved {
+            gate_up_rows,
+            align,
+            down_rows_for_the_slot_weight_grad: None,
+        });
+        Ok((
+            candle_core::CudaStorage::wrap_cuda_slice(act, dev),
+            Shape::from((op.rows(), op.stacks.inter)),
+        ))
+    }
+
+    fn bwd(
+        &self,
+        arg: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> candle_core::Result<Option<Tensor>> {
+        let op = &self.inner;
+        let candle_core::Device::Cuda(dev) = arg.device().clone() else {
+            return Err(candle_core::Error::Msg("moe act rows op bwd: not cuda".into()));
+        };
+        let stream = crate::cuda_stream::current_stream(&dev);
+        let saved = op
+            .saved
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| candle_core::Error::Msg("moe act rows op: backward without a saved forward".into()))?;
+        let dx = op
+            .dx_from_d_act(&stream, &dev, saved, &grad_res.detach())
+            .map_err(|e| candle_core::Error::Msg(format!("moe act rows op backward: {e:#}")))?;
         Ok(Some(dx.to_dtype(arg.dtype())?))
     }
 }

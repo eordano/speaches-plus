@@ -3,7 +3,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Multipart, State};
+use axum::extract::{FromRequest, Multipart, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -31,13 +31,18 @@ pub struct OcrAppState {
     pub deepseek: Option<Arc<ColdSlot<OcrEngine>>>,
     pub dots: Option<Arc<ColdSlot<OcrEngine>>>,
     pub got: Option<Arc<ColdSlot<OcrEngine>>>,
+    pub lighton: Option<Arc<ColdSlot<OcrEngine>>>,
 }
 
 const MIB: u64 = 1024 * 1024;
+const LIGHTON_RESIDENT_ESTIMATE: u64 =
+    LIGHTON_0P8B_BF16_CKPT_1P7_GIB_PLUS_VISION_ACTIVATIONS_OF_A_2048_EDGE_PAGE_MIB * MIB;
+const LIGHTON_0P8B_BF16_CKPT_1P7_GIB_PLUS_VISION_ACTIVATIONS_OF_A_2048_EDGE_PAGE_MIB: u64 = 4096;
 const DEEPSEEK_RESIDENT_ESTIMATE: u64 =
     super::vram_plan::AUX_DEEPSEEK_OCR2_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB * MIB;
 const DOTS_RESIDENT_ESTIMATE: u64 =
-    super::vram_plan::AUX_DOTS_OCR_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB * MIB;
+    super::vram_plan::AUX_DOTS_OCR_STEADY_MIB_CKPT_SHARE_OF_MEASURED_LEDGER_OCR_PAIR_NET_14P6_GIB
+        * MIB;
 
 pub(super) async fn demand(slot: &Option<Arc<ColdSlot<OcrEngine>>>) -> Option<Arc<OcrEngine>> {
     match slot {
@@ -67,17 +72,21 @@ pub(super) struct OcrRuntime {
 }
 
 impl OcrRuntime {
-    fn gate_for(&self, backend: Backend) -> Option<&SurfaceGate> {
+    pub(super) fn gate_for(&self, backend: Backend) -> Option<&SurfaceGate> {
         match backend {
             Backend::Tesseract => self.classical.as_deref(),
-            Backend::DeepSeek | Backend::Dots | Backend::Got => Some(self.generative.as_ref()),
+            Backend::DeepSeek | Backend::Dots | Backend::Got | Backend::LightOn => {
+                Some(self.generative.as_ref())
+            }
         }
     }
 
     pub(super) fn gate_arc_for(&self, backend: Backend) -> Option<Arc<SurfaceGate>> {
         match backend {
             Backend::Tesseract => self.classical.clone(),
-            Backend::DeepSeek | Backend::Dots | Backend::Got => Some(self.generative.clone()),
+            Backend::DeepSeek | Backend::Dots | Backend::Got | Backend::LightOn => {
+                Some(self.generative.clone())
+            }
         }
     }
 
@@ -93,17 +102,6 @@ impl OcrRuntime {
             classical: classical.map(Arc::new),
         }
     }
-}
-
-pub fn router_with_classical_gate(state: OcrAppState, classical: Arc<SurfaceGate>) -> Router {
-    let mut rt = OcrRuntime::from(state);
-    rt.classical = Some(classical);
-    Router::new()
-        .route("/v1/ocr", post(handle_ocr))
-        .route("/v1/ocr/stream", post(super::ocr_stream::handle_ocr_stream))
-        .route("/v1/ocr/load_lora_adapter", post(handle_ocr_load_lora))
-        .route("/v1/ocr/unload_lora_adapter", post(handle_ocr_unload_lora))
-        .with_state(rt)
 }
 
 impl From<OcrAppState> for OcrRuntime {
@@ -149,10 +147,26 @@ pub fn router_from_env() -> Router {
                 Arc::new(load_deepseek_from_env),
             )
         }),
-        dots: dots_dir()
-            .map(|_| ColdSlot::demand("ocr-dots", DOTS_RESIDENT_ESTIMATE, Arc::new(load_dots_from_env))),
+        dots: dots_dir().map(|_| {
+            ColdSlot::demand(
+                "ocr-dots",
+                DOTS_RESIDENT_ESTIMATE,
+                Arc::new(load_dots_from_env),
+            )
+        }),
         got: got_dir().map(|_| {
-            ColdSlot::demand("ocr-got", DEEPSEEK_RESIDENT_ESTIMATE, Arc::new(load_got_from_env))
+            ColdSlot::demand(
+                "ocr-got",
+                DEEPSEEK_RESIDENT_ESTIMATE,
+                Arc::new(load_got_from_env),
+            )
+        }),
+        lighton: lighton_dir().map(|_| {
+            ColdSlot::demand(
+                "ocr-lighton",
+                LIGHTON_RESIDENT_ESTIMATE,
+                Arc::new(load_lighton_from_env),
+            )
         }),
     };
     log_default_backend_at_boot(&state);
@@ -187,12 +201,32 @@ fn log_default_backend_at_boot(state: &OcrAppState) {
 }
 
 pub fn router(state: OcrAppState) -> Router {
+    super::ocr_mistral::note_state(&state);
     Router::new()
-        .route("/v1/ocr", post(handle_ocr))
+        .route("/v1/ocr", post(handle_ocr_json_or_multipart))
         .route("/v1/ocr/stream", post(super::ocr_stream::handle_ocr_stream))
         .route("/v1/ocr/load_lora_adapter", post(handle_ocr_load_lora))
         .route("/v1/ocr/unload_lora_adapter", post(handle_ocr_unload_lora))
         .with_state(OcrRuntime::from(state))
+        .merge(super::ocr_mistral::files_router())
+}
+
+async fn handle_ocr_json_or_multipart(
+    State(rt): State<OcrRuntime>,
+    headers: HeaderMap,
+    req: Request,
+) -> Response {
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.trim_start().starts_with("application/json"));
+    if json {
+        return super::ocr_mistral::handle(rt, headers, req.into_body()).await;
+    }
+    match Multipart::from_request(req, &()).await {
+        Ok(multipart) => handle_ocr(State(rt), headers, multipart).await,
+        Err(rejection) => rejection.into_response(),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -892,7 +926,7 @@ fn ocr_device_chain_from(
     first: candle_core::Device,
     cpu_fallback: bool,
 ) -> Vec<candle_core::Device> {
-    let first_is_cpu = matches!(first, candle_core::Device::Cpu);
+    let first_is_cpu = first.is_cpu();
     if ocr_chain_appends_cpu(first_is_cpu, cpu_fallback) {
         vec![first, candle_core::Device::Cpu]
     } else {
@@ -920,17 +954,12 @@ fn load_deepseek_from_env() -> Option<Arc<OcrEngine>> {
         .unwrap_or(4096);
     let chain = ocr_device_chain();
     let last = chain.len() - 1;
-    let quant_env = std::env::var(
-        nv_models::deepseek_ocr::pipeline::DSOCR_QUANT_ENV_NVFP4_IS_THE_CUDA_DEFAULT_PER_CER_AB_0_0286_BF16_0_0288_NVFP4_IN_PERF_RUNS_AND_BF16_IS_THE_ESCAPE,
-    )
-    .ok();
     for (i, device) in chain.into_iter().enumerate() {
         let precision = DecoderPrecision::for_device(&device);
-        if quant_env.is_none() && device.is_cuda() && precision == DecoderPrecision::Bf16 {
+        if device.is_cuda() && precision == DecoderPrecision::Bf16 {
             eprintln!(
                 "[ocr] PRECISION DOWNGRADE: deepseek on cuda defaults to nvfp4, but this binary \
-                 was compiled without nv-models/cuda so bf16 is what runs; set \
-                 NV_OCR_DEEPSEEK_QUANT=bf16 to accept this silently"
+                 was compiled without nv-models/cuda so bf16 is what runs"
             );
         }
         match DeepSeekOcr2Pipeline::load(&dir, &device, precision) {
@@ -1323,6 +1352,162 @@ pub fn load_got_from_env() -> Option<Arc<OcrEngine>> {
     None
 }
 
+#[cfg(feature = "wgpu")]
+struct LightOnPipelineModel {
+    pipeline: Mutex<super::ocr_lighton::LightOnOcrPipeline>,
+    max_new_tokens: usize,
+}
+
+#[cfg(feature = "wgpu")]
+impl DotsOcrModel for LightOnPipelineModel {
+    fn recognize_page(
+        &self,
+        image_bytes: &[u8],
+        mode: DotsOcrMode,
+    ) -> Result<OcrResult, nv_ocr::Error> {
+        Ok(self.recognize_layout(image_bytes, mode)?.result)
+    }
+
+    fn recognize_layout(
+        &self,
+        image_bytes: &[u8],
+        mode: DotsOcrMode,
+    ) -> Result<nv_ocr::DotsPageResult, nv_ocr::Error> {
+        self.recognize_layout_budgeted(image_bytes, mode, None)
+    }
+
+    fn recognize_layout_budgeted(
+        &self,
+        image_bytes: &[u8],
+        mode: DotsOcrMode,
+        max_new_override: Option<usize>,
+    ) -> Result<nv_ocr::DotsPageResult, nv_ocr::Error> {
+        let effective = max_new_override.unwrap_or(self.max_new_tokens);
+        let img = decode_rgb(image_bytes).map_err(|e| nv_ocr::Error::Decode(format!("{e:#}")))?;
+        let img = super::ocr_orient::maybe_auto_orient(img);
+        let grounding = mode != DotsOcrMode::PlainOcr;
+        let page = self
+            .pipeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .recognize(&img, grounding, effective)
+            .map_err(|e| nv_ocr::Error::Backend(format!("lightonocr: {e:#}")))?;
+        info!(
+            grounding,
+            prompt_tokens = page.prompt_tokens,
+            vision_tokens = page.vision_tokens,
+            generated_tokens = page.generated_tokens,
+            encode_ms = page.encode_ms,
+            prefill_ms = page.prefill_ms,
+            decode_ms = page.decode_ms,
+            hit_eos = page.hit_eos,
+            looped = page.looped,
+            "ocr lighton decode complete"
+        );
+        let layout_only = mode == DotsOcrMode::LayoutOnly;
+        let elements = page
+            .blocks
+            .into_iter()
+            .enumerate()
+            .map(|(i, b)| LayoutBox {
+                order: i,
+                bbox: b.bbox,
+                category: Some(b.label),
+                text: (!layout_only && !b.text.is_empty()).then_some(b.text),
+            })
+            .collect();
+        Ok(nv_ocr::DotsPageResult {
+            result: OcrResult {
+                text: if layout_only { String::new() } else { page.text },
+                tokens: Vec::new(),
+                truncated: !page.hit_eos,
+                looped: page.looped,
+            },
+            layout: LayoutPageResult {
+                elements,
+                truncated: !page.hit_eos,
+            },
+        })
+    }
+}
+
+pub const LIGHTON_HUB_REPO: &str = "models--lightonai--LightOnOCR-3-0.8B";
+
+fn lighton_dir() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("NV_OCR_LIGHTON_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    if std::env::var("NV_OCR_LIGHTON")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let found = hub_snapshot(LIGHTON_HUB_REPO);
+        if found.is_none() {
+            tracing::error!(
+                "{}",
+                hub_snapshot_missing_message("NV_OCR_LIGHTON", &[LIGHTON_HUB_REPO])
+            );
+        }
+        return found;
+    }
+    None
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn load_lighton_from_env() -> Option<Arc<OcrEngine>> {
+    warn!(
+        "ocr lighton backend disabled: LightOnOCR decodes on the qwen3.5 wgpu graph and this \
+         binary was compiled without the wgpu feature"
+    );
+    None
+}
+
+#[cfg(feature = "wgpu")]
+fn load_lighton_from_env() -> Option<Arc<OcrEngine>> {
+    let dir = lighton_dir()?;
+    let max_new_tokens = std::env::var("NV_OCR_LIGHTON_MAX_NEW")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+    let w4 = std::env::var_os("NV_OCR_LIGHTON_W4_DIR").map(PathBuf::from);
+    let chain = ocr_device_chain();
+    let last = chain.len() - 1;
+    for (i, device) in chain.into_iter().enumerate() {
+        let label = device_label(&device);
+        match super::ocr_lighton::LightOnOcrPipeline::load(&dir, w4.as_deref(), device) {
+            Ok(pipeline) => {
+                info!(
+                    dir = %dir.display(),
+                    decoder_weights = %w4.as_deref().unwrap_or(&dir).display(),
+                    vision_device = label,
+                    fell_back = i > 0,
+                    max_new_tokens,
+                    "ocr lighton backend loaded"
+                );
+                return Some(Arc::new(OcrEngine::from_dots(Box::new(
+                    LightOnPipelineModel {
+                        pipeline: Mutex::new(pipeline),
+                        max_new_tokens,
+                    },
+                ))));
+            }
+            Err(err) if i < last => warn!(
+                error = %format!("{err:#}"),
+                dir = %dir.display(),
+                device = label,
+                "ocr lighton backend load failed on this device; retrying on cpu"
+            ),
+            Err(err) => warn!(
+                error = %format!("{err:#}"),
+                dir = %dir.display(),
+                device = label,
+                "ocr lighton backend load failed; disabled"
+            ),
+        }
+    }
+    None
+}
+
 macro_rules! declare_backends {
     ($($variant:ident),+ $(,)?) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1330,12 +1515,13 @@ macro_rules! declare_backends {
             $($variant),+
         }
 
+        #[cfg(test)]
         const BACKEND_PRIORITY: [Backend; [$(Backend::$variant),+].len()] =
             [$(Backend::$variant),+];
     };
 }
 
-declare_backends!(Tesseract, DeepSeek, Dots, Got);
+declare_backends!(Tesseract, DeepSeek, Dots, Got, LightOn);
 
 pub(super) fn backend_name(b: Backend) -> &'static str {
     match b {
@@ -1343,6 +1529,7 @@ pub(super) fn backend_name(b: Backend) -> &'static str {
         Backend::DeepSeek => "deepseek",
         Backend::Dots => "dots",
         Backend::Got => "got",
+        Backend::LightOn => "lighton",
     }
 }
 
@@ -1352,6 +1539,7 @@ pub(super) fn parse_backend(s: &str) -> Option<Backend> {
         "deepseek" => Some(Backend::DeepSeek),
         "dots" | "dots.ocr" => Some(Backend::Dots),
         "got" | "got-ocr" | "got-ocr2" => Some(Backend::Got),
+        "lighton" | "lightonocr" | "lightonocr-3" => Some(Backend::LightOn),
         _ => None,
     }
 }
@@ -1369,6 +1557,9 @@ pub(super) fn configured_backends(state: &OcrAppState) -> Vec<Backend> {
     }
     if state.got.is_some() {
         out.push(Backend::Got);
+    }
+    if state.lighton.is_some() {
+        out.push(Backend::LightOn);
     }
     out
 }
@@ -1432,7 +1623,7 @@ pub(super) fn pick_default_backend(
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "ocr_backend_not_loaded",
             message: format!(
-                "no ocr backend is loaded; loaded backends: {} -- set NV_OCR_TESSDATA (tesseract), NV_OCR_DEEPSEEK_DIR or NV_OCR_DEEPSEEK=1 (deepseek), NV_OCR_DOTS_DIR or NV_OCR_DOTS=1 (dots), or NV_OCR_GOT_DIR or NV_OCR_GOT=1 (got)",
+                "no ocr backend is loaded; loaded backends: {} -- set NV_OCR_TESSDATA (tesseract), NV_OCR_DEEPSEEK_DIR or NV_OCR_DEEPSEEK=1 (deepseek), NV_OCR_DOTS_DIR or NV_OCR_DOTS=1 (dots), or NV_OCR_GOT_DIR or NV_OCR_GOT=1 (got), or NV_OCR_LIGHTON_DIR or NV_OCR_LIGHTON=1 (lighton)",
                 describe_backends(loaded)
             ),
         }),
@@ -1490,10 +1681,14 @@ fn mode_name(m: Option<ModeReq>) -> &'static str {
     }
 }
 
+pub(super) fn backend_emits_layout(b: Backend) -> bool {
+    matches!(b, Backend::Dots | Backend::LightOn)
+}
+
 fn backend_emits_word_boxes(b: Backend) -> bool {
     match b {
         Backend::Tesseract => true,
-        Backend::DeepSeek | Backend::Dots | Backend::Got => false,
+        Backend::DeepSeek | Backend::Dots | Backend::Got | Backend::LightOn => false,
     }
 }
 
@@ -1504,7 +1699,7 @@ fn default_format_for(backend: Backend, mode: Option<ModeReq>) -> Format {
             Some(ModeReq::Markdown) => Format::Markdown,
             _ => Format::Text,
         },
-        Backend::Dots => match mode.unwrap_or(ModeReq::Layout) {
+        Backend::Dots | Backend::LightOn => match mode.unwrap_or(ModeReq::Layout) {
             ModeReq::Plain => Format::Text,
             ModeReq::Markdown => Format::Markdown,
             ModeReq::Layout | ModeReq::LayoutOnly => Format::LayoutJson,
@@ -1514,7 +1709,9 @@ fn default_format_for(backend: Backend, mode: Option<ModeReq>) -> Format {
 
 fn json_boxes_unsupported(b: Backend) -> String {
     let alt = match b {
-        Backend::Dots => "format=layout-json for element boxes, or format=text or format=markdown",
+        Backend::Dots | Backend::LightOn => {
+            "format=layout-json for element boxes, or format=text or format=markdown"
+        }
         _ => "format=text or format=markdown",
     };
     format!(
@@ -1763,9 +1960,9 @@ async fn handle_ocr(
         bytes = image_bytes.len(),
         "ocr request accepted"
     );
-    if format == Format::LayoutJson && backend != Backend::Dots {
+    if format == Format::LayoutJson && !backend_emits_layout(backend) {
         return bad_request(
-            "format=layout-json requires backend=dots; only dots.ocr emits layout boxes".into(),
+            "format=layout-json requires backend=dots or backend=lighton; only they emit layout boxes".into(),
             "format",
         );
     }
@@ -1786,7 +1983,7 @@ async fn handle_ocr(
     }
     if max_new_override.is_some() && backend == Backend::Tesseract {
         return bad_request(
-            "max_new_tokens applies to generative backends (deepseek, dots, got); tesseract emits \
+            "max_new_tokens applies to generative backends (deepseek, dots, got, lighton); tesseract emits \
              no tokens"
                 .into(),
             "max_new_tokens",
@@ -1794,6 +1991,7 @@ async fn handle_ocr(
     }
     let dots_mode_req = match mode.unwrap_or(ModeReq::Layout) {
         ModeReq::Plain => DotsOcrMode::PlainOcr,
+        ModeReq::Markdown if backend == Backend::LightOn => DotsOcrMode::PlainOcr,
         ModeReq::Markdown | ModeReq::Layout => DotsOcrMode::LayoutAll,
         ModeReq::LayoutOnly => DotsOcrMode::LayoutOnly,
     };
@@ -1801,9 +1999,9 @@ async fn handle_ocr(
         ModeReq::Plain => DeepSeekMode::FreeOcr,
         ModeReq::Markdown => DeepSeekMode::Markdown,
         ModeReq::Layout | ModeReq::LayoutOnly => {
-            if backend != Backend::Dots {
+            if !backend_emits_layout(backend) {
                 return bad_request(
-                    "mode=layout requires backend=dots; only dots.ocr emits layout boxes".into(),
+                    "mode=layout requires backend=dots or backend=lighton; only they emit layout boxes".into(),
                     "mode",
                 );
             }
@@ -1823,6 +2021,7 @@ async fn handle_ocr(
         Backend::DeepSeek => (state.deepseek.is_some(), demand(&state.deepseek).await),
         Backend::Dots => (state.dots.is_some(), demand(&state.dots).await),
         Backend::Got => (state.got.is_some(), demand(&state.got).await),
+        Backend::LightOn => (state.lighton.is_some(), demand(&state.lighton).await),
     };
     if configured && engine.is_none() {
         return load_failed_response(backend);
@@ -1840,6 +2039,9 @@ async fn handle_ocr(
             }
             Backend::Got => {
                 "ocr backend not loaded: got -- set NV_OCR_GOT_DIR to a stepfun-ai/GOT-OCR-2.0-hf checkpoint dir (or NV_OCR_GOT=1 for the hub cache)"
+            }
+            Backend::LightOn => {
+                "ocr backend not loaded: lighton -- set NV_OCR_LIGHTON_DIR to a lightonai/LightOnOCR-3-0.8B checkpoint dir (or NV_OCR_LIGHTON=1 for the hub cache)"
             }
         };
         return openai_error(
@@ -1871,7 +2073,7 @@ async fn handle_ocr(
 
     let t0 = Instant::now();
     match backend {
-        Backend::Dots => {
+        Backend::Dots | Backend::LightOn => {
             let dmode = dots_mode_req;
             let joined = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
@@ -1894,7 +2096,7 @@ async fn handle_ocr(
             match result {
                 Ok(res) => {
                     info!(
-                        backend = "dots",
+                        backend = backend_name(backend),
                         elapsed_ms = elapsed_ms(t0),
                         elements = res.layout.elements.len(),
                         chars = res.result.text.len(),
@@ -1930,7 +2132,7 @@ async fn handle_ocr(
                 }
                 Err(err) => {
                     warn!(
-                        backend = "dots",
+                        backend = backend_name(backend),
                         elapsed_ms = elapsed_ms(t0),
                         error = %err,
                         "ocr request failed"
@@ -2179,7 +2381,7 @@ mod tests {
         assert_eq!(device_pref(" Metal "), DevicePref::Metal);
         assert_eq!(device_pref("gpu"), DevicePref::Auto);
         #[cfg(all(not(feature = "cuda"), not(feature = "metal")))]
-        if std::env::var_os("NV_OCR_DEVICE").is_none() {
+        if !nv_config::env_arm_present_at_all_reread_every_call("NV_OCR_DEVICE") {
             assert_eq!(
                 device_label(&ocr_device()),
                 "cpu",
@@ -2187,7 +2389,7 @@ mod tests {
             );
         }
         #[cfg(feature = "metal")]
-        if std::env::var_os("NV_OCR_DEVICE").is_none() && candle_core::utils::metal_is_available() {
+        if !nv_config::env_arm_present_at_all_reread_every_call("NV_OCR_DEVICE") && candle_core::utils::metal_is_available() {
             assert_eq!(
                 device_label(&ocr_device()),
                 "metal",
@@ -2233,56 +2435,48 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_or_empty_max_new_tokens_leaves_the_env_budget_untouched() {
+    fn max_new_tokens_parses_absent_positive_and_rejects_zero_junk_and_over_ceiling() {
         assert_eq!(parse_max_new_tokens(""), Ok(None));
         assert_eq!(parse_max_new_tokens("   "), Ok(None));
-    }
-
-    #[test]
-    fn max_new_tokens_accepts_a_positive_integer_up_to_the_ceiling() {
-        assert_eq!(parse_max_new_tokens("1"), Ok(Some(1)));
-        assert_eq!(parse_max_new_tokens(" 512 "), Ok(Some(512)));
-        assert_eq!(
-            parse_max_new_tokens("131072"),
-            Ok(Some(
-                OCR_MAX_NEW_TOKENS_CEILING_IS_THE_DOTS_DECODER_MAX_POSITION_EMBEDDINGS
-            )),
-            "the ceiling itself is a legal request, not one over the line"
-        );
-    }
-
-    #[test]
-    fn zero_and_unparseable_max_new_tokens_are_rejected_not_silently_defaulted() {
-        for v in ["0", "-1", "abc", "1.5", "4096tokens", "1e4"] {
-            let err = parse_max_new_tokens(v)
-                .expect_err("a budget the surface cannot honour must 400, never fall back");
+        {
+            assert_eq!(parse_max_new_tokens("1"), Ok(Some(1)));
+            assert_eq!(parse_max_new_tokens(" 512 "), Ok(Some(512)));
             assert_eq!(
-                err, "max_new_tokens must be a positive integer",
-                "input {v:?}"
+                parse_max_new_tokens("131072"),
+                Ok(Some(
+                    OCR_MAX_NEW_TOKENS_CEILING_IS_THE_DOTS_DECODER_MAX_POSITION_EMBEDDINGS
+                )),
+                "the ceiling itself is a legal request, not one over the line"
+            );
+        }
+        {
+            for v in ["0", "-1", "abc", "1.5", "4096tokens", "1e4"] {
+                let err = parse_max_new_tokens(v)
+                    .expect_err("a budget the surface cannot honour must 400, never fall back");
+                assert_eq!(
+                    err, "max_new_tokens must be a positive integer",
+                    "input {v:?}"
+                );
+            }
+        }
+        {
+            let over = OCR_MAX_NEW_TOKENS_CEILING_IS_THE_DOTS_DECODER_MAX_POSITION_EMBEDDINGS + 1;
+            let err = parse_max_new_tokens(&over.to_string())
+                .expect_err("dots sizes its KV budget from max_new_tokens with no internal clamp");
+            assert!(err.contains(&over.to_string()), "{err}");
+            assert!(err.contains("131072"), "{err}");
+        }
+        {
+            assert_eq!(
+                OCR_MAX_NEW_TOKENS_CEILING_IS_THE_DOTS_DECODER_MAX_POSITION_EMBEDDINGS, 131072,
+                "dots.ocr DotsDecoderConfig.max_position_embeddings; deepseek (8192) and got (32768) \
+                 self-clamp downstream, so capping lower would truncate a legal dots request"
             );
         }
     }
 
     #[test]
-    fn max_new_tokens_over_the_dots_kv_ceiling_is_rejected_at_the_surface() {
-        let over = OCR_MAX_NEW_TOKENS_CEILING_IS_THE_DOTS_DECODER_MAX_POSITION_EMBEDDINGS + 1;
-        let err = parse_max_new_tokens(&over.to_string())
-            .expect_err("dots sizes its KV budget from max_new_tokens with no internal clamp");
-        assert!(err.contains(&over.to_string()), "{err}");
-        assert!(err.contains("131072"), "{err}");
-    }
-
-    #[test]
-    fn the_ceiling_is_the_largest_generative_decoder_position_budget() {
-        assert_eq!(
-            OCR_MAX_NEW_TOKENS_CEILING_IS_THE_DOTS_DECODER_MAX_POSITION_EMBEDDINGS, 131072,
-            "dots.ocr DotsDecoderConfig.max_position_embeddings; deepseek (8192) and got (32768) \
-             self-clamp downstream, so capping lower would truncate a legal dots request"
-        );
-    }
-
-    #[test]
-    fn the_single_loaded_backend_is_the_default() {
+    fn a_single_loaded_or_configured_backend_is_the_default_and_several_refuse_to_default_positionally() {
         assert_eq!(
             pick_default_backend(&[Backend::DeepSeek], None),
             Ok(Backend::DeepSeek)
@@ -2291,41 +2485,44 @@ mod tests {
             pick_default_backend(&[Backend::Dots], None),
             Ok(Backend::Dots)
         );
-    }
-
-    #[test]
-    fn multiple_configured_backends_refuse_to_default_positionally() {
-        for loaded in [
-            vec![Backend::Tesseract, Backend::DeepSeek, Backend::Dots],
-            vec![Backend::DeepSeek, Backend::Dots],
-            vec![Backend::Tesseract, Backend::Dots],
-        ] {
-            let err = pick_default_backend(&loaded, None)
-                .expect_err("an unqualified request must not pick positionally");
-            assert_eq!(err.status, StatusCode::BAD_REQUEST);
-            assert_eq!(err.code, "ocr_backend_ambiguous");
-            assert!(err.message.contains("NV_OCR_DEFAULT_BACKEND"), "{err:?}");
-            for b in &loaded {
-                assert!(err.message.contains(backend_name(*b)), "{err:?}");
+        {
+            for loaded in [
+                vec![Backend::Tesseract, Backend::DeepSeek, Backend::Dots],
+                vec![Backend::DeepSeek, Backend::Dots],
+                vec![Backend::Tesseract, Backend::Dots],
+            ] {
+                let err = pick_default_backend(&loaded, None)
+                    .expect_err("an unqualified request must not pick positionally");
+                assert_eq!(err.status, StatusCode::BAD_REQUEST);
+                assert_eq!(err.code, "ocr_backend_ambiguous");
+                assert!(err.message.contains("NV_OCR_DEFAULT_BACKEND"), "{err:?}");
+                for b in &loaded {
+                    assert!(err.message.contains(backend_name(*b)), "{err:?}");
+                }
             }
         }
-    }
-
-    #[test]
-    fn a_single_loaded_backend_is_unambiguous_and_still_defaults() {
-        for b in BACKEND_PRIORITY {
-            assert_eq!(pick_default_backend(&[b], None), Ok(b));
+        {
+            for b in BACKEND_PRIORITY {
+                assert_eq!(pick_default_backend(&[b], None), Ok(b));
+            }
         }
-    }
-
-    #[test]
-    fn a_configured_default_resolves_the_ambiguity() {
-        for b in BACKEND_PRIORITY {
+        {
+            for b in BACKEND_PRIORITY {
+                assert_eq!(
+                    pick_default_backend(&BACKEND_PRIORITY, Some(b)),
+                    Ok(b),
+                    "{} should win when configured",
+                    backend_name(b)
+                );
+            }
+        }
+        {
             assert_eq!(
-                pick_default_backend(&BACKEND_PRIORITY, Some(b)),
-                Ok(b),
-                "{} should win when configured",
-                backend_name(b)
+                pick_default_backend(
+                    &[Backend::Tesseract, Backend::DeepSeek],
+                    Some(Backend::DeepSeek)
+                ),
+                Ok(Backend::DeepSeek)
             );
         }
     }
@@ -2341,34 +2538,21 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_backend_wins_over_the_priority_order() {
-        assert_eq!(
-            pick_default_backend(
-                &[Backend::Tesseract, Backend::DeepSeek],
-                Some(Backend::DeepSeek)
-            ),
-            Ok(Backend::DeepSeek)
-        );
-    }
-
-    #[test]
-    fn a_configured_backend_that_is_not_loaded_names_the_loaded_ones() {
+    fn a_missing_configured_or_loaded_backend_names_the_loaded_ones_and_the_env_knobs() {
         let err = pick_default_backend(&[Backend::Dots], Some(Backend::DeepSeek)).unwrap_err();
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.code, "ocr_backend_not_loaded");
         assert!(err.message.contains("deepseek"), "{err:?}");
         assert!(err.message.contains("NV_OCR_DEFAULT_BACKEND"), "{err:?}");
         assert!(err.message.contains("dots"), "{err:?}");
-    }
-
-    #[test]
-    fn no_loaded_backend_names_none_and_the_env_knobs() {
-        let err = pick_default_backend(&[], None).unwrap_err();
-        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(err.message.contains("none"), "{err:?}");
-        assert!(err.message.contains("NV_OCR_TESSDATA"), "{err:?}");
-        assert!(err.message.contains("NV_OCR_DEEPSEEK_DIR"), "{err:?}");
-        assert!(err.message.contains("NV_OCR_DOTS_DIR"), "{err:?}");
+        {
+            let err = pick_default_backend(&[], None).unwrap_err();
+            assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(err.message.contains("none"), "{err:?}");
+            assert!(err.message.contains("NV_OCR_TESSDATA"), "{err:?}");
+            assert!(err.message.contains("NV_OCR_DEEPSEEK_DIR"), "{err:?}");
+            assert!(err.message.contains("NV_OCR_DOTS_DIR"), "{err:?}");
+        }
     }
 
     #[test]
@@ -2390,34 +2574,15 @@ mod tests {
                 backend_name(*b)
             );
         }
-    }
-
-    #[test]
-    fn backend_field_aliases_parse() {
-        assert_eq!(parse_backend("tesseract"), Some(Backend::Tesseract));
-        assert_eq!(parse_backend("classical"), Some(Backend::Tesseract));
-        assert_eq!(parse_backend("deepseek"), Some(Backend::DeepSeek));
-        assert_eq!(parse_backend("dots.ocr"), Some(Backend::Dots));
-        assert_eq!(parse_backend("got"), Some(Backend::Got));
-        assert_eq!(parse_backend("got-ocr"), Some(Backend::Got));
-        assert_eq!(parse_backend("got-ocr2"), Some(Backend::Got));
-    }
-
-    #[test]
-    fn only_tesseract_defaults_to_json_boxes() {
-        for b in BACKEND_PRIORITY {
-            if default_format_for(b, None) == Format::JsonBoxes {
-                assert!(
-                    backend_emits_word_boxes(b),
-                    "{} defaults to json-boxes but cannot populate tokens",
-                    backend_name(b)
-                );
-            }
+        {
+            assert_eq!(parse_backend("tesseract"), Some(Backend::Tesseract));
+            assert_eq!(parse_backend("classical"), Some(Backend::Tesseract));
+            assert_eq!(parse_backend("deepseek"), Some(Backend::DeepSeek));
+            assert_eq!(parse_backend("dots.ocr"), Some(Backend::Dots));
+            assert_eq!(parse_backend("got"), Some(Backend::Got));
+            assert_eq!(parse_backend("got-ocr"), Some(Backend::Got));
+            assert_eq!(parse_backend("got-ocr2"), Some(Backend::Got));
         }
-        assert_eq!(
-            default_format_for(Backend::Tesseract, None),
-            Format::JsonBoxes
-        );
     }
 
     #[test]
@@ -2436,6 +2601,21 @@ mod tests {
             default_format_for(Backend::Dots, Some(ModeReq::Plain)),
             Format::Text
         );
+        {
+            for b in BACKEND_PRIORITY {
+                if default_format_for(b, None) == Format::JsonBoxes {
+                    assert!(
+                        backend_emits_word_boxes(b),
+                        "{} defaults to json-boxes but cannot populate tokens",
+                        backend_name(b)
+                    );
+                }
+            }
+            assert_eq!(
+                default_format_for(Backend::Tesseract, None),
+                Format::JsonBoxes
+            );
+        }
     }
 
     #[tokio::test]
@@ -2688,6 +2868,7 @@ mod tests {
             deepseek: None,
             dots: None,
             got: None,
+            lighton: None,
         };
         let rt = OcrRuntime::with_gates(app, SurfaceGate::new("/v1/ocr", 1, 40), classical);
         Some((rt, gate_test_page()))
@@ -2829,9 +3010,9 @@ mod tests {
 
     #[test]
     fn ocr_gates_are_sized_by_their_own_env_vars() {
-        std::env::set_var("NV_OCR_CONCURRENCY", "3");
-        std::env::set_var("NV_OCR_QUEUE_MS", "1234");
-        std::env::set_var("NV_OCR_CLASSICAL_CONCURRENCY", "6");
+        unsafe { std::env::set_var("NV_OCR_CONCURRENCY", "3") };
+        unsafe { std::env::set_var("NV_OCR_QUEUE_MS", "1234") };
+        unsafe { std::env::set_var("NV_OCR_CLASSICAL_CONCURRENCY", "6") };
         let rt = OcrRuntime::from(OcrAppState::default());
         assert_eq!(rt.generative.permits(), 3);
         assert_eq!(rt.generative.queue_ms(), 1234);
@@ -2839,9 +3020,9 @@ mod tests {
         assert_eq!(classical.permits(), 6);
         assert_eq!(classical.queue_ms(), 1234);
 
-        std::env::remove_var("NV_OCR_CONCURRENCY");
-        std::env::remove_var("NV_OCR_QUEUE_MS");
-        std::env::remove_var("NV_OCR_CLASSICAL_CONCURRENCY");
+        unsafe { std::env::remove_var("NV_OCR_CONCURRENCY") };
+        unsafe { std::env::remove_var("NV_OCR_QUEUE_MS") };
+        unsafe { std::env::remove_var("NV_OCR_CLASSICAL_CONCURRENCY") };
         let rt = OcrRuntime::from(OcrAppState::default());
         assert_eq!(rt.generative.permits(), 1, "default /v1/ocr concurrency");
         assert_eq!(rt.generative.queue_ms(), 3_000, "default queue window");
@@ -2869,19 +3050,19 @@ mod tests {
             SurfaceGate::new("/v1/ocr", 1, 40),
             None,
         );
-        std::env::remove_var(super::super::lora_runtime::RUNTIME_LORA_ENV);
+        unsafe { std::env::remove_var(super::super::lora_runtime::RUNTIME_LORA_ENV) };
         let err = match ocr_lora_gate_or_dots(&rt).await {
             Err(resp) => resp,
             Ok(_) => panic!("disabled env must refuse"),
         };
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
 
-        std::env::set_var(super::super::lora_runtime::RUNTIME_LORA_ENV, "1");
+        unsafe { std::env::set_var(super::super::lora_runtime::RUNTIME_LORA_ENV, "1") };
         let err = match ocr_lora_gate_or_dots(&rt).await {
             Err(resp) => resp,
             Ok(_) => panic!("no dots backend must refuse"),
         };
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        std::env::remove_var(super::super::lora_runtime::RUNTIME_LORA_ENV);
+        unsafe { std::env::remove_var(super::super::lora_runtime::RUNTIME_LORA_ENV) };
     }
 }

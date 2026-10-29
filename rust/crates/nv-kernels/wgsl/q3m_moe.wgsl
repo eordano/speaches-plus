@@ -11,50 +11,6 @@ struct Q3rtParams {
 @group(0) @binding(2) var<storage, read_write> rt_w: array<f32>;
 @group(0) @binding(3) var<uniform> rt_p: Q3rtParams;
 
-@compute @workgroup_size(1)
-fn q3w_router_topk() {
-    var taken: array<u32, 256>;
-    var chosen: array<f32, 16>;
-    for (var i = 0u; i < rt_p.n_experts; i = i + 1u) {
-        taken[i] = 0u;
-    }
-    for (var j = 0u; j < rt_p.k; j = j + 1u) {
-        var best = -3.4028235e38;
-        var bi = 0u;
-        var found = false;
-        for (var i = 0u; i < rt_p.n_experts; i = i + 1u) {
-            if (taken[i] == 1u) {
-                continue;
-            }
-            let v = bitcast<f32>(rt_logits[i]);
-            if (!found || v > best) {
-                best = v;
-                bi = i;
-                found = true;
-            }
-        }
-        taken[bi] = 1u;
-        rt_ids[j] = bi;
-        chosen[j] = best;
-    }
-    var m = chosen[0];
-    for (var j = 1u; j < rt_p.k; j = j + 1u) {
-        m = max(m, chosen[j]);
-    }
-    var s = 0.0;
-    for (var j = 0u; j < rt_p.k; j = j + 1u) {
-        let e = exp(chosen[j] - m);
-        chosen[j] = e;
-        s = s + e;
-    }
-    for (var j = 0u; j < rt_p.k; j = j + 1u) {
-        rt_w[j] = chosen[j] / s;
-    }
-    if (rt_p.shared_slot == 1u) {
-        rt_ids[rt_p.k] = rt_p.n_experts;
-    }
-}
-
 var<workgroup> rtp_v: array<f32, 256>;
 var<workgroup> rtp_chosen: array<f32, 16>;
 

@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
+use wgpu::Buffer;
 
 use nv_kernels::wgpu_backend::kernels as wk;
 use nv_kernels::wgpu_backend::WgpuContext;
@@ -61,7 +62,7 @@ impl LagunaLora {
         config: &LagunaConfig,
     ) -> Result<Self> {
         let rank = adapter.config.r;
-        anyhow::ensure!(
+        ensure!(
             rank > 0 && rank <= wk::lora::FUSED_MAX_RANK,
             "lora rank {rank} outside 1..={}",
             wk::lora::FUSED_MAX_RANK
@@ -163,7 +164,7 @@ impl LagunaLora {
                 skipped[0]
             );
         }
-        anyhow::ensure!(
+        ensure!(
             matched > 0,
             "lora adapter matched no laguna projection; it carries {} modules, the first of \
              which is {:?}. Expected names like {prefix}.0.self_attn.q_proj (the checkpoint's \
@@ -244,8 +245,8 @@ impl LoraSiteCtx<'_> {
         &self,
         b: &mut Builder,
         site: &LoraSiteGpu,
-        x: &wgpu::Buffer,
-        segs: &[&wgpu::Buffer],
+        x: &Buffer,
+        segs: &[&Buffer],
     ) {
         let ctx = b.ctx;
         let mut emitted: Vec<crate::wgpu_lora::Pass> = Vec::new();

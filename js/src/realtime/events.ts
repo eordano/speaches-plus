@@ -127,7 +127,7 @@ export type RealtimeServerEvent =
   | (Stamped & { type: "conversation.item.deleted"; item_id: ItemId })
   | (Stamped & { type: "conversation.item.truncated"; item_id: ItemId; content_index: number; audio_end_ms: number })
   | (Stamped & { type: "conversation.item.assistant_truncated"; item_id: ItemId; audio_end_ms: number; transcript: string })
-  | (Stamped & { type: "conversation.item.input_audio_transcription.completed"; item_id: ItemId; content_index: number; transcript: string })
+  | (Stamped & { type: "conversation.item.input_audio_transcription.completed"; item_id: ItemId; content_index: number; transcript: string; avg_logprob?: number; no_speech_prob?: number; compression_ratio?: number; logprobs?: { token: string; logprob: number }[] })
   | (Stamped & { type: "conversation.item.input_audio_transcription.delta"; item_id: ItemId; content_index: number; delta: string })
   | (Stamped & { type: "conversation.item.input_audio_transcription.failed"; item_id: ItemId; content_index: number; error: JsonValue })
   | (Stamped & { type: "conversation.item.done"; item: RealtimeItem })

@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::{pack_u16_pairs as pack_u16, unpack_u16_pairs as unpack_u16};
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
@@ -202,33 +200,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn odd_head_dim_is_rejected() {
-        let e = check_tables(&[1.0], &[0.0], &[0], 1, 3).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn table_rows_are_derived_from_half_dim() {
-        let cos = vec![0f32; 8];
-        let sin = vec![0f32; 8];
-        let half = check_tables(&cos, &sin, &[0, 3], 2, 4).unwrap();
-        assert_eq!(half, 2);
-    }
-
-    #[test]
-    fn out_of_range_position_is_rejected() {
-        let cos = vec![0f32; 8];
-        let sin = vec![0f32; 8];
-        let e = check_tables(&cos, &sin, &[0, 4], 2, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn u16_word_packing_round_trips() {
-        let src: Vec<u16> = (0u16..32).map(|i| i.wrapping_mul(2311)).collect();
-        let words = pack_u16(&src);
-        let mut back = vec![0u16; src.len()];
-        unpack_u16(&words, &mut back);
-        assert_eq!(back, src);
+    fn tables_derive_half_dim_reject_odd_head_dim_and_bad_positions_and_packing_round_trips() {
+        {
+            let e = check_tables(&[1.0], &[0.0], &[0], 1, 3).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            let cos = vec![0f32; 8];
+            let sin = vec![0f32; 8];
+            let half = check_tables(&cos, &sin, &[0, 3], 2, 4).unwrap();
+            assert_eq!(half, 2);
+        }
+        {
+            let cos = vec![0f32; 8];
+            let sin = vec![0f32; 8];
+            let e = check_tables(&cos, &sin, &[0, 4], 2, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            let src: Vec<u16> = (0u16..32).map(|i| i.wrapping_mul(2311)).collect();
+            let words = pack_u16(&src);
+            let mut back = vec![0u16; src.len()];
+            unpack_u16(&words, &mut back);
+            assert_eq!(back, src);
+        }
     }
 }

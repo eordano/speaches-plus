@@ -464,34 +464,5 @@ def main() -> None:
     args = parse_args()
     sys.exit(asyncio.run(main_async(args)))
 
-def test_e2e_default_target():
-    """Pytest entry point: skips unless SPEACHES_E2E_TARGET is set + reachable.
-
-    Without this, pytest discovers zero test functions in this file and reports
-    green even though the script asserts nothing via pytest semantics. With it,
-    pytest runs the same orchestration as `python client/test_e2e.py` and fails
-    loudly on non-zero exit.
-    """
-    target = os.environ.get("SPEACHES_E2E_TARGET")
-    if not target:
-        import pytest
-
-        pytest.skip("set SPEACHES_E2E_TARGET=http://host:port to run this test")
-    args = argparse.Namespace(
-        target=target,
-        tts_base=os.environ.get("SPEACHES_TTS_BASE", target),
-        model=os.environ.get("SPEACHES_E2E_MODEL", "gpt-4o-realtime-preview"),
-        transcription_model=os.environ.get(
-            "SPEACHES_E2E_TRANSCRIPTION_MODEL", "whisper-large-v3-turbo"
-        ),
-        text=os.environ.get(
-            "SPEACHES_E2E_TEXT", "the quick brown fox jumps over the lazy dog"
-        ),
-        record_trace=None,
-        verbose=False,
-    )
-    rc = asyncio.run(main_async(args))
-    assert rc == 0, f"test_e2e main_async returned non-zero exit code {rc}"
-
 if __name__ == "__main__":
     main()

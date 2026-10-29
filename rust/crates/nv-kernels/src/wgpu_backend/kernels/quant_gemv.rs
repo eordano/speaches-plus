@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
 pub use crate::wgpu_backend::pack::pack_u16_pairs as pack_x_bf16;
@@ -479,223 +477,176 @@ pub fn gelu_fold_rule(n: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn gemv_mxfp4_bf16(
-    ctx: &WgpuContext,
-    packed: &[u32],
-    scale_bytes: &[u8],
-    x: &[u16],
-    y: &mut [u16],
-    n: usize,
-    k: usize,
-) -> Result<()> {
-    shape_rule(k)?;
-    dispatch::check_len("quant_gemv mxfp4 packed", packed.len(), n * k / 8)?;
-    dispatch::check_len(
-        "quant_gemv mxfp4 scales",
-        scale_bytes.len(),
-        n * k / MXFP4_BLOCK,
-    )?;
-    dispatch::check_len("quant_gemv x", x.len(), k)?;
-    dispatch::check_len("quant_gemv y", y.len(), n)?;
-    let groups = dispatch::workgroup_count_1d(ctx, n as u64, TREE_ROWS_PER_GROUP);
-    let params = params_for(n, k, 0, groups.0);
-    let w_buf = dispatch::storage_from_slice(ctx, "quant-gemv-mx-w", packed);
-    let s_buf = dispatch::storage_from_slice(ctx, "quant-gemv-mx-scale", &pack_bytes(scale_bytes));
-    let x_buf = dispatch::storage_from_slice(ctx, "quant-gemv-x", &pack_x_bf16(x));
-    let y_buf = dispatch::storage_zeroed(ctx, "quant-gemv-y", (n * 4) as u64);
-    let p_buf = dispatch::uniform_from(ctx, "quant-gemv-params", &params);
-    dispatch::run(
-        ctx,
-        "quant-gemv-mxfp4",
-        &source(),
-        MXFP4_ENTRY,
-        &[
-            (0, &w_buf),
-            (2, &x_buf),
-            (3, &y_buf),
-            (4, &p_buf),
-            (5, &s_buf),
-        ],
-        groups,
-    )?;
-    let words: Vec<u32> = dispatch::read_back(ctx, &y_buf, n)?;
-    for (dst, w) in y.iter_mut().zip(words.iter()) {
-        *dst = (*w & 0xffff) as u16;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn wgsl_declares_every_entry_point() {
-        for e in [
-            INT8_ENTRY,
-            FP8_ENTRY,
-            MXFP4_ENTRY,
-            INT8_SG_ENTRY,
-            FP8_SG_ENTRY,
-            MXFP4_SG_ENTRY,
-            FP8_GROUP_ENTRY,
-            INT8_GROUP_ENTRY,
-            FP8_GROUP_SG_ENTRY,
-            INT8_GROUP_SG_ENTRY,
-            INT8_GROUP_GELU_ENTRY,
-            INT8_GROUP_GELU_SG_ENTRY,
-            FP8_GROUP_GELU_ENTRY,
-            FP8_GROUP_GELU_SG_ENTRY,
-        ] {
-            assert!(WGSL.contains(&format!("fn {e}(")), "missing entry {e}");
+    fn wgsl_declares_every_entry_point_and_the_gelu_fold_matches_the_standalone_pass_and_rejects_an_odd_row_count(
+    ) {
+        {
+            for e in [
+                INT8_ENTRY,
+                FP8_ENTRY,
+                MXFP4_ENTRY,
+                INT8_SG_ENTRY,
+                FP8_SG_ENTRY,
+                MXFP4_SG_ENTRY,
+                FP8_GROUP_ENTRY,
+                INT8_GROUP_ENTRY,
+                FP8_GROUP_SG_ENTRY,
+                INT8_GROUP_SG_ENTRY,
+                INT8_GROUP_GELU_ENTRY,
+                INT8_GROUP_GELU_SG_ENTRY,
+                FP8_GROUP_GELU_ENTRY,
+                FP8_GROUP_GELU_SG_ENTRY,
+            ] {
+                assert!(WGSL.contains(&format!("fn {e}(")), "missing entry {e}");
+            }
+            assert!(source().contains("fn e4m3_decode("));
+            assert!(source().contains("fn int8_decode("));
         }
-        assert!(source().contains("fn e4m3_decode("));
-        assert!(source().contains("fn int8_decode("));
+        {
+            let all = [
+                GeluFold::Tree.entry(QFormat::Int8),
+                GeluFold::Subgroup.entry(QFormat::Int8),
+                GeluFold::Tree.entry(QFormat::E4m3),
+                GeluFold::Subgroup.entry(QFormat::E4m3),
+            ];
+            assert_eq!(
+                all,
+                [
+                    INT8_GROUP_GELU_ENTRY,
+                    INT8_GROUP_GELU_SG_ENTRY,
+                    FP8_GROUP_GELU_ENTRY,
+                    FP8_GROUP_GELU_SG_ENTRY
+                ]
+            );
+            for (i, a) in all.iter().enumerate() {
+                for b in &all[i + 1..] {
+                    assert_ne!(a, b, "two fold variants share entry {a}");
+                }
+            }
+            for (entry, acc) in [
+                (INT8_GROUP_GELU_ENTRY, "qg_group_acc_i8"),
+                (INT8_GROUP_GELU_SG_ENTRY, "qg_group_acc_i8"),
+                (FP8_GROUP_GELU_ENTRY, "qg_group_acc_e4m3"),
+                (FP8_GROUP_GELU_SG_ENTRY, "qg_group_acc_e4m3"),
+            ] {
+                let at = WGSL.find(&format!("fn {entry}(")).expect("entry");
+                let body = &WGSL[at..];
+                let end = body.find("\n}\n").unwrap_or(body.len());
+                assert!(
+                    body[..end].contains(acc),
+                    "{entry} does not call {acc} -- it decodes the other format"
+                );
+            }
+        }
+        {
+            let split = super::super::gelu_tanh_mul::WGSL;
+            for c in ["0.7978845608028654", "0.044715", "10.0"] {
+                assert!(split.contains(c), "gelu_tanh_mul.wgsl lost {c}");
+                assert!(WGSL.contains(c), "quant_gemv.wgsl lost {c}");
+            }
+            for op in [
+                "let mag = 0.5 * abs(gate) * (1.0 + t) * abs(up);",
+                "let clamped = clamp(inner,",
+                "select(nv_tanhf(clamped), inner, inner != inner)",
+            ] {
+                assert!(split.contains(op), "gelu_tanh_mul.wgsl lost `{op}`");
+                assert!(WGSL.contains(op), "quant_gemv.wgsl lost `{op}`");
+            }
+        }
+        {
+            assert!(gelu_fold_rule(0).is_err());
+            assert!(gelu_fold_rule(43007).is_err());
+            assert!(gelu_fold_rule(43008).is_ok());
+            assert_eq!(GeluFold::Tree.rows_per_group(), TREE_ROWS_PER_GROUP);
+            assert_eq!(GeluFold::Subgroup.rows_per_group(), SG_ROWS_PER_GROUP);
+        }
     }
 
     #[test]
     fn the_int8_text_the_nv_models_mutation_oracles_anchor_is_frozen() {
         for anchor in [
-            "    acc = fma(int8_decode(word, 1u), bf16_hi(xw0), acc);",
-            "        let d = qg_dot16_i8(qg_w4[wbase + v], qg_x4[2u * v], qg_x4[2u * v + 1u]);",
-            "acc = fma(qg_row_scale[sbase + (v >> sh)], d, acc);\n    }\n    return acc;\n}\n\nfn qg_row_acc_mx",
-            "acc = fma(qg_row_scale[sbase + (v >> sh)], d, acc);\n    }\n    return acc;\n}\n\nfn qg_group_acc_i8",
-        ] {
-            assert!(
-                WGSL.contains(anchor),
-                "frozen text moved: {anchor:?} -- graph_g4w_int8_epilogue_oracle and \
-                 wgpu_fp8_epilogue in nv-models string-anchor mutation probes to it, and the g4w \
-                 pk template entries route through qg_group_acc_i8"
-            );
-        }
-    }
-
-    #[test]
-    fn the_folded_gelu_constants_match_the_standalone_pass() {
-        let split = super::super::gelu_tanh_mul::WGSL;
-        for c in ["0.7978845608028654", "0.044715", "10.0"] {
-            assert!(split.contains(c), "gelu_tanh_mul.wgsl lost {c}");
-            assert!(WGSL.contains(c), "quant_gemv.wgsl lost {c}");
-        }
-        for op in [
-            "let mag = 0.5 * abs(gate) * (1.0 + t) * abs(up);",
-            "let clamped = clamp(inner,",
-            "select(nv_tanhf(clamped), inner, inner != inner)",
-        ] {
-            assert!(split.contains(op), "gelu_tanh_mul.wgsl lost `{op}`");
-            assert!(WGSL.contains(op), "quant_gemv.wgsl lost `{op}`");
-        }
-    }
-
-    #[test]
-    fn the_gelu_fold_rejects_an_odd_row_count() {
-        assert!(gelu_fold_rule(0).is_err());
-        assert!(gelu_fold_rule(43007).is_err());
-        assert!(gelu_fold_rule(43008).is_ok());
-        assert_eq!(GeluFold::Tree.rows_per_group(), TREE_ROWS_PER_GROUP);
-        assert_eq!(GeluFold::Subgroup.rows_per_group(), SG_ROWS_PER_GROUP);
-    }
-
-    #[test]
-    fn every_format_and_reduction_pair_has_its_own_fold_entry() {
-        let all = [
-            GeluFold::Tree.entry(QFormat::Int8),
-            GeluFold::Subgroup.entry(QFormat::Int8),
-            GeluFold::Tree.entry(QFormat::E4m3),
-            GeluFold::Subgroup.entry(QFormat::E4m3),
-        ];
-        assert_eq!(
-            all,
-            [
-                INT8_GROUP_GELU_ENTRY,
-                INT8_GROUP_GELU_SG_ENTRY,
-                FP8_GROUP_GELU_ENTRY,
-                FP8_GROUP_GELU_SG_ENTRY
-            ]
+        "    acc = fma(int8_decode(word, 1u), bf16_hi(xw0), acc);",
+        "        let d = qg_dot16_i8(qg_w4[wbase + v], qg_x4[2u * v], qg_x4[2u * v + 1u]);",
+        "acc = fma(qg_row_scale[sbase + (v >> sh)], d, acc);\n    }\n    return acc;\n}\n\nfn qg_row_acc_mx",
+        "acc = fma(qg_row_scale[sbase + (v >> sh)], d, acc);\n    }\n    return acc;\n}\n\nfn qg_group_acc_i8",
+    ] {
+        assert!(
+            WGSL.contains(anchor),
+            "frozen text moved: {anchor:?} -- graph_g4w_int8_epilogue_oracle and \
+             wgpu_fp8_epilogue in nv-models string-anchor mutation probes to it, and the g4w \
+             pk template entries route through qg_group_acc_i8"
         );
-        for (i, a) in all.iter().enumerate() {
-            for b in &all[i + 1..] {
-                assert_ne!(a, b, "two fold variants share entry {a}");
-            }
+    }
+    }
+
+    #[test]
+    fn the_quantizers_and_group_layout_rules_follow_the_shader_contract() {
+        {
+            let w: Vec<u16> = [1.0f32, -1.0, 0.5, 0.25]
+                .iter()
+                .map(|v| half::bf16::from_f32(*v).to_bits())
+                .collect();
+            let (packed, scales) = quantize_rows_int8(&w, 1, 4);
+            assert_eq!(packed.len(), 1);
+            assert!((scales[0] - 1.0 / 127.0).abs() < 1e-9);
+            assert_eq!(packed[0] & 0xff, 127);
+            assert_eq!((packed[0] >> 8) & 0xff, (-127i8) as u8 as u32);
+            assert_eq!((packed[0] >> 16) & 0xff, 64);
+            assert_eq!((packed[0] >> 24) & 0xff, 32);
         }
-        for (entry, acc) in [
-            (INT8_GROUP_GELU_ENTRY, "qg_group_acc_i8"),
-            (INT8_GROUP_GELU_SG_ENTRY, "qg_group_acc_i8"),
-            (FP8_GROUP_GELU_ENTRY, "qg_group_acc_e4m3"),
-            (FP8_GROUP_GELU_SG_ENTRY, "qg_group_acc_e4m3"),
-        ] {
-            let at = WGSL.find(&format!("fn {entry}(")).expect("entry");
-            let body = &WGSL[at..];
-            let end = body.find("\n}\n").unwrap_or(body.len());
-            assert!(
-                body[..end].contains(acc),
-                "{entry} does not call {acc} -- it decodes the other format"
-            );
+        {
+            let w: Vec<u16> = [2.0f32, -2.0, 1.0, 0.0]
+                .iter()
+                .map(|v| half::bf16::from_f32(*v).to_bits())
+                .collect();
+            let (packed, scales) = quantize_rows_fp8(&w, 1, 4);
+            assert!((scales[0] - 2.0 / 448.0).abs() < 1e-9);
+            assert_eq!(packed[0] & 0xff, 0x7e);
+            assert_eq!((packed[0] >> 8) & 0xff, 0xfe);
         }
-    }
-
-    #[test]
-    fn int8_quantizer_packs_low_byte_first() {
-        let w: Vec<u16> = [1.0f32, -1.0, 0.5, 0.25]
-            .iter()
-            .map(|v| half::bf16::from_f32(*v).to_bits())
-            .collect();
-        let (packed, scales) = quantize_rows_int8(&w, 1, 4);
-        assert_eq!(packed.len(), 1);
-        assert!((scales[0] - 1.0 / 127.0).abs() < 1e-9);
-        assert_eq!(packed[0] & 0xff, 127);
-        assert_eq!((packed[0] >> 8) & 0xff, (-127i8) as u8 as u32);
-        assert_eq!((packed[0] >> 16) & 0xff, 64);
-        assert_eq!((packed[0] >> 24) & 0xff, 32);
-    }
-
-    #[test]
-    fn fp8_quantizer_hits_e4m3_max_at_row_amax() {
-        let w: Vec<u16> = [2.0f32, -2.0, 1.0, 0.0]
-            .iter()
-            .map(|v| half::bf16::from_f32(*v).to_bits())
-            .collect();
-        let (packed, scales) = quantize_rows_fp8(&w, 1, 4);
-        assert!((scales[0] - 2.0 / 448.0).abs() < 1e-9);
-        assert_eq!(packed[0] & 0xff, 0x7e);
-        assert_eq!((packed[0] >> 8) & 0xff, 0xfe);
-    }
-
-    #[test]
-    fn group_zero_reproduces_the_row_quantizers_bit_for_bit() {
-        let w: Vec<u16> = (0..2048)
-            .map(|i| half::bf16::from_f32(((i % 97) as f32 - 48.0) * 0.013).to_bits())
-            .collect();
-        let (a, sa) = quantize_rows_fp8(&w, 4, 512);
-        let (b, sb) = quantize_groups(&w, 4, 512, 512, QFormat::E4m3);
-        assert_eq!(a, b);
-        assert_eq!(sa, sb);
-        let (c, sc) = quantize_rows_int8(&w, 4, 512);
-        let (d, sd) = quantize_groups(&w, 4, 512, 512, QFormat::Int8);
-        assert_eq!(c, d);
-        assert_eq!(sc, sd);
-    }
-
-    #[test]
-    fn group_layout_params_and_rules() {
-        assert_eq!(scales_per_row(8192, 0), 1);
-        assert_eq!(scales_per_row(8192, 128), 64);
-        assert_eq!(group_shift(0), ROW_GROUP_SHIFT);
-        assert_eq!(group_shift(16), 0);
-        assert_eq!(group_shift(128), 3);
-        assert!(group_rule(5376, 0).is_ok());
-        assert!(group_rule(5376, 128).is_ok());
-        assert!(group_rule(5376, 64).is_ok());
-        assert!(group_rule(8192, 96).is_err());
-        assert!(group_rule(8192, 48).is_err());
-        assert!(group_rule(5376, 1024).is_err());
-        assert!(group_rule(5376, 256).is_ok());
-        let p = params_for(16, 5376, 128, 2);
-        assert_eq!(p.group_shift, 3);
-        assert_eq!(p.scales_per_row, 42);
-        let r = params_for(16, 5376, 0, 2);
-        assert_eq!(r.scales_per_row, 1);
-        assert_eq!(336u32 >> r.group_shift, 0);
+        {
+            let w: Vec<u16> = (0..2048)
+                .map(|i| half::bf16::from_f32(((i % 97) as f32 - 48.0) * 0.013).to_bits())
+                .collect();
+            let (a, sa) = quantize_rows_fp8(&w, 4, 512);
+            let (b, sb) = quantize_groups(&w, 4, 512, 512, QFormat::E4m3);
+            assert_eq!(a, b);
+            assert_eq!(sa, sb);
+            let (c, sc) = quantize_rows_int8(&w, 4, 512);
+            let (d, sd) = quantize_groups(&w, 4, 512, 512, QFormat::Int8);
+            assert_eq!(c, d);
+            assert_eq!(sc, sd);
+        }
+        {
+            assert_eq!(scales_per_row(8192, 0), 1);
+            assert_eq!(scales_per_row(8192, 128), 64);
+            assert_eq!(group_shift(0), ROW_GROUP_SHIFT);
+            assert_eq!(group_shift(16), 0);
+            assert_eq!(group_shift(128), 3);
+            assert!(group_rule(5376, 0).is_ok());
+            assert!(group_rule(5376, 128).is_ok());
+            assert!(group_rule(5376, 64).is_ok());
+            assert!(group_rule(8192, 96).is_err());
+            assert!(group_rule(8192, 48).is_err());
+            assert!(group_rule(5376, 1024).is_err());
+            assert!(group_rule(5376, 256).is_ok());
+            let p = params_for(16, 5376, 128, 2);
+            assert_eq!(p.group_shift, 3);
+            assert_eq!(p.scales_per_row, 42);
+            let r = params_for(16, 5376, 0, 2);
+            assert_eq!(r.scales_per_row, 1);
+            assert_eq!(336u32 >> r.group_shift, 0);
+        }
+        {
+            assert!(shape_rule(5376).is_ok());
+            assert!(shape_rule(8192).is_ok());
+            assert!(shape_rule(48).is_err());
+            assert!(shape_rule(0).is_err());
+        }
     }
 
     #[test]
@@ -747,13 +698,5 @@ mod tests {
             i_128 * 2.0 < f_128,
             "int8 group=128 must beat e4m3 group=128 by >2x: {i_128:.4e} vs {f_128:.4e}"
         );
-    }
-
-    #[test]
-    fn shape_rule_requires_multiple_of_32() {
-        assert!(shape_rule(5376).is_ok());
-        assert!(shape_rule(8192).is_ok());
-        assert!(shape_rule(48).is_err());
-        assert!(shape_rule(0).is_err());
     }
 }

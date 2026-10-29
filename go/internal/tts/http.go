@@ -31,11 +31,6 @@ func NewSpeechHandler(s Synthesizer) *SpeechHandler {
 	return &SpeechHandler{syn: s, lang: DefaultLanguage}
 }
 
-func (h *SpeechHandler) WithLanguage(lang string) *SpeechHandler {
-	h.lang = lang
-	return h
-}
-
 type speechRequest struct {
 	Model          string   `json:"model"`
 	Input          *string  `json:"input"`

@@ -27,7 +27,7 @@ MAX_TOKENS = 512
 try:
     import requests
 except ImportError:
-    sys.exit("pip install requests")
+    sys.exit("requests is missing: run uv run --with requests scripts/chat.py")
 
 messages = []
 system_prompt = None
@@ -173,7 +173,7 @@ def main():
     BASE = args.url
 
     print(f"chat: {MODEL} @ {BASE}  (ctrl-d to quit)")
-    print(f"commands: /clear /model /system /temp /raw /tts /transcribe /embed")
+    print("commands: /clear /model /system /temp /raw /tts /transcribe /embed")
     print(f"thinking: {'hidden (HIDE_THINKING=1)' if os.environ.get('HIDE_THINKING') == '1' else 'shown in grey'}")
     print()
 
@@ -201,7 +201,7 @@ def main():
         if line.startswith("/system "):
             system_prompt = line[8:].strip()
             messages.clear()
-            print(f"(system prompt set, history cleared)")
+            print("(system prompt set, history cleared)")
             continue
         if line.startswith("/temp "):
             try:

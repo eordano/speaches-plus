@@ -121,14 +121,6 @@ func supportedFusionRulesExtensions() []string {
 	return []string{"gated"}
 }
 
-func supportedEouKinds() []string {
-	return []string{"vad", "heuristic", "text", "audio", "fusion", "integrated"}
-}
-
-func supportedFusionRules() []string {
-	return []string{"noisy_or", "max", "mean", "weighted", "gated"}
-}
-
 func validAudioFormat(v string, supported []string) bool {
 	for _, s := range supported {
 		if s == v {

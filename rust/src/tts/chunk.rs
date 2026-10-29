@@ -85,35 +85,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn short_text_single_chunk() {
+    fn plan_keeps_short_text_whole_splits_on_sentence_ends_and_word_splits_oversize_sentences() {
         let p = plan("Hello there.", 400);
         assert_eq!(p.chunks, vec!["Hello there.".to_string()]);
         assert_eq!(p.boundaries, vec![12]);
         assert_eq!(p.oversize_splits, 0);
-    }
-
-    #[test]
-    fn boundaries_are_sentence_ends() {
-        let text = "Dr. Smith went to Washington. He arrived at noon. The meeting ran long. \
-                    Everyone left at five. It was a busy day for the whole team.";
-        let p = plan(text, 60);
-        assert!(p.chunks.len() > 1);
-        assert_eq!(p.oversize_splits, 0);
-        for &b in &p.boundaries {
-            assert_ne!(b, INTRA_SENTENCE_SPLIT);
-            assert_eq!(&text[b - 1..b], ".", "boundary at sentence-final period");
+        {
+            let text = "Dr. Smith went to Washington. He arrived at noon. The meeting ran long. \
+                        Everyone left at five. It was a busy day for the whole team.";
+            let p = plan(text, 60);
+            assert!(p.chunks.len() > 1);
+            assert_eq!(p.oversize_splits, 0);
+            for &b in &p.boundaries {
+                assert_ne!(b, INTRA_SENTENCE_SPLIT);
+                assert_eq!(&text[b - 1..b], ".", "boundary at sentence-final period");
+            }
+            assert!(!p.chunks[0].ends_with("Dr."));
         }
-        assert!(!p.chunks[0].ends_with("Dr."));
-    }
-
-    #[test]
-    fn oversize_sentence_word_split() {
-        let text = "word ".repeat(200);
-        let p = plan(text.trim(), 50);
-        assert!(p.chunks.len() > 1);
-        assert!(p.oversize_splits >= 1);
-        for c in &p.chunks {
-            assert!(c.chars().count() <= 50);
+        {
+            let text = "word ".repeat(200);
+            let p = plan(text.trim(), 50);
+            assert!(p.chunks.len() > 1);
+            assert!(p.oversize_splits >= 1);
+            for c in &p.chunks {
+                assert!(c.chars().count() <= 50);
+            }
         }
     }
+
 }

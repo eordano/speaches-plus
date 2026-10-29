@@ -7,7 +7,6 @@ export function setupPicker({ store }) {
   store.subscribe('session', () => {
     idText.textContent = store.state.sessionId || '--';
   });
-  // initial render in case session is already set
   if (store.state.sessionId) idText.textContent = store.state.sessionId;
 
   pill.addEventListener('click', async () => {

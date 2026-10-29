@@ -15,11 +15,29 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/go-chi/chi/v5"
 
 	"github.com/eordano/speaches-plus-go/internal/inspect"
 	"github.com/eordano/speaches-plus-go/internal/oapi"
 )
+
+func (s *Server) RegisterInspectRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /v1/inspect/sessions", s.HandleInspectListSessions)
+	mux.HandleFunc("GET /v1/inspect/sessions/history", s.HandleInspectListHistory)
+	mux.HandleFunc("GET /v1/inspect/sessions/{first}/{second}", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.PathValue("first") == "history":
+			r.SetPathValue("sid", r.PathValue("second"))
+			s.HandleInspectGetHistory(w, r)
+		case r.PathValue("second") == "audio":
+			r.SetPathValue("sid", r.PathValue("first"))
+			s.HandleInspectGetAudio(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	mux.HandleFunc("GET /v1/inspect/{sid}/stream", s.HandleInspectStream)
+	mux.HandleFunc("GET /v1/inspect/{sid}", s.HandleInspectStream)
+}
 
 func (s *Server) sessionDir() string {
 	if s != nil && s.cfg.InspectSessionDir != "" {
@@ -80,7 +98,7 @@ func (s *Server) HandleInspectListHistory(w http.ResponseWriter, _ *http.Request
 }
 
 func (s *Server) HandleInspectGetHistory(w http.ResponseWriter, r *http.Request) {
-	sid := chi.URLParam(r, "sid")
+	sid := r.PathValue("sid")
 	if !validSID(sid) {
 		oapi.WriteError(w, http.StatusBadRequest, "invalid sid", oapi.TypeInvalidRequest, "sid", "invalid")
 		return
@@ -101,7 +119,7 @@ func (s *Server) HandleInspectGetHistory(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) HandleInspectGetAudio(w http.ResponseWriter, r *http.Request) {
-	sid := chi.URLParam(r, "sid")
+	sid := r.PathValue("sid")
 	if !validSID(sid) {
 		oapi.WriteError(w, http.StatusBadRequest, "invalid sid", oapi.TypeInvalidRequest, "sid", "invalid")
 		return
@@ -174,7 +192,7 @@ func (s *Server) HandleInspectGetAudio(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) HandleInspectStream(w http.ResponseWriter, r *http.Request) {
-	sid := chi.URLParam(r, "sid")
+	sid := r.PathValue("sid")
 	if !validSID(sid) {
 		oapi.WriteError(w, http.StatusBadRequest, "invalid sid", oapi.TypeInvalidRequest, "sid", "invalid")
 		return

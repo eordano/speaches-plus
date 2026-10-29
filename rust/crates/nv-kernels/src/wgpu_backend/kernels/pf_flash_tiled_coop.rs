@@ -13,8 +13,6 @@ pub const COOP_HEAD_DIM_ONLY_256_BECAUSE_TILE_COUNTS_ARE_BAKED: usize = 256;
 
 pub const COOP_TILE_ROWS_MATCH_THE_SCALAR_TILED_ARM: usize = 32;
 
-pub const COOP_POS_PER_ROUND: usize = 16;
-
 pub fn source() -> String {
     compose_enabled(&gemm_coop_f16::ENABLES, WGSL)
 }

@@ -107,22 +107,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_input() {
-        let result = assemble_spans(&[], &[], &[]);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn all_o_labels() {
+    fn no_spans_for_empty_all_o_masked_or_zero_width_input() {
         let labels: Vec<String> = vec!["O", "O", "O"].into_iter().map(String::from).collect();
         let offsets = vec![(0, 3), (3, 6), (6, 9)];
         let mask = vec![1, 1, 1];
         let result = assemble_spans(&labels, &offsets, &mask);
         assert!(result.is_empty());
+        {
+            let result = assemble_spans(&[], &[], &[]);
+            assert!(result.is_empty());
+        }
+        {
+            let labels: Vec<String> = vec!["S-email", "S-phone"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let offsets = vec![(0, 5), (6, 10)];
+            let mask = vec![1, 0];
+            let result = assemble_spans(&labels, &offsets, &mask);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].label, "email");
+        }
+        {
+            let labels: Vec<String> = vec!["S-email"].into_iter().map(String::from).collect();
+            let offsets = vec![(5, 5)];
+            let mask = vec![1];
+            let result = assemble_spans(&labels, &offsets, &mask);
+            assert!(result.is_empty());
+        }
     }
 
     #[test]
-    fn single_s_label() {
+    fn s_and_bie_sequences_assemble_and_mismatched_tags_start_new_spans() {
         let labels: Vec<String> = vec!["O", "S-email", "O"]
             .into_iter()
             .map(String::from)
@@ -134,74 +150,47 @@ mod tests {
         assert_eq!(result[0].start, 4);
         assert_eq!(result[0].end_exclusive, 20);
         assert_eq!(result[0].label, "email");
+        {
+            let labels: Vec<String> = vec!["B-name", "I-name", "E-name"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let offsets = vec![(0, 4), (5, 9), (10, 15)];
+            let mask = vec![1, 1, 1];
+            let result = assemble_spans(&labels, &offsets, &mask);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].start, 0);
+            assert_eq!(result[0].end_exclusive, 15);
+            assert_eq!(result[0].label, "name");
+        }
+        {
+            let labels: Vec<String> = vec!["B-name", "I-phone"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let offsets = vec![(0, 4), (5, 10)];
+            let mask = vec![1, 1];
+            let result = assemble_spans(&labels, &offsets, &mask);
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0].label, "name");
+            assert_eq!(result[1].label, "phone");
+        }
+        {
+            let labels: Vec<String> = vec!["B-name", "E-phone"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let offsets = vec![(0, 4), (5, 10)];
+            let mask = vec![1, 1];
+            let result = assemble_spans(&labels, &offsets, &mask);
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0].label, "name");
+            assert_eq!(result[0].start, 0);
+            assert_eq!(result[0].end_exclusive, 4);
+            assert_eq!(result[1].label, "phone");
+            assert_eq!(result[1].start, 5);
+            assert_eq!(result[1].end_exclusive, 10);
+        }
     }
 
-    #[test]
-    fn bie_sequence() {
-        let labels: Vec<String> = vec!["B-name", "I-name", "E-name"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let offsets = vec![(0, 4), (5, 9), (10, 15)];
-        let mask = vec![1, 1, 1];
-        let result = assemble_spans(&labels, &offsets, &mask);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].start, 0);
-        assert_eq!(result[0].end_exclusive, 15);
-        assert_eq!(result[0].label, "name");
-    }
-
-    #[test]
-    fn attention_mask_skips_zeros() {
-        let labels: Vec<String> = vec!["S-email", "S-phone"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let offsets = vec![(0, 5), (6, 10)];
-        let mask = vec![1, 0];
-        let result = assemble_spans(&labels, &offsets, &mask);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].label, "email");
-    }
-
-    #[test]
-    fn zero_width_offsets_skipped() {
-        let labels: Vec<String> = vec!["S-email"].into_iter().map(String::from).collect();
-        let offsets = vec![(5, 5)];
-        let mask = vec![1];
-        let result = assemble_spans(&labels, &offsets, &mask);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn mismatched_i_starts_new_span() {
-        let labels: Vec<String> = vec!["B-name", "I-phone"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let offsets = vec![(0, 4), (5, 10)];
-        let mask = vec![1, 1];
-        let result = assemble_spans(&labels, &offsets, &mask);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].label, "name");
-        assert_eq!(result[1].label, "phone");
-    }
-
-    #[test]
-    fn mismatched_e_emits_standalone() {
-        let labels: Vec<String> = vec!["B-name", "E-phone"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let offsets = vec![(0, 4), (5, 10)];
-        let mask = vec![1, 1];
-        let result = assemble_spans(&labels, &offsets, &mask);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].label, "name");
-        assert_eq!(result[0].start, 0);
-        assert_eq!(result[0].end_exclusive, 4);
-        assert_eq!(result[1].label, "phone");
-        assert_eq!(result[1].start, 5);
-        assert_eq!(result[1].end_exclusive, 10);
-    }
 }

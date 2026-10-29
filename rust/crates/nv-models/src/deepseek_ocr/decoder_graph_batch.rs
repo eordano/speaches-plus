@@ -1,11 +1,11 @@
 #![cfg(feature = "cuda")]
 
-use anyhow::{Context, Result};
-use candle_core::{CudaDevice, DType, Device, Tensor};
+use anyhow::{ensure, Context, Result};
+use candle_core::{CudaDevice, DType, Device, Storage, Tensor};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::decoder::{
     select_next_token, DeepseekMoe, DeepseekOcrDecoder, DeepseekOcrKvCache, FeedForward,
@@ -17,16 +17,8 @@ use super::decoder_graph::{
     model_uses_nvfp4, residual_add_scale_bf16_into, rope_apply_inplace_f32, tensor_ptr_bf16,
     tensor_ptr_u32, wrap_bf16, wrap_f32, MoePrealloc,
 };
-use crate::laguna_fa2::{batch_decode_fwd_bf16, varlen_fwd_bf16, BatchDecodeArgs, VarlenArgs};
-
-pub fn attn_batched() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            "NV_DSOCR_ATTN_BATCH",
-        )
-    })
-}
+use crate::laguna_fa2::{batch_decode_fwd_bf16, BatchDecodeArgs};
+use candle_core::op::BackpropOp;
 use nv_kernels::graph::CudaGraphRunner;
 
 pub const DEFAULT_BUCKETS: &[usize] = &[1, 2, 4, 8];
@@ -104,18 +96,8 @@ struct BatchScratch {
     attn_lse: CudaSlice<f32>,
 }
 
-pub fn moe_slot_batched() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("NV_DSOCR_MOE_SLOTBATCH").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
-    })
-}
-
 pub fn prefill_per_thread_stream() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
             std::env::var("NV_DSOCR_PREFILL_STREAM").as_deref(),
@@ -134,7 +116,6 @@ pub fn idlog_path() -> Option<String> {
 unsafe impl Send for BatchScratch {}
 
 impl BatchScratch {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         k: usize,
         e: usize,
@@ -146,51 +127,29 @@ impl BatchScratch {
         layers: usize,
         device: &Device,
     ) -> Result<Self> {
-        anyhow::ensure!(
+        ensure!(
             k > 0 && e > 0 && k <= e,
             "dsocr batch scratch: bad k={k} e={e}"
         );
-        anyhow::ensure!(max_b > 0, "dsocr batch scratch: max_b must be > 0");
+        ensure!(max_b > 0, "dsocr batch scratch: max_b must be > 0");
         let dev = cuda_dev(device)?;
         let stream = nv_layers::cuda_stream::current_stream(&dev);
-        let seeds = stream
-            .alloc_zeros::<u64>(max_b)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let scores_f32 = stream
-            .alloc_zeros::<f32>(max_b * e)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let probs = stream
-            .alloc_zeros::<f32>(max_b * e)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let trash_token = stream
-            .alloc_zeros::<u32>(max_b)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let ids = stream
-            .alloc_zeros::<i32>(max_b * k)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let seeds = stream.alloc_zeros::<u64>(max_b)?;
+        let scores_f32 = stream.alloc_zeros::<f32>(max_b * e)?;
+        let probs = stream.alloc_zeros::<f32>(max_b * e)?;
+        let trash_token = stream.alloc_zeros::<u32>(max_b)?;
+        let ids = stream.alloc_zeros::<i32>(max_b * k)?;
         let ids_log = match idlog_path() {
-            Some(_) => Some(
-                stream
-                    .alloc_zeros::<i32>(layers * max_b * k)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-            ),
+            Some(_) => Some(stream.alloc_zeros::<i32>(layers * max_b * k)?),
             None => None,
         };
-        let weights = stream
-            .alloc_zeros::<f32>(max_b * k)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let h_rows = stream
-            .alloc_zeros::<bf16>(max_b * k * inter)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let shared_f32 = stream
-            .alloc_zeros::<f32>(max_b * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let attn_lse = stream
-            .alloc_zeros::<f32>(max_b * n_heads)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let weights = stream.alloc_zeros::<f32>(max_b * k)?;
+        let h_rows = stream.alloc_zeros::<bf16>(max_b * k * inter)?;
+        let shared_f32 = stream.alloc_zeros::<f32>(max_b * hidden)?;
+        let attn_lse = stream.alloc_zeros::<f32>(max_b * n_heads)?;
         let out = Tensor::zeros((max_b, hidden), DType::BF16, device)?;
         let attn_o = Tensor::zeros((max_b, n_heads, head_dim), DType::BF16, device)?;
-        stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+        stream.synchronize()?;
         Ok(Self {
             k,
             e,
@@ -213,7 +172,6 @@ impl BatchScratch {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn moe_decode_ffn_batch(
     moe: &DeepseekMoe,
     x_normed: &Tensor,
@@ -233,15 +191,15 @@ fn moe_decode_ffn_batch(
     let e = moe.num_experts();
     let hidden = scratch.hidden;
     let inter = scratch.inter;
-    anyhow::ensure!(
+    ensure!(
         k == scratch.k && e == scratch.e,
         "moe_decode_ffn_batch: scratch shape mismatch"
     );
-    anyhow::ensure!(
+    ensure!(
         b > 0 && b <= scratch.max_b,
         "moe_decode_ffn_batch: bad b={b}"
     );
-    anyhow::ensure!(
+    ensure!(
         x_normed.elem_count() == b * hidden && resid.elem_count() == b * hidden,
         "moe_decode_ffn_batch: expected [{b}, {hidden}] input"
     );
@@ -260,7 +218,7 @@ fn moe_decode_ffn_batch(
                     (b * e) as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "moe batch gate cast rc={rc}");
+            ensure!(rc == 0, "moe batch gate cast rc={rc}");
         }
     }
     {
@@ -282,7 +240,7 @@ fn moe_decode_ffn_batch(
                 1.0,
             )
         };
-        anyhow::ensure!(rc == 0, "moe batch softmax rc={rc}");
+        ensure!(rc == 0, "moe batch softmax rc={rc}");
     }
     {
         let (pp, _g1) = scratch.probs.device_ptr(&stream);
@@ -304,7 +262,7 @@ fn moe_decode_ffn_batch(
                 1.0,
             )
         };
-        anyhow::ensure!(rc == 0, "moe batch route rc={rc}");
+        ensure!(rc == 0, "moe batch route rc={rc}");
     }
     if let Some(log) = scratch.ids_log.as_mut() {
         let base = li * scratch.max_b * k;
@@ -328,7 +286,7 @@ fn moe_decode_ffn_batch(
                     k as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "moe batch weight gather rc={rc}");
+            ensure!(rc == 0, "moe batch weight gather rc={rc}");
         }
     }
     match moe_pre {
@@ -345,7 +303,7 @@ fn moe_decode_ffn_batch(
                     (b * hidden) as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "moe batch shared cast rc={rc}");
+            ensure!(rc == 0, "moe batch shared cast rc={rc}");
         }
     }
 
@@ -355,92 +313,49 @@ fn moe_decode_ffn_batch(
     let x_ptr = tensor_ptr_bf16(x_normed, &stream, b * hidden)?;
     let resid_ptr = tensor_ptr_bf16(resid, &stream, b * hidden)?;
     let out_ptr = tensor_ptr_bf16(&scratch.out, &stream, scratch.max_b * hidden)?;
-    let slot_batched = moe_slot_batched();
     {
         let (ids_ptr, _g1) = scratch.ids.device_ptr(&stream);
         let (hp, _g2) = scratch.h_rows.device_ptr_mut(&stream);
-        if slot_batched {
-            let rc = unsafe {
-                nv_kernels::cuda::moe_gemv_swiglu_bf16_mb(
-                    stream.cu_stream() as *mut c_void,
-                    gate_src as *const u16,
-                    up_src as *const u16,
-                    ids_ptr as *const i32,
-                    x_ptr as *const u16,
-                    hp as *mut u16,
-                    b as i32,
-                    k as i32,
-                    e as i32,
-                    inter as i32,
-                    hidden as i32,
-                )
-            };
-            anyhow::ensure!(rc == 0, "moe batch swiglu gemv mb rc={rc}");
-        } else {
-            for j in 0..b {
-                let rc = unsafe {
-                    nv_kernels::cuda::moe_gemv_swiglu_bf16_m1(
-                        stream.cu_stream() as *mut c_void,
-                        gate_src as *const u16,
-                        up_src as *const u16,
-                        off(ids_ptr, j * k, 4) as *const i32,
-                        off(x_ptr, j * hidden, 2) as *const u16,
-                        off(hp, j * k * inter, 2) as *mut u16,
-                        k as i32,
-                        e as i32,
-                        inter as i32,
-                        hidden as i32,
-                    )
-                };
-                anyhow::ensure!(rc == 0, "moe batch swiglu gemv rc={rc}");
-            }
-        }
+        let rc = unsafe {
+            nv_kernels::cuda::moe_gemv_swiglu_bf16_mb(
+                stream.cu_stream() as *mut c_void,
+                gate_src as *const u16,
+                up_src as *const u16,
+                ids_ptr as *const i32,
+                x_ptr as *const u16,
+                hp as *mut u16,
+                b as i32,
+                k as i32,
+                e as i32,
+                inter as i32,
+                hidden as i32,
+            )
+        };
+        ensure!(rc == 0, "moe batch swiglu gemv mb rc={rc}");
     }
     {
         let (ids_ptr, _g1) = scratch.ids.device_ptr(&stream);
         let (wp, _g2) = scratch.weights.device_ptr(&stream);
         let (hp, _g3) = scratch.h_rows.device_ptr(&stream);
         let (sp, _g4) = scratch.shared_f32.device_ptr(&stream);
-        if slot_batched {
-            let rc = unsafe {
-                nv_kernels::cuda::moe_gemv_down_tail_bf16_mb(
-                    stream.cu_stream() as *mut c_void,
-                    down_src as *const u16,
-                    ids_ptr as *const i32,
-                    wp as *const f32,
-                    hp as *const u16,
-                    sp as *const f32,
-                    resid_ptr as *const u16,
-                    out_ptr as *mut u16,
-                    b as i32,
-                    k as i32,
-                    e as i32,
-                    hidden as i32,
-                    inter as i32,
-                )
-            };
-            anyhow::ensure!(rc == 0, "moe batch down gemv tail mb rc={rc}");
-        } else {
-            for j in 0..b {
-                let rc = unsafe {
-                    nv_kernels::cuda::moe_gemv_down_tail_bf16_m1(
-                        stream.cu_stream() as *mut c_void,
-                        down_src as *const u16,
-                        off(ids_ptr, j * k, 4) as *const i32,
-                        off(wp, j * k, 4) as *const f32,
-                        off(hp, j * k * inter, 2) as *const u16,
-                        off(sp, j * hidden, 4) as *const f32,
-                        off(resid_ptr, j * hidden, 2) as *const u16,
-                        off(out_ptr, j * hidden, 2) as *mut u16,
-                        k as i32,
-                        e as i32,
-                        hidden as i32,
-                        inter as i32,
-                    )
-                };
-                anyhow::ensure!(rc == 0, "moe batch down gemv tail rc={rc}");
-            }
-        }
+        let rc = unsafe {
+            nv_kernels::cuda::moe_gemv_down_tail_bf16_mb(
+                stream.cu_stream() as *mut c_void,
+                down_src as *const u16,
+                ids_ptr as *const i32,
+                wp as *const f32,
+                hp as *const u16,
+                sp as *const f32,
+                resid_ptr as *const u16,
+                out_ptr as *mut u16,
+                b as i32,
+                k as i32,
+                e as i32,
+                hidden as i32,
+                inter as i32,
+            )
+        };
+        ensure!(rc == 0, "moe batch down gemv tail mb rc={rc}");
     }
     Ok(scratch.out.narrow(0, 0, b)?)
 }
@@ -488,41 +403,22 @@ impl BatchPrealloc {
         let n_kv = cfg.num_key_value_heads;
         let hd = cfg.head_dim();
         let hidden = cfg.hidden_size;
-        anyhow::ensure!(
+        ensure!(
             model.rope().config().head_dim == hd,
             "dsocr batch prealloc: rope head_dim {} != cfg {}",
             model.rope().config().head_dim,
             hd
         );
         let tok_t = {
-            let slice = forked
-                .alloc_zeros::<u32>(max_b)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let slice = forked.alloc_zeros::<u32>(max_b)?;
             let st = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
-            Tensor::from_storage(
-                candle_core::Storage::Cuda(st),
-                (max_b,),
-                candle_core::op::BackpropOp::none(),
-                false,
-            )
+            Tensor::from_storage(Storage::Cuda(st), (max_b,), BackpropOp::none(), false)
         };
         let alloc_f32 = |n: usize, dims: &[usize]| -> Result<Tensor> {
-            wrap_f32(
-                forked
-                    .alloc_zeros::<f32>(n)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                dims,
-                dev,
-            )
+            wrap_f32(forked.alloc_zeros::<f32>(n)?, dims, dev)
         };
         let alloc_bf = |n: usize, dims: &[usize]| -> Result<Tensor> {
-            wrap_bf16(
-                forked
-                    .alloc_zeros::<bf16>(n)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                dims,
-                dev,
-            )
+            wrap_bf16(forked.alloc_zeros::<bf16>(n)?, dims, dev)
         };
         let q_f32 = alloc_f32(max_b * n_heads * hd, &[max_b, n_heads, hd])?;
         let k_f32 = alloc_f32(max_b * n_kv * hd, &[max_b, n_kv, hd])?;
@@ -532,7 +428,7 @@ impl BatchPrealloc {
         let resid_b = alloc_bf(max_b * hidden, &[max_b, hidden])?;
         let cos_c = model.rope().cos().contiguous()?;
         let sin_c = model.rope().sin().contiguous()?;
-        anyhow::ensure!(
+        ensure!(
             cos_c.dtype() == candle_core::DType::F32 && sin_c.dtype() == candle_core::DType::F32,
             "dsocr batch prealloc: rope tables must be f32"
         );
@@ -571,9 +467,6 @@ pub struct DsocrBatchDecodeGraph {
     host_tok: Box<[u32]>,
     pos_buf: CudaSlice<i32>,
     host_pos: Box<[i32]>,
-    cu_q: CudaSlice<i32>,
-    cu_k: CudaSlice<i32>,
-    host_cu_k: Box<[i32]>,
     seq_k: CudaSlice<i32>,
     host_seq_k: Box<[i32]>,
     kv: Vec<(CudaSlice<bf16>, CudaSlice<bf16>)>,
@@ -600,7 +493,7 @@ impl DsocrBatchDecodeGraph {
     pub fn new(model: Arc<DeepseekOcrDecoder>, cap: usize, buckets: Vec<usize>) -> Result<Self> {
         graph_supported(&model)
             .map_err(|e| anyhow::anyhow!("dsocr bs=N graph unsupported: {e}"))?;
-        anyhow::ensure!(cap > 0, "dsocr bs=N graph: cap must be > 0");
+        ensure!(cap > 0, "dsocr bs=N graph: cap must be > 0");
         let buckets = parse_buckets(Some(
             &buckets
                 .iter()
@@ -630,35 +523,16 @@ impl DsocrBatchDecodeGraph {
         nv_quant::nvfp4::ensure_workspace_for_stream(&forked)?;
         let _ = nv_quant::matmul::TensorCoreGemm::new(forked.clone())?;
 
-        let tok_buf = forked
-            .alloc_zeros::<u32>(max_b)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let pos_buf = forked
-            .alloc_zeros::<i32>(max_b)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        #[allow(deprecated)]
-        let cu_q = forked
-            .memcpy_stod(&[0i32, 1i32])
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let cu_k = forked
-            .alloc_zeros::<i32>(2 * max_b)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let seq_k = forked
-            .alloc_zeros::<i32>(max_b)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let tok_buf = forked.alloc_zeros::<u32>(max_b)?;
+        let pos_buf = forked.alloc_zeros::<i32>(max_b)?;
+        let seq_k = forked.alloc_zeros::<i32>(max_b)?;
         let mut kv = Vec::with_capacity(cfg.num_hidden_layers);
         for _ in 0..cfg.num_hidden_layers {
-            let k = forked
-                .alloc_zeros::<bf16>(max_b * cap * n_kv * hd)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let v = forked
-                .alloc_zeros::<bf16>(max_b * cap * n_kv * hd)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let k = forked.alloc_zeros::<bf16>(max_b * cap * n_kv * hd)?;
+            let v = forked.alloc_zeros::<bf16>(max_b * cap * n_kv * hd)?;
             kv.push((k, v));
         }
-        let logits_buf = forked
-            .alloc_zeros::<f32>(max_b * cfg.vocab_size)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let logits_buf = forked.alloc_zeros::<f32>(max_b * cfg.vocab_size)?;
         let scratch = nv_layers::cuda_stream::with_stream(forked.clone(), || {
             BatchScratch::new(
                 cfg.num_experts_per_tok,
@@ -672,7 +546,7 @@ impl DsocrBatchDecodeGraph {
                 &device,
             )
         })?;
-        forked.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+        forked.synchronize()?;
         let runner = CudaGraphRunner::new(forked.clone());
         let idlog_host = cfg.num_hidden_layers * max_b * cfg.num_experts_per_tok;
         let idlog = match idlog_path() {
@@ -710,9 +584,6 @@ impl DsocrBatchDecodeGraph {
             host_tok: vec![0u32; max_b].into_boxed_slice(),
             pos_buf,
             host_pos: vec![0i32; max_b].into_boxed_slice(),
-            cu_q,
-            cu_k,
-            host_cu_k: vec![0i32; 2 * max_b].into_boxed_slice(),
             seq_k,
             host_seq_k: vec![0i32; max_b].into_boxed_slice(),
             kv,
@@ -793,7 +664,7 @@ impl DsocrBatchDecodeGraph {
         vision_features: Option<&Tensor>,
         max_len: usize,
     ) -> Result<(DeepseekOcrKvCache, Vec<f32>)> {
-        anyhow::ensure!(
+        ensure!(
             prompt_tokens.len() < max_len,
             "prefill_detached: prompt {} leaves no room (max {max_len})",
             prompt_tokens.len()
@@ -844,7 +715,7 @@ impl DsocrBatchDecodeGraph {
     }
 
     pub fn install_prefilled(&mut self, slot: usize, cache: &DeepseekOcrKvCache) -> Result<()> {
-        anyhow::ensure!(slot < self.max_b, "install_prefilled: slot out of range");
+        ensure!(slot < self.max_b, "install_prefilled: slot out of range");
         self.load_kv_into_slot_inner(slot, cache, false)?;
         self.state[slot] = SlotState::Active;
         Ok(())
@@ -857,13 +728,13 @@ impl DsocrBatchDecodeGraph {
         vision_features: Option<&Tensor>,
         max_len: usize,
     ) -> Result<Vec<f32>> {
-        anyhow::ensure!(slot < self.max_b, "prefill_slot: slot {slot} out of range");
-        anyhow::ensure!(
+        ensure!(slot < self.max_b, "prefill_slot: slot {slot} out of range");
+        ensure!(
             max_len <= self.cap,
             "prefill_slot: max_len {max_len} exceeds cap {}",
             self.cap
         );
-        anyhow::ensure!(
+        ensure!(
             prompt_tokens.len() < max_len,
             "prefill_slot: prompt {} leaves no room (max {max_len})",
             prompt_tokens.len()
@@ -890,7 +761,7 @@ impl DsocrBatchDecodeGraph {
         cache: &DeepseekOcrKvCache,
         sync_legacy: bool,
     ) -> Result<()> {
-        anyhow::ensure!(slot < self.max_b, "load_kv_into_slot: slot out of range");
+        ensure!(slot < self.max_b, "load_kv_into_slot: slot out of range");
         let (n_layers, n_kv, hd) = {
             let cfg = self.model.config();
             (
@@ -900,7 +771,7 @@ impl DsocrBatchDecodeGraph {
             )
         };
         let len = cache.current_len();
-        anyhow::ensure!(
+        ensure!(
             len <= self.cap,
             "prefill length {len} exceeds graph capacity {}",
             self.cap
@@ -923,9 +794,9 @@ impl DsocrBatchDecodeGraph {
                     continue;
                 }
                 let (st, l) = src_t.storage_and_layout();
-                anyhow::ensure!(l.is_contiguous(), "kv cache tensor not contiguous");
+                ensure!(l.is_contiguous(), "kv cache tensor not contiguous");
                 let cuda = match &*st {
-                    candle_core::Storage::Cuda(s) => s,
+                    Storage::Cuda(s) => s,
                     _ => anyhow::bail!("kv cache tensor not CUDA"),
                 };
                 let slice = cuda.as_cuda_slice::<bf16>()?;
@@ -945,17 +816,17 @@ impl DsocrBatchDecodeGraph {
 
     pub fn step_batch(&mut self, tokens: &[Option<u32>]) -> Result<usize> {
         let want = tokens.len();
-        anyhow::ensure!(want > 0, "step_batch: empty token slice");
+        ensure!(want > 0, "step_batch: empty token slice");
         let b = bucket_for(&self.buckets, want)
             .ok_or_else(|| anyhow::anyhow!("step_batch: no bucket covers {want} slots"))?;
-        anyhow::ensure!(
+        ensure!(
             b <= self.max_b,
             "step_batch: bucket {b} > max_b {}",
             self.max_b
         );
         for (j, t) in tokens.iter().enumerate() {
             if t.is_some() {
-                anyhow::ensure!(
+                ensure!(
                     self.lens[j] < self.cap,
                     "dsocr bs=N step overflows capacity {} on slot {j}",
                     self.cap
@@ -969,15 +840,11 @@ impl DsocrBatchDecodeGraph {
                 Some(t) => {
                     self.host_tok[j] = t;
                     self.host_pos[j] = self.lens[j] as i32;
-                    self.host_cu_k[2 * j] = 0;
-                    self.host_cu_k[2 * j + 1] = (self.lens[j] + 1) as i32;
                     self.host_seq_k[j] = (self.lens[j] + 1) as i32;
                 }
                 None => {
                     self.host_tok[j] = 0;
                     self.host_pos[j] = 0;
-                    self.host_cu_k[2 * j] = 0;
-                    self.host_cu_k[2 * j + 1] = 1;
                     self.host_seq_k[j] = 1;
                 }
             }
@@ -1003,9 +870,6 @@ impl DsocrBatchDecodeGraph {
             host_tok,
             pos_buf,
             host_pos,
-            cu_q,
-            cu_k,
-            host_cu_k,
             seq_k,
             host_seq_k,
             kv,
@@ -1032,8 +896,6 @@ impl DsocrBatchDecodeGraph {
                 .map_err(|e| anyhow::anyhow!("htod tok: {e:?}"))?;
             s.memcpy_htod(&host_pos[..b], pos_buf)
                 .map_err(|e| anyhow::anyhow!("htod pos: {e:?}"))?;
-            s.memcpy_htod(&host_cu_k[..2 * b], cu_k)
-                .map_err(|e| anyhow::anyhow!("htod cu_k: {e:?}"))?;
             s.memcpy_htod(&host_seq_k[..b], seq_k)
                 .map_err(|e| anyhow::anyhow!("htod seq_k: {e:?}"))?;
             let (tokens_t, pos_t) = if let Some(p) = prealloc.as_mut() {
@@ -1050,32 +912,20 @@ impl DsocrBatchDecodeGraph {
                 .map_err(|e| anyhow::anyhow!("tok dtod: {e:?}"))?;
                 (p.tok_t.narrow(0, 0, b)?, None)
             } else {
-                let tok_clone = tok_buf.try_clone().map_err(|e| anyhow::anyhow!(e))?;
-                let pos_clone = pos_buf.try_clone().map_err(|e| anyhow::anyhow!(e))?;
+                let tok_clone = tok_buf.try_clone()?;
+                let pos_clone = pos_buf.try_clone()?;
                 let tokens_t = {
                     let st = candle_core::CudaStorage::wrap_cuda_slice(tok_clone, dev.clone());
-                    Tensor::from_storage(
-                        candle_core::Storage::Cuda(st),
-                        (max_b,),
-                        candle_core::op::BackpropOp::none(),
-                        false,
-                    )
-                    .narrow(0, 0, b)?
+                    Tensor::from_storage(Storage::Cuda(st), (max_b,), BackpropOp::none(), false)
+                        .narrow(0, 0, b)?
                 };
                 let pos_t = {
                     let st = candle_core::CudaStorage::wrap_cuda_slice(pos_clone, dev.clone());
-                    Tensor::from_storage(
-                        candle_core::Storage::Cuda(st),
-                        (max_b,),
-                        candle_core::op::BackpropOp::none(),
-                        false,
-                    )
-                    .narrow(0, 0, b)?
+                    Tensor::from_storage(Storage::Cuda(st), (max_b,), BackpropOp::none(), false)
+                        .narrow(0, 0, b)?
                 };
                 (tokens_t, Some(pos_t))
             };
-            let (cu_q_ptr, _gq) = cu_q.device_ptr(s);
-            let (cu_k_ptr, _gk) = cu_k.device_ptr(s);
             let (pos_ptr, _gp) = pos_buf.device_ptr(s);
 
             let mut x =
@@ -1128,60 +978,33 @@ impl DsocrBatchDecodeGraph {
                                 hd as i32,
                             )
                         };
-                        anyhow::ensure!(rc == 0, "kv append rc={rc} layer {li} slot {j}");
+                        ensure!(rc == 0, "kv append rc={rc} layer {li} slot {j}");
                     }
                 }
                 {
                     let o_base = tensor_ptr_bf16(&scratch.attn_o, s, max_b * n_heads * hd)?;
                     let (lse_base, _g3) = scratch.attn_lse.device_ptr(s);
-                    if attn_batched() {
-                        let (seq_ptr, _g4) = seq_k.device_ptr(s);
-                        unsafe {
-                            batch_decode_fwd_bf16(
-                                s.cu_stream() as *mut c_void,
-                                &BatchDecodeArgs {
-                                    q_ptr: q_src,
-                                    k_ptr: k_base,
-                                    v_ptr: v_base,
-                                    o_ptr: o_base,
-                                    lse_ptr: lse_base,
-                                    seqused_k: seq_ptr,
-                                    b,
-                                    q_batch_stride: n_heads * hd,
-                                    kv_batch_stride: per_slot_kv,
-                                    max_seqlen_k: cap,
-                                    h: n_heads,
-                                    h_k: n_kv,
-                                    d: hd,
-                                    softmax_scale: scale,
-                                },
-                            )?;
-                        }
-                    } else {
-                        for j in 0..b {
-                            unsafe {
-                                varlen_fwd_bf16(
-                                    s.cu_stream() as *mut c_void,
-                                    &VarlenArgs {
-                                        q_ptr: off(q_src, j * n_heads * hd, 2),
-                                        k_ptr: off(k_base, j * per_slot_kv, 2),
-                                        v_ptr: off(v_base, j * per_slot_kv, 2),
-                                        o_ptr: off(o_base, j * n_heads * hd, 2),
-                                        lse_ptr: off(lse_base, j * n_heads, 4),
-                                        cu_seqlens_q: cu_q_ptr,
-                                        cu_seqlens_k: off(cu_k_ptr, 2 * j, 4),
-                                        max_seqlen_q: 1,
-                                        max_seqlen_k: cap,
-                                        h: n_heads,
-                                        h_k: n_kv,
-                                        d: hd,
-                                        softmax_scale: scale,
-                                        window_size_left: None,
-                                        window_size_right: Some(0),
-                                    },
-                                )?;
-                            }
-                        }
+                    let (seq_ptr, _g4) = seq_k.device_ptr(s);
+                    unsafe {
+                        batch_decode_fwd_bf16(
+                            s.cu_stream() as *mut c_void,
+                            &BatchDecodeArgs {
+                                q_ptr: q_src,
+                                k_ptr: k_base,
+                                v_ptr: v_base,
+                                o_ptr: o_base,
+                                lse_ptr: lse_base,
+                                seqused_k: seq_ptr,
+                                b,
+                                q_batch_stride: n_heads * hd,
+                                kv_batch_stride: per_slot_kv,
+                                max_seqlen_k: cap,
+                                h: n_heads,
+                                h_k: n_kv,
+                                d: hd,
+                                softmax_scale: scale,
+                            },
+                        )?;
                     }
                 }
                 let o2 = scratch.attn_o.narrow(0, 0, b)?.reshape((b, n_heads * hd))?;
@@ -1229,7 +1052,7 @@ impl DsocrBatchDecodeGraph {
                     (b * vocab) as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "logits cast rc={rc}");
+            ensure!(rc == 0, "logits cast rc={rc}");
             Ok(())
         };
 
@@ -1334,7 +1157,7 @@ impl DsocrBatchDecodeGraph {
     }
 
     pub fn logits_batch(&mut self, b: usize) -> Result<Vec<f32>> {
-        anyhow::ensure!(b > 0 && b <= self.max_b, "logits_batch: bad b={b}");
+        ensure!(b > 0 && b <= self.max_b, "logits_batch: bad b={b}");
         let vocab = self.model.config().vocab_size;
         let mut out = vec![0f32; b * vocab];
         let view = self.logits_buf.slice(0..b * vocab);

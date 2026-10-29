@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -799,27 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn noop_sink_swallows_events() {
-        let sink = NoopSink;
-        sink.emit(InspectorEvent::PacerPlayedMs {
-            session_id: "s".into(),
-            played_ms: 100,
-        });
-    }
-
-    #[test]
-    fn vec_sink_records_events() {
-        let sink = VecSink(Mutex::new(Vec::new()));
-        sink.emit(InspectorEvent::BargeinFired {
-            session_id: "s".into(),
-            played_ms: 250,
-        });
-        let v = sink.0.lock().unwrap();
-        assert_eq!(v.len(), 1);
-    }
-
-    #[test]
-    fn fanout_dispatches_to_all_legs() {
+    fn sinks_record_swallow_and_fan_out_events() {
         let a = Arc::new(VecSink(Mutex::new(Vec::new())));
         let b = Arc::new(VecSink(Mutex::new(Vec::new())));
         let fan = FanoutSink::new(vec![a.clone(), b.clone()]);
@@ -829,10 +808,26 @@ mod tests {
         });
         assert_eq!(a.0.lock().unwrap().len(), 1);
         assert_eq!(b.0.lock().unwrap().len(), 1);
+        {
+            let sink = NoopSink;
+            sink.emit(InspectorEvent::PacerPlayedMs {
+                session_id: "s".into(),
+                played_ms: 100,
+            });
+        }
+        {
+            let sink = VecSink(Mutex::new(Vec::new()));
+            sink.emit(InspectorEvent::BargeinFired {
+                session_id: "s".into(),
+                played_ms: 250,
+            });
+            let v = sink.0.lock().unwrap();
+            assert_eq!(v.len(), 1);
+        }
     }
 
     #[test]
-    fn to_wire_vad_confirmed_start() {
+    fn to_wire_maps_every_event_to_its_lane_kind_and_payload() {
         let ev = InspectorEvent::VadConfirmedStart {
             session_id: "s".into(),
             item_id: "item_a".into(),
@@ -846,133 +841,119 @@ mod tests {
             w.payload.get("audio_start_ms"),
             Some(&serde_json::json!(100))
         );
-    }
-
-    #[test]
-    fn to_wire_eou_scored_full_envelope() {
-        let ev = InspectorEvent::EouScored {
-            session_id: "s".into(),
-            kind: "vad",
-            score: 0.8,
-            eager_score: Some(0.9),
-            threshold: 0.5,
-            language: Some("en".into()),
-            input_chars: Some(42),
-            input_audio_ms: Some(2000),
-            delay_ms: 500,
-            elapsed_ms: 12,
-            cancelled_by: "none",
-            hard_cap_fired: false,
-        };
-        let w = ev.to_wire();
-        assert_eq!(w.lane, "eou");
-        assert_eq!(w.kind, "scored");
-        assert_eq!(w.payload.get("delay_ms"), Some(&serde_json::json!(500)));
-        assert_eq!(w.payload.get("threshold"), Some(&serde_json::json!(0.5)));
-    }
-
-    #[test]
-    fn to_wire_invariant_violation_uses_error_lane() {
-        let ev = InspectorEvent::InvariantViolation {
-            session_id: "s".into(),
-            violation: "I1".into(),
-        };
-        let w = ev.to_wire();
-        assert_eq!(w.lane, "error");
-        assert_eq!(w.kind, "invariant_violation");
-        assert_eq!(w.payload.get("violation"), Some(&serde_json::json!("I1")));
-    }
-
-    #[test]
-    fn to_wire_outbound_queue_exceeded_uses_wire_err() {
-        let ev = InspectorEvent::OutboundQueueExceeded {
-            session_id: "s".into(),
-            response_id: "r".into(),
-            queued_ms: 7000,
-            cap_ms: 5000,
-        };
-        let w = ev.to_wire();
-        assert_eq!(w.lane, "wire");
-        assert_eq!(w.kind, "err");
-        assert_eq!(w.corr.response_id.as_deref(), Some("r"));
-    }
-
-    #[test]
-    fn to_wire_eou_eager_dispatch_is_eou_lane_with_score_and_threshold() {
-        let ev = InspectorEvent::EouEagerDispatch {
-            session_id: "s".into(),
-            response_id: "resp_eager".into(),
-            item_id: "item_e".into(),
-            score: 0.5,
-            threshold: 0.5,
-            epoch: 4,
-        };
-        let w = ev.to_wire();
-        assert_eq!(w.lane, "eou");
-        assert_eq!(w.kind, "eager_dispatch");
-        assert_eq!(w.corr.response_id.as_deref(), Some("resp_eager"));
-        assert_eq!(w.corr.item_id.as_deref(), Some("item_e"));
-        let score = w
-            .payload
-            .get("score")
-            .and_then(|v| v.as_f64())
-            .expect("score f64");
-        assert!((score - 0.5_f64).abs() < 1e-5);
-        let thr = w
-            .payload
-            .get("threshold")
-            .and_then(|v| v.as_f64())
-            .expect("threshold f64");
-        assert!((thr - 0.5_f64).abs() < 1e-5);
-        assert_eq!(w.payload.get("epoch"), Some(&serde_json::json!(4)));
-    }
-
-    #[test]
-    fn to_wire_eou_predicted_overflow_includes_dropped_count() {
-        let ev = InspectorEvent::EouPredictedOverflow {
-            session_id: "s".into(),
-            response_id: "resp_o".into(),
-            dropped_tokens: 7,
-        };
-        let w = ev.to_wire();
-        assert_eq!(w.lane, "response");
-        assert_eq!(w.kind, "predicted_overflow");
-        assert_eq!(w.payload.get("dropped_tokens"), Some(&serde_json::json!(7)));
-    }
-
-    #[test]
-    fn to_wire_eou_predicted_rollback_includes_reason() {
-        let ev = InspectorEvent::EouPredictedRollback {
-            session_id: "s".into(),
-            response_id: "resp_r".into(),
-            reason: "speech_resumed",
-            llm_chars_thrown: 12,
-        };
-        let w = ev.to_wire();
-        assert_eq!(w.lane, "response");
-        assert_eq!(w.kind, "predicted_rollback");
-        assert_eq!(
-            w.payload.get("reason"),
-            Some(&serde_json::json!("speech_resumed"))
-        );
-        assert_eq!(
-            w.payload.get("llm_chars_thrown"),
-            Some(&serde_json::json!(12))
-        );
-    }
-
-    #[test]
-    fn to_wire_partial_transcription_uses_stt_partial() {
-        let ev = InspectorEvent::PartialTranscription {
-            session_id: "s".into(),
-            item_id: "item_x".into(),
-            transcript: "hello".into(),
-            ms: 500,
-        };
-        let w = ev.to_wire();
-        assert_eq!(w.lane, "stt");
-        assert_eq!(w.kind, "partial");
-        assert_eq!(w.payload.get("text"), Some(&serde_json::json!("hello")));
+        {
+            let ev = InspectorEvent::EouScored {
+                session_id: "s".into(),
+                kind: "vad",
+                score: 0.8,
+                eager_score: Some(0.9),
+                threshold: 0.5,
+                language: Some("en".into()),
+                input_chars: Some(42),
+                input_audio_ms: Some(2000),
+                delay_ms: 500,
+                elapsed_ms: 12,
+                cancelled_by: "none",
+                hard_cap_fired: false,
+            };
+            let w = ev.to_wire();
+            assert_eq!(w.lane, "eou");
+            assert_eq!(w.kind, "scored");
+            assert_eq!(w.payload.get("delay_ms"), Some(&serde_json::json!(500)));
+            assert_eq!(w.payload.get("threshold"), Some(&serde_json::json!(0.5)));
+        }
+        {
+            let ev = InspectorEvent::InvariantViolation {
+                session_id: "s".into(),
+                violation: "I1".into(),
+            };
+            let w = ev.to_wire();
+            assert_eq!(w.lane, "error");
+            assert_eq!(w.kind, "invariant_violation");
+            assert_eq!(w.payload.get("violation"), Some(&serde_json::json!("I1")));
+        }
+        {
+            let ev = InspectorEvent::OutboundQueueExceeded {
+                session_id: "s".into(),
+                response_id: "r".into(),
+                queued_ms: 7000,
+                cap_ms: 5000,
+            };
+            let w = ev.to_wire();
+            assert_eq!(w.lane, "wire");
+            assert_eq!(w.kind, "err");
+            assert_eq!(w.corr.response_id.as_deref(), Some("r"));
+        }
+        {
+            let ev = InspectorEvent::EouEagerDispatch {
+                session_id: "s".into(),
+                response_id: "resp_eager".into(),
+                item_id: "item_e".into(),
+                score: 0.5,
+                threshold: 0.5,
+                epoch: 4,
+            };
+            let w = ev.to_wire();
+            assert_eq!(w.lane, "eou");
+            assert_eq!(w.kind, "eager_dispatch");
+            assert_eq!(w.corr.response_id.as_deref(), Some("resp_eager"));
+            assert_eq!(w.corr.item_id.as_deref(), Some("item_e"));
+            let score = w
+                .payload
+                .get("score")
+                .and_then(|v| v.as_f64())
+                .expect("score f64");
+            assert!((score - 0.5_f64).abs() < 1e-5);
+            let thr = w
+                .payload
+                .get("threshold")
+                .and_then(|v| v.as_f64())
+                .expect("threshold f64");
+            assert!((thr - 0.5_f64).abs() < 1e-5);
+            assert_eq!(w.payload.get("epoch"), Some(&serde_json::json!(4)));
+        }
+        {
+            let ev = InspectorEvent::EouPredictedOverflow {
+                session_id: "s".into(),
+                response_id: "resp_o".into(),
+                dropped_tokens: 7,
+            };
+            let w = ev.to_wire();
+            assert_eq!(w.lane, "response");
+            assert_eq!(w.kind, "predicted_overflow");
+            assert_eq!(w.payload.get("dropped_tokens"), Some(&serde_json::json!(7)));
+        }
+        {
+            let ev = InspectorEvent::EouPredictedRollback {
+                session_id: "s".into(),
+                response_id: "resp_r".into(),
+                reason: "speech_resumed",
+                llm_chars_thrown: 12,
+            };
+            let w = ev.to_wire();
+            assert_eq!(w.lane, "response");
+            assert_eq!(w.kind, "predicted_rollback");
+            assert_eq!(
+                w.payload.get("reason"),
+                Some(&serde_json::json!("speech_resumed"))
+            );
+            assert_eq!(
+                w.payload.get("llm_chars_thrown"),
+                Some(&serde_json::json!(12))
+            );
+        }
+        {
+            let ev = InspectorEvent::PartialTranscription {
+                session_id: "s".into(),
+                item_id: "item_x".into(),
+                transcript: "hello".into(),
+                ms: 500,
+            };
+            let w = ev.to_wire();
+            assert_eq!(w.lane, "stt");
+            assert_eq!(w.kind, "partial");
+            assert_eq!(w.payload.get("text"), Some(&serde_json::json!("hello")));
+        }
     }
 
     #[test]

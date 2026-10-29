@@ -350,19 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn the_daily_file_name_is_correct_civil_date_math() {
-        assert_eq!(
-            daily_file_name_so_tmpfiles_age_rules_can_prune_old_days(0),
-            "trajectories-19700101.jsonl"
-        );
-        assert_eq!(
-            daily_file_name_so_tmpfiles_age_rules_can_prune_old_days(1_772_064_000),
-            "trajectories-20260226.jsonl"
-        );
-    }
-
-    #[test]
-    fn appended_lines_parse_back_and_carry_prompt_completion_keys_train_runner_reads() {
+    fn appended_lines_land_in_a_correctly_named_daily_file_and_parse_back() {
         let dir = std::env::temp_dir().join(format!("traj-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         append_to(&dir, &record("a\nb")).unwrap();
@@ -385,10 +373,20 @@ mod tests {
             assert_eq!(parsed.label.as_deref(), Some("good"));
         }
         let _ = std::fs::remove_dir_all(&dir);
+        {
+            assert_eq!(
+                daily_file_name_so_tmpfiles_age_rules_can_prune_old_days(0),
+                "trajectories-19700101.jsonl"
+            );
+            assert_eq!(
+                daily_file_name_so_tmpfiles_age_rules_can_prune_old_days(1_772_064_000),
+                "trajectories-20260226.jsonl"
+            );
+        }
     }
 
     #[test]
-    fn label_requests_reject_empty_oversized_and_control_input() {
+    fn label_requests_headers_and_responses_keep_their_wire_contract() {
         assert!(validate_label_request(Some("chatcmpl-x"), None, "good").is_ok());
         assert!(validate_label_request(None, Some("tag-1"), "good").is_ok());
         assert!(validate_label_request(None, None, "good").is_err());
@@ -396,10 +394,33 @@ mod tests {
         assert!(validate_label_request(Some("chatcmpl-x"), None, "  ").is_err());
         assert!(validate_label_request(Some("chatcmpl-x"), None, &"g".repeat(65)).is_err());
         assert!(validate_label_request(Some("chatcmpl-x"), None, "bad\nrow").is_err());
+        {
+            let mut h = axum::http::HeaderMap::new();
+            assert_eq!(label_from_headers(&h), None);
+            h.insert(LABEL_HEADER, " good ".parse().unwrap());
+            assert_eq!(label_from_headers(&h).as_deref(), Some("good"));
+            h.insert(LABEL_HEADER, "  ".parse().unwrap());
+            assert_eq!(label_from_headers(&h), None);
+        }
+        {
+            let v = serde_json::to_value(LabelHttpResponse {
+                id: None,
+                tag: Some("tag-1".into()),
+                label: "good".into(),
+                recorded: true,
+                matched: false,
+            })
+            .unwrap();
+            assert!(v.get("id").is_some_and(|x| x.is_null()));
+            assert_eq!(v["tag"].as_str(), Some("tag-1"));
+            assert_eq!(v["label"].as_str(), Some("good"));
+            assert_eq!(v["recorded"].as_bool(), Some(true));
+            assert_eq!(v["matched"].as_bool(), Some(false));
+        }
     }
 
     #[test]
-    fn label_records_land_in_a_daily_labels_file_and_parse_back() {
+    fn label_records_land_in_a_daily_file_and_the_matched_scan_joins_only_real_fields() {
         let dir = std::env::temp_dir().join(format!("traj-label-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let rec = LabelRecord {
@@ -416,78 +437,50 @@ mod tests {
         assert_eq!(parsed.label, "good");
         assert_eq!(daily_label_file_name(1), "labels-19700101.jsonl");
         let _ = std::fs::remove_dir_all(&dir);
+        {
+            let dir = std::env::temp_dir().join(format!("traj-match-test-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                !label_target_exists_in_retained_trajectories(&dir, None, Some("tag-1")),
+                "a missing dir means no retained record can match"
+            );
+            let mut rec = record("hello");
+            rec.prompt = "user mentioned tag-2 in conversation".into();
+            append_to(&dir, &rec).unwrap();
+            assert!(label_target_exists_in_retained_trajectories(
+                &dir,
+                None,
+                Some("tag-1")
+            ));
+            assert!(label_target_exists_in_retained_trajectories(
+                &dir,
+                Some("chatcmpl-x"),
+                None
+            ));
+            assert!(label_target_exists_in_retained_trajectories(
+                &dir,
+                Some("chatcmpl-x"),
+                Some("tag-unknown")
+            ));
+            assert!(
+                !label_target_exists_in_retained_trajectories(&dir, None, Some("tag-2")),
+                "a tag appearing only inside prompt text is not a join"
+            );
+            assert!(!label_target_exists_in_retained_trajectories(
+                &dir,
+                Some("chatcmpl-nope"),
+                Some("tag-nope")
+            ));
+            assert!(!label_target_exists_in_retained_trajectories(
+                &dir, None, None
+            ));
+            assert!(!label_target_exists_in_retained_trajectories(
+                &dir,
+                Some("  "),
+                Some("")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
-    #[test]
-    fn label_matched_scan_finds_only_real_tag_or_id_fields_in_retained_files() {
-        let dir = std::env::temp_dir().join(format!("traj-match-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(
-            !label_target_exists_in_retained_trajectories(&dir, None, Some("tag-1")),
-            "a missing dir means no retained record can match"
-        );
-        let mut rec = record("hello");
-        rec.prompt = "user mentioned tag-2 in conversation".into();
-        append_to(&dir, &rec).unwrap();
-        assert!(label_target_exists_in_retained_trajectories(
-            &dir,
-            None,
-            Some("tag-1")
-        ));
-        assert!(label_target_exists_in_retained_trajectories(
-            &dir,
-            Some("chatcmpl-x"),
-            None
-        ));
-        assert!(label_target_exists_in_retained_trajectories(
-            &dir,
-            Some("chatcmpl-x"),
-            Some("tag-unknown")
-        ));
-        assert!(
-            !label_target_exists_in_retained_trajectories(&dir, None, Some("tag-2")),
-            "a tag appearing only inside prompt text is not a join"
-        );
-        assert!(!label_target_exists_in_retained_trajectories(
-            &dir,
-            Some("chatcmpl-nope"),
-            Some("tag-nope")
-        ));
-        assert!(!label_target_exists_in_retained_trajectories(
-            &dir, None, None
-        ));
-        assert!(!label_target_exists_in_retained_trajectories(
-            &dir,
-            Some("  "),
-            Some("")
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn label_response_keeps_the_pre_named_wire_shape_with_null_id_and_tag_keys() {
-        let v = serde_json::to_value(LabelHttpResponse {
-            id: None,
-            tag: Some("tag-1".into()),
-            label: "good".into(),
-            recorded: true,
-            matched: false,
-        })
-        .unwrap();
-        assert!(v.get("id").is_some_and(|x| x.is_null()));
-        assert_eq!(v["tag"].as_str(), Some("tag-1"));
-        assert_eq!(v["label"].as_str(), Some("good"));
-        assert_eq!(v["recorded"].as_bool(), Some(true));
-        assert_eq!(v["matched"].as_bool(), Some(false));
-    }
-
-    #[test]
-    fn label_header_is_trimmed_and_empty_means_none() {
-        let mut h = axum::http::HeaderMap::new();
-        assert_eq!(label_from_headers(&h), None);
-        h.insert(LABEL_HEADER, " good ".parse().unwrap());
-        assert_eq!(label_from_headers(&h).as_deref(), Some("good"));
-        h.insert(LABEL_HEADER, "  ".parse().unwrap());
-        assert_eq!(label_from_headers(&h), None);
-    }
 }

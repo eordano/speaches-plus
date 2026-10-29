@@ -21,7 +21,6 @@ export class AudioPlayer {
     return this.actx;
   }
 
-  // Lane -> which channel(s) we want during replay.
   preferredChannels(anchor) {
     const prefer = { mic: true, tts: true };
     if (anchor && anchor.lane) {
@@ -89,7 +88,6 @@ export class AudioPlayer {
     this.updateIndicator(null);
   }
 
-  // Restart audio sources at a new playhead (called when scrubbing settles).
   reseekAudio() {
     const ph = this.store.state.playback.playheadMs;
     if (ph == null) return;
@@ -104,7 +102,6 @@ export class AudioPlayer {
     if (g) g.gain.value = on ? 1 : 0;
   }
 
-  // ── internals ──────────────────────────────────────────────────────────
   async scheduleAudio(fromMs, toMs, anchor) {
     this.stopAudio();
     const sid = this.store.state.sessionId;

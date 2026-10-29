@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -304,40 +303,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat_template_single_user_partial() {
+    fn chat_template_renders_turns_partials_and_default_roles() {
         let got = format_qwen_chat(&[], "hello world");
         let want = "<|im_start|>user\nhello world";
         assert_eq!(got, want);
-    }
-
-    #[test]
-    fn chat_template_prior_turns_then_partial() {
-        let turns = vec![
-            Turn::user("what's the weather"),
-            Turn::assistant("it's sunny"),
-        ];
-        let got = format_qwen_chat(&turns, "and humid");
-        let expected = "<|im_start|>user\nwhat's the weather<|im_end|>\n\
-                        <|im_start|>assistant\nit's sunny<|im_end|>\n\
-                        <|im_start|>user\nand humid";
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn chat_template_empty_partial_ends_with_im_end_newline() {
-        let turns = vec![Turn::user("hi")];
-        let got = format_qwen_chat(&turns, "");
-        assert!(got.ends_with("<|im_end|>\n"), "{got}");
-    }
-
-    #[test]
-    fn chat_template_defaults_role_to_user() {
-        let t = Turn {
-            role: String::new(),
-            content: "no role".into(),
-        };
-        let got = format_qwen_chat(std::slice::from_ref(&t), "");
-        assert!(got.contains("<|im_start|>user\nno role"), "{got}");
+        {
+            let turns = vec![
+                Turn::user("what's the weather"),
+                Turn::assistant("it's sunny"),
+            ];
+            let got = format_qwen_chat(&turns, "and humid");
+            let expected = "<|im_start|>user\nwhat's the weather<|im_end|>\n\
+                            <|im_start|>assistant\nit's sunny<|im_end|>\n\
+                            <|im_start|>user\nand humid";
+            assert_eq!(got, expected);
+        }
+        {
+            let turns = vec![Turn::user("hi")];
+            let got = format_qwen_chat(&turns, "");
+            assert!(got.ends_with("<|im_end|>\n"), "{got}");
+        }
+        {
+            let t = Turn {
+                role: String::new(),
+                content: "no role".into(),
+            };
+            let got = format_qwen_chat(std::slice::from_ref(&t), "");
+            assert!(got.contains("<|im_start|>user\nno role"), "{got}");
+        }
     }
 
     #[test]
@@ -355,105 +348,78 @@ mod tests {
     }
 
     #[test]
-    fn byte_map_round_trip_all_bytes() {
+    fn byte_map_round_trips_all_bytes_and_bpe_strings() {
         let table = byte_map::byte_to_char_table();
         for b in 0u32..256 {
             let ch = table[b as usize];
             let back = byte_map::char_to_byte(ch);
             assert_eq!(back, Some(b as u8), "byte {} ch {:?}", b, ch);
         }
-    }
-
-    #[test]
-    fn byte_map_bpe_chars_round_trip() {
-        for s in ["hello world", "line\nbreak", "\t\rweird", "\x00\x01\x02"] {
-            let chars = byte_map::bytes_to_bpe_chars(s);
-            let back = byte_map::bpe_chars_to_bytes(&chars);
-            assert_eq!(back, s, "round-trip {s:?}");
+        {
+            for s in ["hello world", "line\nbreak", "\t\rweird", "\x00\x01\x02"] {
+                let chars = byte_map::bytes_to_bpe_chars(s);
+                let back = byte_map::bpe_chars_to_bytes(&chars);
+                assert_eq!(back, s, "round-trip {s:?}");
+            }
         }
     }
 
     #[test]
-    fn tokenizer_loads_mock_and_finds_im_end() {
+    fn tokenizer_loads_mock_encodes_specials_atomically_round_trips_and_rejects_unsupported_models() {
         let raw = build_mock_tokenizer_json();
         let tok = Tokenizer::load_from_json(&raw).expect("load tokenizer");
         assert!(tok.im_end_id() >= 0, "im_end_id detected");
         assert!(tok.has_im_tokens());
+        {
+            let raw = build_mock_tokenizer_json();
+            let tok = Tokenizer::load_from_json(&raw).expect("load");
+            let s = format!(
+                "{}user\nhello{}",
+                defaults::eou::IM_START,
+                defaults::eou::IM_END
+            );
+            let ids = tok.encode(&s);
+            assert!(
+                ids.iter().any(|id| *id == tok.im_start_id()),
+                "im_start present: {ids:?}"
+            );
+            assert!(
+                ids.iter().any(|id| *id == tok.im_end_id()),
+                "im_end present: {ids:?}"
+            );
+        }
+        {
+            let raw = build_mock_tokenizer_json();
+            let tok = Tokenizer::load_from_json(&raw).expect("load");
+            let text = " hello world";
+            let ids = tok.encode(text);
+            let got = tok.decode(&ids);
+            assert_eq!(got, text);
+        }
+        {
+            let raw = build_mock_tokenizer_json();
+            let tok = Tokenizer::load_from_json(&raw).expect("load");
+            assert!(tok.encode("").is_empty());
+        }
+        {
+            let bad = serde_json::json!({"model": {"type": "WordPiece"}}).to_string();
+            let r = Tokenizer::load_from_json(&bad);
+            assert!(r.is_err(), "unsupported model type must error");
+        }
     }
 
     #[test]
-    fn tokenizer_encodes_special_tokens_atomically() {
-        let raw = build_mock_tokenizer_json();
-        let tok = Tokenizer::load_from_json(&raw).expect("load");
-        let s = format!(
-            "{}user\nhello{}",
-            defaults::eou::IM_START,
-            defaults::eou::IM_END
-        );
-        let ids = tok.encode(&s);
-        assert!(
-            ids.iter().any(|id| *id == tok.im_start_id()),
-            "im_start present: {ids:?}"
-        );
-        assert!(
-            ids.iter().any(|id| *id == tok.im_end_id()),
-            "im_end present: {ids:?}"
-        );
-    }
-
-    #[test]
-    fn tokenizer_encode_decode_round_trip() {
-        let raw = build_mock_tokenizer_json();
-        let tok = Tokenizer::load_from_json(&raw).expect("load");
-        let text = " hello world";
-        let ids = tok.encode(text);
-        let got = tok.decode(&ids);
-        assert_eq!(got, text);
-    }
-
-    #[test]
-    fn tokenizer_empty_returns_empty() {
-        let raw = build_mock_tokenizer_json();
-        let tok = Tokenizer::load_from_json(&raw).expect("load");
-        assert!(tok.encode("").is_empty());
-    }
-
-    #[test]
-    fn tokenizer_unsupported_model_errors() {
-        let bad = serde_json::json!({"model": {"type": "WordPiece"}}).to_string();
-        let r = Tokenizer::load_from_json(&bad);
-        assert!(r.is_err(), "unsupported model type must error");
-    }
-
-    #[test]
-    fn extract_im_end_prob_normalizes_via_softmax() {
+    fn extract_im_end_prob_normalizes_via_softmax_and_rejects_oob_ids() {
         let vocab: usize = 5;
         let mut logits = vec![0.0f32; vocab * 2];
         logits[vocab + 3] = 100.0;
         let p = extract_im_end_prob(&logits, &[1, 2, vocab as i64], 3).expect("ok");
         assert!(p > 0.99, "expected near-1, got {p}");
-    }
-
-    #[test]
-    fn extract_im_end_prob_rejects_oob_id() {
-        let logits = vec![0.0f32; 5];
-        let r = extract_im_end_prob(&logits, &[1, 1, 5], 9);
-        assert!(r.is_err());
-    }
-
-    #[test]
-    fn text_eou_model_load_skips_loud_when_artifacts_missing() {
-        let model_path = std::path::PathBuf::from("/nonexistent/eou-model.onnx");
-        let tok_path = std::path::PathBuf::from("/nonexistent/tokenizer.json");
-        if !model_path.exists() || !tok_path.exists() {
-            eprintln!(
-                "[skip] text_eou_model_load: model files not present ({} / {})",
-                model_path.display(),
-                tok_path.display()
-            );
-            return;
+        {
+            let logits = vec![0.0f32; 5];
+            let r = extract_im_end_prob(&logits, &[1, 1, 5], 9);
+            assert!(r.is_err());
         }
-        let _ = TextEouModel::load(&model_path, &tok_path).expect("load");
     }
 
     #[test]

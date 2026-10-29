@@ -88,10 +88,6 @@ if [ "${BA_RING_ARM:-0}" = "1" ]; then
   run_arm nospec-batched-noring NV_NO_SPEC=1 NV_BATCH_ENGINE=1 NV_KV_RING=0
 fi
 
-if [ "${BA_RINGFP8_ARM:-0}" = "1" ]; then
-  run_arm nospec-batched-ringfp8 NV_NO_SPEC=1 NV_BATCH_ENGINE=1 NV_PAGED_ATTN_FP8_RING=1
-fi
-
 echo
 echo "=== RESULTS ($LOGDIR/RESULTS.txt) ==="
 cat "$LOGDIR/RESULTS.txt"

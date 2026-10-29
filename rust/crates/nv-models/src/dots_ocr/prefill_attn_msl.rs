@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use nv_kernels::wgpu_backend::{na, WgpuContext};
+use na::{storage_entry, uniform_entry};
 
 use super::vision_attn_msl;
 
@@ -32,32 +33,6 @@ fn causal_source() -> String {
     );
     base.replace(causal_from, "constant bool do_causal = true;")
         .replace(&entry_from, &format!("host_name(\"{CAUSAL_ENTRY}\")"))
-}
-
-fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
 }
 
 pub struct CausalSteelPipelines {

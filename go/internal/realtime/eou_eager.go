@@ -238,8 +238,6 @@ func (p *sessionPipeline) runEagerStreaming(r *eagerRunner, transcribeStart time
 	if !llmDone {
 		<-r.finished
 		r.mu.Lock()
-		llmDone = r.llmDone
-
 		for _, c := range r.buffered[len(buffered):] {
 			r.mu.Unlock()
 			for _, chunk := range chunks.feed(c) {

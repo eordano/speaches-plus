@@ -258,8 +258,7 @@ fn rowquant_normed_mk_gemv(
                 let (qp, _gq) = wq.device_ptr(&stream);
                 let prenorm = !force_h
                     && m <= PRENORM_SPLIT_WINS_ONLY_UP_TO_M
-                    && hidden >= PRENORM_SPLIT_WINS_ONLY_FROM_HIDDEN
-                    && std::env::var("NV_LMI8_PRENORM").ok().as_deref() != Some("0");
+                    && hidden >= PRENORM_SPLIT_WINS_ONLY_FROM_HIDDEN;
                 let rc = unsafe {
                     if prenorm {
                         let mut xn_dev: CudaSlice<bf16> = stream

@@ -134,14 +134,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_logits_returns_empty() {
-        let labels = vec!["O".to_string(), "B-PER".to_string()];
-        let result = viterbi_decode(&[], 0, 2, &labels);
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn single_step_picks_best_valid() {
+    fn viterbi_picks_the_best_valid_path_under_the_bioes_constraints() {
         let labels: Vec<String> = vec!["O", "B-PER", "I-PER", "E-PER", "S-PER"]
             .into_iter()
             .map(String::from)
@@ -150,33 +143,34 @@ mod tests {
         logits[4] = 10.0;
         let result = viterbi_decode(&logits, 1, 5, &labels);
         assert_eq!(result, vec![4]);
-    }
-
-    #[test]
-    fn ie_cannot_start() {
-        let labels: Vec<String> = vec!["O", "B-PER", "I-PER", "E-PER", "S-PER"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let mut logits = vec![0.0_f32; 5];
-        logits[2] = 100.0;
-        let result = viterbi_decode(&logits, 1, 5, &labels);
-        assert_ne!(result[0], 2);
-        assert_ne!(result[0], 3);
-    }
-
-    #[test]
-    fn b_must_be_followed_by_i_or_e_of_same_class() {
-        let labels: Vec<String> = vec!["O", "B-PER", "I-PER", "E-PER", "S-LOC"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let mut logits = vec![0.0_f32; 10];
-        logits[1] = 10.0;
-        logits[5 + 3] = 10.0;
-        let result = viterbi_decode(&logits, 2, 5, &labels);
-        assert_eq!(result[0], 1);
-        assert!(result[1] == 2 || result[1] == 3);
+        {
+            let labels = vec!["O".to_string(), "B-PER".to_string()];
+            let result = viterbi_decode(&[], 0, 2, &labels);
+            assert!(result.is_empty());
+        }
+        {
+            let labels: Vec<String> = vec!["O", "B-PER", "I-PER", "E-PER", "S-PER"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let mut logits = vec![0.0_f32; 5];
+            logits[2] = 100.0;
+            let result = viterbi_decode(&logits, 1, 5, &labels);
+            assert_ne!(result[0], 2);
+            assert_ne!(result[0], 3);
+        }
+        {
+            let labels: Vec<String> = vec!["O", "B-PER", "I-PER", "E-PER", "S-LOC"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let mut logits = vec![0.0_f32; 10];
+            logits[1] = 10.0;
+            logits[5 + 3] = 10.0;
+            let result = viterbi_decode(&logits, 2, 5, &labels);
+            assert_eq!(result[0], 1);
+            assert!(result[1] == 2 || result[1] == 3);
+        }
     }
 
     #[test]

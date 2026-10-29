@@ -73,6 +73,7 @@ __device__ __forceinline__ int rgq_swizzled_scale_dst(int m, int kb, int k_block
 
 }
 
+template <int ITEMS_PER_LANE>
 __global__ void moe_route_topk_kernel(
     const float* __restrict__ logits,
     const float* __restrict__ bias,
@@ -102,31 +103,31 @@ __global__ void moe_route_topk_kernel(
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
 
-    if (E <= nthreads && nthreads <= 256) {
+    if (E <= ITEMS_PER_LANE * 32 && nthreads <= 256) {
         constexpr int kW = 32;
         const int lane = tid & (kW - 1);
         const int warp = tid >> 5;
 
-        if (tid < E) {
-            float x = logits[(size_t)n * E + tid];
+        for (int e = tid; e < E; e += nthreads) {
+            float x = logits[(size_t)n * E + e];
             if (softcap > 0.f) {
                 x = softcap * tanhf(x / softcap);
             }
             if (mode == 1) {
                 float s = 1.f / (1.f + expf(-x));
-                raw[tid] = s;
-                sel[tid] = s + (bias ? bias[tid] : 0.f);
+                raw[e] = s;
+                sel[e] = s + (bias ? bias[e] : 0.f);
             } else {
-                raw[tid] = x;
-                sel[tid] = x;
+                raw[e] = x;
+                sel[e] = x;
             }
         }
         __syncthreads();
         if (warp != 0) return;
 
-        float my[8];
+        float my[ITEMS_PER_LANE];
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < ITEMS_PER_LANE; ++i) {
             int e = lane + i * kW;
             my[i] = (e < E) ? sel[e] : -INFINITY;
         }
@@ -135,7 +136,7 @@ __global__ void moe_route_topk_kernel(
             float bv = -INFINITY;
             int bi = 0x7fffffff;
             #pragma unroll
-            for (int i = 0; i < 8; ++i) {
+            for (int i = 0; i < ITEMS_PER_LANE; ++i) {
                 int e = lane + i * kW;
                 if (e < E && (my[i] > bv || (my[i] == bv && e < bi))) {
                     bv = my[i];
@@ -159,7 +160,7 @@ __global__ void moe_route_topk_kernel(
             if (bi < E && (bi & (kW - 1)) == lane) {
                 int slot = bi >> 5;
                 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
+                for (int i = 0; i < ITEMS_PER_LANE; ++i) {
                     if (i == slot) my[i] = -INFINITY;
                 }
             }
@@ -272,6 +273,24 @@ __global__ void moe_route_topk_kernel(
     }
 }
 
+static void moe_route_topk_launch(
+    cudaStream_t s, const float* logits, const float* bias, int32_t* topk_ids, float* topk_weights,
+    int n_tokens, int E, int K, int mode, float softcap, int norm_topk, float routed_scaling,
+    int out_stride, int shared_tail_id
+) {
+    const int tx = 256;
+    size_t shmem = (size_t)2 * E * sizeof(float);
+    if (E <= 256) {
+        moe_route_topk_kernel<8><<<n_tokens, tx, shmem, s>>>(
+            logits, bias, topk_ids, topk_weights, n_tokens, E, K, mode, softcap, norm_topk,
+            routed_scaling, out_stride, shared_tail_id);
+    } else {
+        moe_route_topk_kernel<16><<<n_tokens, tx, shmem, s>>>(
+            logits, bias, topk_ids, topk_weights, n_tokens, E, K, mode, softcap, norm_topk,
+            routed_scaling, out_stride, shared_tail_id);
+    }
+}
+
 extern "C" int nv_kernels_moe_route_topk(
     void* stream,
     const float* logits,
@@ -289,13 +308,9 @@ extern "C" int nv_kernels_moe_route_topk(
     if (n_tokens <= 0 || E <= 0 || K <= 0) return 0;
     if (E > ROUTE_MAX_E || K > ROUTE_MAX_K || K > E) return -2;
     cudaStream_t s = static_cast<cudaStream_t>(stream);
-    const int tx = 256;
-    size_t shmem = (size_t)2 * E * sizeof(float);
-    moe_route_topk_kernel<<<n_tokens, tx, shmem, s>>>(
-        logits, bias, topk_ids, topk_weights,
-        n_tokens, E, K, mode, softcap, norm_topk, routed_scaling,
-        K, -1
-    );
+    moe_route_topk_launch(
+        s, logits, bias, topk_ids, topk_weights, n_tokens, E, K, mode, softcap, norm_topk,
+        routed_scaling, K, -1);
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : (int)e;
 }
@@ -319,17 +334,14 @@ extern "C" int nv_kernels_moe_route_topk_shared_tail(
     if (E > ROUTE_MAX_E || K + 1 > ROUTE_MAX_K || K > E) return -2;
     if (shared_tail_id < 0) return -3;
     cudaStream_t s = static_cast<cudaStream_t>(stream);
-    const int tx = 256;
-    size_t shmem = (size_t)2 * E * sizeof(float);
-    moe_route_topk_kernel<<<n_tokens, tx, shmem, s>>>(
-        logits, bias, topk_ids, topk_weights,
-        n_tokens, E, K, mode, softcap, norm_topk, routed_scaling,
-        K + 1, shared_tail_id
-    );
+    moe_route_topk_launch(
+        s, logits, bias, topk_ids, topk_weights, n_tokens, E, K, mode, softcap, norm_topk,
+        routed_scaling, K + 1, shared_tail_id);
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : (int)e;
 }
 
+template <int ITEMS_PER_LANE>
 __global__ void moe_route_gather_quant_small_m_kernel(
     const float* __restrict__ logits,
     const float* __restrict__ bias,
@@ -368,26 +380,26 @@ __global__ void moe_route_gather_quant_small_m_kernel(
     const int n = blockIdx.y;
     const bool writer_cta = blockIdx.x == 0;
 
-    if (tid < E) {
-        float xv = logits[(size_t)n * E + tid];
+    for (int e = tid; e < E; e += blockDim.x) {
+        float xv = logits[(size_t)n * E + e];
         if (softcap > 0.f) {
             xv = softcap * tanhf(xv / softcap);
         }
         if (mode == 1) {
             float s = 1.f / (1.f + expf(-xv));
-            raw[tid] = s;
-            sel[tid] = s + (bias ? bias[tid] : 0.f);
+            raw[e] = s;
+            sel[e] = s + (bias ? bias[e] : 0.f);
         } else {
-            raw[tid] = xv;
-            sel[tid] = xv;
+            raw[e] = xv;
+            sel[e] = xv;
         }
     }
     __syncthreads();
 
     if (warp == 0) {
-        float my[8];
+        float my[ITEMS_PER_LANE];
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < ITEMS_PER_LANE; ++i) {
             int e = lane + i * kW;
             my[i] = (e < E) ? sel[e] : -INFINITY;
         }
@@ -395,7 +407,7 @@ __global__ void moe_route_gather_quant_small_m_kernel(
             float bv = -INFINITY;
             int bi = 0x7fffffff;
             #pragma unroll
-            for (int i = 0; i < 8; ++i) {
+            for (int i = 0; i < ITEMS_PER_LANE; ++i) {
                 int e = lane + i * kW;
                 if (e < E && (my[i] > bv || (my[i] == bv && e < bi))) {
                     bv = my[i];
@@ -418,7 +430,7 @@ __global__ void moe_route_gather_quant_small_m_kernel(
             if (bi < E && (bi & (kW - 1)) == lane) {
                 int slot = bi >> 5;
                 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
+                for (int i = 0; i < ITEMS_PER_LANE; ++i) {
                     if (i == slot) my[i] = -INFINITY;
                 }
             }
@@ -528,7 +540,7 @@ extern "C" int nv_kernels_moe_route_gather_quant_small_m(
     int quant_ctas
 ) {
     if (n_tokens <= 0 || E <= 0 || K <= 0 || hidden <= 0 || min_tile <= 0) return -1;
-    if (E > 256 || K + 1 > ROUTE_MAX_K || K > E) return -2;
+    if (E > 512 || K + 1 > ROUTE_MAX_K || K > E) return -2;
     if ((hidden % 16) != 0 || (min_tile % 128) != 0) return -3;
     if (n_tokens > 65535) return -4;
     if (quant_ctas <= 0 || quant_ctas > 64) return -5;
@@ -536,9 +548,10 @@ extern "C" int nv_kernels_moe_route_gather_quant_small_m(
     const int tx = 256;
     size_t shmem = (size_t)2 * E * sizeof(float);
     dim3 grid((unsigned)quant_ctas, (unsigned)n_tokens);
+    auto kern = (E <= 256) ? moe_route_gather_quant_small_m_kernel<8> : moe_route_gather_quant_small_m_kernel<16>;
     if (nvk_pdl_enabled()) {
         NVK_PDL_ATTR(cfg, grid, dim3((unsigned)tx), shmem, s);
-        cudaLaunchKernelEx(&cfg, moe_route_gather_quant_small_m_kernel,
+        cudaLaunchKernelEx(&cfg, kern,
             logits, bias,
             reinterpret_cast<const __nv_bfloat16*>(x_bf16),
             globals_gu, globals_dn,
@@ -547,7 +560,7 @@ extern "C" int nv_kernels_moe_route_gather_quant_small_m(
             E, K, mode, softcap, norm_topk, routed_scaling,
             shared_tail_id, hidden, min_tile);
     } else {
-        moe_route_gather_quant_small_m_kernel<<<grid, tx, shmem, s>>>(
+        kern<<<grid, tx, shmem, s>>>(
             logits, bias,
             reinterpret_cast<const __nv_bfloat16*>(x_bf16),
             globals_gu, globals_dn,

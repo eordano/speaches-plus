@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 pub const RFC_VERSION: &str = "v3";
 
@@ -190,7 +189,6 @@ pub mod stt {
     pub const CT2_THREADS_DEFAULT: usize = 2;
 
     pub const BEAM_SIZE: usize = 5;
-    pub const BEAM_SIZE_ENV_RESTORES_THE_GREEDY_DECODE: &str = "SPEACHES_STT_BEAM_SIZE";
 }
 
 pub mod kokoro {
@@ -235,13 +233,11 @@ pub mod env {
 
     pub const KOKORO_INTRA_THREADS: &str = "KOKORO_INTRA_THREADS";
     pub const KOKORO_ONNX_PROVIDER: &str = "KOKORO_ONNX_PROVIDER";
-    pub const VAD_COMMIT_TAIL: &str = "VAD_COMMIT_TAIL";
     pub const EOU_TEXT_HEAD_PATH: &str = "EOU_TEXT_HEAD_PATH";
     pub const KOKORO_MAX_INPUT_CHARS: &str = "KOKORO_MAX_INPUT_CHARS";
     pub const KOKORO_CHUNK_CHARS: &str = "KOKORO_CHUNK_CHARS";
     pub const KOKORO_QUEUE_WAIT_S: &str = "KOKORO_QUEUE_WAIT_S";
     pub const KOKORO_SYNTH_BUDGET_S: &str = "KOKORO_SYNTH_BUDGET_S";
-    pub const KOKORO_WARMUP: &str = "KOKORO_WARMUP";
 
     pub const OUTBOUND_QUEUE_CAP_MS: &str = "OUTBOUND_QUEUE_CAP_MS";
     pub const OUTBOUND_QUEUE_CAP: &str = "OUTBOUND_QUEUE_CAP";
@@ -253,7 +249,6 @@ pub mod env {
     pub const CHAT_COMPLETION_API_KEY: &str = "CHAT_COMPLETION_API_KEY";
     pub const DEFAULT_REALTIME_CONVERSATION_MODEL: &str = "DEFAULT_REALTIME_CONVERSATION_MODEL";
 
-    pub const EOU_ENABLED: &str = "EOU_ENABLED";
     pub const EOU_KIND: &str = "EOU_KIND";
     pub const EOU_EAGERNESS: &str = "EOU_EAGERNESS";
     pub const EOU_P_THRESHOLD: &str = "EOU_P_THRESHOLD";
@@ -270,7 +265,6 @@ pub mod env {
     pub const EOU_EAGER_PERIODIC: &str = "EOU_EAGER_PERIODIC";
     pub const EOU_EAGER_INTERVAL_MS: &str = "EOU_EAGER_INTERVAL_MS";
     pub const EOU_PREDICTED_TOKEN_BUFFER_CAP: &str = "EOU_PREDICTED_TOKEN_BUFFER_CAP";
-    pub const REASONING_EFFORT: &str = "NV_REASONING_EFFORT";
     pub const EOU_EOT_THRESHOLD: &str = "EOU_EOT_THRESHOLD";
     pub const EOU_EAGER_EOT_THRESHOLD: &str = "EOU_EAGER_EOT_THRESHOLD";
     pub const EOU_FUSION_RULE: &str = "EOU_FUSION_RULE";
@@ -291,7 +285,6 @@ pub mod env {
     pub const DIAR_MAX_SPEAKERS: &str = "DIAR_MAX_SPEAKERS";
     pub const DIAR_MIN_SPAN_FRAMES: &str = "DIAR_MIN_SPAN_FRAMES";
     pub const DIAR_MEDIAN_FILTER_FRAMES: &str = "DIAR_MEDIAN_FILTER_FRAMES";
-    pub const MIN_SPEECH_FOR_COMMIT_MS: &str = "MIN_SPEECH_FOR_COMMIT_MS";
 
     pub const INSPECT_SESSION_DIR: &str = "INSPECT_SESSION_DIR";
     pub const INSPECT_RETENTION_COUNT: &str = "INSPECT_RETENTION_COUNT";

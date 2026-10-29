@@ -75,6 +75,7 @@ fn fnc_res_reduce(lid: u32, local: f32) -> f32 {
 
 @compute @workgroup_size(256)
 fn e4b_rms_res_rms_bf16(
+    #def b1
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
@@ -95,6 +96,7 @@ fn e4b_rms_res_rms_bf16(
         local = fma(v, v, local);
     }
     let rms1 = fnc_rms_reduce(lid, local);
+    #end
 
     var local2 = 0.0;
     for (var i = lid; i < words; i = i + FNC_BLOCK) {
@@ -122,26 +124,8 @@ fn e4b_rms_res_rms_bf16(
 
 @compute @workgroup_size(256)
 fn e4b_res_of_rms_bf16(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let row = fnc_row_index(wg, nwg);
-    if (row >= fnc_params.batch) {
-        return;
-    }
-    let lid = tid.x;
-    let hidden = fnc_params.hidden;
-    let words = fnc_params.words_per_row;
-    let base = row * words;
-
-    var local = 0.0;
-    for (var i = lid; i < hidden; i = i + FNC_BLOCK) {
-        let word = fnc_in[base + (i >> 1u)];
-        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
-        local = fma(v, v, local);
-    }
-    let rms1 = fnc_rms_reduce(lid, local);
+    #def b2
+    #use b1
 
     let scale = fnc_params.scale;
     for (var i = lid; i < words; i = i + FNC_BLOCK) {
@@ -155,43 +139,12 @@ fn e4b_res_of_rms_bf16(
         let hi = (bf16_hi(rw) + bf16_hi(tw)) * scale;
         fnc_out[base + i] = bf16_pack(lo, hi);
     }
+    #end
 }
 
 @compute @workgroup_size(256)
 fn e4b_rms_res_rms_next_bf16(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let row = fnc_row_index(wg, nwg);
-    if (row >= fnc_params.batch) {
-        return;
-    }
-    let lid = tid.x;
-    let hidden = fnc_params.hidden;
-    let words = fnc_params.words_per_row;
-    let base = row * words;
-
-    var local = 0.0;
-    for (var i = lid; i < hidden; i = i + FNC_BLOCK) {
-        let word = fnc_in[base + (i >> 1u)];
-        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
-        local = fma(v, v, local);
-    }
-    let rms1 = fnc_rms_reduce(lid, local);
-
-    let scale = fnc_params.scale;
-    for (var i = lid; i < words; i = i + FNC_BLOCK) {
-        let xw = fnc_in[base + i];
-        let w1w = fnc_w1[i];
-        let tlo = bf16_lo(xw) * rms1 * bf16_lo(w1w);
-        let thi = bf16_hi(xw) * rms1 * bf16_hi(w1w);
-        let tw = bf16_pack(tlo, thi);
-        let rw = fnc_res[base + i];
-        let lo = (bf16_lo(rw) + bf16_lo(tw)) * scale;
-        let hi = (bf16_hi(rw) + bf16_hi(tw)) * scale;
-        fnc_out[base + i] = bf16_pack(lo, hi);
-    }
+    #use b2
     storageBarrier();
 
     var local2 = 0.0;

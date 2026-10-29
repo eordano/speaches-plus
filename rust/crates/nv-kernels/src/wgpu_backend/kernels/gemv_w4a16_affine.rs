@@ -1,6 +1,6 @@
 use crate::wgpu_backend::compose;
 
-pub const WGSL: &str = include_str!("../../../wgsl/gemv_w4a16_affine.wgsl");
+pub const WGSL: &str = crate::wgsl!("../../../wgsl/gemv_w4a16_affine.wgsl");
 
 pub const WORKGROUP_SIZE: u32 = 256;
 pub const LANES_PER_ROW: u32 = 32;

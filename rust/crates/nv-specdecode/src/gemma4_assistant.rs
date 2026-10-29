@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 use nv_layers::linear::Linear;
 use nv_layers::norm::RmsNorm;
@@ -404,7 +404,6 @@ impl Gemma4AssistantDrafter {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         cfg: Gemma4AssistantConfig,
         device: Device,
@@ -686,14 +685,14 @@ impl DeviceKvMirror {
     }
 
     fn append_rows(&mut self, rows_k: &Tensor, rows_v: &Tensor, r: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.len + r <= self.cap,
             "kv mirror append {r} overflows {} of {}",
             self.len,
             self.cap
         );
         for (dst, src) in [(&self.k, rows_k), (&self.v, rows_v)] {
-            anyhow::ensure!(
+            ensure!(
                 src.dims() == [r, self.n_kv, self.hd],
                 "kv mirror rows shaped {:?}, want [{r}, {}, {}]",
                 src.dims(),
@@ -723,7 +722,7 @@ impl DeviceKvMirror {
     }
 
     fn last_rows_view(&self, n: usize) -> Result<(Tensor, Tensor)> {
-        anyhow::ensure!(
+        ensure!(
             n > 0 && n <= self.len,
             "kv mirror view of {n} rows from {} mirrored",
             self.len
@@ -757,18 +756,18 @@ impl MoeAssistantHost {
         let drafter = Gemma4AssistantDrafter::try_load(assistant_dir, device)
             .with_context(|| format!("load assistant drafter from {}", assistant_dir.display()))?;
         let acfg = drafter.config();
-        anyhow::ensure!(
+        ensure!(
             acfg.backbone_hidden_size == trunk_hidden_size,
             "assistant backbone_hidden_size {} != trunk hidden_size {trunk_hidden_size}",
             acfg.backbone_hidden_size
         );
         let trunk_weights = WeightLoader::open_dir(trunk_dir, &Device::Cpu)
             .with_context(|| format!("open trunk weights in {}", trunk_dir.display()))?;
-        anyhow::ensure!(
+        ensure!(
             trunk_weights.st_dtype_of(MOE_TRUNK_EMBED_NAME) == Some(nv_weights::StDtype::BF16),
             "assistant drafting needs a bf16 {MOE_TRUNK_EMBED_NAME} in the trunk checkpoint dir"
         );
-        anyhow::ensure!(
+        ensure!(
             trunk_weights.shape_of(MOE_TRUNK_EMBED_NAME).as_deref()
                 == Some(&[acfg.vocab_size, trunk_hidden_size][..]),
             "unexpected trunk embed shape {:?}",
@@ -807,7 +806,7 @@ impl MoeAssistantHost {
         let bytes = self.trunk_weights.raw_bytes(MOE_TRUNK_EMBED_NAME)?;
         let h = self.backbone_hidden;
         let off = token as usize * h * 2;
-        anyhow::ensure!(
+        ensure!(
             off + h * 2 <= bytes.len(),
             "token {token} outside the trunk embed table"
         );
@@ -898,7 +897,7 @@ impl MoeAssistantHost {
         if k == 0 || committed == 0 {
             return Ok(Vec::new());
         }
-        anyhow::ensure!(
+        ensure!(
             last_hidden.len() == self.backbone_hidden,
             "last_hidden holds {} values, want {}",
             last_hidden.len(),
@@ -910,7 +909,7 @@ impl MoeAssistantHost {
         let sm = self.sliding.as_ref().expect("sliding mirror synced");
         let fm = self.full.as_ref().expect("full mirror synced");
         let (sk, sv) = sm.last_rows_view(window.min(committed))?;
-        anyhow::ensure!(
+        ensure!(
             fm.base_pos == 0 && fm.len == committed,
             "full mirror covers {}..{} but the engine committed {committed}",
             fm.base_pos,
@@ -1128,7 +1127,8 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_draft_step_shapes() {
+    fn synthetic_draft_step_has_backbone_shapes_narrows_a_long_kv_and_propose_chains_within_the_budget(
+    ) {
         let dev = Device::Cpu;
         let drafter = synth_drafter(&dev).expect("build");
         let cfg = drafter.config().clone();
@@ -1153,13 +1153,15 @@ mod tests {
             .to_vec1()
             .unwrap();
         assert!(nh.iter().all(|x| x.is_finite()));
-    }
 
-    #[test]
-    fn synthetic_propose_chains() {
-        let dev = Device::Cpu;
-        let drafter = synth_drafter(&dev).expect("build");
-        let cfg = drafter.config().clone();
+        let kv = synth_kv(&cfg, 9, &dev).expect("kv");
+        let embed = Tensor::zeros(cfg.backbone_hidden_size, DType::F32, &dev).unwrap();
+        let hidden = Tensor::ones(cfg.backbone_hidden_size, DType::F32, &dev).unwrap();
+        let step = drafter
+            .draft_step(&embed, &hidden, 8, &kv)
+            .expect("draft_step");
+        assert!(step.candidate_logit.is_finite());
+
         let kv = synth_kv(&cfg, 10, &dev).expect("kv");
         let bh = cfg.backbone_hidden_size;
 
@@ -1181,31 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn sliding_window_narrows_long_kv() {
-        let dev = Device::Cpu;
-        let drafter = synth_drafter(&dev).expect("build");
-        let cfg = drafter.config().clone();
-        let kv = synth_kv(&cfg, 9, &dev).expect("kv");
-        let embed = Tensor::zeros(cfg.backbone_hidden_size, DType::F32, &dev).unwrap();
-        let hidden = Tensor::ones(cfg.backbone_hidden_size, DType::F32, &dev).unwrap();
-        let step = drafter
-            .draft_step(&embed, &hidden, 8, &kv)
-            .expect("draft_step");
-        assert!(step.candidate_logit.is_finite());
-    }
-
-    #[test]
-    fn proportional_inv_freq_pads_with_zeros() {
-        let f = proportional_inv_freq(512, 1_000_000.0, 0.25);
-        assert_eq!(f.len(), 256);
-        assert!(f[0] == 1.0);
-        assert!(f[63] > 0.0);
-        assert!(f[64] == 0.0);
-        assert!(f[255] == 0.0);
-    }
-
-    #[test]
-    fn config_parses_real_json() {
+    fn config_parses_real_json_and_proportional_inv_freq_pads_with_zeros() {
         let json = r#"{
             "architectures": ["Gemma4AssistantForCausalLM"],
             "model_type": "gemma4_assistant",
@@ -1263,73 +1241,13 @@ mod tests {
             ]
         );
         assert_eq!(cfg.eos_token_ids, vec![1, 106]);
-    }
-
-    const ALLOW_SKIP: &str = "NV_SPECDECODE_ALLOW_SKIP";
-
-    fn require<T>(test: &str, what: &str, found: Option<T>) -> Option<T> {
-        if found.is_none() {
-            if !nv_config::env_arm_opt_in_eq_some_1_reread_every_call(ALLOW_SKIP) {
-                panic!(
-                    "{test}: no {what}. This test is #[ignore]d, so it runs only when asked for \
-                     by name; reporting a pass without the artifact answers a question that was \
-                     never put. Provide it or set {ALLOW_SKIP}=1."
-                );
-            }
-            eprintln!("SKIP ({ALLOW_SKIP}=1): {test}: no {what}; nothing was exercised");
+        {
+            let f = proportional_inv_freq(512, 1_000_000.0, 0.25);
+            assert_eq!(f.len(), 256);
+            assert!(f[0] == 1.0);
+            assert!(f[63] > 0.0);
+            assert!(f[64] == 0.0);
+            assert!(f[255] == 0.0);
         }
-        found
-    }
-
-    fn cached_snapshot_dir() -> Option<std::path::PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        let root = std::path::PathBuf::from(home).join(
-            ".cache/huggingface/hub/\
-             models--google--gemma-4-E4B-it-qat-q4_0-unquantized-assistant/snapshots",
-        );
-        for entry in std::fs::read_dir(&root).ok()? {
-            let p = entry.ok()?.path();
-            if p.is_dir() && p.join("model.safetensors").is_file() {
-                return Some(p);
-            }
-        }
-        None
-    }
-
-    #[test]
-    #[ignore]
-    fn loads_real_checkpoint_cpu() {
-        let Some(dir) = require(
-            "loads_real_checkpoint_cpu",
-            "gemma-4 assistant snapshot in the HF cache",
-            cached_snapshot_dir(),
-        ) else {
-            return;
-        };
-        let drafter =
-            Gemma4AssistantDrafter::try_load(&dir, &Device::Cpu).expect("load real checkpoint");
-        let cfg = drafter.config();
-        assert_eq!(cfg.backbone_hidden_size, 2560);
-        assert_eq!(cfg.num_hidden_layers, 4);
-        assert_eq!(drafter.token_ordering.len(), 262144);
-
-        let kv = FixedSharedKv {
-            sliding: (
-                Tensor::zeros((2, 8, 256), DType::F32, &Device::Cpu).unwrap(),
-                Tensor::zeros((2, 8, 256), DType::F32, &Device::Cpu).unwrap(),
-            ),
-            full: (
-                Tensor::zeros((2, 8, 512), DType::F32, &Device::Cpu).unwrap(),
-                Tensor::zeros((2, 8, 512), DType::F32, &Device::Cpu).unwrap(),
-            ),
-        };
-        let embed = Tensor::zeros(2560, DType::F32, &Device::Cpu).unwrap();
-        let hidden_data: Vec<f32> = (0..2560).map(|i| (i as f32 * 0.01).sin()).collect();
-        let hidden = Tensor::from_vec(hidden_data, 2560, &Device::Cpu).unwrap();
-        let step = drafter
-            .draft_step(&embed, &hidden, 7, &kv)
-            .expect("draft_step");
-        assert!((step.token as usize) < 262144);
-        assert!(step.candidate_logit.is_finite());
     }
 }

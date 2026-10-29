@@ -53,14 +53,14 @@ let
 
     gemma4E4B = {
       url = "google/gemma-4-E4B-it";
-      rev = "3555bddc93a623db8887dd2e52123facc45ade77";
-      fileTreeHash = "sha256-4uPmNOiA3VGtvLR8LygSXe2AmelMKOuhDGvSylPc9M0=";
+      rev = "ee0ef6023621cff504d758262d4e04895a5af4a2";
+      fileTreeHash = "sha256-UnskmK8DBZy/VmRvd702z3tRk3DJClRG2CjcDouCWh4=";
     };
 
     gemma431B = {
       url = "google/gemma-4-31B-it";
-      rev = "ba74f5b6c647c0911554e50278d6f6f4477f9010";
-      fileTreeHash = "sha256-nRsFyVTqn/di0QBrpCkaC5I5z51AgfAzRyfg5iZa+II=";
+      rev = "842da3794eaa0b77d5f08bae87a17459d91ff475";
+      fileTreeHash = "sha256-X0vibZsjUGa5prnju8uvY9O1HRNg1RM39mgfymwaUjE=";
     };
 
     whisperGgml = {
@@ -98,8 +98,8 @@ let
 
     diarizen = {
       url = "BUT-FIT/diarizen-wavlm-large-s80-md-v2";
-      rev = "f27b9ffbedcf422856d104ecee9b94be37ea578e";
-      fileTreeHash = "sha256-q8q1I6jFLQpKEbqMTd6d/LUjLcfJcop11rILS/aLwdk=";
+      rev = "027b3e221b9d81dce2be794084f1dbd3ba2da403";
+      fileTreeHash = "sha256-1qHMHoJEwLiqcF7VK2k74gIPwOmzEfvDq9aIZPz99YA=";
     };
 
     wespeaker = {

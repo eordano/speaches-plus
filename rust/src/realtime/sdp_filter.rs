@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn strips_pcmu_when_offer_lists_it_first() {
+    fn opus_only_m_line_keeps_telephone_event_and_cn_and_leaves_video_and_opusless_offers_alone() {
         let input = "v=0\r\n\
                      m=audio 9 UDP/TLS/RTP/SAVPF 0 96 8\r\n\
                      a=mid:0\r\n\
@@ -229,49 +229,44 @@ mod tests {
 
         assert!(out.contains("a=rtpmap:96 opus/48000/2"));
         assert!(out.contains("a=fmtp:96 minptime=10;useinbandfec=1"));
+        {
+            let input = "v=0\r\n\
+                         m=audio 9 UDP/TLS/RTP/SAVPF 96 0 101 13\r\n\
+                         a=mid:0\r\n\
+                         a=rtpmap:96 opus/48000/2\r\n\
+                         a=rtpmap:0 PCMU/8000\r\n\
+                         a=rtpmap:101 telephone-event/8000\r\n\
+                         a=rtpmap:13 CN/8000\r\n";
+            let out = normalize_offer(input);
+            let m_line = out
+                .lines()
+                .find(|l| l.starts_with("m=audio"))
+                .expect("m=audio line present");
+            let payloads: Vec<&str> = m_line.split_whitespace().skip(3).collect();
+
+            assert_eq!(payloads, vec!["96", "101", "13"], "got: {m_line}");
+        }
+        {
+            let input = "v=0\r\n\
+                         m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+                         a=mid:0\r\n\
+                         a=rtpmap:96 VP8/90000\r\n\
+                         a=rtpmap:97 H264/90000\r\n";
+            let out = normalize_offer(input);
+            assert!(out.contains("m=video 9 UDP/TLS/RTP/SAVPF 96 97"));
+            assert!(out.contains("a=rtpmap:96 VP8/90000"));
+            assert!(out.contains("a=rtpmap:97 H264/90000"));
+        }
+        {
+            let input = "v=0\r\n\
+                         m=audio 9 UDP/TLS/RTP/SAVPF 0 8\r\n\
+                         a=mid:0\r\n\
+                         a=rtpmap:0 PCMU/8000\r\n\
+                         a=rtpmap:8 PCMA/8000\r\n";
+            let out = normalize_offer(input);
+            assert!(out.contains("m=audio 9 UDP/TLS/RTP/SAVPF 0 8"));
+            assert!(out.contains("a=rtpmap:0 PCMU/8000"));
+        }
     }
 
-    #[test]
-    fn preserves_telephone_event_and_cn() {
-        let input = "v=0\r\n\
-                     m=audio 9 UDP/TLS/RTP/SAVPF 96 0 101 13\r\n\
-                     a=mid:0\r\n\
-                     a=rtpmap:96 opus/48000/2\r\n\
-                     a=rtpmap:0 PCMU/8000\r\n\
-                     a=rtpmap:101 telephone-event/8000\r\n\
-                     a=rtpmap:13 CN/8000\r\n";
-        let out = normalize_offer(input);
-        let m_line = out
-            .lines()
-            .find(|l| l.starts_with("m=audio"))
-            .expect("m=audio line present");
-        let payloads: Vec<&str> = m_line.split_whitespace().skip(3).collect();
-
-        assert_eq!(payloads, vec!["96", "101", "13"], "got: {m_line}");
-    }
-
-    #[test]
-    fn leaves_video_section_alone() {
-        let input = "v=0\r\n\
-                     m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
-                     a=mid:0\r\n\
-                     a=rtpmap:96 VP8/90000\r\n\
-                     a=rtpmap:97 H264/90000\r\n";
-        let out = normalize_offer(input);
-        assert!(out.contains("m=video 9 UDP/TLS/RTP/SAVPF 96 97"));
-        assert!(out.contains("a=rtpmap:96 VP8/90000"));
-        assert!(out.contains("a=rtpmap:97 H264/90000"));
-    }
-
-    #[test]
-    fn passthrough_when_no_opus_present() {
-        let input = "v=0\r\n\
-                     m=audio 9 UDP/TLS/RTP/SAVPF 0 8\r\n\
-                     a=mid:0\r\n\
-                     a=rtpmap:0 PCMU/8000\r\n\
-                     a=rtpmap:8 PCMA/8000\r\n";
-        let out = normalize_offer(input);
-        assert!(out.contains("m=audio 9 UDP/TLS/RTP/SAVPF 0 8"));
-        assert!(out.contains("a=rtpmap:0 PCMU/8000"));
-    }
 }

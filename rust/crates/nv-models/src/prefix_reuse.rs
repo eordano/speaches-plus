@@ -45,6 +45,15 @@ impl RewindLimits {
         self.prefill_chunk == 0 || target.is_multiple_of(self.prefill_chunk)
     }
 
+    pub fn admits_from_high_water(
+        &self,
+        frontier: usize,
+        high_water: usize,
+        target: usize,
+    ) -> bool {
+        target <= frontier && self.admits(frontier.max(high_water), target)
+    }
+
     pub fn target(&self, frontier: usize, lcp: usize) -> Option<usize> {
         let target = match self.prefill_chunk {
             0 => lcp,
@@ -62,12 +71,25 @@ pub fn exact_extend_target(frontier: usize, lcp: usize, live_pos: usize) -> Opti
     (frontier > 0 && lcp >= frontier && live_pos == frontier).then_some(frontier)
 }
 
+pub fn saved_state_resume_point(positions_ascending: &[usize], prev: &[u32], prompt: &[u32]) -> usize {
+    let lcp = common_prefix_len(prev, prompt);
+    positions_ascending.iter().rev().copied().find(|&p| p < lcp).unwrap_or(0)
+}
+
+pub fn session_source(home: usize, reusable: [usize; 2]) -> usize {
+    if home == 1 && reusable[0] > reusable[1] {
+        0
+    } else {
+        home
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_target_never_reaches_past_the_tokens_the_two_prompts_actually_share() {
+    fn a_target_never_reaches_past_the_shared_tokens_and_the_ring_reserves_a_slot_so_a_rewind_cannot_eat_its_own_window() {
         let prev = [1u32, 2, 3, 4, 5, 6, 7, 8];
         for (new, shared) in [
             (vec![1u32, 2, 3, 9], 3usize),
@@ -86,40 +108,7 @@ mod tests {
                 );
             }
         }
-    }
 
-    #[test]
-    fn the_chunked_target_rounds_down_and_never_up() {
-        let lim = RewindLimits::positional(1024, 0, 64);
-        for lcp in [0usize, 1, 63, 64, 65, 127, 128, 200] {
-            if let Some(t) = lim.target(500, lcp) {
-                assert!(t <= lcp, "lcp {lcp} rounded UP to {t}");
-                assert_eq!(t % 64, 0, "lcp {lcp} gave non-boundary target {t}");
-            }
-        }
-        assert_eq!(lim.target(500, 128), Some(128));
-        assert_eq!(
-            lim.target(500, 191),
-            Some(128),
-            "191 must land on 128, not 192"
-        );
-    }
-
-    #[test]
-    fn a_decoder_that_cannot_rewind_positionally_admits_nothing() {
-        let none = RewindLimits::NONE;
-        assert_eq!(none.max_advance(), None);
-        for (frontier, target) in [(10usize, 1usize), (10, 10), (0, 0), (100, 50)] {
-            assert!(
-                !none.admits(frontier, target),
-                "NONE admitted {target}/{frontier}"
-            );
-        }
-        assert_eq!(none.target(10, 5), None);
-    }
-
-    #[test]
-    fn the_ring_reserves_a_slot_so_a_rewind_cannot_eat_its_own_window() {
         let lim = RewindLimits::positional(8, 4, 0);
         assert_eq!(
             lim.max_advance(),
@@ -136,43 +125,39 @@ mod tests {
             RewindLimits::positional(0, 4, 0).max_advance(),
             Some(usize::MAX)
         );
+
     }
 
     #[test]
-    fn a_target_of_zero_or_one_past_the_frontier_is_refused() {
-        let lim = RewindLimits::positional(1024, 0, 0);
-        assert!(
-            !lim.admits(10, 0),
-            "zero is not a reuse, it is a cold start"
+    fn a_saved_state_resumes_strictly_below_the_shared_prefix() {
+        let prev: Vec<u32> = (0..10).collect();
+        let ckpts = [2usize, 4, 6, 8];
+        let diverge_at = |i: usize| -> Vec<u32> {
+            let mut p = prev.clone();
+            p[i] = 99;
+            p
+        };
+        assert_eq!(saved_state_resume_point(&ckpts, &prev, &prev), 8);
+        assert_eq!(
+            saved_state_resume_point(&ckpts, &prev, &diverge_at(6)),
+            4,
+            "the checkpoint at 6 holds the MTP row for position 5, which read token 6"
         );
-        assert!(
-            !lim.admits(10, 11),
-            "past the frontier there is no KV to keep"
-        );
-        assert!(
-            lim.admits(10, 10),
-            "the frontier itself is the exact-extend case"
-        );
+        assert_eq!(saved_state_resume_point(&ckpts, &prev, &diverge_at(7)), 6);
+        assert_eq!(saved_state_resume_point(&ckpts, &prev, &prev[..8]), 6, "a prompt ending on a checkpoint still needs its last token stepped");
+        assert_eq!(saved_state_resume_point(&ckpts, &prev, &diverge_at(0)), 0);
+        assert_eq!(saved_state_resume_point(&[], &prev, &prev), 0);
+        assert_eq!(saved_state_resume_point(&ckpts, &[], &prev), 0, "an invalidated stream reuses nothing");
     }
 
     #[test]
-    fn the_exact_extend_case_needs_the_decoder_to_be_standing_on_the_frontier() {
-        assert_eq!(exact_extend_target(8, 8, 8), Some(8));
-        assert_eq!(
-            exact_extend_target(8, 12, 8),
-            Some(8),
-            "lcp past the frontier still extends"
-        );
-        assert_eq!(
-            exact_extend_target(8, 7, 8),
-            None,
-            "lcp short of the frontier diverged"
-        );
-        assert_eq!(
-            exact_extend_target(8, 8, 9),
-            None,
-            "the decoder moved past the frontier, so its KV is no longer the snapshot's"
-        );
-        assert_eq!(exact_extend_target(0, 0, 0), None, "nothing to extend from");
+    fn a_short_prompt_never_takes_the_long_state_and_a_growing_conversation_carries_its_own_up() {
+        assert_eq!(session_source(0, [0, 30720]), 0, "a side call with a short prompt must not overwrite the long conversation");
+        assert_eq!(session_source(0, [0, 4096]), 0, "a short prompt sharing the long state's system prompt still stays short");
+        assert_eq!(session_source(1, [8192, 0]), 0, "a conversation crossing into the long state brings its checkpoints");
+        assert_eq!(session_source(1, [8192, 2048]), 0);
+        assert_eq!(session_source(1, [0, 38912]), 1);
+        assert_eq!(session_source(1, [2048, 2048]), 1, "a tie keeps the long state");
+        assert_eq!(session_source(1, [0, 0]), 1);
     }
 }

@@ -107,7 +107,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn normalize_nested_to_flat() {
+    fn normalize_flattens_nested_idempotently_and_enrich_adds_the_nested_shape() {
         let nested = json!({
             "type": "realtime",
             "audio": {
@@ -122,29 +122,26 @@ mod tests {
         assert_eq!(flat["voice"], "alloy");
         assert_eq!(flat["turn_detection"]["type"], "server_vad");
         assert_eq!(flat["modalities"], json!(["audio"]));
+        {
+            let flat = json!({"input_audio_format": "pcm16"});
+            let again = normalize_session_object(&flat);
+            assert_eq!(again, flat);
+        }
+        {
+            let mut v = json!({
+                "id": "sess_x",
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "voice": "alloy",
+                "modalities": ["audio", "text"],
+            });
+            enrich_session_view(&mut v);
+            assert_eq!(v["type"], "realtime");
+            assert_eq!(v["audio"]["input"]["format"], "pcm16");
+            assert_eq!(v["audio"]["output"]["format"], "pcm16");
+            assert_eq!(v["audio"]["output"]["voice"], "alloy");
+            assert_eq!(v["output_modalities"], json!(["audio", "text"]));
+        }
     }
 
-    #[test]
-    fn normalize_is_idempotent_on_flat() {
-        let flat = json!({"input_audio_format": "pcm16"});
-        let again = normalize_session_object(&flat);
-        assert_eq!(again, flat);
-    }
-
-    #[test]
-    fn enrich_adds_nested_shape() {
-        let mut v = json!({
-            "id": "sess_x",
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm16",
-            "voice": "alloy",
-            "modalities": ["audio", "text"],
-        });
-        enrich_session_view(&mut v);
-        assert_eq!(v["type"], "realtime");
-        assert_eq!(v["audio"]["input"]["format"], "pcm16");
-        assert_eq!(v["audio"]["output"]["format"], "pcm16");
-        assert_eq!(v["audio"]["output"]["voice"], "alloy");
-        assert_eq!(v["output_modalities"], json!(["audio", "text"]));
-    }
 }

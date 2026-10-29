@@ -133,15 +133,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn spanish_text_is_clean_under_a_latin_prior() {
-        let text = "Tengo una tendencia a tener la idea de un poema y no tener una idea real \
-                    sobre las cosas que me rodean cada noche antes de escribir.";
-        assert_eq!(suspect_reason(text, ExpectedScript::Latin), None);
-        assert_eq!(suspect_reason(text, ExpectedScript::Any), None);
-    }
-
-    #[test]
-    fn arabic_output_under_a_latin_prior_is_the_archive_confabulation_case() {
+    fn script_mismatch_and_digit_floods_are_suspect_but_matching_short_or_mixed_text_is_not() {
         let text = "حقيقة أن نسمي هذا الكتاب من أحكام النبي فقط فإنها ليست فقط من إمامنا بل هي \
                     أيضا من حقائق التي تعكس الحياة وتصرف إلى الواقع فأنا أستاذ في شعوبنا";
         assert_eq!(
@@ -155,20 +147,33 @@ mod tests {
             "the same output under a matching prior is not suspect"
         );
         assert_eq!(suspect_reason(text, ExpectedScript::Any), None);
+        {
+            let text = "Tengo una tendencia a tener la idea de un poema y no tener una idea real \
+                        sobre las cosas que me rodean cada noche antes de escribir.";
+            assert_eq!(suspect_reason(text, ExpectedScript::Latin), None);
+            assert_eq!(suspect_reason(text, ExpectedScript::Any), None);
+        }
+        {
+            let text = "<table>1234567891011121314151617181920212223242526272829303132333435363738\
+                        39404142434445464748495051525354555657585960616263646566676869707172737475</table>";
+            assert_eq!(
+                suspect_reason(text, ExpectedScript::Any),
+                Some("digit-flood")
+            );
+        }
+        {
+            assert_eq!(suspect_reason("你好", ExpectedScript::Latin), None);
+            assert_eq!(suspect_reason("ESA", ExpectedScript::Latin), None);
+        }
+        {
+            let text = "El café de la esquina sirve razonablemente bien y el menú tiene un par de \
+                        palabras en 日本語 pero el resto es castellano corriente de todos los días.";
+            assert_eq!(suspect_reason(text, ExpectedScript::Latin), None);
+        }
     }
 
     #[test]
-    fn digit_table_flood_flags_without_any_prior() {
-        let text = "<table>1234567891011121314151617181920212223242526272829303132333435363738\
-                    39404142434445464748495051525354555657585960616263646566676869707172737475</table>";
-        assert_eq!(
-            suspect_reason(text, ExpectedScript::Any),
-            Some("digit-flood")
-        );
-    }
-
-    #[test]
-    fn a_white_page_with_sensor_jitter_is_near_blank_and_flags_generated_prose() {
+    fn a_white_page_is_near_blank_and_flags_prose_but_a_printed_paragraph_never_is() {
         let mut hist = [0u32; 256];
         hist[250] = 900_000;
         hist[248] = 60_000;
@@ -197,28 +202,14 @@ mod tests {
             blank_page_suspect(false, "any amount of text on a page with ink"),
             None
         );
-    }
-
-    #[test]
-    fn a_printed_paragraph_is_never_near_blank() {
-        let mut hist = [0u32; 256];
-        hist[245] = 940_000;
-        for v in 10..40 {
-            hist[v] = 2_000;
+        {
+            let mut hist = [0u32; 256];
+            hist[245] = 940_000;
+            for v in 10..40 {
+                hist[v] = 2_000;
+            }
+            assert!(!near_blank(&hist), "6% ink coverage must not read as blank");
         }
-        assert!(!near_blank(&hist), "6% ink coverage must not read as blank");
     }
 
-    #[test]
-    fn short_outputs_never_get_a_script_verdict() {
-        assert_eq!(suspect_reason("你好", ExpectedScript::Latin), None);
-        assert_eq!(suspect_reason("ESA", ExpectedScript::Latin), None);
-    }
-
-    #[test]
-    fn mixed_but_mostly_matching_text_is_not_flagged() {
-        let text = "El café de la esquina sirve razonablemente bien y el menú tiene un par de \
-                    palabras en 日本語 pero el resto es castellano corriente de todos los días.";
-        assert_eq!(suspect_reason(text, ExpectedScript::Latin), None);
-    }
 }

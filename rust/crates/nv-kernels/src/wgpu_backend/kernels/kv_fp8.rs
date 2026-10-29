@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::dequant::bytes_to_words;
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
@@ -8,7 +6,7 @@ use crate::wgpu_backend::pack::{
 };
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
-pub const WGSL: &str = include_str!("../../../wgsl/kv_fp8.wgsl");
+pub const WGSL: &str = crate::wgsl!("../../../wgsl/kv_fp8.wgsl");
 
 pub const QUANTIZE_ENTRY: &str = "quantize_kv_fp8";
 pub const QUANTIZE_ENTRY_KT: &str = "quantize_kv_fp8_kt";
@@ -389,69 +387,42 @@ pub fn cpu_quantize_kv_fp8(
     }
 }
 
-pub fn cpu_dequantize_kv_fp8(
-    src: &[u8],
-    scales: &[f32],
-    out: &mut [u16],
-    start: usize,
-    n_tokens: usize,
-    n_kv: usize,
-    head_dim: usize,
-    ring: usize,
-) {
-    for token in 0..n_tokens {
-        for kv_head in 0..n_kv {
-            let mut slot = start + token;
-            if ring > 0 {
-                slot %= ring;
-            }
-            let base = (slot * n_kv + kv_head) * head_dim;
-            let obase = (token * n_kv + kv_head) * head_dim;
-            let scale = scales[slot * n_kv + kv_head];
-            for d in 0..head_dim {
-                let v = decode_e4m3(src[base + d]) * scale;
-                out[obase + d] = half::bf16::from_f32(v).to_bits();
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn e4m3_round_trips_every_finite_code() {
-        for b in 0u16..256 {
-            let b = b as u8;
-            if b & 0x7f == 0x7f {
-                continue;
+    fn e4m3_encode_ties_to_even_and_round_trips_every_finite_code() {
+        {
+            for b in 0u16..256 {
+                let b = b as u8;
+                if b & 0x7f == 0x7f {
+                    continue;
+                }
+                let v = decode_e4m3(b);
+                let back = encode_e4m3(v);
+                assert_eq!(
+                    back, b,
+                    "code {b:#04x} decoded to {v} re-encoded to {back:#04x}"
+                );
             }
-            let v = decode_e4m3(b);
-            let back = encode_e4m3(v);
-            assert_eq!(
-                back, b,
-                "code {b:#04x} decoded to {v} re-encoded to {back:#04x}"
-            );
         }
-    }
-
-    #[test]
-    fn e4m3_encode_ties_to_even() {
-        assert_eq!(encode_e4m3(1.0), 0x38);
-        assert_eq!(encode_e4m3(1.0625), 0x38);
-        assert_eq!(encode_e4m3(1.1875), 0x3a);
-        assert_eq!(encode_e4m3(-1.0625), 0xb8);
-        assert_eq!(encode_e4m3(448.0), 0x7e);
-        assert_eq!(encode_e4m3(464.0), 0x7e);
-        assert_eq!(encode_e4m3(f32::INFINITY), 0x7e);
-        assert_eq!(encode_e4m3(f32::NEG_INFINITY), 0xfe);
-        assert_eq!(encode_e4m3(0.0), 0x00);
-        assert_eq!(encode_e4m3(-0.0), 0x80);
-        assert_eq!(encode_e4m3(0.001_953_125), 0x01);
-        assert_eq!(encode_e4m3(0.000_976_562_5), 0x00);
-        assert_eq!(encode_e4m3(0.002_929_687_5), 0x02);
-        assert_eq!(encode_e4m3(0.015_625), 0x08);
+        {
+            assert_eq!(encode_e4m3(1.0), 0x38);
+            assert_eq!(encode_e4m3(1.0625), 0x38);
+            assert_eq!(encode_e4m3(1.1875), 0x3a);
+            assert_eq!(encode_e4m3(-1.0625), 0xb8);
+            assert_eq!(encode_e4m3(448.0), 0x7e);
+            assert_eq!(encode_e4m3(464.0), 0x7e);
+            assert_eq!(encode_e4m3(f32::INFINITY), 0x7e);
+            assert_eq!(encode_e4m3(f32::NEG_INFINITY), 0xfe);
+            assert_eq!(encode_e4m3(0.0), 0x00);
+            assert_eq!(encode_e4m3(-0.0), 0x80);
+            assert_eq!(encode_e4m3(0.001_953_125), 0x01);
+            assert_eq!(encode_e4m3(0.000_976_562_5), 0x00);
+            assert_eq!(encode_e4m3(0.002_929_687_5), 0x02);
+            assert_eq!(encode_e4m3(0.015_625), 0x08);
+        }
     }
 
     #[test]
@@ -469,25 +440,25 @@ mod tests {
     }
 
     #[test]
-    fn slot_bounds_are_checked() {
-        assert!(slot_count(10, 4, "x").is_err());
-        assert_eq!(slot_count(12, 4, "x").unwrap(), 3);
-        assert_eq!(max_slot_touched(3, 2, 0), 4);
-        assert_eq!(max_slot_touched(3, 2, 4), 3);
-    }
+    fn slot_bounds_are_checked_and_word_packing_round_trips() {
+        {
+            assert!(slot_count(10, 4, "x").is_err());
+            assert_eq!(slot_count(12, 4, "x").unwrap(), 3);
+            assert_eq!(max_slot_touched(3, 2, 0), 4);
+            assert_eq!(max_slot_touched(3, 2, 4), 3);
+        }
+        {
+            let src: Vec<u16> = (0u16..32).map(|i| i.wrapping_mul(2731)).collect();
+            let words = pack_bf16(&src);
+            let mut back = vec![0u16; src.len()];
+            unpack_bf16(&words, &mut back);
+            assert_eq!(back, src);
 
-    #[test]
-    fn word_packing_round_trips() {
-        let src: Vec<u16> = (0u16..32).map(|i| i.wrapping_mul(2731)).collect();
-        let words = pack_bf16(&src);
-        let mut back = vec![0u16; src.len()];
-        unpack_bf16(&words, &mut back);
-        assert_eq!(back, src);
-
-        let bytes: Vec<u8> = (0u8..16).collect();
-        let w = bytes_to_words(&bytes);
-        let mut rb = vec![0u8; bytes.len()];
-        words_to_bytes(&w, &mut rb);
-        assert_eq!(rb, bytes);
+            let bytes: Vec<u8> = (0u8..16).collect();
+            let w = bytes_to_words(&bytes);
+            let mut rb = vec![0u8; bytes.len()];
+            words_to_bytes(&w, &mut rb);
+            assert_eq!(rb, bytes);
+        }
     }
 }

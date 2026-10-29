@@ -7,7 +7,7 @@ synthesis, transcription, translation, text and audio embeddings, speaker
 diarization, OCR, PII classification, a realtime WebRTC voice protocol — on an
 in-tree model stack: kernels, quantized linear algebra, model graphs, the
 KV-cache scheduler, speculative decoding, tokenizers and weight loading are all
-Rust crates in the server's workspace, per **G6 — single binary**, "No Python
+Rust crates in the server's workspace, per G6 — single binary, "No Python
 at runtime. No sidecar." (01.1-native-rust-port-prd.md).
 
 ## One process, one binary
@@ -34,7 +34,7 @@ optional, so the binary boots and health-checks with any subset of the corpus.
 | Crate | Layer | Exists for |
 |---|---|---|
 | `nv-config` | 0 | `Dtype`, `Backend`, `EngineConfig`. One file, no heavy deps. |
-| `nv-lookup` | 0 | Suffix automaton / n-gram matching. **Zero dependencies**, so it compiles everywhere. |
+| `nv-lookup` | 0 | Suffix automaton / n-gram matching. Zero dependencies, so it compiles everywhere. |
 | `nv-punkt` | 0 | Punkt sentence segmentation plus a `punkt-train` binary; cuts TTS text into utterances. |
 | `nv-grammar` | 0 | Guided decoding: JSON Schema → regex → DFA over `regex-automata`, then a token mask over the vocabulary's raw bytes. |
 | `nv-tokenizer` | 0 | Wrapper over `tokenizers` plus a minijinja chat-template renderer. |
@@ -75,7 +75,7 @@ parses `NV_KERNELS_BACKEND`, and the serving selector
 cuda-first: `auto` falls back to wgpu only on a concrete CUDA reason it cannot
 serve the model, an explicit `wgpu` never falls back, and `WgpuEvidence`
 separates a decoder verified on real weights from one inferred from its
-architecture family, so **the surface claims no more than has been tested**
+architecture family, so the surface claims no more than has been tested
 (05-backends.md). `nv-kernels` carries `cuda/` (with a vendored Marlin
 subtree), `cuda_sm120/` for Blackwell FP4, `hip/` (a ROCm stub), and `wgsl/`
 driven by `src/wgpu_backend/`; Metal reaches the GPU through wgpu/WGSL, so
@@ -111,21 +111,21 @@ tree crosses the PRD's "inference only" non-goal.
 
 ## The parallel trees
 
-**`python/`** is the parity reference: `nano_vllm/`, the vLLM-style engine
+`python/` is the parity reference: `nano_vllm/`, the vLLM-style engine
 ported module for module (`engine/` onto `nv-engine`, `layers/` onto
 `nv-layers` + `nv-quant`, `spec_decode/` onto `nv-specdecode`), with a `pyo3`
 dev-dependency embedding CPython for parity tests that diff at named hook
-points; PRD §8 keeps it, **not** deprecated. **`go/`** independently implements
+points; PRD §8 keeps it, not deprecated. `go/` independently implements
 the realtime endpoint only (pion WebRTC, whisper.cpp and Kokoro via cgo, ONNX
 Runtime), with no chat engine; a Go port of the inference stack is an explicit
-PRD non-goal. **`conformance/`** is the contract between them: wire-trace
+PRD non-goal. `conformance/` is the contract between them: wire-trace
 fixtures replayed in-process by both, endpoint manifests driven over HTTP, and
 declarative manifests consumed by named Rust and Go tests, over
 `conformance/lib/`'s assertion library (trace canonicalization, diffing, the
 W1–W8 wire and I1–I11 state-machine invariants), **so an implementation cannot
 pass by agreeing with itself** (08-build-and-testing.md). **`client/`** holds
 Python and Node e2e drivers driving the server over `aiortc`, upstream
-`speaches`'s own WebRTC stack; **`inspector/`** is a dependency-free static
+`speaches`'s own WebRTC stack; `inspector/` is a dependency-free static
 frontend over `/v1/inspect/*`, not served by the binary; `examples/` a LoRA
 training notebook.
 

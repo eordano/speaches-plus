@@ -4,6 +4,7 @@ pub mod dense;
 pub mod kokoro;
 #[cfg(test)]
 pub(crate) mod model_gate;
+pub mod precision;
 pub mod sampling;
 pub mod speaker_encoder;
 pub mod spk_mel;
@@ -19,6 +20,8 @@ pub use codec_decoder::{
     Qwen3TtsCodecVocoder, CODEC_CODEBOOK_SIZE, CODEC_NUM_QUANTIZERS, CODEC_SAMPLES_PER_FRAME,
     CODEC_SAMPLE_RATE,
 };
+pub use dense::LinearQuant;
+pub use precision::TalkerPrecision;
 pub use sampling::{Sampler, SamplerConfig};
 pub use speaker_encoder::{
     qwen3_tts_base_dir, SpeakerEncoder, SpeakerEncoderConfig, SpeakerEncoderSource,

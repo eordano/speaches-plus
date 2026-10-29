@@ -50,7 +50,6 @@ export const ERROR_KINDS = new Set([
   'error', 'phrase_error', 'dropped', 'raised', 'bargein_missed',
 ]);
 
-// Kinds that get bigger ticks on the timeline (the "important" treatment).
 export const IMPORTANT_KINDS = new Set([
   'first_token', 'pending_start',
   'error', 'dropped', 'raised', 'bargein_missed',

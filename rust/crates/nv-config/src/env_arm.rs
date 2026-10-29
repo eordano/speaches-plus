@@ -67,113 +67,95 @@ mod tests {
     use super::*;
 
     #[test]
-    fn env_arm_opt_in_reads_fresh_every_call() {
+    fn every_reread_env_arm_family_reads_fresh_every_call_with_its_own_truth_table() {
         let name = "NV_CFG_TEST_OPT_IN_REREAD";
-        std::env::remove_var(name);
+        unsafe { std::env::remove_var(name) };
         assert!(!env_arm_opt_in_eq_some_1_reread_every_call(name));
-        std::env::set_var(name, "1");
+        unsafe { std::env::set_var(name, "1") };
         assert!(env_arm_opt_in_eq_some_1_reread_every_call(name));
-        std::env::set_var(name, "0");
+        unsafe { std::env::set_var(name, "0") };
         assert!(!env_arm_opt_in_eq_some_1_reread_every_call(name));
-        std::env::remove_var(name);
-    }
+        unsafe { std::env::remove_var(name) };
 
-    #[test]
-    fn env_arm_opt_out_defaults_on_and_only_literal_zero_disables() {
         let name = "NV_CFG_TEST_OPT_OUT_REREAD";
-        std::env::remove_var(name);
+        unsafe { std::env::remove_var(name) };
         assert!(env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(name));
-        std::env::set_var(name, "0");
+        unsafe { std::env::set_var(name, "0") };
         assert!(!env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(name));
-        std::env::set_var(name, "off");
+        unsafe { std::env::set_var(name, "off") };
         assert!(env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(name));
-        std::env::remove_var(name);
-    }
+        unsafe { std::env::remove_var(name) };
 
-    #[test]
-    fn env_arm_presence_triggers_on_any_value_including_0_and_empty() {
         let name = "NV_CFG_TEST_PRESENCE_REREAD";
-        std::env::remove_var(name);
+        unsafe { std::env::remove_var(name) };
         assert!(!env_arm_present_at_all_reread_every_call(name));
-        std::env::set_var(name, "0");
+        unsafe { std::env::set_var(name, "0") };
         assert!(env_arm_present_at_all_reread_every_call(name));
-        std::env::set_var(name, "");
+        unsafe { std::env::set_var(name, "") };
         assert!(env_arm_present_at_all_reread_every_call(name));
-        std::env::remove_var(name);
+        unsafe { std::env::remove_var(name) };
         assert!(!env_arm_present_at_all_reread_every_call(name));
-    }
 
-    #[test]
-    fn env_arm_set_to_anything_but_0_is_off_when_unset_or_literal_zero_only() {
         let name = "NV_CFG_TEST_SET_NOT0_REREAD";
-        std::env::remove_var(name);
+        unsafe { std::env::remove_var(name) };
         assert!(!env_arm_opt_in_set_to_anything_but_0_reread_every_call(
             name
         ));
-        std::env::set_var(name, "0");
+        unsafe { std::env::set_var(name, "0") };
         assert!(!env_arm_opt_in_set_to_anything_but_0_reread_every_call(
             name
         ));
-        std::env::set_var(name, "off");
+        unsafe { std::env::set_var(name, "off") };
         assert!(env_arm_opt_in_set_to_anything_but_0_reread_every_call(name));
-        std::env::set_var(name, "");
+        unsafe { std::env::set_var(name, "") };
         assert!(env_arm_opt_in_set_to_anything_but_0_reread_every_call(name));
-        std::env::remove_var(name);
+        unsafe { std::env::remove_var(name) };
     }
 
     #[test]
-    fn env_arm_cached_macro_caches_per_call_site_so_the_call_sites_first_read_wins_over_later_env_changes(
+    fn every_cached_env_arm_macro_caches_per_call_site_so_the_first_read_wins_over_later_env_changes(
     ) {
         let name = "NV_CFG_TEST_CACHED_FIRST_READ";
         fn one_call_site_like_a_family_wrapper_fn(name: &str) -> bool {
             env_arm_opt_in_eq_some_1_cached_first_read_wins!(name)
         }
-        std::env::set_var(name, "1");
+        unsafe { std::env::set_var(name, "1") };
         assert!(one_call_site_like_a_family_wrapper_fn(name));
-        std::env::set_var(name, "0");
+        unsafe { std::env::set_var(name, "0") };
         assert!(one_call_site_like_a_family_wrapper_fn(name));
-        std::env::remove_var(name);
+        unsafe { std::env::remove_var(name) };
         assert!(!env_arm_opt_in_eq_some_1_cached_first_read_wins!(name));
-    }
 
-    #[test]
-    fn env_arm_cached_opt_out_macro_defaults_on_and_first_read_wins() {
         let name = "NV_CFG_TEST_CACHED_OPT_OUT";
-        fn one_call_site(name: &str) -> bool {
+        fn opt_out_call_site(name: &str) -> bool {
             env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins!(name)
         }
-        std::env::set_var(name, "0");
-        assert!(!one_call_site(name));
-        std::env::remove_var(name);
-        assert!(!one_call_site(name));
+        unsafe { std::env::set_var(name, "0") };
+        assert!(!opt_out_call_site(name));
+        unsafe { std::env::remove_var(name) };
+        assert!(!opt_out_call_site(name));
         assert!(env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins!(name));
-    }
 
-    #[test]
-    fn env_arm_cached_presence_macro_first_read_wins_and_triggers_on_any_value() {
         let name = "NV_CFG_TEST_CACHED_PRESENCE";
-        fn one_call_site(name: &str) -> bool {
+        fn presence_call_site(name: &str) -> bool {
             env_arm_present_at_all_cached_first_read_wins!(name)
         }
-        std::env::set_var(name, "0");
-        assert!(one_call_site(name));
-        std::env::remove_var(name);
-        assert!(one_call_site(name));
+        unsafe { std::env::set_var(name, "0") };
+        assert!(presence_call_site(name));
+        unsafe { std::env::remove_var(name) };
+        assert!(presence_call_site(name));
         assert!(!env_arm_present_at_all_cached_first_read_wins!(name));
-    }
 
-    #[test]
-    fn env_arm_cached_set_not0_macro_first_read_wins() {
         let name = "NV_CFG_TEST_CACHED_SET_NOT0";
-        fn one_call_site(name: &str) -> bool {
+        fn set_not0_call_site(name: &str) -> bool {
             env_arm_opt_in_set_to_anything_but_0_cached_first_read_wins!(name)
         }
-        std::env::set_var(name, "0");
-        assert!(!one_call_site(name));
-        std::env::set_var(name, "on");
-        assert!(!one_call_site(name));
+        unsafe { std::env::set_var(name, "0") };
+        assert!(!set_not0_call_site(name));
+        unsafe { std::env::set_var(name, "on") };
+        assert!(!set_not0_call_site(name));
         assert!(env_arm_opt_in_set_to_anything_but_0_cached_first_read_wins!(name));
-        std::env::remove_var(name);
+        unsafe { std::env::remove_var(name) };
     }
 
     #[test]

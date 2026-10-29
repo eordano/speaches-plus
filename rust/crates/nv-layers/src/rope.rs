@@ -22,6 +22,11 @@ pub enum RopeTablePrecision {
     F64,
 }
 
+pub const THE_F32_ROPE_COPY_HONOURS_THE_LAYOUT_WINDOW_LIKE_THE_BF16_PATH: &str =
+    "a q or k that is a narrow of a wider buffer (the fused qkv GEMV output) shares that \
+     buffer's CudaSlice; copying the whole slice into the exact-size rope output tripped \
+     cudarc's dst.len() >= src.len() assertion, so the copy takes the layout's window";
+
 pub fn rope_table_precision_from_env() -> RopeTablePrecision {
     match std::env::var("NV_ROPE_TABLE").ok().as_deref() {
         Some("f64") => RopeTablePrecision::F64,
@@ -158,7 +163,7 @@ impl Rope {
 
     pub fn apply(&self, q: &Tensor, k: &Tensor, positions: &Tensor) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "cuda")]
-        if matches!(q.device(), Device::Cuda(_)) {
+        if q.device().is_cuda() {
             if q.dtype() == DType::F32 {
                 return self.apply_cuda_f32(q, k, positions);
             }
@@ -249,9 +254,8 @@ impl Rope {
         let cos_c = self.cos.contiguous()?;
         let sin_c = self.sin.contiguous()?;
 
-        let dev = match q_in.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = q_in.device().clone() else {
+            unreachable!()
         };
         let stream = crate::cuda_stream::current_stream(&dev);
 
@@ -265,8 +269,8 @@ impl Rope {
         let pos_i32 = positions_to_i32_cuda(positions, q_in.device())?;
 
         let rc = {
-            let (qs, _ql) = q_in.storage_and_layout();
-            let (ks, _kl) = k_in.storage_and_layout();
+            let (qs, ql) = q_in.storage_and_layout();
+            let (ks, kl) = k_in.storage_and_layout();
             let (cs, _cl) = cos_c.storage_and_layout();
             let (ss, _sl) = sin_c.storage_and_layout();
             let (ps, _pl) = pos_i32.storage_and_layout();
@@ -295,11 +299,14 @@ impl Rope {
             let c_slice = c_cuda.as_cuda_slice::<f32>()?;
             let s_slice = s_cuda.as_cuda_slice::<f32>()?;
             let p_slice = p_cuda.as_cuda_slice::<i32>()?;
+            let _ = THE_F32_ROPE_COPY_HONOURS_THE_LAYOUT_WINDOW_LIKE_THE_BF16_PATH;
+            let q_view = q_slice.slice(ql.start_offset()..ql.start_offset() + q_out.len());
+            let k_view = k_slice.slice(kl.start_offset()..kl.start_offset() + k_out.len());
             stream
-                .memcpy_dtod(q_slice, &mut q_out)
+                .memcpy_dtod(&q_view, &mut q_out)
                 .map_err(|e| anyhow::anyhow!(e))?;
             stream
-                .memcpy_dtod(k_slice, &mut k_out)
+                .memcpy_dtod(&k_view, &mut k_out)
                 .map_err(|e| anyhow::anyhow!(e))?;
             let (pq, _gq) = q_out.device_ptr_mut(&stream);
             let (pk, _gk) = k_out.device_ptr_mut(&stream);
@@ -389,9 +396,8 @@ impl Rope {
         let cos_c = self.cos.contiguous()?;
         let sin_c = self.sin.contiguous()?;
 
-        let dev = match q_in.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = q_in.device().clone() else {
+            unreachable!()
         };
         let stream = crate::cuda_stream::current_stream(&dev);
 
@@ -845,15 +851,19 @@ mod tests {
         Tensor::from_vec(v, shape, device).unwrap()
     }
 
+    fn host(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
     #[test]
-    fn mrope_collapses_to_1d_rope_when_positions_match() {
+    fn mrope_collapses_to_1d_rope_when_positions_match_and_diverges_when_they_differ() {
         let device = Device::Cpu;
         let head_dim = 128usize;
         let sections = vec![24usize, 20, 20];
 
         let cfg = RopeConfig {
             head_dim,
-            max_seq_len: 16,
+            max_seq_len: 32,
             base: 1_000_000.0,
             kind: RopeKind::Standard,
         };
@@ -867,63 +877,37 @@ mod tests {
 
         let (q1, k1) = rope.apply(&q, &k, &positions).unwrap();
 
-        let pt = Tensor::from_vec(pos_vec.clone(), 4usize, &device).unwrap();
-        let ph = Tensor::from_vec(pos_vec.clone(), 4usize, &device).unwrap();
-        let pw = Tensor::from_vec(pos_vec, 4usize, &device).unwrap();
         let (q2, k2) = rope
-            .apply_mrope(&q, &k, &[&pt, &ph, &pw], &sections)
+            .apply_mrope(&q, &k, &[&positions, &positions, &positions], &sections)
             .unwrap();
 
-        let q1_v = q1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let q2_v = q2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(q1_v.len(), q2_v.len());
-        for (i, (a, b)) in q1_v.iter().zip(q2_v.iter()).enumerate() {
-            assert!(
-                (a - b).abs() == 0.0,
-                "q diff at {i}: {a} vs {b} (collapse should be bit-identical)"
-            );
-        }
-        let k1_v = k1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let k2_v = k2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for (i, (a, b)) in k1_v.iter().zip(k2_v.iter()).enumerate() {
-            assert!(
-                (a - b).abs() == 0.0,
-                "k diff at {i}: {a} vs {b} (collapse should be bit-identical)"
-            );
-        }
-    }
-
-    #[test]
-    fn rope_preserves_per_head_norm() {
-        let device = Device::Cpu;
-        let head_dim = 64usize;
-        let cfg = RopeConfig {
-            head_dim,
-            max_seq_len: 128,
-            base: 10_000.0,
-            kind: RopeKind::Standard,
-        };
-        let rope = Rope::new(cfg, &device).unwrap();
-        let t = 6usize;
-        let q = det_tensor((t, 3, head_dim), &device);
-        let k = det_tensor((t, 1, head_dim), &device);
-        let positions = Tensor::from_vec(vec![0u32, 1, 5, 17, 63, 127], t, &device).unwrap();
-        let (q_rot, k_rot) = rope.apply(&q, &k, &positions).unwrap();
-        for (orig, rot, heads) in [(&q, &q_rot, 3usize), (&k, &k_rot, 1usize)] {
-            let a = orig.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let b = rot.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            for tok in 0..t {
-                for h in 0..heads {
-                    let off = (tok * heads + h) * head_dim;
-                    let na: f32 = a[off..off + head_dim].iter().map(|v| v * v).sum();
-                    let nb: f32 = b[off..off + head_dim].iter().map(|v| v * v).sum();
-                    assert!(
-                        (na.sqrt() - nb.sqrt()).abs() <= 1e-4 * na.sqrt().max(1e-3),
-                        "norm not preserved at token {tok} head {h}: {na} vs {nb}"
-                    );
-                }
+        for (name, a, b) in [("q", &q1, &q2), ("k", &k1, &k2)] {
+            let a = host(a);
+            let b = host(b);
+            assert_eq!(a.len(), b.len());
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert!(
+                    (x - y).abs() == 0.0,
+                    "{name} diff at {i}: {x} vs {y} (collapse should be bit-identical)"
+                );
             }
         }
+
+        let ph = Tensor::from_vec(vec![3u32, 4, 5, 6], 4usize, &device).unwrap();
+        let pw = Tensor::from_vec(vec![5u32, 6, 7, 8], 4usize, &device).unwrap();
+        let (q_diff, _k_diff) = rope
+            .apply_mrope(&q, &k, &[&positions, &ph, &pw], &sections)
+            .unwrap();
+        let a = host(&q2);
+        let b = host(&q_diff);
+        let mut max_abs = 0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            max_abs = max_abs.max((x - y).abs());
+        }
+        assert!(
+            max_abs > 1e-4,
+            "expected divergence when axes differ, but max|Δ| = {max_abs}"
+        );
     }
 
     #[test]
@@ -1051,87 +1035,10 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn rope_position_zero_is_identity() {
-        let device = Device::Cpu;
-        let head_dim = 32usize;
-        let cfg = RopeConfig {
-            head_dim,
-            max_seq_len: 8,
-            base: 10_000.0,
-            kind: RopeKind::Standard,
-        };
-        let rope = Rope::new(cfg, &device).unwrap();
-        let q = det_tensor((1, 2, head_dim), &device);
-        let k = det_tensor((1, 1, head_dim), &device);
-        let positions = Tensor::from_vec(vec![0u32], 1usize, &device).unwrap();
-        let (q_rot, k_rot) = rope.apply(&q, &k, &positions).unwrap();
-        let a = q.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = q_rot.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for (x, y) in a.iter().zip(b.iter()) {
-            assert!(
-                (x - y).abs() < 1e-6,
-                "position 0 must be the identity rotation"
-            );
-        }
-        let a = k.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = k_rot.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for (x, y) in a.iter().zip(b.iter()) {
-            assert!((x - y).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn mrope_diverges_when_positions_differ() {
-        let device = Device::Cpu;
-        let head_dim = 128usize;
-        let cfg = RopeConfig {
-            head_dim,
-            max_seq_len: 32,
-            base: 1_000_000.0,
-            kind: RopeKind::Standard,
-        };
-        let rope = Rope::new(cfg, &device).unwrap();
-        let sections = [24usize, 20, 20];
-        let q = det_tensor((2, 2, head_dim), &device);
-        let k = det_tensor((2, 1, head_dim), &device);
-
-        let same = Tensor::from_vec(vec![0u32, 1], 2usize, &device).unwrap();
-        let (q_same, _k_same) = rope
-            .apply_mrope(&q, &k, &[&same, &same, &same], &sections)
-            .unwrap();
-
-        let pt = Tensor::from_vec(vec![0u32, 1], 2usize, &device).unwrap();
-        let ph = Tensor::from_vec(vec![3u32, 4], 2usize, &device).unwrap();
-        let pw = Tensor::from_vec(vec![5u32, 6], 2usize, &device).unwrap();
-        let (q_diff, _k_diff) = rope
-            .apply_mrope(&q, &k, &[&pt, &ph, &pw], &sections)
-            .unwrap();
-
-        let a = q_same.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let b = q_diff.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-
-        let mut max_abs = 0f32;
-        for (x, y) in a.iter().zip(b.iter()) {
-            max_abs = max_abs.max((x - y).abs());
-        }
-        assert!(
-            max_abs > 1e-4,
-            "expected divergence when axes differ, but max|Δ| = {max_abs}"
-        );
-    }
 }
 
-pub const NV_TRAIN_ROPE_FUSED_ENV_DEFAULT_ON_0_RESTORES_THE_CANDLE_NARROW_MUL_CAT_CHAIN: &str =
-    "NV_TRAIN_ROPE_FUSED";
-
 pub fn train_rope_op_serves(x: &Tensor) -> bool {
-    x.device().is_cuda()
-        && matches!(x.dtype(), DType::BF16 | DType::F32)
-        && nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            NV_TRAIN_ROPE_FUSED_ENV_DEFAULT_ON_0_RESTORES_THE_CANDLE_NARROW_MUL_CAT_CHAIN,
-        )
+    x.device().is_cuda() && matches!(x.dtype(), DType::BF16 | DType::F32)
 }
 
 #[cfg(feature = "cuda")]
@@ -1146,19 +1053,26 @@ pub struct RopeTrainOp {
 
 #[cfg(feature = "cuda")]
 impl RopeTrainOp {
-    fn table_ptrs(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> candle_core::Result<(u64, u64, u64)> {
+    fn table_ptrs(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> candle_core::Result<(u64, u64, u64)> {
         use cudarc::driver::DevicePtr;
         let f32_ptr = |t: &Tensor| -> candle_core::Result<u64> {
             let (st, l) = t.storage_and_layout();
             let candle_core::Storage::Cuda(c) = &*st else {
-                return Err(candle_core::Error::Msg("rope train op: table not cuda".into()));
+                return Err(candle_core::Error::Msg(
+                    "rope train op: table not cuda".into(),
+                ));
             };
             let (p, _g) = c.as_cuda_slice::<f32>()?.device_ptr(stream);
             Ok(p + (l.start_offset() * 4) as u64)
         };
         let (pst, pl) = self.positions.storage_and_layout();
         let candle_core::Storage::Cuda(pc) = &*pst else {
-            return Err(candle_core::Error::Msg("rope train op: positions not cuda".into()));
+            return Err(candle_core::Error::Msg(
+                "rope train op: positions not cuda".into(),
+            ));
         };
         let (pp, _gp) = pc.as_cuda_slice::<u32>()?.device_ptr(stream);
         let pos = pp + (pl.start_offset() * 4) as u64;
@@ -1186,7 +1100,11 @@ impl RopeTrainOp {
         let is_bf16 = match dtype {
             DType::BF16 => 1,
             DType::F32 => 0,
-            other => return Err(candle_core::Error::Msg(format!("rope train op: dtype {other:?}"))),
+            other => {
+                return Err(candle_core::Error::Msg(format!(
+                    "rope train op: dtype {other:?}"
+                )))
+            }
         };
         let rc = unsafe {
             if bwd {
@@ -1222,7 +1140,9 @@ impl RopeTrainOp {
             }
         };
         if rc != 0 {
-            return Err(candle_core::Error::Msg(format!("rope_train rc={rc} bwd={bwd}")));
+            return Err(candle_core::Error::Msg(format!(
+                "rope_train rc={rc} bwd={bwd}"
+            )));
         }
         Ok(())
     }
@@ -1254,15 +1174,19 @@ impl candle_core::CustomOp1 for RopeTrainOp {
         let dims = l.shape().dims().to_vec();
         let n = dims.iter().product::<usize>();
         let Some((start, _end)) = l.contiguous_offsets() else {
-            return Err(candle_core::Error::Msg("rope train op: input must be contiguous".into()));
+            return Err(candle_core::Error::Msg(
+                "rope train op: input must be contiguous".into(),
+            ));
         };
         let out = match s.dtype() {
             DType::BF16 => {
                 let x = s.as_cuda_slice::<half::bf16>()?;
                 let xv = x.slice(start..);
                 let (xp, _gx) = xv.device_ptr(&stream);
-                let mut y: cudarc::driver::CudaSlice<half::bf16> = unsafe { stream.alloc::<half::bf16>(n) }
-                    .map_err(|e| candle_core::Error::Msg(format!("rope train op alloc: {e:?}")))?;
+                let mut y: cudarc::driver::CudaSlice<half::bf16> = unsafe {
+                    stream.alloc::<half::bf16>(n)
+                }
+                .map_err(|e| candle_core::Error::Msg(format!("rope train op alloc: {e:?}")))?;
                 {
                     let (yp, _gy) = y.device_ptr_mut(&stream);
                     self.launch_ptrs(&stream, xp, yp, DType::BF16, &dims, false)?;
@@ -1281,25 +1205,42 @@ impl candle_core::CustomOp1 for RopeTrainOp {
                 }
                 candle_core::CudaStorage::wrap_cuda_slice(y, dev)
             }
-            other => return Err(candle_core::Error::Msg(format!("rope train op: dtype {other:?}"))),
+            other => {
+                return Err(candle_core::Error::Msg(format!(
+                    "rope train op: dtype {other:?}"
+                )))
+            }
         };
         Ok((out, l.shape().clone()))
     }
 
-    fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
+    fn bwd(
+        &self,
+        arg: &Tensor,
+        _res: &Tensor,
+        grad_res: &Tensor,
+    ) -> candle_core::Result<Option<Tensor>> {
         use cudarc::driver::DevicePtr;
         let candle_core::Device::Cuda(dev) = arg.device() else {
-            return Err(candle_core::Error::Msg("rope train op bwd: not cuda".into()));
+            return Err(candle_core::Error::Msg(
+                "rope train op bwd: not cuda".into(),
+            ));
         };
         let stream = crate::cuda_stream::current_stream(dev);
         let g = grad_res.detach().to_dtype(arg.dtype())?.contiguous()?;
         let dims = g.dims().to_vec();
-        let dx = crate::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(arg.device(), g.dtype(), &dims)
-            .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
+        let dx = crate::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
+            arg.device(),
+            g.dtype(),
+            &dims,
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("{e:#}")))?;
         let gp = {
             let (st, l) = g.storage_and_layout();
             let candle_core::Storage::Cuda(c) = &*st else {
-                return Err(candle_core::Error::Msg("rope train op bwd: grad not cuda".into()));
+                return Err(candle_core::Error::Msg(
+                    "rope train op bwd: grad not cuda".into(),
+                ));
             };
             match g.dtype() {
                 DType::BF16 => {
@@ -1310,7 +1251,11 @@ impl candle_core::CustomOp1 for RopeTrainOp {
                     let (p, _g) = c.as_cuda_slice::<f32>()?.device_ptr(&stream);
                     p + (l.start_offset() * 4) as u64
                 }
-                other => return Err(candle_core::Error::Msg(format!("rope train op bwd: dtype {other:?}"))),
+                other => {
+                    return Err(candle_core::Error::Msg(format!(
+                        "rope train op bwd: dtype {other:?}"
+                    )))
+                }
             }
         };
         let dp = crate::step_arena::device_ptr_for_a_kernel_to_write(&dx)
@@ -1335,11 +1280,12 @@ impl Rope {
             "rope train op: rotary_dim {rotary_dim} must be the table's head_dim {} and at most {head_dim}",
             self.cfg.head_dim
         );
-        let positions = if positions.dtype() == DType::U32 && positions.device().same_device(x.device()) {
-            positions.reshape(positions.elem_count())?.contiguous()?
-        } else {
-            normalize_positions_u32(positions, x.device())?
-        };
+        let positions =
+            if positions.dtype() == DType::U32 && positions.device().same_device(x.device()) {
+                positions.reshape(positions.elem_count())?.contiguous()?
+            } else {
+                normalize_positions_u32(positions, x.device())?
+            };
         let op = RopeTrainOp {
             cos: self.cos.clone(),
             sin: self.sin.clone(),

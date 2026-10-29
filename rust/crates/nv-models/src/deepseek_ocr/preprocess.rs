@@ -590,10 +590,6 @@ impl PreparedViews {
     }
 }
 
-pub fn deskew_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_DESKEW")
-}
-
 pub fn fast_res_override(requested: ResolutionMode) -> ResolutionMode {
     match std::env::var("NV_DSOCR_FAST_RES").ok().as_deref() {
         Some("base1024") => ResolutionMode::Base1024,
@@ -612,23 +608,20 @@ pub fn gundam_max_tiles() -> usize {
 
 pub fn prepare(img: &RgbImage, mode: ResolutionMode) -> Result<PreparedViews> {
     anyhow::ensure!(img.w > 0 && img.h > 0, "empty image");
+    let (deg, gain) = estimate_skew_deg(img);
+    let apply = deg.abs() >= SKEW_DEAD_ZONE_DEG && gain >= SKEW_MIN_GAIN;
+    if nv_config::env_arm_present_at_all_reread_every_call("NV_DSOCR_DESKEW_DEBUG") {
+        eprintln!("[dsocr] deskew {deg:+.2} deg gain={gain:.4} applied={apply}");
+    }
+    if !apply {
+        return prepare_upright(img, mode);
+    }
+    prepare_upright(&rotate_rgb(img, -deg, border_fill(img)), mode)
+}
+
+pub fn prepare_upright(img: &RgbImage, mode: ResolutionMode) -> Result<PreparedViews> {
+    anyhow::ensure!(img.w > 0 && img.h > 0, "empty image");
     let mode = fast_res_override(mode);
-    let owned;
-    let img = if deskew_enabled() {
-        let (deg, gain) = estimate_skew_deg(img);
-        let apply = deg.abs() >= SKEW_DEAD_ZONE_DEG && gain >= SKEW_MIN_GAIN;
-        if nv_config::env_arm_present_at_all_reread_every_call("NV_DSOCR_DESKEW_DEBUG") {
-            eprintln!("[dsocr] deskew {deg:+.2} deg gain={gain:.4} applied={apply}");
-        }
-        if apply {
-            owned = rotate_rgb(img, -deg, border_fill(img));
-            &owned
-        } else {
-            img
-        }
-    } else {
-        img
-    };
     match mode {
         ResolutionMode::Gundam => {
             let (tiles, crop_grid) = if img.w <= TILE_SIZE && img.h <= TILE_SIZE {
@@ -674,23 +667,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_resize_is_noop() {
+    fn resize_is_identity_at_size_constant_on_flat_input_and_mean_preserving_on_a_ramp() {
         let img = RgbImage::from_fn(8, 6, |x, y| [(x * 30) as u8, (y * 40) as u8, 7]);
         let out = resize_rgb(&img, 8, 6);
         assert_eq!(out.data, img.data);
-    }
-
-    #[test]
-    fn constant_image_resize_stays_constant() {
-        let img = RgbImage::filled(100, 60, [200, 10, 90]);
-        let out = resize_rgb(&img, 37, 23);
-        for p in out.data.chunks(3) {
+        let flat = RgbImage::filled(100, 60, [200, 10, 90]);
+        for p in resize_rgb(&flat, 37, 23).data.chunks(3) {
             assert_eq!(p, [200, 10, 90]);
         }
-    }
-
-    #[test]
-    fn plane_resize_preserves_linear_ramp_mean() {
         let src: Vec<f32> = (0..64).map(|i| i as f32).collect();
         let out = resize_plane_f32(&src, 8, 8, 4, 4);
         let mean_in: f32 = src.iter().sum::<f32>() / 64.0;
@@ -712,16 +696,12 @@ mod tests {
     }
 
     #[test]
-    fn tile_grid_matches_reference_cases() {
+    fn tile_grid_matches_reference_cases_and_dynamic_tiles_are_row_major() {
         assert_eq!(select_tile_grid(2000, 1000, 2, 6, 768), (2, 1));
         assert_eq!(select_tile_grid(1000, 2000, 2, 6, 768), (1, 2));
         assert_eq!(select_tile_grid(1500, 1000, 2, 6, 768), (3, 2));
         assert_eq!(select_tile_grid(900, 900, 2, 6, 768), (2, 2));
         assert_eq!(select_tile_grid(3000, 500, 2, 6, 768), (6, 1));
-    }
-
-    #[test]
-    fn dynamic_tiles_are_row_major() {
         let img = RgbImage::from_fn(2000, 1000, |x, _| {
             if x < 1000 {
                 [0, 0, 0]
@@ -754,7 +734,16 @@ mod tests {
     }
 
     #[test]
-    fn gundam_token_counts() {
+    fn token_counts_per_resolution_mode_match_the_reference() {
+        assert_eq!(num_queries(1024), 16);
+        assert_eq!(num_queries(768), 12);
+        let img = RgbImage::filled(500, 700, [80, 80, 80]);
+        let p = prepare(&img, ResolutionMode::Base1024).unwrap();
+        assert_eq!(p.vision_tokens(), 257);
+        let p = prepare(&img, ResolutionMode::Base768).unwrap();
+        assert_eq!(p.global_size, 768);
+        assert_eq!(p.vision_tokens(), 145);
+        assert_eq!(p.global.len(), 3 * 768 * 768);
         let small = RgbImage::filled(600, 400, [10, 10, 10]);
         let p = prepare(&small, ResolutionMode::Gundam).unwrap();
         assert_eq!(p.tiles.len(), 0);
@@ -768,17 +757,6 @@ mod tests {
         assert_eq!(p.vision_tokens(), 257 + 288);
     }
 
-    #[test]
-    fn base_modes_token_counts() {
-        let img = RgbImage::filled(500, 700, [80, 80, 80]);
-        let p = prepare(&img, ResolutionMode::Base1024).unwrap();
-        assert_eq!(p.vision_tokens(), 257);
-        let p = prepare(&img, ResolutionMode::Base768).unwrap();
-        assert_eq!(p.global_size, 768);
-        assert_eq!(p.vision_tokens(), 145);
-        assert_eq!(p.global.len(), 3 * 768 * 768);
-    }
-
     fn ruled_page(w: usize, h: usize) -> RgbImage {
         RgbImage::from_fn(w, h, |_, y| {
             if y % 16 < 5 && y > 20 && y < h - 20 {
@@ -790,15 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_zero_is_identity() {
-        let img = ruled_page(64, 48);
-        let out = rotate_rgb(&img, 0.0, PAD_FILL);
-        assert_eq!(out.w, img.w);
-        assert_eq!(out.data, img.data);
-    }
-
-    #[test]
-    fn skew_estimator_recovers_synthetic_rotation() {
+    fn skew_estimator_recovers_synthetic_rotation_and_deskew_straightens_it() {
         let base = ruled_page(400, 300);
         for truth in [-3.0f64, 2.0, 4.5, -12.0, 16.0] {
             let rot = rotate_rgb(&base, truth, [245, 245, 245]);
@@ -809,37 +779,37 @@ mod tests {
             );
             assert!(gain > SKEW_MIN_GAIN, "gain {gain} for truth {truth}");
         }
+        let rot = rotate_rgb(&base, 4.0, [245, 245, 245]);
+        let (fixed, applied) = deskew(&rot);
+        assert!((applied - 4.0).abs() < 0.5, "applied {applied}");
+        let (residual, _) = estimate_skew_deg(&fixed);
+        assert!(residual.abs() < SKEW_DEAD_ZONE_DEG, "residual {residual}");
     }
 
     #[test]
-    fn skew_estimator_is_flat_on_axis_aligned_text() {
+    fn deskew_and_zero_rotation_are_noops_on_straight_blank_and_prepared_pages() {
         let img = ruled_page(400, 300);
         let (deg, _) = estimate_skew_deg(&img);
         assert!(
             deg.abs() < SKEW_DEAD_ZONE_DEG,
             "estimated {deg} on straight page"
         );
-        let (out, applied) = deskew(&img);
+        let rotated = rotate_rgb(&img, 0.0, PAD_FILL);
+        assert_eq!(rotated.w, img.w);
+        assert_eq!(rotated.data, img.data);
+        for page in [img, RgbImage::filled(300, 200, [250, 250, 250])] {
+            let (out, applied) = deskew(&page);
+            assert_eq!(applied, 0.0);
+            assert_eq!(out.data, page.data);
+        }
+        let big = ruled_page(900, 900);
+        let (pre, applied) = deskew(&big);
         assert_eq!(applied, 0.0);
-        assert_eq!(out.data, img.data);
-    }
-
-    #[test]
-    fn deskew_on_blank_page_is_a_noop() {
-        let img = RgbImage::filled(300, 200, [250, 250, 250]);
-        let (out, applied) = deskew(&img);
-        assert_eq!(applied, 0.0);
-        assert_eq!(out.data, img.data);
-    }
-
-    #[test]
-    fn deskew_straightens_a_rotated_page() {
-        let base = ruled_page(400, 300);
-        let rot = rotate_rgb(&base, 4.0, [245, 245, 245]);
-        let (fixed, applied) = deskew(&rot);
-        assert!((applied - 4.0).abs() < 0.5, "applied {applied}");
-        let (residual, _) = estimate_skew_deg(&fixed);
-        assert!(residual.abs() < SKEW_DEAD_ZONE_DEG, "residual {residual}");
+        let a = prepare(&big, ResolutionMode::Gundam).unwrap();
+        let b = prepare(&pre, ResolutionMode::Gundam).unwrap();
+        assert_eq!(a.crop_grid, b.crop_grid);
+        assert_eq!(a.global, b.global);
+        assert_eq!(a.tiles, b.tiles);
     }
 
     #[test]
@@ -852,42 +822,5 @@ mod tests {
             }
         });
         assert_eq!(border_fill(&img), [200, 100, 50]);
-    }
-
-    #[test]
-    fn deskew_leaves_a_straight_page_bit_identical_through_prepare() {
-        let img = ruled_page(900, 900);
-        let (pre, applied) = deskew(&img);
-        assert_eq!(applied, 0.0);
-        let a = prepare(&img, ResolutionMode::Gundam).unwrap();
-        let b = prepare(&pre, ResolutionMode::Gundam).unwrap();
-        assert_eq!(a.crop_grid, b.crop_grid);
-        assert_eq!(a.global, b.global);
-        assert_eq!(a.tiles, b.tiles);
-    }
-
-    #[test]
-    #[ignore]
-    fn scan_skew_angles_from_env() {
-        let Ok(list) = std::env::var("NV_DSOCR_SKEW_SCAN") else {
-            return;
-        };
-        for path in list.split(':').filter(|s| !s.is_empty()) {
-            let img = RgbImage::decode_file(std::path::Path::new(path)).unwrap();
-            let t = std::time::Instant::now();
-            let (deg, gain) = estimate_skew_deg(&img);
-            println!(
-                "{deg:+7.2} gain={gain:.4} {:.2}s {}x{} {path}",
-                t.elapsed().as_secs_f64(),
-                img.w,
-                img.h
-            );
-        }
-    }
-
-    #[test]
-    fn num_queries_matches_reference() {
-        assert_eq!(num_queries(1024), 16);
-        assert_eq!(num_queries(768), 12);
     }
 }

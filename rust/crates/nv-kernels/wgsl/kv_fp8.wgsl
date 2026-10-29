@@ -178,6 +178,7 @@ fn quantize_kv_fp8(
     if (flat >= kvq_params.pairs) {
         return;
     }
+    #def b1
     let n_kv = kvq_params.n_kv;
     let head_dim = kvq_params.head_dim;
     let token = flat / n_kv;
@@ -188,12 +189,14 @@ fn quantize_kv_fp8(
         slot = slot % kvq_params.ring;
     }
     let base_src = (token * n_kv + kv_head) * head_dim;
+    #end
     let base_dst = (slot * n_kv + kv_head) * head_dim;
     let lid = tid.x;
 
     var local = 0.0;
     for (var d = lid; d < head_dim; d = d + KV_WG) {
         let a = abs(kv_bf16_at(base_src, d));
+        #def b2
         if (a > local) {
             local = a;
         }
@@ -204,6 +207,7 @@ fn quantize_kv_fp8(
     let inv_scale = select(1.0, kv_div_rn(KV_FP8_E4M3_MAX, amax), positive);
 
     if (lid == 0u) {
+        #end
         kvq_scales[slot * n_kv + kv_head] = scale;
     }
 
@@ -229,31 +233,13 @@ fn quantize_kv_fp8_kt(
     if (flat >= kvq_params.pairs) {
         return;
     }
-    let n_kv = kvq_params.n_kv;
-    let head_dim = kvq_params.head_dim;
-    let token = flat / n_kv;
-    let kv_head = flat % n_kv;
-
-    var slot = u32(max(kvq_start[0], 0)) + token;
-    if (kvq_params.ring > 0u) {
-        slot = slot % kvq_params.ring;
-    }
-    let base_src = (token * n_kv + kv_head) * head_dim;
+    #use b1
     let lid = tid.x;
 
     var local = 0.0;
     for (var d = lid; d < head_dim; d = d + KV_WG) {
         let a = abs(kv_bf16_at(base_src, d));
-        if (a > local) {
-            local = a;
-        }
-    }
-    let amax = kv_reduce_max(lid, local);
-    let positive = amax > 0.0;
-    let scale = select(1.0, kv_div_rn(amax, KV_FP8_E4M3_MAX), positive);
-    let inv_scale = select(1.0, kv_div_rn(KV_FP8_E4M3_MAX, amax), positive);
-
-    if (lid == 0u) {
+        #use b2
         kvq_scales[slot * n_kv + kv_head] = scale;
     }
 
@@ -325,32 +311,14 @@ fn quantize_kv_fp8_kv_write_bf16(
         return;
     }
     let use_v = wg.y;
-    let n_kv = kvq_params.n_kv;
-    let head_dim = kvq_params.head_dim;
-    let token = flat / n_kv;
-    let kv_head = flat % n_kv;
-
-    var slot = u32(max(kvq_start[0], 0)) + token;
-    if (kvq_params.ring > 0u) {
-        slot = slot % kvq_params.ring;
-    }
-    let base_src = (token * n_kv + kv_head) * head_dim;
+    #use b1
     let base_dst = (slot * n_kv + kv_head) * head_dim;
     let lid = tid.x;
 
     var local = 0.0;
     for (var d = lid; d < head_dim; d = d + KV_WG) {
         let a = abs(kvw_bf16_at(use_v, base_src, d));
-        if (a > local) {
-            local = a;
-        }
-    }
-    let amax = kv_reduce_max(lid, local);
-    let positive = amax > 0.0;
-    let scale = select(1.0, kv_div_rn(amax, KV_FP8_E4M3_MAX), positive);
-    let inv_scale = select(1.0, kv_div_rn(KV_FP8_E4M3_MAX, amax), positive);
-
-    if (lid == 0u) {
+        #use b2
         if (use_v == 1u) {
             kvw_vscales[slot * n_kv + kv_head] = scale;
         } else {

@@ -145,14 +145,6 @@ impl LayerMixPlan {
         self.linear_slot_for_layer.get(layer).copied().flatten()
     }
 
-    pub fn full_slot_map(&self) -> &[Option<usize>] {
-        &self.full_slot_for_layer
-    }
-
-    pub fn linear_slot_map(&self) -> &[Option<usize>] {
-        &self.linear_slot_for_layer
-    }
-
     pub fn full_layer_indices(&self) -> Vec<usize> {
         self.kinds
             .iter()
@@ -215,7 +207,8 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_is_dense_within_its_own_kind_and_a_layer_has_exactly_one() {
+    fn a_slot_is_dense_within_its_own_kind_and_the_interval_counts_from_one_so_the_first_layer_is_never_full(
+    ) {
         let plan = LayerMixPlan::from_full_attention_interval(8, 3).unwrap();
         assert_eq!(kinds_of(&plan), "LLFLLFLL");
 
@@ -254,10 +247,7 @@ mod tests {
         );
         assert_eq!(plan.full_layer_indices(), vec![2, 5]);
         assert_eq!(plan.linear_layer_indices(), vec![0, 1, 3, 4, 6, 7]);
-    }
 
-    #[test]
-    fn the_interval_counts_from_one_so_the_first_layer_is_never_full() {
         assert_eq!(
             kinds_of(&LayerMixPlan::from_full_attention_interval(6, 2).unwrap()),
             "LFLFLF"
@@ -339,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    fn the_error_cases_are_refused_rather_than_defaulted() {
+    fn the_error_cases_are_refused_and_a_layer_type_list_round_trips_through_its_own_wire_names() {
         assert!(
             LayerMixPlan::from_full_attention_interval(4, 0).is_err(),
             "interval 0"
@@ -357,10 +347,6 @@ mod tests {
             MixerKind::parse("FullAttention").is_err(),
             "the wire name is snake_case"
         );
-    }
-
-    #[test]
-    fn a_layer_type_list_round_trips_through_its_own_wire_names() {
         for k in [MixerKind::FullAttention, MixerKind::LinearAttention] {
             assert_eq!(MixerKind::parse(k.as_str()).unwrap(), k);
         }

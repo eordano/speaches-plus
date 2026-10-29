@@ -93,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn header_is_read_case_insensitively_in_milliseconds() {
+    fn header_is_read_case_insensitively_and_garbage_falls_back_to_the_server_default() {
         assert_eq!(from_headers(&hdr("1500")), Some(ms(1500)));
         assert_eq!(from_headers(&hdr("  1500  ")), Some(ms(1500)));
 
@@ -103,96 +103,84 @@ mod tests {
             HeaderValue::from_static("250"),
         );
         assert_eq!(from_headers(&mixed), Some(ms(250)));
-    }
-
-    #[test]
-    fn garbage_and_absent_headers_fall_back_to_the_server_default() {
-        for junk in [
-            "",
-            "  ",
-            "soon",
-            "-1",
-            "1.5",
-            "1500ms",
-            "99999999999999999999",
-        ] {
-            assert_eq!(from_headers(&hdr(junk)), None, "junk header {junk:?}");
+        {
+            for junk in [
+                "",
+                "  ",
+                "soon",
+                "-1",
+                "1.5",
+                "1500ms",
+                "99999999999999999999",
+            ] {
+                assert_eq!(from_headers(&hdr(junk)), None, "junk header {junk:?}");
+                assert_eq!(
+                    resolve_with_max(from_headers(&hdr(junk)), ms(3000), ms(120_000)),
+                    ms(3000),
+                    "junk header {junk:?} must fall back, not error"
+                );
+            }
+            assert_eq!(from_headers(&HeaderMap::new()), None);
             assert_eq!(
-                resolve_with_max(from_headers(&hdr(junk)), ms(3000), ms(120_000)),
-                ms(3000),
-                "junk header {junk:?} must fall back, not error"
+                resolve_with_max(from_headers(&HeaderMap::new()), ms(3000), ms(120_000)),
+                ms(3000)
             );
         }
-        assert_eq!(from_headers(&HeaderMap::new()), None);
-        assert_eq!(
-            resolve_with_max(from_headers(&HeaderMap::new()), ms(3000), ms(120_000)),
-            ms(3000)
-        );
     }
 
     #[test]
-    fn a_short_client_budget_is_honoured_below_the_server_default() {
+    fn resolve_with_max_honours_clamps_floors_and_passes_the_server_default_through() {
         assert_eq!(
             resolve_with_max(Some(ms(120)), ms(3000), ms(120_000)),
             ms(120)
         );
+        {
+            assert_eq!(
+                resolve_with_max(Some(ms(10_000_000)), ms(3000), ms(120_000)),
+                ms(120_000)
+            );
+            assert_eq!(
+                resolve_with_max(Some(Duration::from_secs(3600)), ms(3000), ms(120_000)),
+                ms(120_000)
+            );
+        }
+        {
+            assert_eq!(
+                resolve_with_max(Some(ms(600_000)), ms(3000), ms(DEFAULT_MAX_MS)),
+                ms(600_000)
+            );
+            assert_eq!(
+                resolve_with_max(Some(ms(300_000)), ms(3000), ms(DEFAULT_MAX_MS)),
+                ms(300_000),
+                "a 5-minute x-request-timeout-ms must not be cut to 120 s and shed"
+            );
+        }
+        {
+            assert_eq!(resolve_with_max(Some(ms(0)), ms(3000), ms(120_000)), ms(50));
+            assert_eq!(resolve_with_max(Some(ms(7)), ms(3000), ms(120_000)), ms(50));
+            assert_eq!(
+                resolve_with_max(Some(Duration::ZERO), ms(3000), ms(120_000)),
+                floor()
+            );
+        }
+        {
+            assert_eq!(resolve_with_max(None, ms(0), ms(120_000)), ms(0));
+            assert_eq!(
+                resolve_with_max(None, ms(300_000), ms(120_000)),
+                ms(300_000)
+            );
+        }
+        {
+            assert_eq!(resolve_with_max(Some(ms(5000)), ms(3000), ms(1)), floor());
+            assert_eq!(
+                resolve_with_max(Some(ms(5000)), ms(3000), Duration::ZERO),
+                floor()
+            );
+        }
     }
 
     #[test]
-    fn a_long_client_budget_is_clamped_to_the_server_maximum() {
-        assert_eq!(
-            resolve_with_max(Some(ms(10_000_000)), ms(3000), ms(120_000)),
-            ms(120_000)
-        );
-        assert_eq!(
-            resolve_with_max(Some(Duration::from_secs(3600)), ms(3000), ms(120_000)),
-            ms(120_000)
-        );
-    }
-
-    #[test]
-    fn a_ten_minute_caller_budget_for_a_196k_prefill_is_honoured_by_the_default_ceiling() {
-        assert_eq!(
-            resolve_with_max(Some(ms(600_000)), ms(3000), ms(DEFAULT_MAX_MS)),
-            ms(600_000)
-        );
-        assert_eq!(
-            resolve_with_max(Some(ms(300_000)), ms(3000), ms(DEFAULT_MAX_MS)),
-            ms(300_000),
-            "a 5-minute x-request-timeout-ms must not be cut to 120 s and shed"
-        );
-    }
-
-    #[test]
-    fn a_zero_or_tiny_client_budget_is_lifted_to_the_floor() {
-        assert_eq!(resolve_with_max(Some(ms(0)), ms(3000), ms(120_000)), ms(50));
-        assert_eq!(resolve_with_max(Some(ms(7)), ms(3000), ms(120_000)), ms(50));
-        assert_eq!(
-            resolve_with_max(Some(Duration::ZERO), ms(3000), ms(120_000)),
-            floor()
-        );
-    }
-
-    #[test]
-    fn the_server_default_passes_through_unclamped() {
-        assert_eq!(resolve_with_max(None, ms(0), ms(120_000)), ms(0));
-        assert_eq!(
-            resolve_with_max(None, ms(300_000), ms(120_000)),
-            ms(300_000)
-        );
-    }
-
-    #[test]
-    fn a_degenerate_max_cannot_drop_below_the_floor() {
-        assert_eq!(resolve_with_max(Some(ms(5000)), ms(3000), ms(1)), floor());
-        assert_eq!(
-            resolve_with_max(Some(ms(5000)), ms(3000), Duration::ZERO),
-            floor()
-        );
-    }
-
-    #[test]
-    fn max_ms_parses_the_env_var_and_rejects_garbage() {
+    fn max_ms_parses_the_env_var_rejects_garbage_and_defaults_when_unset() {
         assert_eq!(max_ms_from(None), DEFAULT_MAX_MS);
         assert_eq!(max_ms_from(Some("")), DEFAULT_MAX_MS);
         assert_eq!(max_ms_from(Some("forever")), DEFAULT_MAX_MS);
@@ -207,10 +195,15 @@ mod tests {
              decode; 120_000 shed those requests (limits census ARB-5)"
         );
         assert_eq!(FLOOR_MS, 50);
+        {
+            if std::env::var(MAX_VAR).is_err() {
+                assert_eq!(max_ms(), DEFAULT_MAX_MS);
+            }
+        }
     }
 
     #[test]
-    fn the_body_field_beats_the_header() {
+    fn the_body_field_beats_the_header_and_body_seconds_reject_nonsense() {
         let headers = hdr("9000");
         assert_eq!(
             client_budget(from_body_ms(Some(250)), &headers),
@@ -222,26 +215,18 @@ mod tests {
         );
         assert_eq!(client_budget(None, &headers), Some(ms(9000)));
         assert_eq!(client_budget(None, &HeaderMap::new()), None);
-    }
-
-    #[test]
-    fn body_seconds_rejects_nonsense_without_erroring() {
-        assert_eq!(from_body_seconds(None), None);
-        assert_eq!(from_body_seconds(Some(-1.0)), None);
-        assert_eq!(from_body_seconds(Some(f64::NAN)), None);
-        assert_eq!(from_body_seconds(Some(f64::INFINITY)), None);
-        assert_eq!(from_body_seconds(Some(1.5)), Some(ms(1500)));
-        assert_eq!(from_body_seconds(Some(0.0)), Some(Duration::ZERO));
-        assert_eq!(
-            resolve_with_max(from_body_seconds(Some(0.0)), ms(3000), ms(120_000)),
-            floor()
-        );
-    }
-
-    #[test]
-    fn max_defaults_when_the_env_var_is_unset() {
-        if std::env::var(MAX_VAR).is_err() {
-            assert_eq!(max_ms(), DEFAULT_MAX_MS);
+        {
+            assert_eq!(from_body_seconds(None), None);
+            assert_eq!(from_body_seconds(Some(-1.0)), None);
+            assert_eq!(from_body_seconds(Some(f64::NAN)), None);
+            assert_eq!(from_body_seconds(Some(f64::INFINITY)), None);
+            assert_eq!(from_body_seconds(Some(1.5)), Some(ms(1500)));
+            assert_eq!(from_body_seconds(Some(0.0)), Some(Duration::ZERO));
+            assert_eq!(
+                resolve_with_max(from_body_seconds(Some(0.0)), ms(3000), ms(120_000)),
+                floor()
+            );
         }
     }
+
 }

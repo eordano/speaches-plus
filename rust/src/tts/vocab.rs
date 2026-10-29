@@ -77,26 +77,24 @@ mod tests {
     }
 
     #[test]
-    fn cleans_r_to_alveolar_approximant() {
+    fn clean_phonemes_maps_r_keeps_spanish_and_punctuation_and_drops_unknown_runes() {
         let cleaned = clean_phonemes("brown", "en-us");
         assert!(cleaned.contains('ɹ'));
         assert!(!cleaned.contains('r'));
+        {
+            let cleaned = clean_phonemes("rˈosa peɾo xamˈon", "es");
+            assert_eq!(cleaned, "rˈosa peɾo xamˈon");
+        }
+        {
+            assert_eq!(
+                clean_phonemes("ˈola, mˈundo. ¿kˈomo?", "es"),
+                "ˈola, mˈundo. ¿kˈomo?"
+            );
+        }
+        {
+            let cleaned = clean_phonemes("hello@world", "en-us");
+            assert!(!cleaned.contains('@'));
+        }
     }
 
-    #[test]
-    fn spanish_keeps_trill_tap_and_velar_fricative() {
-        let cleaned = clean_phonemes("rˈosa peɾo xamˈon", "es");
-        assert_eq!(cleaned, "rˈosa peɾo xamˈon");
-    }
-
-    #[test]
-    fn punctuation_survives_cleaning() {
-        assert_eq!(clean_phonemes("ˈola, mˈundo. ¿kˈomo?", "es"), "ˈola, mˈundo. ¿kˈomo?");
-    }
-
-    #[test]
-    fn drops_unknown_runes() {
-        let cleaned = clean_phonemes("hello@world", "en-us");
-        assert!(!cleaned.contains('@'));
-    }
 }

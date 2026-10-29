@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from audio import normalize_parts, process_mm_info
+
+if TYPE_CHECKING:
+    import xgrammar
+    from xgrammar.contrib.hf import LogitsProcessor as XGrammarLogitsProcessor
 
 def move_inputs_to(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
     target_device = model.device

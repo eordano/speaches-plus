@@ -152,30 +152,7 @@ pub fn smart_resize(
     min_pixels: usize,
     max_pixels: usize,
 ) -> Result<(usize, usize)> {
-    anyhow::ensure!(h > 0 && w > 0, "smart_resize: zero dimension");
-    let hf = h as f64;
-    let wf = w as f64;
-    let ratio = hf.max(wf) / hf.min(wf);
-    anyhow::ensure!(
-        ratio <= 200.0,
-        "smart_resize: aspect ratio {ratio:.1} exceeds 200"
-    );
-    let ff = factor as f64;
-    let round_mult = |x: f64| -> usize { ((x / ff).round() * ff).max(ff) as usize };
-    let floor_mult = |x: f64| -> usize { ((x / ff).floor() * ff).max(ff) as usize };
-    let ceil_mult = |x: f64| -> usize { ((x / ff).ceil() * ff).max(ff) as usize };
-    let mut h_bar = round_mult(hf);
-    let mut w_bar = round_mult(wf);
-    if h_bar * w_bar > max_pixels {
-        let beta = ((hf * wf) / max_pixels as f64).sqrt();
-        h_bar = floor_mult(hf / beta);
-        w_bar = floor_mult(wf / beta);
-    } else if h_bar * w_bar < min_pixels {
-        let beta = (min_pixels as f64 / (hf * wf)).sqrt();
-        h_bar = ceil_mult(hf * beta);
-        w_bar = ceil_mult(wf * beta);
-    }
-    Ok((h_bar, w_bar))
+    nv_omni::smart_resize_matching_hf_qwen2_vl(h, w, factor, min_pixels, max_pixels)
 }
 
 pub struct PreppedImage {
@@ -203,22 +180,8 @@ pub fn prep_images(spec: &Qwen3MmSpec, images: &[image::RgbImage]) -> Result<Vec
     for img in images {
         let (w0, h0) = (img.width() as usize, img.height() as usize);
         let (h, w) = smart_resize(h0, w0, factor, spec.min_pixels, spec.max_pixels)?;
-        let resized = image::imageops::resize(
-            img,
-            w as u32,
-            h as u32,
-            image::imageops::FilterType::CatmullRom,
-        );
-        let mut pixels = vec![0f32; 3 * h * w];
-        for y in 0..h {
-            for x in 0..w {
-                let p = resized.get_pixel(x as u32, y as u32);
-                for c in 0..3 {
-                    let v = (p.0[c] as f32 / 255.0 - spec.mean[c]) / spec.std[c];
-                    pixels[c * h * w + y * w + x] = v;
-                }
-            }
-        }
+        let resized = nv_omni::resize_rgb8_bicubic_matching_pil(img.as_raw(), w0, h0, w, h);
+        let pixels = nv_omni::rgb8_to_normalized_chw(&resized, w, h, spec.mean, spec.std);
         out.push(PreppedImage {
             pixels,
             h,
@@ -284,6 +247,10 @@ impl Qwen3VisionMm {
         let device = Device::new_cuda(0).context("qwen3 vision tower needs a cuda device")?;
         #[cfg(not(feature = "cuda"))]
         let device = Device::Cpu;
+        Self::load_on(spec, model_dir, device)
+    }
+
+    pub fn load_on(spec: Qwen3MmSpec, model_dir: &Path, device: Device) -> Result<Self> {
         let weights = nv_weights::WeightLoader::open_dir(model_dir, &device)?;
         let cfg = nv_omni::Qwen3VisionConfig::from_hf_config_json(model_dir.join("config.json"))?;
         let mut tower = nv_omni::Qwen3VisionTower::new_empty(cfg, &device)?;

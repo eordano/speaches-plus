@@ -1,32 +1,38 @@
 # 030-voice-clone-design-warm
 
-VoiceDesign profile with `warm=1.0`. Multi-step fixture:
+A voice designed from a description, then cloned:
 
-1. POST `/v1/voice-profiles` with `name=test-design-warm` and
-   `design_params={"warm": 1.0}` (multipart form).
-2. POST `/v1/audio/speech` using `voice="test-design-warm"`.
-3. DELETE `/v1/voice-profiles/test-design-warm`.
+1. POST `/v1/audio/speech` to `qwen3-tts-voicedesign` with the description in
+   `instructions` and the draw in `voice` (a decimal seed; LiteLLM forwards
+   `voice` and drops `seed`).
+2. POST `/v1/voice-profiles` with that sample (`file_from_step: 1`).
+3. POST `/v1/audio/speech` to the 0.6B Base with `voice=test-design-warm`,
+   reading a longer paragraph.
+4. DELETE the profile.
+
+`contrast` adds a deep male and a high female description read with the same
+draw.
 
 ## What it asserts
 
-- Round-trip: the `design_params` we POST come back from the create response
-  (and from a later GET, if added) byte-equal. This is the regression gate
-  against silent drop of unknown design fields in
-  `nv_tts::VoiceProfile::design_params`.
-- Cleanup: DELETE returns 200 or 204.
-- Audio envelope on the produced WAV (same envelope shape as
-  `030-voice-clone-base`).
+The consumer is
+`rust/src/oapi/audio_speech_nvtts.rs::tests::real_voice_design_follows_the_description_repeats_by_seed_and_clones_onto_base`
+(`#[ignore]`, `NV_TTS_VOICE_DESIGN_TEST=1`, `NV_TTS_VOICE_DESIGN_DIR`,
+`NV_TTS_STT_URL`). It drives the engine in process (enrollment uses the same
+decode and `extract_embedding` as the route) and checks `gates`:
 
-## Placeholder mode
+- every sample round-trips its text through STT within `max_word_error_rate`;
+- the deep male description's median F0 is at most `low_max_median_f0_hz`, the
+  high female one's at least `high_min_median_f0_hz`;
+- in the Base checkpoint's speaker-encoder space the two male descriptions sit
+  closer than the deep male and the high female by `contrast_min_ecapa_margin`,
+  and the clone sits closer to the designed sample than the Base default voice
+  does by `clone_min_ecapa_margin_over_default_voice`;
+- the clone's median F0 stays within `clone_max_median_f0_deviation` of the
+  designed sample's;
+- the same description, text and draw give bit-identical audio;
+- the text and instruction-prompt token ids equal `python_reference`, taken from
+  the Python reference's processor.
 
-`design_params` is opaque JSON today (see
-`rust/src/oapi/voice_profiles.rs::handle_create`). The structural round-trip
-assertion is meaningful even without a VoiceDesign-conditioned model. Once
-the model treats `warm` as a real conditioning axis the audio envelope (and
-optionally a per-axis A/B perceptual delta) becomes the canonical check.
-
-## Spec pins
-
-- §11.4 — 030-voice-clone-* family
-- `nv_tts::VoiceProfile`, `nv_tts::VoiceProfileStore`
-- `rust/src/oapi/voice_profiles.rs`
+The speaker-encoder cosines of this checkpoint are compressed near 1, so the
+gates are margins between pairs, not absolute similarities.

@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::qualify::{CoopDecision, CoopRequest, CoopScalar, COOP_UNSAFE_SWEEP_ENV};
 use crate::wgpu_backend::{compose_enabled, Result, WgpuError};
@@ -178,37 +176,53 @@ impl CoopGemm {
         let abt = self.ab.wgsl();
         let mut b = String::new();
 
-        writeln!(b, "alias CGA = coop_mat{t}x{t}<{abt}, A>;").unwrap();
-        writeln!(b, "alias CGB = coop_mat{t}x{t}<{abt}, B>;").unwrap();
-        writeln!(b, "alias CGC = coop_mat{t}x{t}<f32, C>;\n").unwrap();
-        b.push_str("struct CoopGemmParams {\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    pad0: u32,\n    pad1: u32,\n};\n\n");
-        writeln!(
+        write!(
             b,
-            "@group(0) @binding(0) var<storage, read> cg_w: array<{abt}>;"
-        )
-        .unwrap();
-        writeln!(
-            b,
-            "@group(0) @binding(1) var<storage, read> cg_x: array<{abt}>;"
-        )
-        .unwrap();
-        b.push_str("@group(0) @binding(2) var<storage, read_write> cg_y: array<f32>;\n");
-        b.push_str("@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;\n");
-        b.push_str("@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;\n\n");
+            "alias CGA = coop_mat{t}x{t}<{abt}, A>;
+alias CGB = coop_mat{t}x{t}<{abt}, B>;
+alias CGC = coop_mat{t}x{t}<f32, C>;
 
-        writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-        writeln!(b, "fn {entry}(").unwrap();
-        b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) lidx: u32\n) {\n");
-        b.push_str("    let sgid = lidx / 32u;\n");
-        b.push_str("    let block = wid.x + wid.y * cg_p.groups_x;\n");
-        b.push_str("    let bm = block / cg_p.blocks_n;\n");
-        b.push_str("    let bn = block - bm * cg_p.blocks_n;\n");
+struct CoopGemmParams {{
+    n_rows: u32,
+    k_elems: u32,
+    m_rows: u32,
+    blocks_n: u32,
+    y_stride: u32,
+    groups_x: u32,
+    pad0: u32,
+    pad1: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> cg_w: array<{abt}>;
+@group(0) @binding(1) var<storage, read> cg_x: array<{abt}>;
+@group(0) @binding(2) var<storage, read_write> cg_y: array<f32>;
+@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;
+@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;
+\n"
+        )
+        .unwrap();
+
+        write!(
+            b,
+            "@compute @workgroup_size({wg})
+fn {entry}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32
+) {{
+    let sgid = lidx / 32u;
+    let block = wid.x + wid.y * cg_p.groups_x;
+    let bm = block / cg_p.blocks_n;
+    let bn = block - bm * cg_p.blocks_n;\n"
+        )
+        .unwrap();
         writeln!(b, "    let m0 = bm * {}u;", self.rows_per_block(tm)).unwrap();
         writeln!(b, "    let n0 = bn * {cols}u + sgid * {}u;", t * tn).unwrap();
-        b.push_str("    let kk = cg_p.k_elems;\n");
-        b.push_str("    let ys = cg_p.y_stride;\n");
-        b.push_str("    let mrows = cg_p.m_rows;\n");
-        b.push_str("    let nrows = cg_p.n_rows;\n");
+        b.push_str(
+            "    let kk = cg_p.k_elems;
+    let ys = cg_p.y_stride;
+    let mrows = cg_p.m_rows;
+    let nrows = cg_p.n_rows;\n",
+        );
         let _ = A_ROW_AND_B_COL_BASES_ARE_CLAMPED_TO_THE_LAST_WHOLE_FRAGMENT_BECAUSE_THE_EPILOGUE_GUARDS_THE_STORE_AND_NEVER_THE_LOAD;
         let _ =
             COOP_BAND_BASE_CLAMP_COSTS_ONE_HOISTED_MIN_PER_ROW_AND_COLUMN_TILE_NOT_ONE_PER_K_STEP;
@@ -288,8 +302,12 @@ impl CoopGemm {
                     j * t
                 )
                 .unwrap();
-                writeln!(b, "        coopStoreT(sc{r}_{j}, &cg_y[yo{r}_{j}], ys);").unwrap();
-                b.push_str("    }\n");
+                write!(
+                    b,
+                    "        coopStoreT(sc{r}_{j}, &cg_y[yo{r}_{j}], ys);
+    }}\n"
+                )
+                .unwrap();
             }
         }
         b.push_str("}\n");
@@ -330,33 +348,57 @@ pub fn source_splitk(tm: u32, tn: u32, sg: u32, splits: u32) -> String {
     let cols = g.cols_per_workgroup(tn, sg);
     let mut b = String::new();
 
-    writeln!(b, "alias CGA = coop_mat{t}x{t}<f16, A>;").unwrap();
-    writeln!(b, "alias CGB = coop_mat{t}x{t}<f16, B>;").unwrap();
-    writeln!(b, "alias CGC = coop_mat{t}x{t}<f32, C>;\n").unwrap();
-    b.push_str("struct CoopGemmParams {\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    blocks_mn: u32,\n    kseg: u32,\n};\n\n");
-    b.push_str("@group(0) @binding(0) var<storage, read> cg_w: array<f16>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> cg_x: array<f16>;\n");
-    b.push_str("@group(0) @binding(2) var<storage, read_write> cg_y: array<f32>;\n");
-    b.push_str("@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;\n");
-    b.push_str("@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;\n\n");
+    write!(
+        b,
+        "alias CGA = coop_mat{t}x{t}<f16, A>;
+alias CGB = coop_mat{t}x{t}<f16, B>;
+alias CGC = coop_mat{t}x{t}<f32, C>;
 
-    writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-    writeln!(b, "fn {entry}(").unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) lidx: u32\n) {\n");
-    b.push_str("    let sgid = lidx / 32u;\n");
-    b.push_str("    let block = wid.x + wid.y * cg_p.groups_x;\n");
-    b.push_str("    let sblk = block / cg_p.blocks_mn;\n");
-    b.push_str("    let bmn = block - sblk * cg_p.blocks_mn;\n");
-    b.push_str("    let bm = bmn / cg_p.blocks_n;\n");
-    b.push_str("    let bn = bmn - bm * cg_p.blocks_n;\n");
+struct CoopGemmParams {{
+    n_rows: u32,
+    k_elems: u32,
+    m_rows: u32,
+    blocks_n: u32,
+    y_stride: u32,
+    groups_x: u32,
+    blocks_mn: u32,
+    kseg: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> cg_w: array<f16>;
+@group(0) @binding(1) var<storage, read> cg_x: array<f16>;
+@group(0) @binding(2) var<storage, read_write> cg_y: array<f32>;
+@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;
+@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;
+\n"
+    )
+    .unwrap();
+
+    write!(
+        b,
+        "@compute @workgroup_size({wg})
+fn {entry}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32
+) {{
+    let sgid = lidx / 32u;
+    let block = wid.x + wid.y * cg_p.groups_x;
+    let sblk = block / cg_p.blocks_mn;
+    let bmn = block - sblk * cg_p.blocks_mn;
+    let bm = bmn / cg_p.blocks_n;
+    let bn = bmn - bm * cg_p.blocks_n;\n"
+    )
+    .unwrap();
     writeln!(b, "    let m0 = bm * {}u;", g.rows_per_block(tm)).unwrap();
     writeln!(b, "    let n0 = bn * {cols}u + sgid * {}u;", t * tn).unwrap();
-    b.push_str("    let kk = cg_p.k_elems;\n");
-    b.push_str("    let ys = cg_p.y_stride;\n");
-    b.push_str("    let mrows = cg_p.m_rows;\n");
-    b.push_str("    let nrows = cg_p.n_rows;\n");
-    b.push_str("    let k0 = sblk * cg_p.kseg;\n");
-    b.push_str("    let kend = min(kk, k0 + cg_p.kseg);\n");
+    b.push_str(
+        "    let kk = cg_p.k_elems;
+    let ys = cg_p.y_stride;
+    let mrows = cg_p.m_rows;
+    let nrows = cg_p.n_rows;
+    let k0 = sblk * cg_p.kseg;
+    let kend = min(kk, k0 + cg_p.kseg);\n",
+    );
     for r in 0..tm {
         writeln!(
             b,
@@ -402,8 +444,10 @@ pub fn source_splitk(tm: u32, tn: u32, sg: u32, splits: u32) -> String {
             .unwrap();
         }
     }
-    b.push_str("    }\n");
-    b.push_str("    let pbase = sblk * mrows * ys;\n");
+    b.push_str(
+        "    }
+    let pbase = sblk * mrows * ys;\n",
+    );
     for r in 0..tm {
         for j in 0..tn {
             writeln!(b, "    let sc{r}_{j} = c{r}_{j};").unwrap();
@@ -421,8 +465,12 @@ pub fn source_splitk(tm: u32, tn: u32, sg: u32, splits: u32) -> String {
                 j * t
             )
             .unwrap();
-            writeln!(b, "        coopStoreT(sc{r}_{j}, &cg_y[yo{r}_{j}], ys);").unwrap();
-            b.push_str("    }\n");
+            write!(
+                b,
+                "        coopStoreT(sc{r}_{j}, &cg_y[yo{r}_{j}], ys);
+    }}\n"
+            )
+            .unwrap();
         }
     }
     b.push_str("}\n");
@@ -577,9 +625,13 @@ fn source_wq16_act_inner(
     );
     let mut b = String::new();
 
-    writeln!(b, "alias CGA = coop_mat{t}x{t}<f16, A>;").unwrap();
-    writeln!(b, "alias CGB = coop_mat{t}x{t}<f16, B>;").unwrap();
-    writeln!(b, "alias CGC = coop_mat{t}x{t}<f32, C>;\n").unwrap();
+    writeln!(
+        b,
+        "alias CGA = coop_mat{t}x{t}<f16, A>;
+alias CGB = coop_mat{t}x{t}<f16, B>;
+alias CGC = coop_mat{t}x{t}<f32, C>;\n"
+    )
+    .unwrap();
     let tail_word = if fmt == WqFmt::MlxAffineGe16 {
         "gs"
     } else {
@@ -601,8 +653,10 @@ fn source_wq16_act_inner(
     } else {
         b.push_str("@group(0) @binding(2) var<storage, read_write> cg_y: array<f32>;\n");
     }
-    b.push_str("@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;\n");
-    b.push_str("@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;\n");
+    b.push_str(
+        "@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;
+@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;\n",
+    );
     match fmt {
         WqFmt::Nvfp4Block16 => {
             b.push_str("@group(0) @binding(5) var<storage, read> cg_sf: array<u32>;\n")
@@ -640,20 +694,29 @@ fn source_wq16_act_inner(
         writeln!(b, "var<workgroup> xas: array<f16, {a_elems}>;").unwrap();
     }
 
-    writeln!(b, "\n@compute @workgroup_size({wg})").unwrap();
-    writeln!(b, "fn {entry}(").unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) lidx: u32\n) {\n");
-    b.push_str("    let sgid = lidx / 32u;\n");
-    b.push_str("    let block = wid.x + wid.y * cg_p.groups_x;\n");
-    b.push_str("    let bm = block / cg_p.blocks_n;\n");
-    b.push_str("    let bn = block - bm * cg_p.blocks_n;\n");
+    write!(
+        b,
+        "
+@compute @workgroup_size({wg})
+fn {entry}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32
+) {{
+    let sgid = lidx / 32u;
+    let block = wid.x + wid.y * cg_p.groups_x;
+    let bm = block / cg_p.blocks_n;
+    let bn = block - bm * cg_p.blocks_n;\n"
+    )
+    .unwrap();
     writeln!(b, "    let m0 = bm * {}u;", g.rows_per_block(tm)).unwrap();
     writeln!(b, "    let n0w = bn * {cols}u;").unwrap();
     writeln!(b, "    let n0 = n0w + sgid * {}u;", t * tn).unwrap();
-    b.push_str("    let kk = cg_p.k_elems;\n");
-    b.push_str("    let ys = cg_p.y_stride;\n");
-    b.push_str("    let mrows = cg_p.m_rows;\n");
-    b.push_str("    let nrows = cg_p.n_rows;\n");
+    b.push_str(
+        "    let kk = cg_p.k_elems;
+    let ys = cg_p.y_stride;
+    let mrows = cg_p.m_rows;
+    let nrows = cg_p.n_rows;\n",
+    );
     if act == WqAct::F16 {
         let _ = A_ROW_AND_B_COL_BASES_ARE_CLAMPED_TO_THE_LAST_WHOLE_FRAGMENT_BECAUSE_THE_EPILOGUE_GUARDS_THE_STORE_AND_NEVER_THE_LOAD;
         for r in 0..tm {
@@ -667,15 +730,19 @@ fn source_wq16_act_inner(
     }
     match fmt {
         WqFmt::Nvfp4Block16 => {
-            b.push_str("    let row_words = kk >> 3u;\n");
-            b.push_str("    let sf_row = kk >> 4u;\n");
+            b.push_str(
+                "    let row_words = kk >> 3u;
+    let sf_row = kk >> 4u;\n",
+            );
         }
         WqFmt::Fp8RowscalePlain => {
             b.push_str("    let row_words = kk >> 2u;\n");
         }
         WqFmt::MlxAffineGe16 => {
-            b.push_str("    let row_words = kk >> 3u;\n");
-            b.push_str("    let sf_row = kk / cg_p.gs;\n");
+            b.push_str(
+                "    let row_words = kk >> 3u;
+    let sf_row = kk / cg_p.gs;\n",
+            );
         }
     }
     match act {
@@ -684,8 +751,10 @@ fn source_wq16_act_inner(
             b.push_str("    let xrow_words = kk >> 2u;\n");
         }
         WqAct::Nvfp4Block16 => {
-            b.push_str("    let xrow_words = kk >> 3u;\n");
-            b.push_str("    let xsf_row = kk >> 4u;\n");
+            b.push_str(
+                "    let xrow_words = kk >> 3u;
+    let xsf_row = kk >> 4u;\n",
+            );
         }
     }
 
@@ -708,52 +777,52 @@ fn source_wq16_act_inner(
         cols * ku
     )
     .unwrap();
-    writeln!(b, "            let u = e / {cols}u;").unwrap();
-    writeln!(b, "            let c = e - u * {cols}u;").unwrap();
-    b.push_str("            let gr = n0w + c;\n");
-    b.push_str("            let ku16 = kt + u * 16u;\n");
-    writeln!(b, "            let tile = u * {tiles}u + (c >> 4u);").unwrap();
-    b.push_str("            let row = c & 15u;\n");
+    write!(
+        b,
+        "            let u = e / {cols}u;
+            let c = e - u * {cols}u;
+            let gr = n0w + c;
+            let ku16 = kt + u * 16u;
+            let tile = u * {tiles}u + (c >> 4u);
+            let row = c & 15u;\n"
+    )
+    .unwrap();
     writeln!(b, "            let tb = tile * {}u;", t * t).unwrap();
     match fmt {
         WqFmt::Nvfp4Block16 => {
-            b.push_str("            var s = 0.0;\n");
-            b.push_str("            var w0 = 0u;\n");
-            b.push_str("            var w1 = 0u;\n");
-            b.push_str("            if (gr < nrows) {\n");
-            b.push_str("                let base = gr * row_words + (ku16 >> 3u);\n");
-            b.push_str("                w0 = cg_w4[base];\n");
-            b.push_str("                w1 = cg_w4[base + 1u];\n");
-            b.push_str("                let sbi = gr * sf_row + (ku16 >> 4u);\n");
-            b.push_str("                s = ue4m3_decode(byte_at(cg_sf[sbi >> 2u], sbi));\n");
-            b.push_str("            }\n");
-            b.push_str("            for (var j = 0u; j < 8u; j = j + 1u) {\n");
-            writeln!(
-                b,
-                "                w4bs[tb + j * {t}u + row] = f16(nvfp4_decode(nvfp4_nibble(w0, j)) * s);"
-            )
-            .unwrap();
-            writeln!(
-                b,
-                "                w4bs[tb + (j + 8u) * {t}u + row] = f16(nvfp4_decode(nvfp4_nibble(w1, j)) * s);"
-            )
-            .unwrap();
+            b.push_str(
+                "            var s = 0.0;
+            var w0 = 0u;
+            var w1 = 0u;
+            if (gr < nrows) {
+                let base = gr * row_words + (ku16 >> 3u);
+                w0 = cg_w4[base];
+                w1 = cg_w4[base + 1u];
+                let sbi = gr * sf_row + (ku16 >> 4u);
+                s = ue4m3_decode(byte_at(cg_sf[sbi >> 2u], sbi));
+            }
+            for (var j = 0u; j < 8u; j = j + 1u) {\n",
+            );
+            writeln!(b, "                w4bs[tb + j * {t}u + row] = f16(nvfp4_decode(nvfp4_nibble(w0, j)) * s);
+                w4bs[tb + (j + 8u) * {t}u + row] = f16(nvfp4_decode(nvfp4_nibble(w1, j)) * s);").unwrap();
             b.push_str("            }\n");
         }
         WqFmt::Fp8RowscalePlain => {
-            b.push_str("            var s = 0.0;\n");
-            b.push_str("            var w0 = 0u;\n");
-            b.push_str("            var w1 = 0u;\n");
-            b.push_str("            var w2 = 0u;\n");
-            b.push_str("            var w3 = 0u;\n");
-            b.push_str("            if (gr < nrows) {\n");
-            b.push_str("                let base = gr * row_words + (ku16 >> 2u);\n");
-            b.push_str("                w0 = cg_w4[base];\n");
-            b.push_str("                w1 = cg_w4[base + 1u];\n");
-            b.push_str("                w2 = cg_w4[base + 2u];\n");
-            b.push_str("                w3 = cg_w4[base + 3u];\n");
-            b.push_str("                s = cg_sf[gr];\n");
-            b.push_str("            }\n");
+            b.push_str(
+                "            var s = 0.0;
+            var w0 = 0u;
+            var w1 = 0u;
+            var w2 = 0u;
+            var w3 = 0u;
+            if (gr < nrows) {
+                let base = gr * row_words + (ku16 >> 2u);
+                w0 = cg_w4[base];
+                w1 = cg_w4[base + 1u];
+                w2 = cg_w4[base + 2u];
+                w3 = cg_w4[base + 3u];
+                s = cg_sf[gr];
+            }\n",
+            );
             for (wi, off) in [("w0", 0u32), ("w1", 4), ("w2", 8), ("w3", 12)] {
                 b.push_str("            for (var j = 0u; j < 4u; j = j + 1u) {\n");
                 writeln!(
@@ -766,19 +835,21 @@ fn source_wq16_act_inner(
             }
         }
         WqFmt::MlxAffineGe16 => {
-            b.push_str("            var s = 0.0;\n");
-            b.push_str("            var bv = 0.0;\n");
-            b.push_str("            var w0 = 0u;\n");
-            b.push_str("            var w1 = 0u;\n");
-            b.push_str("            if (gr < nrows) {\n");
-            b.push_str("                let base = gr * row_words + (ku16 >> 3u);\n");
-            b.push_str("                w0 = cg_w4[base];\n");
-            b.push_str("                w1 = cg_w4[base + 1u];\n");
-            b.push_str("                let sbi = gr * sf_row + ku16 / cg_p.gs;\n");
-            b.push_str("                s = bf16_decode(cg_sf[sbi]);\n");
-            b.push_str("                bv = bf16_decode(cg_bq[sbi]);\n");
-            b.push_str("            }\n");
-            b.push_str("            for (var j = 0u; j < 8u; j = j + 1u) {\n");
+            b.push_str(
+                "            var s = 0.0;
+            var bv = 0.0;
+            var w0 = 0u;
+            var w1 = 0u;
+            if (gr < nrows) {
+                let base = gr * row_words + (ku16 >> 3u);
+                w0 = cg_w4[base];
+                w1 = cg_w4[base + 1u];
+                let sbi = gr * sf_row + ku16 / cg_p.gs;
+                s = bf16_decode(cg_sf[sbi]);
+                bv = bf16_decode(cg_bq[sbi]);
+            }
+            for (var j = 0u; j < 8u; j = j + 1u) {\n",
+            );
             writeln!(
                 b,
                 "                w4bs[tb + j * {t}u + row] = \
@@ -802,27 +873,33 @@ fn source_wq16_act_inner(
             rows_pb * ku
         )
         .unwrap();
-        writeln!(b, "            let u = e / {rows_pb}u;").unwrap();
-        writeln!(b, "            let r = e - u * {rows_pb}u;").unwrap();
-        b.push_str("            let gm = m0 + r;\n");
-        b.push_str("            let ku16 = kt + u * 16u;\n");
-        writeln!(b, "            let xb = r * {a_pitch}u + u * 16u;").unwrap();
+        write!(
+            b,
+            "            let u = e / {rows_pb}u;
+            let r = e - u * {rows_pb}u;
+            let gm = m0 + r;
+            let ku16 = kt + u * 16u;
+            let xb = r * {a_pitch}u + u * 16u;\n"
+        )
+        .unwrap();
         match act {
             WqAct::F16 => unreachable!(),
             WqAct::Fp8Rowscale => {
-                b.push_str("            var s = 0.0;\n");
-                b.push_str("            var w0 = 0u;\n");
-                b.push_str("            var w1 = 0u;\n");
-                b.push_str("            var w2 = 0u;\n");
-                b.push_str("            var w3 = 0u;\n");
-                b.push_str("            if (gm < mrows) {\n");
-                b.push_str("                let base = gm * xrow_words + (ku16 >> 2u);\n");
-                b.push_str("                w0 = cg_x[base];\n");
-                b.push_str("                w1 = cg_x[base + 1u];\n");
-                b.push_str("                w2 = cg_x[base + 2u];\n");
-                b.push_str("                w3 = cg_x[base + 3u];\n");
-                b.push_str("                s = cg_xsf[gm];\n");
-                b.push_str("            }\n");
+                b.push_str(
+                    "            var s = 0.0;
+            var w0 = 0u;
+            var w1 = 0u;
+            var w2 = 0u;
+            var w3 = 0u;
+            if (gm < mrows) {
+                let base = gm * xrow_words + (ku16 >> 2u);
+                w0 = cg_x[base];
+                w1 = cg_x[base + 1u];
+                w2 = cg_x[base + 2u];
+                w3 = cg_x[base + 3u];
+                s = cg_xsf[gm];
+            }\n",
+                );
                 for (wi, off) in [("w0", 0u32), ("w1", 4), ("w2", 8), ("w3", 12)] {
                     b.push_str("            for (var j = 0u; j < 4u; j = j + 1u) {\n");
                     writeln!(
@@ -835,22 +912,22 @@ fn source_wq16_act_inner(
                 }
             }
             WqAct::Nvfp4Block16 => {
-                b.push_str("            var s = 0.0;\n");
-                b.push_str("            var w0 = 0u;\n");
-                b.push_str("            var w1 = 0u;\n");
-                b.push_str("            if (gm < mrows) {\n");
-                b.push_str("                let base = gm * xrow_words + (ku16 >> 3u);\n");
-                b.push_str("                w0 = cg_x[base];\n");
-                b.push_str("                w1 = cg_x[base + 1u];\n");
-                b.push_str("                let sbi = gm * xsf_row + (ku16 >> 4u);\n");
-                b.push_str("                s = ue4m3_decode(byte_at(cg_xsf[sbi >> 2u], sbi));\n");
-                b.push_str("            }\n");
-                b.push_str("            for (var j = 0u; j < 8u; j = j + 1u) {\n");
                 b.push_str(
-                    "                xas[xb + j] = f16(nvfp4_decode(nvfp4_nibble(w0, j)) * s);\n",
+                    "            var s = 0.0;
+            var w0 = 0u;
+            var w1 = 0u;
+            if (gm < mrows) {
+                let base = gm * xrow_words + (ku16 >> 3u);
+                w0 = cg_x[base];
+                w1 = cg_x[base + 1u];
+                let sbi = gm * xsf_row + (ku16 >> 4u);
+                s = ue4m3_decode(byte_at(cg_xsf[sbi >> 2u], sbi));
+            }
+            for (var j = 0u; j < 8u; j = j + 1u) {
+                xas[xb + j] = f16(nvfp4_decode(nvfp4_nibble(w0, j)) * s);
+                xas[xb + j + 8u] = f16(nvfp4_decode(nvfp4_nibble(w1, j)) * s);
+            }\n",
                 );
-                b.push_str("                xas[xb + j + 8u] = f16(nvfp4_decode(nvfp4_nibble(w1, j)) * s);\n");
-                b.push_str("            }\n");
             }
         }
         b.push_str("        }\n");
@@ -909,9 +986,13 @@ fn source_wq16_act_inner(
                     j * t
                 )
                 .unwrap();
-                writeln!(b, "        coopStoreT(c{r}_{j}, &ysh[sgid * 256u], 16u);").unwrap();
-                b.push_str("    }\n");
-                b.push_str("    workgroupBarrier();\n");
+                write!(
+                    b,
+                    "        coopStoreT(c{r}_{j}, &ysh[sgid * 256u], 16u);
+    }}
+    workgroupBarrier();\n"
+                )
+                .unwrap();
                 writeln!(
                     b,
                     "    if (m0 + {}u < mrows && n0 + {}u < nrows) {{",
@@ -919,11 +1000,13 @@ fn source_wq16_act_inner(
                     j * t
                 )
                 .unwrap();
-                b.push_str("        for (var p = ylane; p < 128u; p = p + 32u) {\n");
-                b.push_str("            let rr = p >> 3u;\n");
-                b.push_str("            let pc = (p & 7u) << 1u;\n");
-                b.push_str("            let v0 = ysh[sgid * 256u + rr * 16u + pc];\n");
-                b.push_str("            let v1 = ysh[sgid * 256u + rr * 16u + pc + 1u];\n");
+                b.push_str(
+                    "        for (var p = ylane; p < 128u; p = p + 32u) {
+            let rr = p >> 3u;
+            let pc = (p & 7u) << 1u;
+            let v0 = ysh[sgid * 256u + rr * 16u + pc];
+            let v1 = ysh[sgid * 256u + rr * 16u + pc + 1u];\n",
+                );
                 writeln!(
                     b,
                     "            cg_y[((m0 + {}u + rr) * ys + n0 + {}u + pc) >> 1u] = \
@@ -932,8 +1015,10 @@ fn source_wq16_act_inner(
                     j * t
                 )
                 .unwrap();
-                b.push_str("        }\n");
-                b.push_str("    }\n");
+                b.push_str(
+                    "        }
+    }\n",
+                );
             }
         }
     } else {
@@ -953,8 +1038,12 @@ fn source_wq16_act_inner(
                     j * t
                 )
                 .unwrap();
-                writeln!(b, "        coopStoreT(c{r}_{j}, &cg_y[yo{r}_{j}], ys);").unwrap();
-                b.push_str("    }\n");
+                write!(
+                    b,
+                    "        coopStoreT(c{r}_{j}, &cg_y[yo{r}_{j}], ys);
+    }}\n"
+                )
+                .unwrap();
             }
         }
     }
@@ -1029,16 +1118,31 @@ pub fn source_wq8_affine(tm: u32, tn: u32, sg: u32, ku: u32) -> String {
     let cols = g.cols_per_workgroup(tn, sg);
     let mut b = String::new();
 
-    writeln!(b, "alias CGA = coop_mat{t}x{t}<f16, A>;").unwrap();
-    writeln!(b, "alias CGB = coop_mat{t}x{t}<f16, B>;").unwrap();
-    writeln!(b, "alias CGC = coop_mat{t}x{t}<f32, C>;\n").unwrap();
-    b.push_str("struct CoopGemmParams {\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    pad0: u32,\n    gs: u32,\n};\n\n");
-    b.push_str("@group(0) @binding(0) var<storage, read> cg_w4: array<u32>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> cg_x: array<f16>;\n");
-    b.push_str("@group(0) @binding(2) var<storage, read_write> cg_y: array<f32>;\n");
-    b.push_str("@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;\n");
-    b.push_str("@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;\n");
-    b.push_str("@group(0) @binding(5) var<storage, read> cg_sf: array<u32>;\n");
+    write!(
+        b,
+        "alias CGA = coop_mat{t}x{t}<f16, A>;
+alias CGB = coop_mat{t}x{t}<f16, B>;
+alias CGC = coop_mat{t}x{t}<f32, C>;
+
+struct CoopGemmParams {{
+    n_rows: u32,
+    k_elems: u32,
+    m_rows: u32,
+    blocks_n: u32,
+    y_stride: u32,
+    groups_x: u32,
+    pad0: u32,
+    gs: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> cg_w4: array<u32>;
+@group(0) @binding(1) var<storage, read> cg_x: array<f16>;
+@group(0) @binding(2) var<storage, read_write> cg_y: array<f32>;
+@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;
+@group(0) @binding(4) var<storage, read> cg_zero: array<f32>;
+@group(0) @binding(5) var<storage, read> cg_sf: array<u32>;\n"
+    )
+    .unwrap();
     writeln!(
         b,
         "@group(0) @binding({}) var<storage, read> cg_bq: array<u32>;\n",
@@ -1047,20 +1151,29 @@ pub fn source_wq8_affine(tm: u32, tn: u32, sg: u32, ku: u32) -> String {
     .unwrap();
     writeln!(b, "var<workgroup> w4bs: array<f16, {}>;", cols * t * ku).unwrap();
 
-    writeln!(b, "\n@compute @workgroup_size({wg})").unwrap();
-    writeln!(b, "fn {entry}(").unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) lidx: u32\n) {\n");
-    b.push_str("    let sgid = lidx / 32u;\n");
-    b.push_str("    let block = wid.x + wid.y * cg_p.groups_x;\n");
-    b.push_str("    let bm = block / cg_p.blocks_n;\n");
-    b.push_str("    let bn = block - bm * cg_p.blocks_n;\n");
+    write!(
+        b,
+        "
+@compute @workgroup_size({wg})
+fn {entry}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32
+) {{
+    let sgid = lidx / 32u;
+    let block = wid.x + wid.y * cg_p.groups_x;
+    let bm = block / cg_p.blocks_n;
+    let bn = block - bm * cg_p.blocks_n;\n"
+    )
+    .unwrap();
     writeln!(b, "    let m0 = bm * {}u;", g.rows_per_block(tm)).unwrap();
     writeln!(b, "    let n0w = bn * {cols}u;").unwrap();
     writeln!(b, "    let n0 = n0w + sgid * {}u;", t * tn).unwrap();
-    b.push_str("    let kk = cg_p.k_elems;\n");
-    b.push_str("    let ys = cg_p.y_stride;\n");
-    b.push_str("    let mrows = cg_p.m_rows;\n");
-    b.push_str("    let nrows = cg_p.n_rows;\n");
+    b.push_str(
+        "    let kk = cg_p.k_elems;
+    let ys = cg_p.y_stride;
+    let mrows = cg_p.m_rows;
+    let nrows = cg_p.n_rows;\n",
+    );
     let _ = A_ROW_AND_B_COL_BASES_ARE_CLAMPED_TO_THE_LAST_WHOLE_FRAGMENT_BECAUSE_THE_EPILOGUE_GUARDS_THE_STORE_AND_NEVER_THE_LOAD;
     for r in 0..tm {
         writeln!(
@@ -1070,8 +1183,10 @@ pub fn source_wq8_affine(tm: u32, tn: u32, sg: u32, ku: u32) -> String {
         )
         .unwrap();
     }
-    b.push_str("    let row_words = kk >> 3u;\n");
-    b.push_str("    let sf_row = kk / cg_p.gs;\n");
+    b.push_str(
+        "    let row_words = kk >> 3u;
+    let sf_row = kk / cg_p.gs;\n",
+    );
     for r in 0..tm {
         for j in 0..tn {
             writeln!(b, "    var c{r}_{j} = coopLoadT<CGC>(&cg_zero[0], {t}u);").unwrap();
@@ -1091,36 +1206,36 @@ pub fn source_wq8_affine(tm: u32, tn: u32, sg: u32, ku: u32) -> String {
         cols * ku
     )
     .unwrap();
-    writeln!(b, "            let u = e / {cols}u;").unwrap();
-    writeln!(b, "            let c = e - u * {cols}u;").unwrap();
-    b.push_str("            let gr = n0w + c;\n");
-    writeln!(b, "            let ku8 = kt + u * {t}u;").unwrap();
-    writeln!(b, "            let tile = u * {tiles}u + (c >> 3u);").unwrap();
-    b.push_str("            let row = c & 7u;\n");
+    write!(
+        b,
+        "            let u = e / {cols}u;
+            let c = e - u * {cols}u;
+            let gr = n0w + c;
+            let ku8 = kt + u * {t}u;
+            let tile = u * {tiles}u + (c >> 3u);
+            let row = c & 7u;\n"
+    )
+    .unwrap();
     writeln!(b, "            let tb = tile * {}u;", t * t).unwrap();
-    b.push_str("            var s = 0.0;\n");
-    b.push_str("            var bv = 0.0;\n");
-    b.push_str("            var w0 = 0u;\n");
-    b.push_str("            if (gr < nrows) {\n");
-    b.push_str("                w0 = cg_w4[gr * row_words + (ku8 >> 3u)];\n");
-    b.push_str("                let sbi = gr * sf_row + ku8 / cg_p.gs;\n");
-    b.push_str("                s = bf16_decode(cg_sf[sbi]);\n");
-    b.push_str("                bv = bf16_decode(cg_bq[sbi]);\n");
-    b.push_str("            }\n");
-    b.push_str("            for (var j = 0u; j < 8u; j = j + 1u) {\n");
-    writeln!(
+    write!(
         b,
-        "                let dq = f32((w0 >> (j * 4u)) & 0xfu) * s;"
+        "            var s = 0.0;
+            var bv = 0.0;
+            var w0 = 0u;
+            if (gr < nrows) {{
+                w0 = cg_w4[gr * row_words + (ku8 >> 3u)];
+                let sbi = gr * sf_row + ku8 / cg_p.gs;
+                s = bf16_decode(cg_sf[sbi]);
+                bv = bf16_decode(cg_bq[sbi]);
+            }}
+            for (var j = 0u; j < 8u; j = j + 1u) {{
+                let dq = f32((w0 >> (j * 4u)) & 0xfu) * s;
+                w4bs[tb + j * {t}u + row] = f16(dq + bv);
+            }}
+        }}
+        workgroupBarrier();\n"
     )
     .unwrap();
-    writeln!(
-        b,
-        "                w4bs[tb + j * {t}u + row] = f16(dq + bv);"
-    )
-    .unwrap();
-    b.push_str("            }\n");
-    b.push_str("        }\n");
-    b.push_str("        workgroupBarrier();\n");
     for u in 0..ku {
         for r in 0..tm {
             writeln!(
@@ -1168,8 +1283,12 @@ pub fn source_wq8_affine(tm: u32, tn: u32, sg: u32, ku: u32) -> String {
                 j * t
             )
             .unwrap();
-            writeln!(b, "        coopStoreT(c{r}_{j}, &cg_y[yo{r}_{j}], ys);").unwrap();
-            b.push_str("    }\n");
+            write!(
+                b,
+                "        coopStoreT(c{r}_{j}, &cg_y[yo{r}_{j}], ys);
+    }}\n"
+            )
+            .unwrap();
         }
     }
     b.push_str("}\n");
@@ -1255,283 +1374,296 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tiling_fills_the_accumulator_budget() {
-        assert_eq!(tiles(8, ACC_FRAGS), (1, 16));
-        assert_eq!(tiles(16, ACC_FRAGS), (2, 8));
-        assert_eq!(tiles(32, ACC_FRAGS), (4, 4));
-        assert_eq!(tiles(64, ACC_FRAGS), (8, 2));
-        assert_eq!(tiles(64, 32), (8, 4));
+    fn tiling_fills_an_accumulator_budget_counted_in_registers_per_lane_not_fragments() {
+        {
+            assert_eq!(tiles(8, ACC_FRAGS), (1, 16));
+            assert_eq!(tiles(16, ACC_FRAGS), (2, 8));
+            assert_eq!(tiles(32, ACC_FRAGS), (4, 4));
+            assert_eq!(tiles(64, ACC_FRAGS), (8, 2));
+            assert_eq!(tiles(64, 32), (8, 4));
 
-        let g16 = CoopGemm::new(16, Operand::F16);
-        assert_eq!(g16.tiles(16, ACC_FRAGS), (1, 16));
-        assert_eq!(g16.tiles(32, ACC_FRAGS), (2, 8));
-        assert_eq!(g16.tiles(64, ACC_FRAGS), (4, 4));
-        assert_eq!(g16.tiles(128, ACC_FRAGS), (8, 2));
-        assert_eq!(g16.rows_per_block(4), 64);
-        assert_eq!(g16.cols_per_workgroup(4, 4), 256);
-        assert_eq!(g16.grid(64, 512, 4, 4, 4), (1, 2));
-    }
-
-    #[test]
-    fn the_accumulator_budget_is_registers_per_lane_not_fragments() {
-        let g8 = CoopGemm::new(8, Operand::F16);
-        let g16 = CoopGemm::new(16, Operand::F16);
-        for (tm, tn) in [(1u32, 4u32), (2, 8), (4, 4), (8, 4), (4, 8)] {
-            assert_eq!(
-                g8.acc_fits_a_register_file(tm, tn),
-                tm * tn <= 32,
-                "at 8x8 the dword budget must reproduce the historical tm*tn<=32 filter exactly \
-                 ({tm}x{tn})"
-            );
+            let g16 = CoopGemm::new(16, Operand::F16);
+            assert_eq!(g16.tiles(16, ACC_FRAGS), (1, 16));
+            assert_eq!(g16.tiles(32, ACC_FRAGS), (2, 8));
+            assert_eq!(g16.tiles(64, ACC_FRAGS), (4, 4));
+            assert_eq!(g16.tiles(128, ACC_FRAGS), (8, 2));
+            assert_eq!(g16.rows_per_block(4), 64);
+            assert_eq!(g16.cols_per_workgroup(4, 4), 256);
+            assert_eq!(g16.grid(64, 512, 4, 4, 4), (1, 2));
         }
-        assert_eq!(g8.acc_lane_dwords(4, 8), 64);
-        assert_eq!(g16.acc_lane_dwords(4, 4), 128);
-        assert!(g16.acc_fits_a_register_file(4, 4));
-        assert_eq!(g16.acc_lane_dwords(2, 16), 256);
-        assert!(
-            !g16.acc_fits_a_register_file(2, 16),
-            "32 accumulator fragments of 16x16 f32 are 256 dwords per lane, past any 255-register \
-             file; that config wedged this adapter for >15 minutes on one dispatch"
-        );
-        assert!(!g16.acc_fits_a_register_file(1, 32));
-    }
-
-    #[test]
-    fn w4a16_source_parses_and_validates_for_the_swept_configs() {
-        for fmt in [WqFmt::Nvfp4Block16, WqFmt::Fp8RowscalePlain] {
-            for (tm, tn, sg, ku) in [
-                (1u32, 4u32, 1u32, 1u32),
-                (2, 2, 2, 1),
-                (4, 4, 2, 2),
-                (8, 2, 2, 2),
-                (8, 1, 1, 4),
-                (2, 2, 2, 3),
-            ] {
-                for (src, entry) in [
-                    (
-                        source_wq16(fmt, tm, tn, sg, ku),
-                        entry_wq16(fmt, tm, tn, sg, ku),
-                    ),
-                    (
-                        source_wq16_act_y16(fmt, WqAct::F16, tm, tn, sg, ku),
-                        entry_wq16_act_y16(fmt, WqAct::F16, tm, tn, sg, ku),
-                    ),
-                ] {
-                    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
-                        panic!("{fmt:?} tm={tm} tn={tn} sg={sg} ku={ku}: parse: {e}")
-                    });
-                    naga::valid::Validator::new(
-                        naga::valid::ValidationFlags::all(),
-                        naga::valid::Capabilities::all(),
-                    )
-                    .validate(&module)
-                    .unwrap_or_else(|e| {
-                        panic!("{fmt:?} tm={tm} tn={tn} sg={sg} ku={ku}: validate: {e}")
-                    });
-                    assert!(src.contains(&entry));
-                }
+        {
+            let g8 = CoopGemm::new(8, Operand::F16);
+            let g16 = CoopGemm::new(16, Operand::F16);
+            for (tm, tn) in [(1u32, 4u32), (2, 8), (4, 4), (8, 4), (4, 8)] {
+                assert_eq!(
+                    g8.acc_fits_a_register_file(tm, tn),
+                    tm * tn <= 32,
+                    "at 8x8 the dword budget must reproduce the historical tm*tn<=32 filter exactly \
+                     ({tm}x{tn})"
+                );
             }
+            assert_eq!(g8.acc_lane_dwords(4, 8), 64);
+            assert_eq!(g16.acc_lane_dwords(4, 4), 128);
+            assert!(g16.acc_fits_a_register_file(4, 4));
+            assert_eq!(g16.acc_lane_dwords(2, 16), 256);
+            assert!(
+                !g16.acc_fits_a_register_file(2, 16),
+                "32 accumulator fragments of 16x16 f32 are 256 dwords per lane, past any 255-register \
+                 file; that config wedged this adapter for >15 minutes on one dispatch"
+            );
+            assert!(!g16.acc_fits_a_register_file(1, 32));
         }
     }
 
     #[test]
-    fn wq16_act_arms_parse_validate_and_leave_the_f16_act_arm_untouched() {
-        for fmt in [WqFmt::Nvfp4Block16, WqFmt::Fp8RowscalePlain] {
-            assert_eq!(
-                source_wq16(fmt, 4, 4, 2, 2),
-                source_wq16_act(fmt, WqAct::F16, 4, 4, 2, 2),
-                "source_wq16 must stay the F16-act arm byte for byte: other lanes wire it"
-            );
-            assert_eq!(
-                entry_wq16(fmt, 4, 4, 2, 2),
-                entry_wq16_act(fmt, WqAct::F16, 4, 4, 2, 2)
-            );
-            for act in [WqAct::Fp8Rowscale, WqAct::Nvfp4Block16] {
+    fn every_emitted_source_parses_validates_is_fully_unrolled_asks_for_its_declared_request_and_binds_every_coop_store_argument(
+    ) {
+        {
+            for fmt in [WqFmt::Nvfp4Block16, WqFmt::Fp8RowscalePlain] {
                 for (tm, tn, sg, ku) in [
-                    (2u32, 2u32, 2u32, 1u32),
+                    (1u32, 4u32, 1u32, 1u32),
+                    (2, 2, 2, 1),
                     (4, 4, 2, 2),
                     (8, 2, 2, 2),
                     (8, 1, 1, 4),
+                    (2, 2, 2, 3),
                 ] {
-                    let src = source_wq16_act(fmt, act, tm, tn, sg, ku);
-                    let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
-                        panic!("{fmt:?}x{act:?} tm={tm} tn={tn} sg={sg} ku={ku}: parse: {e}")
-                    });
-                    naga::valid::Validator::new(
-                        naga::valid::ValidationFlags::all(),
-                        naga::valid::Capabilities::all(),
-                    )
-                    .validate(&module)
-                    .unwrap_or_else(|e| {
-                        panic!("{fmt:?}x{act:?} tm={tm} tn={tn} sg={sg} ku={ku}: validate: {e}")
-                    });
-                    assert!(src.contains(&entry_wq16_act(fmt, act, tm, tn, sg, ku)));
-                    assert!(src.contains("var<workgroup> xas"));
+                    for (src, entry) in [
+                        (
+                            source_wq16(fmt, tm, tn, sg, ku),
+                            entry_wq16(fmt, tm, tn, sg, ku),
+                        ),
+                        (
+                            source_wq16_act_y16(fmt, WqAct::F16, tm, tn, sg, ku),
+                            entry_wq16_act_y16(fmt, WqAct::F16, tm, tn, sg, ku),
+                        ),
+                    ] {
+                        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+                            panic!("{fmt:?} tm={tm} tn={tn} sg={sg} ku={ku}: parse: {e}")
+                        });
+                        naga::valid::Validator::new(
+                            naga::valid::ValidationFlags::all(),
+                            naga::valid::Capabilities::all(),
+                        )
+                        .validate(&module)
+                        .unwrap_or_else(|e| {
+                            panic!("{fmt:?} tm={tm} tn={tn} sg={sg} ku={ku}: validate: {e}")
+                        });
+                        assert!(src.contains(&entry));
+                    }
+                }
+            }
+        }
+        {
+            for fmt in [WqFmt::Nvfp4Block16, WqFmt::Fp8RowscalePlain] {
+                assert_eq!(
+                    source_wq16(fmt, 4, 4, 2, 2),
+                    source_wq16_act(fmt, WqAct::F16, 4, 4, 2, 2),
+                    "source_wq16 must stay the F16-act arm byte for byte: other lanes wire it"
+                );
+                assert_eq!(
+                    entry_wq16(fmt, 4, 4, 2, 2),
+                    entry_wq16_act(fmt, WqAct::F16, 4, 4, 2, 2)
+                );
+                for act in [WqAct::Fp8Rowscale, WqAct::Nvfp4Block16] {
+                    for (tm, tn, sg, ku) in [
+                        (2u32, 2u32, 2u32, 1u32),
+                        (4, 4, 2, 2),
+                        (8, 2, 2, 2),
+                        (8, 1, 1, 4),
+                    ] {
+                        let src = source_wq16_act(fmt, act, tm, tn, sg, ku);
+                        let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+                            panic!("{fmt:?}x{act:?} tm={tm} tn={tn} sg={sg} ku={ku}: parse: {e}")
+                        });
+                        naga::valid::Validator::new(
+                            naga::valid::ValidationFlags::all(),
+                            naga::valid::Capabilities::all(),
+                        )
+                        .validate(&module)
+                        .unwrap_or_else(|e| {
+                            panic!("{fmt:?}x{act:?} tm={tm} tn={tn} sg={sg} ku={ku}: validate: {e}")
+                        });
+                        assert!(src.contains(&entry_wq16_act(fmt, act, tm, tn, sg, ku)));
+                        assert!(src.contains("var<workgroup> xas"));
+                        assert_eq!(
+                            src.matches("coopLoadT<CGA>(&xas[").count() as u32,
+                            tm * ku,
+                            "every A fragment must come from the staged tile, not cg_x"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                entry_wq16_act(WqFmt::Nvfp4Block16, WqAct::Fp8Rowscale, 2, 2, 2, 1),
+                "gemm_coop_w4a8_16_tm2_tn2_sg2_ku1"
+            );
+            assert_eq!(
+                entry_wq16_act(WqFmt::Nvfp4Block16, WqAct::Nvfp4Block16, 2, 2, 2, 1),
+                "gemm_coop_w4a4_16_tm2_tn2_sg2_ku1"
+            );
+            assert_eq!(
+                entry_wq16_act(WqFmt::Fp8RowscalePlain, WqAct::Fp8Rowscale, 2, 2, 2, 1),
+                "gemm_coop_w8a8_16_tm2_tn2_sg2_ku1"
+            );
+            assert_eq!(
+                entry_wq16(WqFmt::Nvfp4Block16, 2, 2, 2, 1),
+                "gemm_coop_w4a16_16_tm2_tn2_sg2_ku1"
+            );
+        }
+        {
+            for (tm, tn, sg, s) in [
+                (4u32, 4u32, 4u32, 4u32),
+                (4, 4, 4, 8),
+                (8, 2, 2, 16),
+                (2, 4, 4, 2),
+            ] {
+                let src = source_splitk(tm, tn, sg, s);
+                let module = naga::front::wgsl::parse_str(&src)
+                    .unwrap_or_else(|e| panic!("tm={tm} tn={tn} sg={sg} s={s}: parse: {e}"));
+                naga::valid::Validator::new(
+                    naga::valid::ValidationFlags::all(),
+                    naga::valid::Capabilities::all(),
+                )
+                .validate(&module)
+                .unwrap_or_else(|e| panic!("tm={tm} tn={tn} sg={sg} s={s}: validate: {e}"));
+                assert!(src.contains(&entry_splitk(tm, tn, sg, s)));
+                assert!(src.contains("let pbase = sblk * mrows * ys;"));
+                assert_eq!(src.matches("coopMultiplyAdd").count() as u32, tm * tn);
+            }
+            assert_eq!(entry_splitk(4, 4, 4, 8), "gemm_coop_h8k_tm4_tn4_sg4_s8");
+        }
+        {
+            let src = source(2, 8, 4, 1);
+            assert!(
+                !src.contains("array<CGC"),
+                "accumulators must not be an array"
+            );
+            assert_eq!(src.matches("coopMultiplyAdd").count(), 16);
+            assert_eq!(src.matches("coopLoad<CGB>").count(), 8);
+            assert_eq!(src.matches("coopLoadT<CGA>").count(), 2);
+            assert!(src.starts_with("enable f16;\nenable wgpu_cooperative_matrix;\n"));
+            let u2 = source(4, 4, 2, 2);
+            assert_eq!(u2.matches("coopMultiplyAdd").count(), 32);
+            assert_eq!(u2.matches("coopLoad<CGB>").count(), 8);
+
+            let s16 = CoopGemm::new(16, Operand::F16).source(2, 8, 4, 1);
+            assert!(!s16.contains("array<CGC"));
+            assert_eq!(s16.matches("coopMultiplyAdd").count(), 16);
+            assert_eq!(s16.matches("coopLoad<CGB>").count(), 8);
+            assert_eq!(s16.matches("coopLoadT<CGA>").count(), 2);
+            assert!(s16.starts_with("enable f16;\nenable wgpu_cooperative_matrix;\n"));
+        }
+        {
+            let s8 = source(2, 4, 2, 2);
+            let s16 = CoopGemm::new(16, Operand::F16).source(2, 4, 2, 2);
+            assert!(s8.contains("coop_mat8x8<f16, A>"));
+            assert!(s16.contains("coop_mat16x16<f16, A>"));
+            assert!(s8.contains("coopLoadT<CGC>(&cg_zero[0], 8u)"));
+            assert!(s16.contains("coopLoadT<CGC>(&cg_zero[0], 16u)"));
+            assert!(s8.contains("kt = kt + 16u"), "8x8 with ku=2 steps K by 16");
+            assert!(
+                s16.contains("kt = kt + 32u"),
+                "16x16 with ku=2 steps K by 32"
+            );
+            assert_eq!(
+                s8.matches("coopMultiplyAdd").count(),
+                s16.matches("coopMultiplyAdd").count()
+            );
+            assert_eq!(CoopGemm::new(8, Operand::F16).zero_elems(), 64);
+            assert_eq!(CoopGemm::new(16, Operand::F16).zero_elems(), 256);
+        }
+        {
+            assert_eq!(entry(2, 8, 4, 1), "gemm_coop_h8_tm2_tn8_sg4_ku1");
+            assert_eq!(
+                CoopGemm::new(16, Operand::F16).entry(2, 8, 4, 1),
+                "gemm_coop_h16_tm2_tn8_sg4_ku1"
+            );
+            assert!(source(2, 8, 4, 1).contains("fn gemm_coop_h8_tm2_tn8_sg4_ku1("));
+            assert!(CoopGemm::new(16, Operand::F16)
+                .source(2, 8, 4, 1)
+                .contains("fn gemm_coop_h16_tm2_tn8_sg4_ku1("));
+        }
+        {
+            use crate::wgpu_backend::qualify::coop_requests_in_wgsl;
+            for tile in TILES {
+                for ab in [Operand::F16, Operand::F32] {
+                    let g = CoopGemm::new(tile, ab);
+                    let src = g.source(2, 8, 4, 1);
                     assert_eq!(
-                        src.matches("coopLoadT<CGA>(&xas[").count() as u32,
-                        tm * ku,
-                        "every A fragment must come from the staged tile, not cg_x"
+                        coop_requests_in_wgsl(&src),
+                        vec![g.request()],
+                        "{:?} {tile}x{tile} source declares something other than {}",
+                        ab,
+                        g.request().label()
+                    );
+                }
+            }
+            assert_eq!(request(Operand::F16).label(), "8x8x8 f16xf16->f32");
+            assert_eq!(request(Operand::F32).label(), "8x8x8 f32xf32->f32");
+            assert_eq!(
+                CoopGemm::new(16, Operand::F16).request().label(),
+                "16x16x16 f16xf16->f32"
+            );
+        }
+        {
+            for tile in TILES {
+                let src = CoopGemm::new(tile, Operand::F16).source(2, 2, 2, 1);
+                let stores: Vec<&str> = src
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| l.contains("coopStoreT("))
+                    .collect();
+                assert_eq!(stores.len(), 4, "{tile}x{tile}: one store per accumulator");
+                for line in stores {
+                    assert!(
+                        line.starts_with("coopStoreT(sc")
+                            && line.contains("&cg_y[yo")
+                            && line.ends_with(", ys);"),
+                        "naga 30 pushes Statement::CooperativeStore without first flushing its emitter \
+                         (front/wgsl/lower/mod.rs:3762; atomicStore at :3227 does flush), so any \
+                         argument built at the call site is never cached and the SPIR-V backend panics \
+                         at back/spv/block.rs:4153/4160. Every coopStore argument must be a let \
+                         bound in an earlier statement: {line}"
                     );
                 }
             }
         }
-        assert_eq!(
-            entry_wq16_act(WqFmt::Nvfp4Block16, WqAct::Fp8Rowscale, 2, 2, 2, 1),
-            "gemm_coop_w4a8_16_tm2_tn2_sg2_ku1"
-        );
-        assert_eq!(
-            entry_wq16_act(WqFmt::Nvfp4Block16, WqAct::Nvfp4Block16, 2, 2, 2, 1),
-            "gemm_coop_w4a4_16_tm2_tn2_sg2_ku1"
-        );
-        assert_eq!(
-            entry_wq16_act(WqFmt::Fp8RowscalePlain, WqAct::Fp8Rowscale, 2, 2, 2, 1),
-            "gemm_coop_w8a8_16_tm2_tn2_sg2_ku1"
-        );
-        assert_eq!(
-            entry_wq16(WqFmt::Nvfp4Block16, 2, 2, 2, 1),
-            "gemm_coop_w4a16_16_tm2_tn2_sg2_ku1"
-        );
     }
 
     #[test]
-    fn the_a_stage_budget_counts_both_tiles_and_the_error_names_the_overflow() {
-        assert_eq!(wq16_act_stage_elems(WqAct::F16, 8, 1, 1, 4), 1024);
-        assert_eq!(
-            wq16_act_stage_elems(WqAct::Fp8Rowscale, 8, 1, 1, 4),
-            1024 + 8192
-        );
-        assert_eq!(
-            wq16_act_stage_elems(WqAct::Nvfp4Block16, 4, 4, 2, 2),
-            4096 + 2048
-        );
-        assert_eq!(wq16_act_stage_elems(WqAct::F16, 8, 3, 8, 4), 24576);
-        let _fits = source_wq16_act(WqFmt::Nvfp4Block16, WqAct::F16, 8, 3, 8, 4);
-        let r = std::panic::catch_unwind(|| {
-            source_wq16_act(WqFmt::Nvfp4Block16, WqAct::Fp8Rowscale, 8, 3, 8, 4)
-        });
-        assert!(
-            r.is_err(),
-            "a B stage at exactly the budget plus any A stage must refuse to emit"
-        );
-    }
-
-    #[test]
-    fn source_is_fully_unrolled_and_has_no_indexed_accumulator_array() {
-        let src = source(2, 8, 4, 1);
-        assert!(
-            !src.contains("array<CGC"),
-            "accumulators must not be an array"
-        );
-        assert_eq!(src.matches("coopMultiplyAdd").count(), 16);
-        assert_eq!(src.matches("coopLoad<CGB>").count(), 8);
-        assert_eq!(src.matches("coopLoadT<CGA>").count(), 2);
-        assert!(src.starts_with("enable f16;\nenable wgpu_cooperative_matrix;\n"));
-        let u2 = source(4, 4, 2, 2);
-        assert_eq!(u2.matches("coopMultiplyAdd").count(), 32);
-        assert_eq!(u2.matches("coopLoad<CGB>").count(), 8);
-
-        let s16 = CoopGemm::new(16, Operand::F16).source(2, 8, 4, 1);
-        assert!(!s16.contains("array<CGC"));
-        assert_eq!(s16.matches("coopMultiplyAdd").count(), 16);
-        assert_eq!(s16.matches("coopLoad<CGB>").count(), 8);
-        assert_eq!(s16.matches("coopLoadT<CGA>").count(), 2);
-        assert!(s16.starts_with("enable f16;\nenable wgpu_cooperative_matrix;\n"));
-    }
-
-    #[test]
-    fn the_tile_is_the_only_thing_that_changes_between_the_two_fragment_shapes() {
-        let s8 = source(2, 4, 2, 2);
-        let s16 = CoopGemm::new(16, Operand::F16).source(2, 4, 2, 2);
-        assert!(s8.contains("coop_mat8x8<f16, A>"));
-        assert!(s16.contains("coop_mat16x16<f16, A>"));
-        assert!(s8.contains("coopLoadT<CGC>(&cg_zero[0], 8u)"));
-        assert!(s16.contains("coopLoadT<CGC>(&cg_zero[0], 16u)"));
-        assert!(s8.contains("kt = kt + 16u"), "8x8 with ku=2 steps K by 16");
-        assert!(
-            s16.contains("kt = kt + 32u"),
-            "16x16 with ku=2 steps K by 32"
-        );
-        assert_eq!(
-            s8.matches("coopMultiplyAdd").count(),
-            s16.matches("coopMultiplyAdd").count()
-        );
-        assert_eq!(CoopGemm::new(8, Operand::F16).zero_elems(), 64);
-        assert_eq!(CoopGemm::new(16, Operand::F16).zero_elems(), 256);
-    }
-
-    #[test]
-    fn a_ragged_extent_is_refused_rather_than_written_past() {
-        let g16 = CoopGemm::new(16, Operand::F16);
-        g16.check_shape(32, 64, 128).expect("aligned shape");
-        for (m, n, k) in [(32, 72, 128), (24, 64, 128), (32, 64, 120)] {
+    fn the_stage_budget_and_the_shape_check_refuse_what_the_kernel_cannot_write() {
+        {
+            assert_eq!(wq16_act_stage_elems(WqAct::F16, 8, 1, 1, 4), 1024);
+            assert_eq!(
+                wq16_act_stage_elems(WqAct::Fp8Rowscale, 8, 1, 1, 4),
+                1024 + 8192
+            );
+            assert_eq!(
+                wq16_act_stage_elems(WqAct::Nvfp4Block16, 4, 4, 2, 2),
+                4096 + 2048
+            );
+            assert_eq!(wq16_act_stage_elems(WqAct::F16, 8, 3, 8, 4), 24576);
+            let _fits = source_wq16_act(WqFmt::Nvfp4Block16, WqAct::F16, 8, 3, 8, 4);
+            let r = std::panic::catch_unwind(|| {
+                source_wq16_act(WqFmt::Nvfp4Block16, WqAct::Fp8Rowscale, 8, 3, 8, 4)
+            });
             assert!(
-                g16.check_shape(m, n, k).is_err(),
-                "16x16 must refuse M={m} N={n} K={k}"
+                r.is_err(),
+                "a B stage at exactly the budget plus any A stage must refuse to emit"
             );
         }
-        check_shape(32, 72, 128).expect("72 and 128 are both multiples of 8");
-        assert!(check_shape(32, 68, 128).is_err());
-    }
-
-    #[test]
-    fn the_emitted_source_asks_for_exactly_the_declared_request() {
-        use crate::wgpu_backend::qualify::coop_requests_in_wgsl;
-        for tile in TILES {
-            for ab in [Operand::F16, Operand::F32] {
-                let g = CoopGemm::new(tile, ab);
-                let src = g.source(2, 8, 4, 1);
-                assert_eq!(
-                    coop_requests_in_wgsl(&src),
-                    vec![g.request()],
-                    "{:?} {tile}x{tile} source declares something other than {}",
-                    ab,
-                    g.request().label()
-                );
-            }
-        }
-        assert_eq!(request(Operand::F16).label(), "8x8x8 f16xf16->f32");
-        assert_eq!(request(Operand::F32).label(), "8x8x8 f32xf32->f32");
-        assert_eq!(
-            CoopGemm::new(16, Operand::F16).request().label(),
-            "16x16x16 f16xf16->f32"
-        );
-    }
-
-    #[test]
-    fn the_entry_point_name_carries_the_fragment_shape() {
-        assert_eq!(entry(2, 8, 4, 1), "gemm_coop_h8_tm2_tn8_sg4_ku1");
-        assert_eq!(
-            CoopGemm::new(16, Operand::F16).entry(2, 8, 4, 1),
-            "gemm_coop_h16_tm2_tn8_sg4_ku1"
-        );
-        assert!(source(2, 8, 4, 1).contains("fn gemm_coop_h8_tm2_tn8_sg4_ku1("));
-        assert!(CoopGemm::new(16, Operand::F16)
-            .source(2, 8, 4, 1)
-            .contains("fn gemm_coop_h16_tm2_tn8_sg4_ku1("));
-    }
-
-    #[test]
-    fn every_coop_store_argument_is_a_binding_naga_has_already_emitted() {
-        for tile in TILES {
-            let src = CoopGemm::new(tile, Operand::F16).source(2, 2, 2, 1);
-            let stores: Vec<&str> = src
-                .lines()
-                .map(str::trim)
-                .filter(|l| l.contains("coopStoreT("))
-                .collect();
-            assert_eq!(stores.len(), 4, "{tile}x{tile}: one store per accumulator");
-            for line in stores {
+        {
+            let g16 = CoopGemm::new(16, Operand::F16);
+            g16.check_shape(32, 64, 128).expect("aligned shape");
+            for (m, n, k) in [(32, 72, 128), (24, 64, 128), (32, 64, 120)] {
                 assert!(
-                    line.starts_with("coopStoreT(sc")
-                        && line.contains("&cg_y[yo")
-                        && line.ends_with(", ys);"),
-                    "naga 30 pushes Statement::CooperativeStore without first flushing its emitter \
-                     (front/wgsl/lower/mod.rs:3762; atomicStore at :3227 does flush), so any \
-                     argument built at the call site is never cached and the SPIR-V backend panics \
-                     at back/spv/block.rs:4153/4160. Every coopStore argument must be a let \
-                     bound in an earlier statement: {line}"
+                    g16.check_shape(m, n, k).is_err(),
+                    "16x16 must refuse M={m} N={n} K={k}"
                 );
             }
+            check_shape(32, 72, 128).expect("72 and 128 are both multiples of 8");
+            assert!(check_shape(32, 68, 128).is_err());
         }
     }
 
@@ -1539,29 +1671,5 @@ mod tests {
     #[should_panic(expected = "coop_mat8x8 and coop_mat16x16")]
     fn a_fragment_shape_wgsl_cannot_spell_is_refused_at_construction() {
         CoopGemm::new(32, Operand::F16);
-    }
-
-    #[test]
-    fn splitk_source_parses_validates_and_stores_each_split_into_its_own_partial_slab() {
-        for (tm, tn, sg, s) in [
-            (4u32, 4u32, 4u32, 4u32),
-            (4, 4, 4, 8),
-            (8, 2, 2, 16),
-            (2, 4, 4, 2),
-        ] {
-            let src = source_splitk(tm, tn, sg, s);
-            let module = naga::front::wgsl::parse_str(&src)
-                .unwrap_or_else(|e| panic!("tm={tm} tn={tn} sg={sg} s={s}: parse: {e}"));
-            naga::valid::Validator::new(
-                naga::valid::ValidationFlags::all(),
-                naga::valid::Capabilities::all(),
-            )
-            .validate(&module)
-            .unwrap_or_else(|e| panic!("tm={tm} tn={tn} sg={sg} s={s}: validate: {e}"));
-            assert!(src.contains(&entry_splitk(tm, tn, sg, s)));
-            assert!(src.contains("let pbase = sblk * mrows * ys;"));
-            assert_eq!(src.matches("coopMultiplyAdd").count() as u32, tm * tn);
-        }
-        assert_eq!(entry_splitk(4, 4, 4, 8), "gemm_coop_h8k_tm4_tn4_sg4_s8");
     }
 }

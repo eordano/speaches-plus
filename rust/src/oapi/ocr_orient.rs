@@ -73,6 +73,7 @@ fn rot_cw90_grey(g: &GreyImage) -> GreyImage {
     out
 }
 
+#[cfg(test)]
 fn rot_180_grey(g: &GreyImage) -> GreyImage {
     let mut out = GreyImage::new(g.w, g.h);
     let n = g.w * g.h;
@@ -490,15 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn upright_page_is_left_alone() {
-        assert_eq!(
-            detect_content_rotation(&synth_left_aligned_page()),
-            ContentRotation::Upright
-        );
-    }
-
-    #[test]
-    fn every_rotation_is_detected_and_undone() {
+    fn upright_is_left_alone_and_every_rotation_is_detected_and_undone() {
         let upright = synth_left_aligned_page();
         let cases = [
             (rot_cw90_grey(&upright), ContentRotation::ApplyCcw90),
@@ -515,10 +508,16 @@ mod tests {
                 "a page rotated so that applying {expect:?} restores it must be detected"
             );
         }
+        {
+            assert_eq!(
+                detect_content_rotation(&synth_left_aligned_page()),
+                ContentRotation::Upright
+            );
+        }
     }
 
     #[test]
-    fn rotate_field_reencode_round_trips_dimensions() {
+    fn rotations_round_trip_in_rgb_and_through_reencode() {
         let img = as_rgb(&synth_left_aligned_page());
         let mut png = std::io::Cursor::new(Vec::new());
         nv_imgdec::image::RgbImage::from_raw(img.w as u32, img.h as u32, img.data.clone())
@@ -533,15 +532,13 @@ mod tests {
             (img.h, img.w),
             "cw90 must swap dimensions in the re-encoded image"
         );
-    }
-
-    #[test]
-    fn rgb_rotations_round_trip() {
-        let img = as_rgb(&synth_left_aligned_page());
-        let back = rot_ccw90_rgb(&rot_cw90_rgb(&img));
-        assert_eq!(back.data, img.data, "cw then ccw must be the identity");
-        let back2 = rot_180_rgb(&rot_180_rgb(&img));
-        assert_eq!(back2.data, img.data, "180 twice must be the identity");
+        {
+            let img = as_rgb(&synth_left_aligned_page());
+            let back = rot_ccw90_rgb(&rot_cw90_rgb(&img));
+            assert_eq!(back.data, img.data, "cw then ccw must be the identity");
+            let back2 = rot_180_rgb(&rot_180_rgb(&img));
+            assert_eq!(back2.data, img.data, "180 twice must be the identity");
+        }
     }
 
     const UPRIGHT_FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../conformance/fixtures");

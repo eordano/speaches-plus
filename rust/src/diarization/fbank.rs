@@ -213,7 +213,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fbank_silence_gives_floor() {
+    fn fbank_silence_gives_the_floor_and_frame_count_matches_kaldi() {
         let fb = FBank::new(80, 400, 160);
         let audio = vec![0.0f32; 16_000];
         let feats = fb.compute(&audio).unwrap();
@@ -227,33 +227,30 @@ mod tests {
                 v
             );
         }
+        {
+            let fb = FBank::new(80, 400, 160);
+            let audio = vec![0.1f32; 16_000];
+            let feats = fb.compute(&audio).unwrap();
+
+            let expected = 1 + (16_000 - 400) / 160;
+            assert_eq!(feats.len() / 80, expected);
+        }
     }
 
     #[test]
-    fn fbank_frame_count_matches_kaldi_formula() {
-        let fb = FBank::new(80, 400, 160);
-        let audio = vec![0.1f32; 16_000];
-        let feats = fb.compute(&audio).unwrap();
-
-        let expected = 1 + (16_000 - 400) / 160;
-        assert_eq!(feats.len() / 80, expected);
-    }
-
-    #[test]
-    fn mel_filters_cover_band() {
+    fn mel_filters_cover_the_band_and_hz_mel_round_trips() {
         let filters = build_mel_filters(80, 512, 16_000.0, 20.0, 7600.0);
         assert_eq!(filters.len(), 80);
 
         for (m, f) in filters.iter().enumerate() {
             assert!(!f.is_empty(), "mel {} has no taps", m);
         }
-    }
-
-    #[test]
-    fn hz_mel_round_trip() {
-        for hz in [20.0f32, 1000.0, 4000.0, 7600.0] {
-            let back = mel_to_hz(hz_to_mel(hz));
-            assert!((back - hz).abs() < 0.5, "hz {} -> {}", hz, back);
+        {
+            for hz in [20.0f32, 1000.0, 4000.0, 7600.0] {
+                let back = mel_to_hz(hz_to_mel(hz));
+                assert!((back - hz).abs() < 0.5, "hz {} -> {}", hz, back);
+            }
         }
     }
+
 }

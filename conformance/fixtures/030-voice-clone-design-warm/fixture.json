@@ -1,46 +1,21 @@
 {
   "name": "030-voice-clone-design-warm",
   "family": "030-voice-clone",
-  "description": "VoiceDesign profile with warm=1.0. Creates the profile then uses it for /v1/audio/speech synthesis. Asserts the design_params round-trip through the profile store and the resulting audio passes the same envelope check as 030-voice-clone-base.",
+  "description": "Voice design, then cloning. The Qwen3-TTS 1.7B VoiceDesign talker synthesizes a short sample in a voice described by `instructions`; the sample is enrolled as a voice profile on the 0.6B Base talker, which reads a longer paragraph in that voice. Two contrasting descriptions show the description steers the voice. The gates are measured on the audio: STT word error rate, median F0, and ECAPA speaker-encoder cosine.",
   "steps": [
     {
       "step": 1,
-      "kind": "create_voice_profile",
-      "endpoint": {
-        "method": "POST",
-        "path": "/v1/voice-profiles"
-      },
-      "request_multipart": {
-        "name": "test-design-warm",
-        "design_params": {
-          "warm": 1.0
-        }
-      },
-      "expected_response": {
-        "status": 201,
-        "body": {
-          "name": "test-design-warm",
-          "schema_version": 1,
-          "embedding_state_in": ["encoded", "no_encoder"],
-          "design_params": {
-            "warm": 1.0
-          }
-        }
-      }
-    },
-    {
-      "step": 2,
-      "kind": "synthesize_with_profile",
+      "kind": "design_voice",
       "endpoint": {
         "method": "POST",
         "path": "/v1/audio/speech"
       },
       "request_body": {
-        "model": "qwen3-tts-12hz",
-        "input": "Hello, this is a warm test voice.",
-        "voice": "test-design-warm",
-        "response_format": "wav",
-        "speed": 1.0
+        "model": "qwen3-tts-voicedesign",
+        "input": "Good evening. Tonight I will read you a story about the sea, so settle in and listen closely.",
+        "instructions": "A warm, mature male narrator with a deep, calm and resonant voice, speaking slowly and clearly.",
+        "voice": "7",
+        "response_format": "wav"
       },
       "expected_response": {
         "status": 200,
@@ -50,11 +25,55 @@
           "sample_rate": 24000,
           "channels": 1
         },
-        "expected_duration_ms_range": [1000, 4000]
+        "expected_duration_ms_range": [3000, 12000]
+      }
+    },
+    {
+      "step": 2,
+      "kind": "create_voice_profile",
+      "endpoint": {
+        "method": "POST",
+        "path": "/v1/voice-profiles"
+      },
+      "request_multipart": {
+        "name": "test-design-warm",
+        "file_from_step": 1,
+        "design_params": {
+          "instructions": "A warm, mature male narrator with a deep, calm and resonant voice, speaking slowly and clearly.",
+          "seed": 7
+        }
+      },
+      "expected_response": {
+        "status": 201,
+        "body": {
+          "name": "test-design-warm",
+          "embedding_state": "encoded",
+          "embedding_dim": 1024
+        }
       }
     },
     {
       "step": 3,
+      "kind": "synthesize_with_profile",
+      "endpoint": {
+        "method": "POST",
+        "path": "/v1/audio/speech"
+      },
+      "request_body": {
+        "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "input": "The old lighthouse stood at the edge of the cliff, its white paint worn grey by a century of storms. Every evening the keeper climbed the spiral stairs, trimmed the wick, and watched the beam sweep across the dark water, guiding the fishing boats safely home.",
+        "voice": "test-design-warm",
+        "seed": 7,
+        "response_format": "wav"
+      },
+      "expected_response": {
+        "status": 200,
+        "content_type": "audio/wav",
+        "expected_duration_ms_range": [10000, 30000]
+      }
+    },
+    {
+      "step": 4,
       "kind": "cleanup",
       "endpoint": {
         "method": "DELETE",
@@ -65,10 +84,26 @@
       }
     }
   ],
-  "comparison_strategy": "structural+audio_envelope",
-  "ref_outputs": {
-    "mode": "placeholder",
-    "notes": "design_params is currently passed through opaquely (see `VoiceProfile::design_params` in nv_tts and `oapi::voice_profiles::handle_create`). The placeholder assertion is round-trip: the profile we POST must come back from GET with identical design_params. Once a VoiceDesign conditioning head is wired the audio envelope assertion in step 2 becomes the canonical check."
+  "contrast": {
+    "input": "Good evening. Tonight I will read you a story about the sea, so settle in and listen closely.",
+    "voice": "7",
+    "low": "A deep, low-pitched adult male voice, calm and steady.",
+    "high": "A high-pitched, bright young female voice, cheerful and energetic."
   },
+  "gates": {
+    "max_word_error_rate": 0.2,
+    "low_max_median_f0_hz": 160.0,
+    "high_min_median_f0_hz": 190.0,
+    "contrast_min_ecapa_margin": 0.05,
+    "clone_min_ecapa_margin_over_default_voice": 0.03,
+    "clone_max_median_f0_deviation": 0.2
+  },
+  "python_reference": {
+    "source": "python/tts/qwen3/inference/qwen3_tts_model.py: _tokenize_texts(_build_assistant_text(input))[3:-5] and _tokenize_texts(_build_instruct_text(instructions)) for step 1",
+    "body_ids": [15216, 11458, 13, 54214, 358, 686, 1349, 498, 264, 3364, 911, 279, 9396, 11, 773, 24729, 304, 323, 8844, 15148, 13],
+    "instruct_ids": [151644, 872, 198, 32, 8205, 11, 14851, 8593, 64171, 448, 264, 5538, 11, 19300, 323, 28180, 517, 7743, 11, 12094, 13970, 323, 9355, 13, 151645, 198]
+  },
+  "comparison_strategy": "stt_round_trip+median_f0+ecapa_cosine",
+  "consumed_by": "rust/src/oapi/audio_speech_nvtts.rs::tests::real_voice_design_follows_the_description_repeats_by_seed_and_clones_onto_base",
   "skip_when_no_model": true
 }

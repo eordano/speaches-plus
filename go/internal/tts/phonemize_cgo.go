@@ -86,12 +86,3 @@ func (p *Phonemizer) Phonemize(text, lang string) (string, error) {
 		}
 	}
 }
-
-func closePhonemizer() {
-	globalPhon.mu.Lock()
-	defer globalPhon.mu.Unlock()
-	if globalPhon.inited {
-		C.sp_espeak_terminate()
-		globalPhon.inited = false
-	}
-}

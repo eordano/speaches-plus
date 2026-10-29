@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use nv_weights::WeightLoader;
+use std::env;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -16,7 +18,7 @@ pub const DOTS_DECODER_IS_QWEN2_ARCH_ON_THE_Q3D_GRAPH: &str =
 
 pub fn dots_decoder_dense_config_from_hf_json_str(s: &str) -> Result<Qwen3_5DenseConfig> {
     let v: serde_json::Value = serde_json::from_str(s).context("parse dots_ocr config json")?;
-    anyhow::ensure!(
+    ensure!(
         v.get("model_type").and_then(|x| x.as_str()) == Some("dots_ocr"),
         "config model_type {:?} != dots_ocr",
         v.get("model_type")
@@ -25,7 +27,7 @@ pub fn dots_decoder_dense_config_from_hf_json_str(s: &str) -> Result<Qwen3_5Dens
         v.get(k)
             .and_then(|x| x.as_u64())
             .map(|x| x as usize)
-            .ok_or_else(|| anyhow::anyhow!("missing/invalid {k}"))
+            .ok_or_else(|| anyhow!("missing/invalid {k}"))
     };
     let hidden_size = get_u("hidden_size")?;
     let num_attention_heads = get_u("num_attention_heads")?;
@@ -38,12 +40,10 @@ pub fn dots_decoder_dense_config_from_hf_json_str(s: &str) -> Result<Qwen3_5Dens
         Some(serde_json::Value::Array(a)) => {
             a.first()
                 .and_then(|x| x.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("empty eos_token_id list"))? as u32
+                .ok_or_else(|| anyhow!("empty eos_token_id list"))? as u32
         }
-        Some(x) => x
-            .as_u64()
-            .ok_or_else(|| anyhow::anyhow!("invalid eos_token_id"))? as u32,
-        None => anyhow::bail!("missing eos_token_id"),
+        Some(x) => x.as_u64().ok_or_else(|| anyhow!("invalid eos_token_id"))? as u32,
+        None => bail!("missing eos_token_id"),
     };
     Ok(Qwen3_5DenseConfig {
         hidden_size,
@@ -95,7 +95,7 @@ pub fn dots_decoder_wgpu_from_dir_with_lora(
     adapter_dir: Option<&Path>,
 ) -> Result<Qwen3_5DenseWgpu> {
     let cfg = dots_decoder_dense_config_from_dir(dir)?;
-    let loader = nv_weights::WeightLoader::open_dir(dir, &candle_core::Device::Cpu)
+    let loader = WeightLoader::open_dir(dir, &candle_core::Device::Cpu)
         .with_context(|| format!("open dots decoder weights in {}", dir.display()))?;
     let lora = adapter_dir
         .map(|d| crate::qwen3_5_dense_wgpu::Q3dLora::from_peft_dir(d, &cfg))
@@ -132,10 +132,10 @@ pub const DOTS_Q3D_ARMS_SET_IF_UNSET_BECAUSE_THE_BIAS_LANE_NUMBERS_WERE_MEASURED
 ];
 
 pub fn dots_mlx_snapshot_dir() -> Result<PathBuf> {
-    if let Ok(d) = std::env::var(DOTS_Q3D_MLX_DIR_ENV_FALLS_BACK_TO_THE_HUB_SNAPSHOT) {
+    if let Ok(d) = env::var(DOTS_Q3D_MLX_DIR_ENV_FALLS_BACK_TO_THE_HUB_SNAPSHOT) {
         if !d.is_empty() {
             let p = PathBuf::from(&d);
-            anyhow::ensure!(
+            ensure!(
                 p.is_dir(),
                 "{} = {d} is not a directory",
                 DOTS_Q3D_MLX_DIR_ENV_FALLS_BACK_TO_THE_HUB_SNAPSHOT
@@ -143,7 +143,7 @@ pub fn dots_mlx_snapshot_dir() -> Result<PathBuf> {
             return Ok(p);
         }
     }
-    let home = std::env::var("HOME").context("HOME unset and NV_DOTS_MLX_DIR unset")?;
+    let home = env::var("HOME").context("HOME unset and NV_DOTS_MLX_DIR unset")?;
     let snaps = PathBuf::from(home)
         .join(".cache/huggingface/hub/models--mlx-community--dots.ocr-4bit/snapshots");
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&snaps)
@@ -160,7 +160,7 @@ pub fn dots_mlx_snapshot_dir() -> Result<PathBuf> {
     entries.sort();
     entries
         .pop()
-        .ok_or_else(|| anyhow::anyhow!("empty mlx-community/dots.ocr-4bit snapshot dir"))
+        .ok_or_else(|| anyhow!("empty mlx-community/dots.ocr-4bit snapshot dir"))
 }
 
 pub struct DotsQ3dDecoder {
@@ -172,7 +172,7 @@ pub const DOTS_Q3D_LORA_DIR_ENV_HOT_LOADS_A_PEFT_ADAPTER_ON_THE_TRUNK: &str = "N
 
 impl DotsQ3dDecoder {
     pub fn from_snapshot() -> Result<Self> {
-        let lora_dir = std::env::var(DOTS_Q3D_LORA_DIR_ENV_HOT_LOADS_A_PEFT_ADAPTER_ON_THE_TRUNK)
+        let lora_dir = env::var(DOTS_Q3D_LORA_DIR_ENV_HOT_LOADS_A_PEFT_ADAPTER_ON_THE_TRUNK)
             .ok()
             .filter(|d| !d.is_empty())
             .map(PathBuf::from);
@@ -183,11 +183,11 @@ impl DotsQ3dDecoder {
         for (k, v) in DOTS_Q3D_ARMS_SET_IF_UNSET_BECAUSE_THE_BIAS_LANE_NUMBERS_WERE_MEASURED_ON_THEM
         {
             if std::env::var_os(k).is_none() {
-                std::env::set_var(k, v);
+                unsafe { std::env::set_var(k, v) };
             }
         }
         let dir = dots_mlx_snapshot_dir()?;
-        let max_seq = std::env::var(DOTS_Q3D_MAX_SEQ_ENV_DEFAULT_16384)
+        let max_seq = env::var(DOTS_Q3D_MAX_SEQ_ENV_DEFAULT_16384)
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(16384);
@@ -212,8 +212,8 @@ impl DotsQ3dDecoder {
     ) -> Result<GenerateOutcome> {
         let hidden = self.m.config().hidden_size;
         let prompt_len = prompt_tokens.len();
-        anyhow::ensure!(prompt_len >= 2, "dots prompt needs at least two tokens");
-        anyhow::ensure!(
+        ensure!(prompt_len >= 2, "dots prompt needs at least two tokens");
+        ensure!(
             prompt_len + opts.max_new_tokens.min(64) < self.max_seq,
             "prompt {} tokens does not fit max_seq {} ({} raises it)",
             prompt_len,
@@ -223,13 +223,13 @@ impl DotsQ3dDecoder {
         self.m.reset()?;
         let splices: Vec<ImageRowSplice> = match vision_rows_f32 {
             Some(f) => {
-                anyhow::ensure!(
+                ensure!(
                     f.len().is_multiple_of(hidden),
                     "vision rows hold {} values, not a multiple of hidden {hidden}",
                     f.len()
                 );
                 let n_vis = f.len() / hidden;
-                anyhow::ensure!(
+                ensure!(
                     vision_start + n_vis < prompt_len,
                     "vision span {vision_start}+{n_vis} must end before the prompt tail"
                 );
@@ -243,7 +243,7 @@ impl DotsQ3dDecoder {
         let done = self
             .m
             .prefill_tokens_with_image_rows(&prompt_tokens[..prompt_len - 1], &splices)?;
-        anyhow::ensure!(
+        ensure!(
             done == prompt_len - 1,
             "chunked prefill covered {done} of {} prompt rows",
             prompt_len - 1

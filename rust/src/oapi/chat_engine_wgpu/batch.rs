@@ -279,7 +279,7 @@ pub trait BatchStepper {
 
     fn prefill_slot(&mut self, slot: usize, tokens: &[u32]) -> anyhow::Result<u32>;
 
-    fn decode_step_batch(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<u32>>;
+    fn decode_step_batch(&mut self, rows: &[Option<u32>]) -> anyhow::Result<Vec<u32>>;
 
     fn end_batch(&mut self) {}
 }
@@ -426,15 +426,19 @@ impl<S: SlotSink> Batch<S> {
     }
 
     pub fn step(&mut self, model: &mut dyn BatchStepper) -> anyhow::Result<()> {
-        let tokens: Vec<u32> = self.slots.iter().map(|s| s.feed).collect();
-        let out = model.decode_step_batch(&tokens)?;
+        let rows: Vec<Option<u32>> = self
+            .slots
+            .iter()
+            .map(|s| s.live.then_some(s.feed))
+            .collect();
+        let out = model.decode_step_batch(&rows)?;
         anyhow::ensure!(
-            out.len() == tokens.len(),
+            out.len() == rows.len(),
             "decode_step_batch returned {} ids for {} slots: the graph and the scheduler \
              disagree about the batch, and a short return would silently serve one stream's \
              token to another",
             out.len(),
-            tokens.len()
+            rows.len()
         );
         self.steps += 1;
         for (slot, sampled) in self.slots.iter_mut().zip(out) {
@@ -505,27 +509,24 @@ mod batch_pays_tests {
     use super::*;
 
     #[test]
-    fn the_model_reproduces_the_measured_pair() {
+    fn the_step_model_reproduces_the_measured_pair_and_breaks_even_at_four() {
         let ratio = (2.0 * SINGLE_STEP_MS) / (BATCH_FIXED_MS + BATCH_PER_SLOT_MS * 2.0);
         assert!(
             (ratio - 0.787).abs() < 0.005,
             "model says {ratio:.3}x, measurement said 0.787x"
         );
         assert!(!batch_pays(2));
+        {
+            assert_eq!(batch_break_even(16), Some(4));
+            assert!(!batch_pays(3));
+            assert!(batch_pays(4));
+        }
+        {
+            assert!(!batch_pays(1));
+            assert!(!batch_pays(0));
+        }
     }
 
-    #[test]
-    fn four_is_where_the_fixed_term_amortizes() {
-        assert_eq!(batch_break_even(16), Some(4));
-        assert!(!batch_pays(3));
-        assert!(batch_pays(4));
-    }
-
-    #[test]
-    fn a_lone_request_never_batches() {
-        assert!(!batch_pays(1));
-        assert!(!batch_pays(0));
-    }
 }
 
 #[cfg(test)]
@@ -533,7 +534,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_kv_term_stops_growing_once_the_sliding_window_is_full() {
+    fn the_kv_term_saturates_at_the_window_and_the_knee_is_where_doubling_stops_paying() {
         let b = gemma4_31b_budget(2);
         let at_1k = b.kv.bytes_at(1024);
         let at_2k = b.kv.bytes_at(2048);
@@ -541,30 +542,27 @@ mod tests {
         let global_per_pos = 10 * 2 * 4 * 512 * 2;
         assert_eq!(at_1k, sliding + 1024 * global_per_pos);
         assert_eq!(at_2k - at_1k, 1024 * global_per_pos);
-    }
-
-    #[test]
-    fn the_knee_is_where_doubling_the_batch_stops_paying() {
-        let b = gemma4_31b_budget(2);
-        for l in [1024u64, 8192, 32768, 131072] {
-            let k = b.knee(l);
-            let at_knee = b.bytes_per_token(k.round() as u64, l);
-            let at_double = b.bytes_per_token((k.round() * 2.0) as u64, l);
-            let gain = at_knee / at_double;
-            assert!(
-                (1.25..1.4).contains(&gain),
-                "ctx {l}: doubling B past the knee ({k:.1}) gained {gain:.3}x, not the ~1.33x \
-                 that a half-weight-half-KV split predicts"
-            );
+        {
+            let b = gemma4_31b_budget(2);
+            for l in [1024u64, 8192, 32768, 131072] {
+                let k = b.knee(l);
+                let at_knee = b.bytes_per_token(k.round() as u64, l);
+                let at_double = b.bytes_per_token((k.round() * 2.0) as u64, l);
+                let gain = at_knee / at_double;
+                assert!(
+                    (1.25..1.4).contains(&gain),
+                    "ctx {l}: doubling B past the knee ({k:.1}) gained {gain:.3}x, not the ~1.33x \
+                     that a half-weight-half-KV split predicts"
+                );
+            }
+        }
+        {
+            let b = gemma4_31b_budget(2);
+            let floor = b.kv.bytes_at(32768) as f64;
+            assert!(b.bytes_per_token(1_000_000, 32768) / floor < 1.001);
         }
     }
 
-    #[test]
-    fn bytes_per_token_floors_at_the_kv_term_however_large_the_batch() {
-        let b = gemma4_31b_budget(2);
-        let floor = b.kv.bytes_at(32768) as f64;
-        assert!(b.bytes_per_token(1_000_000, 32768) / floor < 1.001);
-    }
 }
 
 #[cfg(test)]
@@ -584,6 +582,8 @@ mod sched_tests {
 
     struct ToyLm {
         state: Vec<u64>,
+        pos: Vec<usize>,
+        max_seq: usize,
         capacity: usize,
         short_by: usize,
     }
@@ -592,6 +592,8 @@ mod sched_tests {
         fn new(capacity: usize) -> Self {
             Self {
                 state: Vec::new(),
+                pos: Vec::new(),
+                max_seq: usize::MAX,
                 capacity,
                 short_by: 0,
             }
@@ -605,6 +607,7 @@ mod sched_tests {
 
         fn reset_batch(&mut self, slots: usize) -> anyhow::Result<()> {
             self.state = vec![0u64; slots];
+            self.pos = vec![0; slots];
             Ok(())
         }
 
@@ -617,16 +620,25 @@ mod sched_tests {
             for t in tokens {
                 out = toy_advance(s, *t);
             }
+            self.pos[slot] = tokens.len();
             Ok(out)
         }
 
-        fn decode_step_batch(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<u32>> {
-            anyhow::ensure!(tokens.len() == self.state.len());
-            let mut out: Vec<u32> = tokens
-                .iter()
-                .zip(self.state.iter_mut())
-                .map(|(t, s)| toy_advance(s, *t))
-                .collect();
+        fn decode_step_batch(&mut self, rows: &[Option<u32>]) -> anyhow::Result<Vec<u32>> {
+            anyhow::ensure!(rows.len() == self.state.len());
+            for (j, (row, p)) in rows.iter().zip(&self.pos).enumerate() {
+                anyhow::ensure!(
+                    row.is_none() || *p < self.max_seq,
+                    "slot {j}: kv cache full at {p}"
+                );
+            }
+            let mut out = vec![0u32; rows.len()];
+            for (j, row) in rows.iter().enumerate() {
+                if let Some(t) = row {
+                    out[j] = toy_advance(&mut self.state[j], *t);
+                    self.pos[j] += 1;
+                }
+            }
             out.truncate(out.len() - self.short_by);
             Ok(out)
         }
@@ -697,7 +709,7 @@ mod sched_tests {
     }
 
     #[test]
-    fn a_batch_of_one_is_refused_rather_than_scheduled() {
+    fn a_batch_of_one_and_a_short_graph_return_are_refused() {
         let out = Rc::new(RefCell::new(Collected::default()));
         let made = Batch::new(vec![(
             ToySink {
@@ -711,6 +723,10 @@ mod sched_tests {
             Err(e) => e,
         };
         assert!(format!("{err}").contains("single-stream"));
+        {
+            let err = run_batch(&[&[1, 2], &[3, 4], &[5, 6]], 8, 1).expect_err("short return accepted");
+            assert!(format!("{err}").contains("decode_step_batch returned"));
+        }
     }
 
     #[test]
@@ -789,9 +805,51 @@ mod sched_tests {
     }
 
     #[test]
-    fn a_short_return_from_the_graph_is_refused_not_realigned() {
-        let err = run_batch(&[&[1, 2], &[3, 4], &[5, 6]], 8, 1).expect_err("short return accepted");
-        assert!(format!("{err}").contains("decode_step_batch returned"));
+    fn a_slot_retired_near_the_kv_window_never_fails_its_live_neighbour() {
+        let max_seq = 16usize;
+        let long: &[u32] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13];
+        let short: &[u32] = &[5, 6];
+        let budgets = [(long, 2usize), (short, 10usize)];
+        for (p, max_new) in budgets {
+            assert!(
+                p.len() + max_new <= max_seq,
+                "prepare_prompt admits only prompt + max_new <= max_seq; the fixture must too"
+            );
+        }
+        let short_ref = single_stream_reference(short, 10);
+        assert!(
+            short_ref.len() > max_seq - long.len(),
+            "the live slot must outlast the steps the retired slot has left before max_seq, or \
+             the fixture cannot show a retired slot failing it"
+        );
+        let mut lm = ToyLm::new(2);
+        lm.max_seq = max_seq;
+        lm.reset_batch(2).unwrap();
+        let mut sinks = Vec::new();
+        let mut seeded = Vec::new();
+        for (i, (p, max_new)) in budgets.iter().enumerate() {
+            let first = lm.prefill_slot(i, p).unwrap();
+            let out = Rc::new(RefCell::new(Collected::default()));
+            sinks.push(out.clone());
+            seeded.push((
+                ToySink {
+                    max_new: *max_new,
+                    out,
+                },
+                first,
+            ));
+        }
+        let mut batch = Batch::new(seeded).unwrap();
+        batch
+            .drain(&mut lm, 64)
+            .expect("a retired slot was fed until its KV filled and the whole step was refused");
+        assert_eq!(sinks[0].borrow().tokens, single_stream_reference(long, 2));
+        assert_eq!(
+            sinks[1].borrow().tokens,
+            short_ref,
+            "the live slot lost tokens to its retired neighbour"
+        );
+        assert_eq!(sinks[1].borrow().finished, 1);
     }
 
     #[test]
@@ -801,13 +859,6 @@ mod sched_tests {
         assert!(stats.worst_stream_ms_per_token() >= stats.best_stream_ms_per_token());
         let s = stats.summary();
         assert!(s.contains("aggregate") && s.contains("per-stream"));
-    }
-
-    #[test]
-    fn batching_is_off_unless_the_knob_is_set() {
-        let d = BatchKnobs::default();
-        assert_eq!(d.max_batch, 1);
-        assert!(!d.enabled());
     }
 
     fn adm(max_batch: usize, headroom: f64, ctx: u64) -> Admission {
@@ -823,7 +874,7 @@ mod sched_tests {
     }
 
     #[test]
-    fn admission_refuses_slots_that_would_eat_the_reserve() {
+    fn admission_is_off_by_default_and_refuses_slots_that_would_eat_the_reserve() {
         let a = adm(32, 6.0, 32768);
         let per = a.slot_gib();
         assert!(per > 0.0);
@@ -831,6 +882,14 @@ mod sched_tests {
         assert_eq!(a.memory_slots(exactly_four), 4);
         assert_eq!(a.memory_slots(exactly_four - per), 3);
         assert_eq!(a.memory_slots(1.0), 1);
+        {
+            let d = BatchKnobs::default();
+            assert_eq!(d.max_batch, 1);
+            assert!(!d.enabled());
+        }
+        {
+            assert_eq!(adm(32, 0.0, 1024).slots(1, Some(1024.0)), 1);
+        }
     }
 
     #[test]
@@ -845,31 +904,24 @@ mod sched_tests {
         );
         assert!(long.slots(64, None) < 64);
         assert!(long.knee_slots() >= FREE_ROWS);
+        {
+            let a = Admission {
+                budget: StepBudget {
+                    weight_bytes: 1,
+                    kv: gemma4_31b_budget(KV_ELEM_BYTES).kv,
+                },
+                max_seq: 131_072,
+                knobs: BatchKnobs {
+                    max_batch: 32,
+                    ..BatchKnobs::default()
+                },
+            };
+            assert_eq!(a.knee_slots(), FREE_ROWS);
+        }
     }
 
     #[test]
-    fn the_free_fragment_is_a_floor_the_knee_cannot_cross() {
-        let a = Admission {
-            budget: StepBudget {
-                weight_bytes: 1,
-                kv: gemma4_31b_budget(KV_ELEM_BYTES).kv,
-            },
-            max_seq: 131_072,
-            knobs: BatchKnobs {
-                max_batch: 32,
-                ..BatchKnobs::default()
-            },
-        };
-        assert_eq!(a.knee_slots(), FREE_ROWS);
-    }
-
-    #[test]
-    fn a_graph_without_a_batch_path_gets_one_slot() {
-        assert_eq!(adm(32, 0.0, 1024).slots(1, Some(1024.0)), 1);
-    }
-
-    #[test]
-    fn kv_geometry_reads_a_gemma4_style_mixed_layer_stack() {
+    fn kv_geometry_reads_mixed_and_unwindowed_stacks_and_is_none_when_unreadable() {
         let raw = r#"{"num_hidden_layers":6,"num_key_value_heads":4,"head_dim":256,
             "num_global_key_value_heads":2,"global_head_dim":512,"sliding_window":1024,
             "layer_types":["sliding_attention","sliding_attention","sliding_attention",
@@ -880,6 +932,19 @@ mod sched_tests {
         assert_eq!(g.sliding_bytes_per_pos, 2 * 4 * 256 * 2);
         assert_eq!(g.global_bytes_per_pos, 2 * 2 * 512 * 2);
         assert_eq!(g.bytes_at(2048), 5 * 1024 * 4096 + 2048 * 4096);
+        {
+            let raw = r#"{"num_hidden_layers":48,"num_key_value_heads":8,"hidden_size":4096,
+                "num_attention_heads":32}"#;
+            let g = kv_geometry_from_config(raw, 2).expect("dense config");
+            assert_eq!(g.sliding_layers, 0);
+            assert_eq!(g.global_layers, 48);
+            assert_eq!(g.global_bytes_per_pos, 2 * 8 * 128 * 2);
+        }
+        {
+            assert!(kv_geometry_from_config("{}", 2).is_none());
+            assert!(kv_geometry_from_config("not json", 2).is_none());
+            assert!(kv_geometry_from_config(r#"{"num_hidden_layers":32}"#, 2).is_none());
+        }
     }
 
     #[test]
@@ -903,22 +968,6 @@ mod sched_tests {
         }
     }
 
-    #[test]
-    fn kv_geometry_charges_an_unwindowed_stack_entirely_as_global() {
-        let raw = r#"{"num_hidden_layers":48,"num_key_value_heads":8,"hidden_size":4096,
-            "num_attention_heads":32}"#;
-        let g = kv_geometry_from_config(raw, 2).expect("dense config");
-        assert_eq!(g.sliding_layers, 0);
-        assert_eq!(g.global_layers, 48);
-        assert_eq!(g.global_bytes_per_pos, 2 * 8 * 128 * 2);
-    }
-
-    #[test]
-    fn kv_geometry_is_none_when_the_stack_cannot_be_read() {
-        assert!(kv_geometry_from_config("{}", 2).is_none());
-        assert!(kv_geometry_from_config("not json", 2).is_none());
-        assert!(kv_geometry_from_config(r#"{"num_hidden_layers":32}"#, 2).is_none());
-    }
 }
 
 #[cfg(all(test, feature = "wgpu"))]

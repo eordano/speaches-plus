@@ -7,26 +7,12 @@ A Go server wire-compatible with the speaches `/v1/realtime` endpoint.
 
 ## Conformance
 
-The canonical harness is shared across implementations: `client/`
-drives the language-agnostic e2e suite over the wire; `conformance/`
-holds the §15.6 fixture corpus + canonical assertion library that both
-Go and Rust replay in-process (corpus layout and bands:
-`docs/book/08-build-and-testing.md` § "The conformance corpus" and
-`conformance/README.md`).
-
-| Tool | Purpose |
-|---|---|
-| `client/test_e2e.py` | Single-leg STT round-trip |
-| `client/test_e2e_full.py` | Full conversation (orchestrator spawns subprocess) |
-| `client/fuzz_e2e.py` | Black-box fuzzer + RFC v3 invariant checker (§9.6, §8.2, §8.4, §10.x) |
-| `client/fake_llm.py` | Deterministic LLM stub (validates received text + emits fixed response) |
-| `client/fixtures/` | Synthetic audio WAVs |
-| `conformance/lib/trace_invariants.py` | W1-W8 wire + I1-I11 state-machine invariants checker |
-| `conformance/lib/trace_diff.py` | Canonical trace diff against expected |
-| `conformance/runner/run_fixture.py` | Standalone fixture runner (no per-language harness needed) |
-
+`client/` drives the language-agnostic e2e suite over the wire;
+`conformance/` holds the §15.6 fixture corpus that Go and Rust replay
+in-process (tools: `../conformance/README.md` §Running; corpus layout:
+`docs/book/08-build-and-testing.md` § "The conformance corpus").
 Run the e2e suite against this server with `--target` or
-`--speaches-binary`; run the in-process corpus replay with
+`--speaches-binary`; run the corpus replay with
 `go test ./internal/realtime/ -run TestConformanceCorpus -v`.
 Spec violations surface as wire-trace diffs against the canonical
 expected. Both `client/test_e2e.py` and `client/test_e2e_full.py` pass

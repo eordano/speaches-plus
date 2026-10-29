@@ -25,7 +25,6 @@ pub struct BatchOptions {
     pub slots: usize,
     pub prep_threads: usize,
     pub queue_depth: usize,
-    pub loop_retry: bool,
 }
 
 impl BatchOptions {
@@ -36,9 +35,6 @@ impl BatchOptions {
             slots,
             prep_threads,
             queue_depth: env_usize("NV_OCR_BATCH_QUEUE", 64).max(1),
-            loop_retry: std::env::var("NV_DSOCR_LOOP_RETRY")
-                .map(|v| v != "0")
-                .unwrap_or(true),
         }
     }
 }
@@ -49,7 +45,6 @@ impl Default for BatchOptions {
             slots: 1,
             prep_threads: 1,
             queue_depth: 64,
-            loop_retry: true,
         }
     }
 }
@@ -106,13 +101,6 @@ struct Prepared {
     reply: Reply,
 }
 
-pub fn bsn_enabled() -> bool {
-    match std::env::var("NV_OCR_BSN") {
-        Ok(v) if !v.is_empty() => v != "0",
-        _ => true,
-    }
-}
-
 pub struct DsocrScheduler {
     job_tx: Option<mpsc::SyncSender<Envelope>>,
     threads: Vec<thread::JoinHandle<()>>,
@@ -124,27 +112,25 @@ pub struct DsocrScheduler {
 impl DsocrScheduler {
     pub fn new(pipeline: Arc<DeepSeekOcr2Pipeline>, opts: BatchOptions) -> Self {
         #[cfg(feature = "cuda")]
-        if bsn_enabled() {
-            match nv_models::deepseek_ocr::graph_supported(pipeline.decoder()) {
-                Ok(()) => {
-                    let bopts = super::ocr_batch_n::BsnOptions::from_env();
-                    eprintln!(
-                        "[dsocr-batch] routing to the bs=N engine (buckets {:?}, front {}); NV_OCR_BSN=0 to opt out",
-                        bopts.buckets, bopts.front_threads
-                    );
-                    return Self {
-                        job_tx: None,
-                        threads: Vec::new(),
-                        opts,
-                        bsn: Some(super::ocr_batch_n::DsocrBsnEngine::new(pipeline, bopts)),
-                    };
-                }
-                Err(reason) => eprintln!(
-                    "[dsocr-batch] bs=N engine needs the bf16 batch decode graph ({reason}); \
-                     routing to the single-sequence scheduler, which decodes NVFP4 eagerly \
-                     instead of dropping every job on a dead decode thread"
-                ),
+        match nv_models::deepseek_ocr::graph_supported(pipeline.decoder()) {
+            Ok(()) => {
+                let bopts = super::ocr_batch_n::BsnOptions::from_env();
+                eprintln!(
+                    "[dsocr-batch] routing to the bs=N engine (buckets {:?}, front {})",
+                    bopts.buckets, bopts.front_threads
+                );
+                return Self {
+                    job_tx: None,
+                    threads: Vec::new(),
+                    opts,
+                    bsn: Some(super::ocr_batch_n::DsocrBsnEngine::new(pipeline, bopts)),
+                };
             }
+            Err(reason) => eprintln!(
+                "[dsocr-batch] bs=N engine needs the bf16 batch decode graph ({reason}); \
+                 routing to the single-sequence scheduler, which decodes NVFP4 eagerly \
+                 instead of dropping every job on a dead decode thread"
+            ),
         }
         let (job_tx, job_rx) = mpsc::sync_channel::<Envelope>(opts.queue_depth);
         let (prep_tx, prep_rx) = mpsc::sync_channel::<Prepared>(opts.queue_depth);
@@ -168,7 +154,7 @@ impl DsocrScheduler {
             threads.push(
                 thread::Builder::new()
                     .name(format!("dsocr-gpu-{i}"))
-                    .spawn(move || gpu_loop(pipe, rx, opts))
+                    .spawn(move || gpu_loop(pipe, rx))
                     .expect("spawn dsocr gpu thread"),
             );
         }
@@ -309,11 +295,7 @@ impl GraphSlot {
     }
 }
 
-fn gpu_loop(
-    pipeline: Arc<DeepSeekOcr2Pipeline>,
-    rx: Arc<Mutex<mpsc::Receiver<Prepared>>>,
-    opts: BatchOptions,
-) {
+fn gpu_loop(pipeline: Arc<DeepSeekOcr2Pipeline>, rx: Arc<Mutex<mpsc::Receiver<Prepared>>>) {
     let mut slot = GraphSlot::new();
     let mut first = true;
     loop {
@@ -328,9 +310,9 @@ fn gpu_loop(
         let out = if first {
             let _g = FIRST_JOB.lock();
             first = false;
-            run_one(&pipeline, &mut slot, &item, &opts)
+            run_one(&pipeline, &mut slot, &item)
         } else {
-            run_one(&pipeline, &mut slot, &item, &opts)
+            run_one(&pipeline, &mut slot, &item)
         };
         let _ = item.reply.send(out.map_err(|e| format!("{e:#}")));
     }
@@ -342,7 +324,6 @@ fn run_one(
     pipeline: &DeepSeekOcr2Pipeline,
     slot: &mut GraphSlot,
     item: &Prepared,
-    opts: &BatchOptions,
 ) -> Result<OcrOutput> {
     let t_vis = Instant::now();
     let feats = pipeline.vision().encode_prepared(&item.prep)?;
@@ -361,7 +342,7 @@ fn run_one(
     if let Some(d) = outcome.loop_detection {
         looped = true;
         out.truncate(d.onset);
-        if item.prompt.trim() == PROMPT_FREE_OCR && opts.loop_retry {
+        if item.prompt.trim() == PROMPT_FREE_OCR {
             let retry_outcome = decode_once(
                 pipeline,
                 slot,
@@ -418,10 +399,7 @@ fn decode_once(
     let tokens = build_prompt_tokens(|s| pipeline.encode_text(s), prompt, n_vis)?;
     #[cfg(feature = "cuda")]
     {
-        if nv_models::deepseek_ocr::decoder_graph::graph_enabled()
-            && pipeline.device().is_cuda()
-            && !slot.failed
-        {
+        if pipeline.device().is_cuda() && !slot.failed {
             if slot.graph.is_none() {
                 let cap = pipeline.decoder().config().max_position_embeddings;
                 match DsocrDecodeGraph::new(pipeline.decoder_arc(), cap) {
@@ -455,29 +433,12 @@ mod tests {
     }
 
     #[test]
-    fn bsn_defaults_on_and_zero_opts_out() {
-        let prev = std::env::var("NV_OCR_BSN").ok();
-        std::env::remove_var("NV_OCR_BSN");
-        assert!(bsn_enabled());
-        std::env::set_var("NV_OCR_BSN", "");
-        assert!(bsn_enabled());
-        std::env::set_var("NV_OCR_BSN", "0");
-        assert!(!bsn_enabled());
-        std::env::set_var("NV_OCR_BSN", "1");
-        assert!(bsn_enabled());
-        match prev {
-            Some(v) => std::env::set_var("NV_OCR_BSN", v),
-            None => std::env::remove_var("NV_OCR_BSN"),
-        }
-    }
-
-    #[test]
     fn env_options_clamp_to_at_least_one() {
-        std::env::set_var("NV_OCR_BATCH_SLOTS", "0");
-        std::env::set_var("NV_OCR_BATCH_PREP_THREADS", "0");
+        unsafe { std::env::set_var("NV_OCR_BATCH_SLOTS", "0") };
+        unsafe { std::env::set_var("NV_OCR_BATCH_PREP_THREADS", "0") };
         let o = BatchOptions::from_env();
-        std::env::remove_var("NV_OCR_BATCH_SLOTS");
-        std::env::remove_var("NV_OCR_BATCH_PREP_THREADS");
+        unsafe { std::env::remove_var("NV_OCR_BATCH_SLOTS") };
+        unsafe { std::env::remove_var("NV_OCR_BATCH_PREP_THREADS") };
         assert_eq!(o.slots, 1);
         assert_eq!(o.prep_threads, 1);
     }

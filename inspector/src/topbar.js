@@ -12,7 +12,6 @@ export function setupTopbar({ store, audio, timeline }) {
   const btnChTts    = $('#btnChTts');
   const btnFollow   = $('#btnFollow');
 
-  // ── mode pill (live / replay / paused) ─────────────────────────────────
   function refreshModePill() {
     const m = store.state.mode;
     statePill.classList.remove('state-live', 'state-paused', 'state-replay');
@@ -48,7 +47,6 @@ export function setupTopbar({ store, audio, timeline }) {
     btnChTts.setAttribute('aria-pressed', store.state.playback.channels.tts ? 'true' : 'false');
   }
 
-  // ── click wiring ───────────────────────────────────────────────────────
   // Play conductor:
   //   playing               -> stop
   //   live + tail-following -> peel tail off (so user can pick a moment),
@@ -63,7 +61,6 @@ export function setupTopbar({ store, audio, timeline }) {
       store.setFollowTail(false);
       return;
     }
-    // For historical replay, drop tail before starting.
     if (s.followTail) store.setFollowTail(false);
     audio.startLive();
   });
@@ -96,7 +93,6 @@ export function setupTopbar({ store, audio, timeline }) {
     }
   });
 
-  // ── subscriptions ──────────────────────────────────────────────────────
   store.subscribe('mode', () => { refreshModePill(); refreshLiveGroup(); });
   store.subscribe('view', refreshLiveGroup);
   store.subscribe('playback', refreshPlayback);

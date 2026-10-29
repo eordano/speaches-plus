@@ -265,7 +265,7 @@ __device__ __forceinline__ float nvfp4_block_dot_e2m1_against_bf16_row(
     return bd;
 }
 
-template <int MROWS>
+template <int MROWS, bool ROW_MAJOR_SCALES>
 __global__ void nvfp4_gemv_bf16act_kernel(
     const uint8_t* __restrict__ W_packed,
     const uint8_t* __restrict__ W_scales,
@@ -288,8 +288,9 @@ __global__ void nvfp4_gemv_bf16act_kernel(
     for (int r = 0; r < MROWS; ++r) acc[r] = 0.f;
 
     for (int kb = lane; kb < n_blocks; kb += 32) {
-        float scale =
-            decode_ue4m3_branchless_dev(W_scales[swizzled_scale_dst(n, kb, n_blocks)]) * 16384.f;
+        const uint8_t sbyte = ROW_MAJOR_SCALES ? W_scales[(size_t)n * n_blocks + kb]
+                                               : W_scales[swizzled_scale_dst(n, kb, n_blocks)];
+        float scale = decode_ue4m3_branchless_dev(sbyte) * 16384.f;
         uint2 wq = *reinterpret_cast<const uint2*>(w_row + (size_t)kb * 8);
         unsigned w0 = wq.x;
         unsigned w1 = wq.y;
@@ -413,6 +414,46 @@ __global__ void nvfp4_gemv_bf16act_prenorm_kernel(
     }
 }
 
+constexpr int kSweptRowsMax = 8;
+constexpr int kSweptWarps = 16;
+constexpr int kSweptTwoRowsPerWarpUpToThisNBecauseTheGridNeedsEverySm = 4096;
+constexpr int kSweptLmHeadRowsFromWhichTheSweptKernelWinsAtOneRow = 65536;
+
+template <bool ROW_MAJOR_SCALES>
+static int nvk_gemv_act_mrows_launch(
+    cudaStream_t s,
+    dim3 grid,
+    dim3 block,
+    const uint8_t* W_packed,
+    const uint8_t* W_scales,
+    const __nv_bfloat16* xx,
+    __nv_bfloat16* yy,
+    float alpha,
+    int N,
+    int K,
+    int M
+) {
+#define NVK_GEMV_ACT_MROWS(R)                                                                   \
+    nvfp4_gemv_bf16act_kernel<R, ROW_MAJOR_SCALES>                                              \
+        <<<grid, block, 0, s>>>(W_packed, W_scales, xx, yy, alpha, N, K)
+    switch (M) {
+        case 1: NVK_GEMV_ACT_MROWS(1); break;
+        case 2: NVK_GEMV_ACT_MROWS(2); break;
+        case 3: NVK_GEMV_ACT_MROWS(3); break;
+        case 4: NVK_GEMV_ACT_MROWS(4); break;
+        case 5: NVK_GEMV_ACT_MROWS(5); break;
+        case 6: NVK_GEMV_ACT_MROWS(6); break;
+        case 7: NVK_GEMV_ACT_MROWS(7); break;
+        case 8: NVK_GEMV_ACT_MROWS(8); break;
+        case 12: NVK_GEMV_ACT_MROWS(12); break;
+        case 16: NVK_GEMV_ACT_MROWS(16); break;
+        case 24: NVK_GEMV_ACT_MROWS(24); break;
+        default: return -2;
+    }
+#undef NVK_GEMV_ACT_MROWS
+    return (int)cudaGetLastError();
+}
+
 extern "C" int nv_kernels_nvfp4_gemv_bf16act_mrows(
     void* stream,
     const uint8_t* W_packed,
@@ -432,24 +473,37 @@ extern "C" int nv_kernels_nvfp4_gemv_bf16act_mrows(
     dim3 block(kGemvActWarps * kWarpSize);
     const __nv_bfloat16* xx = reinterpret_cast<const __nv_bfloat16*>(x_bf16);
     __nv_bfloat16* yy = reinterpret_cast<__nv_bfloat16*>(y);
-#define NVK_GEMV_ACT_MROWS(R)                                                                   \
-    nvfp4_gemv_bf16act_kernel<R><<<grid, block, 0, s>>>(W_packed, W_scales, xx, yy, alpha, N, K)
-    switch (M) {
-        case 1: NVK_GEMV_ACT_MROWS(1); break;
-        case 2: NVK_GEMV_ACT_MROWS(2); break;
-        case 3: NVK_GEMV_ACT_MROWS(3); break;
-        case 4: NVK_GEMV_ACT_MROWS(4); break;
-        case 5: NVK_GEMV_ACT_MROWS(5); break;
-        case 6: NVK_GEMV_ACT_MROWS(6); break;
-        case 7: NVK_GEMV_ACT_MROWS(7); break;
-        case 8: NVK_GEMV_ACT_MROWS(8); break;
-        case 12: NVK_GEMV_ACT_MROWS(12); break;
-        case 16: NVK_GEMV_ACT_MROWS(16); break;
-        case 24: NVK_GEMV_ACT_MROWS(24); break;
-        default: return -2;
+    return nvk_gemv_act_mrows_launch<false>(s, grid, block, W_packed, W_scales, xx, yy, alpha, N, K, M);
+}
+
+extern "C" int nv_kernels_nvfp4_gemv_bf16act_mrows_rm(
+    void* stream,
+    const uint8_t* W_packed,
+    const uint8_t* W_scales_row_major,
+    const uint16_t* x_bf16,
+    uint16_t* y,
+    float alpha,
+    int N,
+    int K,
+    int M
+) {
+    if (N <= 0 || K <= 0 || M <= 0) return 0;
+    if ((K & 15) != 0) return -1;
+    if (!gemv_act_mrows_case_instantiated(M)) return -2;
+    if ((M >= 2 && M <= kSweptRowsMax) || N >= kSweptLmHeadRowsFromWhichTheSweptKernelWinsAtOneRow) {
+        return nv_kernels_nvfp4_gemv_bf16act_swept_cfg(
+            stream, W_packed, W_scales_row_major, x_bf16, y, alpha, N, K, M,
+            kSweptWarps,
+            N <= kSweptTwoRowsPerWarpUpToThisNBecauseTheGridNeedsEverySm ? 2 : 4,
+            1);
     }
-#undef NVK_GEMV_ACT_MROWS
-    return (int)cudaGetLastError();
+    cudaStream_t s = (cudaStream_t)stream;
+    dim3 grid((unsigned)((N + kGemvActWarps - 1) / kGemvActWarps));
+    dim3 block(kGemvActWarps * kWarpSize);
+    const __nv_bfloat16* xx = reinterpret_cast<const __nv_bfloat16*>(x_bf16);
+    __nv_bfloat16* yy = reinterpret_cast<__nv_bfloat16*>(y);
+    return nvk_gemv_act_mrows_launch<true>(
+        s, grid, block, W_packed, W_scales_row_major, xx, yy, alpha, N, K, M);
 }
 
 extern "C" int nv_kernels_nvfp4_gemv_bf16act(

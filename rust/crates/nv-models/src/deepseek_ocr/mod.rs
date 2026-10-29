@@ -36,15 +36,15 @@ pub use decoder_wgpu::{
     DSOCR_WGPU_QUANT_ENV_BF16_DEFAULT_UNTIL_A_REAL_WEIGHT_WGPU_CER_AB_IS_RECORDED,
 };
 
-pub fn default_snapshot_dir() -> Option<std::path::PathBuf> {
+pub fn default_snapshot_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("NV_DSOCR_DIR") {
-        let p = std::path::PathBuf::from(d);
+        let p = PathBuf::from(d);
         return p.is_dir().then_some(p);
     }
     let home = std::env::var("HOME").ok()?;
-    let snaps = std::path::PathBuf::from(home)
+    let snaps = PathBuf::from(home)
         .join(".cache/huggingface/hub/models--deepseek-ai--DeepSeek-OCR-2/snapshots");
-    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&snaps)
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&snaps)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -57,6 +57,7 @@ pub fn default_snapshot_dir() -> Option<std::path::PathBuf> {
 use compressor::{Compressor, CompressorConfig};
 use preprocess::PreparedViews;
 use sam::{SamConfig, SamEncoder};
+use std::path::PathBuf;
 use visual_flow::{FlowConfig, VisualFlow};
 
 #[cfg(feature = "cuda")]
@@ -70,12 +71,6 @@ pub(crate) mod h2d {
     thread_local! {
         static STAGE: RefCell<Vec<(usize, PinnedHostSlice<bf16>)>> =
             const { RefCell::new(Vec::new()) };
-    }
-
-    pub fn enabled() -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            "NV_DSOCR_H2D_PINNED",
-        )
     }
 
     pub(crate) fn cache_budget_bytes() -> usize {
@@ -308,7 +303,7 @@ impl DeepSeekOcr2Vision {
 
     fn upload(&self, chunks: &[&[f32]], b: usize, s: usize) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
-        if self.dtype == DType::BF16 && h2d::enabled() {
+        if self.dtype == DType::BF16 {
             if let Device::Cuda(dev) = &self.device {
                 return h2d::upload_bf16(chunks, dev, (b, 3, s, s));
             }
@@ -418,7 +413,7 @@ mod tests {
             return;
         };
 
-        std::env::set_var("NV_DSOCR_H2D_CACHE_MB", "1");
+        unsafe { std::env::set_var("NV_DSOCR_H2D_CACHE_MB", "1") };
         let budget = h2d::cache_budget_bytes();
 
         let mut peak = 0usize;

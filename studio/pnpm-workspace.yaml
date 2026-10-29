@@ -1,5 +1,6 @@
 packages:
   - .
   - ../js
-allowBuilds:
-  esbuild: true
+minimumReleaseAge: 10080
+strictDepBuilds: true
+allowBuilds: {}

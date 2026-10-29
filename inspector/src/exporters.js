@@ -17,7 +17,6 @@ export function setupExporters({ store }) {
           return;
         }
       }
-      // Fallback: serialize the in-memory event stream.
       const body = store.state.events.map(e => JSON.stringify(stripT(e))).join('\n') + '\n';
       const blob = new Blob([body], { type: 'application/x-ndjson' });
       const name = sid ? `${sid}.ndjson` : `inspector-${Date.now()}.ndjson`;

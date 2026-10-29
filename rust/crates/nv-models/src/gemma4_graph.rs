@@ -63,7 +63,6 @@ pub fn decode_graph_key(dtod_logits: bool) -> u64 {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 fn decode_step_body(
     s: &Arc<CudaStream>,
     dev: &candle_core::CudaDevice,
@@ -88,24 +87,14 @@ fn decode_step_body(
         .try_clone()
         .map_err(|e| anyhow::anyhow!("clone pos_buf: {e:?}"))?;
     let tokens = {
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(tok_clone, dev.clone());
-        let storage = candle_core::Storage::Cuda(storage);
-        Tensor::from_storage(
-            storage,
-            (1usize, 1usize),
-            candle_core::op::BackpropOp::none(),
-            false,
-        )
+        let storage = CudaStorage::wrap_cuda_slice(tok_clone, dev.clone());
+        let storage = Storage::Cuda(storage);
+        Tensor::from_storage(storage, (1usize, 1usize), BackpropOp::none(), false)
     };
     let positions = {
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(pos_clone, dev.clone());
-        let storage = candle_core::Storage::Cuda(storage);
-        Tensor::from_storage(
-            storage,
-            (1usize,),
-            candle_core::op::BackpropOp::none(),
-            false,
-        )
+        let storage = CudaStorage::wrap_cuda_slice(pos_clone, dev.clone());
+        let storage = Storage::Cuda(storage);
+        Tensor::from_storage(storage, (1usize,), BackpropOp::none(), false)
     };
 
     if dtod_logits {
@@ -153,9 +142,8 @@ pub struct GraphedGemma4Decoder<'m> {
 impl<'m> GraphedGemma4Decoder<'m> {
     #[cfg(feature = "cuda")]
     pub fn new(model: &'m Gemma4, cache: Gemma4KvCacheFp8, device: &Device) -> Result<Self> {
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("GraphedGemma4Decoder requires a CUDA device"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("GraphedGemma4Decoder requires a CUDA device")
         };
 
         let capture = CaptureStream::for_device(device)?;
@@ -367,9 +355,8 @@ impl<'m> GraphedGemma4Decoder<'m> {
         self.cache
             .set_pending_pos_host_only(self.current_pos, self.current_pos + 1)?;
 
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
 
         let ctx = dev.cuda_stream().context().clone();
@@ -479,6 +466,14 @@ impl Drop for GraphedGemma4Decoder<'_> {
 
 #[cfg(feature = "cuda")]
 use crate::gemma4::Gemma4VerifyCache;
+#[cfg(feature = "cuda")]
+use anyhow::bail;
+#[cfg(feature = "cuda")]
+use candle_core::op::BackpropOp;
+#[cfg(feature = "cuda")]
+use candle_core::CudaStorage;
+#[cfg(feature = "cuda")]
+use candle_core::Storage;
 
 #[cfg(feature = "cuda")]
 pub struct GraphedGemma4Verify<M> {
@@ -516,8 +511,8 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
         k: usize,
         aux_layers: Vec<usize>,
     ) -> Result<Self> {
-        if !matches!(device, Device::Cuda(_)) {
-            anyhow::bail!("GraphedGemma4Verify requires cuda");
+        if !device.is_cuda() {
+            bail!("GraphedGemma4Verify requires cuda");
         }
         let capture = CaptureStream::for_device(device)?;
         capture.forked_candle_capture_is_an_asserted_coincidence(
@@ -525,36 +520,18 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
             GEMMA4_GRAPH_COINCIDENCE_GATE,
         );
         let capture_stream = capture.stream().clone();
-        let tokens_buf = capture_stream
-            .alloc_zeros::<u32>(k)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let pos_buf = capture_stream
-            .alloc_zeros::<i32>(k)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let mask_buf = capture_stream
-            .alloc_zeros::<u8>(k * k)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let tokens_buf = capture_stream.alloc_zeros::<u32>(k)?;
+        let pos_buf = capture_stream.alloc_zeros::<i32>(k)?;
+        let mask_buf = capture_stream.alloc_zeros::<u8>(k * k)?;
         let vocab = model.config().vocab_size;
-        let logits_buf = capture_stream
-            .alloc_zeros::<f32>(k * vocab)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let logits_buf = capture_stream.alloc_zeros::<f32>(k * vocab)?;
         let hidden = model.config().hidden_size;
-        let aux_buf = capture_stream
-            .alloc_zeros::<half::bf16>(aux_layers.len() * k * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let aux_buf = capture_stream.alloc_zeros::<half::bf16>(aux_layers.len() * k * hidden)?;
         let parts = nv_kernels::cuda::argmax_parts();
-        let amax_val = capture_stream
-            .alloc_zeros::<f32>(k * parts)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let amax_idx = capture_stream
-            .alloc_zeros::<i32>(k * parts)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let amax_out = capture_stream
-            .alloc_zeros::<u32>(k)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        capture_stream
-            .synchronize()
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let amax_val = capture_stream.alloc_zeros::<f32>(k * parts)?;
+        let amax_idx = capture_stream.alloc_zeros::<i32>(k * parts)?;
+        let amax_out = capture_stream.alloc_zeros::<u32>(k)?;
+        capture_stream.synchronize()?;
         let runner = CudaGraphRunner::new(capture_stream.clone());
         Ok(Self {
             model,
@@ -609,11 +586,7 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
         committed: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         self.run_inner(toks, positions, mask, committed)?;
-        let logits: Vec<f32> = self
-            .capture
-            .stream()
-            .clone_dtoh(&self.logits_buf)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let logits: Vec<f32> = self.capture.stream().clone_dtoh(&self.logits_buf)?;
         let aux = self.fetch_aux()?;
         Ok((logits, aux))
     }
@@ -626,21 +599,13 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
         committed: usize,
     ) -> Result<(Vec<u32>, Vec<f32>)> {
         self.run_inner(toks, positions, mask, committed)?;
-        let amax: Vec<u32> = self
-            .capture
-            .stream()
-            .clone_dtoh(&self.amax_out)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let amax: Vec<u32> = self.capture.stream().clone_dtoh(&self.amax_out)?;
         let aux = self.fetch_aux()?;
         Ok((amax, aux))
     }
 
     fn fetch_aux(&self) -> Result<Vec<f32>> {
-        let aux_bf: Vec<half::bf16> = self
-            .capture
-            .stream()
-            .clone_dtoh(&self.aux_buf)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let aux_bf: Vec<half::bf16> = self.capture.stream().clone_dtoh(&self.aux_buf)?;
         Ok(aux_bf.iter().map(|x| x.to_f32()).collect())
     }
 
@@ -667,16 +632,13 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
         self.host_mask.copy_from_slice(mask);
         self.host_committed[0] = committed as i32;
 
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let ctx = dev.cuda_stream().context().clone();
         if ctx.is_event_tracking() {
             unsafe { ctx.disable_event_tracking() };
-            dev.cuda_stream()
-                .synchronize()
-                .map_err(|e| anyhow::anyhow!(e))?;
+            dev.cuda_stream().synchronize()?;
         }
 
         let hidden = self.model.config().hidden_size;
@@ -708,87 +670,53 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
 
         if !was_captured {
             nv_layers::cuda_stream::with_stream(capture_stream.clone(), || -> Result<()> {
-                capture_stream
-                    .memcpy_htod(&host_toks[..], tokens_buf)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                capture_stream
-                    .memcpy_htod(&host_pos[..], pos_buf)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                capture_stream
-                    .memcpy_htod(&host_mask[..], mask_buf)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                capture_stream
-                    .memcpy_htod(&host_committed[..], cache.n_committed_mut())
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                let tc = tokens_buf.try_clone().map_err(|e| anyhow::anyhow!(e))?;
-                let pc = pos_buf.try_clone().map_err(|e| anyhow::anyhow!(e))?;
+                capture_stream.memcpy_htod(&host_toks[..], tokens_buf)?;
+                capture_stream.memcpy_htod(&host_pos[..], pos_buf)?;
+                capture_stream.memcpy_htod(&host_mask[..], mask_buf)?;
+                capture_stream.memcpy_htod(&host_committed[..], cache.n_committed_mut())?;
+                let tc = tokens_buf.try_clone()?;
+                let pc = pos_buf.try_clone()?;
                 let ids_t = {
-                    let st = candle_core::CudaStorage::wrap_cuda_slice(tc, dev2.clone());
-                    Tensor::from_storage(
-                        candle_core::Storage::Cuda(st),
-                        (1usize, k),
-                        candle_core::op::BackpropOp::none(),
-                        false,
-                    )
+                    let st = CudaStorage::wrap_cuda_slice(tc, dev2.clone());
+                    Tensor::from_storage(Storage::Cuda(st), (1usize, k), BackpropOp::none(), false)
                 };
                 let pos_t = {
-                    let st = candle_core::CudaStorage::wrap_cuda_slice(pc, dev2.clone());
-                    Tensor::from_storage(
-                        candle_core::Storage::Cuda(st),
-                        (1usize, k),
-                        candle_core::op::BackpropOp::none(),
-                        false,
-                    )
+                    let st = CudaStorage::wrap_cuda_slice(pc, dev2.clone());
+                    Tensor::from_storage(Storage::Cuda(st), (1usize, k), BackpropOp::none(), false)
                 };
                 let _ = model.forward_verify_dev(&ids_t, &pos_t, mask_buf, k, aux_layers, cache)?;
                 Ok(())
             })?;
-            capture_stream
-                .synchronize()
-                .map_err(|e| anyhow::anyhow!(e))?;
+            capture_stream.synchronize()?;
         }
 
         let sol_evt = nv_config::env_arm_present_at_all_reread_every_call("NV_SOL_EVT");
         let evt_pair = if sol_evt {
             let flags = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
             let ctx2 = capture_stream.context().clone();
-            let e0 = ctx2.new_event(flags).map_err(|e| anyhow::anyhow!(e))?;
-            let e1 = ctx2.new_event(flags).map_err(|e| anyhow::anyhow!(e))?;
-            e0.record(&capture_stream).map_err(|e| anyhow::anyhow!(e))?;
+            let e0 = ctx2.new_event(flags)?;
+            let e1 = ctx2.new_event(flags)?;
+            e0.record(&capture_stream)?;
             Some((e0, e1))
         } else {
             None
         };
         runner.run(1u64, |s| -> Result<()> {
             nv_layers::cuda_stream::with_stream(s.clone(), || -> Result<()> {
-                s.memcpy_htod(&host_toks[..], tokens_buf)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                s.memcpy_htod(&host_pos[..], pos_buf)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                s.memcpy_htod(&host_mask[..], mask_buf)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                s.memcpy_htod(&host_committed[..], cache.n_committed_mut())
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                s.memcpy_htod(&host_toks[..], tokens_buf)?;
+                s.memcpy_htod(&host_pos[..], pos_buf)?;
+                s.memcpy_htod(&host_mask[..], mask_buf)?;
+                s.memcpy_htod(&host_committed[..], cache.n_committed_mut())?;
 
-                let tok_clone = tokens_buf.try_clone().map_err(|e| anyhow::anyhow!(e))?;
-                let pos_clone = pos_buf.try_clone().map_err(|e| anyhow::anyhow!(e))?;
+                let tok_clone = tokens_buf.try_clone()?;
+                let pos_clone = pos_buf.try_clone()?;
                 let ids_t = {
-                    let st = candle_core::CudaStorage::wrap_cuda_slice(tok_clone, dev2.clone());
-                    Tensor::from_storage(
-                        candle_core::Storage::Cuda(st),
-                        (1usize, k),
-                        candle_core::op::BackpropOp::none(),
-                        false,
-                    )
+                    let st = CudaStorage::wrap_cuda_slice(tok_clone, dev2.clone());
+                    Tensor::from_storage(Storage::Cuda(st), (1usize, k), BackpropOp::none(), false)
                 };
                 let pos_t = {
-                    let st = candle_core::CudaStorage::wrap_cuda_slice(pos_clone, dev2.clone());
-                    Tensor::from_storage(
-                        candle_core::Storage::Cuda(st),
-                        (1usize, k),
-                        candle_core::op::BackpropOp::none(),
-                        false,
-                    )
+                    let st = CudaStorage::wrap_cuda_slice(pos_clone, dev2.clone());
+                    Tensor::from_storage(Storage::Cuda(st), (1usize, k), BackpropOp::none(), false)
                 };
                 let (logits, aux) =
                     model.forward_verify_dev(&ids_t, &pos_t, mask_buf, k, aux_layers, cache)?;
@@ -798,26 +726,22 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
                     let lc = logits.contiguous()?;
                     let (ls, _l) = lc.storage_and_layout();
                     let lcuda = match &*ls {
-                        candle_core::Storage::Cuda(s) => s,
-                        _ => anyhow::bail!("logits"),
+                        Storage::Cuda(s) => s,
+                        _ => bail!("logits"),
                     };
                     let lsl = lcuda.as_cuda_slice::<f32>()?;
-                    stream
-                        .memcpy_dtod(lsl, logits_buf)
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                    stream.memcpy_dtod(lsl, logits_buf)?;
                 }
                 for (i, a) in aux.iter().enumerate() {
                     let ac = a.reshape((k * hidden,))?.contiguous()?;
                     let (as_, _l) = ac.storage_and_layout();
                     let acuda = match &*as_ {
-                        candle_core::Storage::Cuda(s) => s,
-                        _ => anyhow::bail!("aux"),
+                        Storage::Cuda(s) => s,
+                        _ => bail!("aux"),
                     };
                     let asl = acuda.as_cuda_slice::<half::bf16>()?;
                     let mut dst = aux_buf.slice_mut(i * k * hidden..(i + 1) * k * hidden);
-                    stream
-                        .memcpy_dtod(asl, &mut dst)
-                        .map_err(|e| anyhow::anyhow!(e))?;
+                    stream.memcpy_dtod(asl, &mut dst)?;
                 }
 
                 {
@@ -843,19 +767,12 @@ impl<M: std::ops::Deref<Target = Gemma4>> GraphedGemma4Verify<M> {
             })
         })?;
         if let Some((e0, e1)) = evt_pair {
-            e1.record(self.capture.stream())
-                .map_err(|e| anyhow::anyhow!(e))?;
-            self.capture
-                .stream()
-                .synchronize()
-                .map_err(|e| anyhow::anyhow!(e))?;
-            self.last_replay_ms = Some(e0.elapsed_ms(&e1).map_err(|e| anyhow::anyhow!(e))?);
+            e1.record(self.capture.stream())?;
+            self.capture.stream().synchronize()?;
+            self.last_replay_ms = Some(e0.elapsed_ms(&e1)?);
         }
         self.captured = true;
-        self.capture
-            .stream()
-            .synchronize()
-            .map_err(|e| anyhow::anyhow!(e))?;
+        self.capture.stream().synchronize()?;
         Ok(())
     }
 }

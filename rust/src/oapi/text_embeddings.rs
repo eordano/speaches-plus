@@ -7,8 +7,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::oapi;
-use crate::oapi::deadline;
 use crate::oapi::cold_tier::ColdSlot;
+use crate::oapi::deadline;
 use crate::oapi::gate::SurfaceGate;
 
 #[derive(Debug, Deserialize)]
@@ -56,7 +56,7 @@ mod ts_wire {
     }
 }
 
-mod backend {
+pub(crate) mod backend {
     use anyhow::{Context, Result};
     use candle_core::{DType, Device, IndexOp, Tensor};
     use nv_models::qwen3::{Qwen3, Qwen3Config};
@@ -100,7 +100,7 @@ mod backend {
     impl QwenEmbedder {
         pub fn load(dir: &std::path::Path) -> Result<Self> {
             let device = embedding_device()?;
-            if matches!(device, Device::Cpu) {
+            if device.is_cpu() {
                 return Self::load_on(dir, device);
             }
             match Self::load_on(dir, device.clone()).and_then(|e| {
@@ -118,6 +118,28 @@ mod backend {
                     Self::load_on(dir, Device::Cpu)
                 }
             }
+        }
+
+        pub(crate) fn load_clm(dir: &std::path::Path, max_tokens: usize) -> Result<Self> {
+            anyhow::ensure!(max_tokens > 1, "CLM max_tokens must exceed one");
+            let cfg = Qwen3Config::from_hf_json_file(&dir.join("config.json"))?;
+            anyhow::ensure!(
+                max_tokens <= cfg.max_position_embeddings,
+                "CLM context exceeds encoder capacity"
+            );
+            let mut encoder = Self::load_on(dir, embedding_device()?)?;
+            encoder.max_seq_len = max_tokens - 1;
+            Ok(encoder)
+        }
+
+        pub(crate) fn embed_clm(&self, text: &str) -> Result<(Vec<f32>, usize)> {
+            let text = if text.is_empty() { " " } else { text };
+            let encoded = self
+                .tokenizer
+                .encode(text, false)
+                .map_err(|e| anyhow::anyhow!("tokenize CLM: {e}"))?;
+            let ids = encoded.get_ids();
+            self.embed_ids(ids[ids.len().saturating_sub(self.max_seq_len)..].to_vec())
         }
 
         pub fn device_label(&self) -> &'static str {
@@ -179,6 +201,11 @@ mod backend {
                 );
                 ids.truncate(self.max_seq_len);
             }
+            self.embed_ids(ids)
+        }
+
+        fn embed_ids(&self, ids: Vec<u32>) -> Result<(Vec<f32>, usize)> {
+            anyhow::ensure!(!ids.is_empty(), "empty tokenization");
             let seq = ids.len();
             let positions: Vec<i32> = (0..seq as i32).collect();
             let tokens =
@@ -576,7 +603,7 @@ mod tests {
 
     #[tokio::test]
     async fn text_embeddings_returns_503_when_model_unset() {
-        std::env::remove_var("NV_EMBEDDING_MODEL_DIR");
+        unsafe { std::env::remove_var("NV_EMBEDDING_MODEL_DIR") };
         let body = Bytes::from(r#"{"model":"qwen3-embedding","input":"hello world"}"#);
         let resp = text_embeddings_post(body).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -605,8 +632,8 @@ mod tests {
 
     #[tokio::test]
     async fn embed_gate_admits_one_sheds_the_next_and_reuses_the_slot() {
-        std::env::set_var("NV_EMBED_CONCURRENCY", "1");
-        std::env::set_var("NV_EMBED_QUEUE_MS", "80");
+        unsafe { std::env::set_var("NV_EMBED_CONCURRENCY", "1") };
+        unsafe { std::env::set_var("NV_EMBED_QUEUE_MS", "80") };
         let gate = new_embed_gate();
         assert_eq!(gate.permits(), 1);
         assert_eq!(gate.queue_ms(), 80);
@@ -625,8 +652,8 @@ mod tests {
             .await
             .expect("the slot is admitted again once the holder releases it");
 
-        std::env::remove_var("NV_EMBED_CONCURRENCY");
-        std::env::remove_var("NV_EMBED_QUEUE_MS");
+        unsafe { std::env::remove_var("NV_EMBED_CONCURRENCY") };
+        unsafe { std::env::remove_var("NV_EMBED_QUEUE_MS") };
         let defaults = new_embed_gate();
         assert_eq!(defaults.permits(), 1);
         assert_eq!(defaults.queue_ms(), 3000);

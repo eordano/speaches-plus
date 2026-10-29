@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::dequant::bytes_to_words;
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::kernels::kv_fp8::{decode_e4m3, encode_e4m3, FP8_E4M3_MAX};
@@ -14,7 +12,6 @@ pub const WGSL: &str = include_str!("../../../wgsl/kv_fp8_paged.wgsl");
 pub const QUANTIZE_ENTRY: &str = "quantize_kv_fp8_paged";
 pub const DEQUANTIZE_ENTRY: &str = "dequantize_kv_fp8_paged";
 pub const COPY_ENTRY: &str = "copy_kv_block_fp8";
-pub const COPY_CROSS_ENTRY: &str = "copy_kv_block_fp8_x";
 pub const WORKGROUP_SIZE: u32 = 256;
 
 const SCRATCH_BYTES: u32 = WORKGROUP_SIZE * 4 + 4;
@@ -349,96 +346,6 @@ pub fn copy_kv_block_fp8(
     Ok(())
 }
 
-pub fn copy_kv_block_fp8_into(
-    ctx: &WgpuContext,
-    src_fp8: &[u8],
-    src_scales: &[f32],
-    dst_fp8: &mut [u8],
-    dst_scales: &mut [f32],
-    src_block: usize,
-    dst_block: usize,
-    block_size: usize,
-    n_kv: usize,
-    head_dim: usize,
-) -> Result<()> {
-    if block_size == 0 || n_kv == 0 || head_dim == 0 {
-        return Ok(());
-    }
-    if src_block == dst_block {
-        return Ok(());
-    }
-    if !head_dim.is_multiple_of(4) {
-        return Err(WgpuError::Unsupported(format!(
-            "kv_fp8_paged copy needs head_dim divisible by 4 so fp8 bytes land on whole u32 words; got {head_dim}"
-        )));
-    }
-    let src_slots = slot_count(src_fp8.len(), n_kv * head_dim, "kv_fp8_paged copy src")?;
-    let dst_slots = slot_count(dst_fp8.len(), n_kv * head_dim, "kv_fp8_paged copy dst")?;
-    dispatch::check_len(
-        "kv_fp8_paged copy src_scales",
-        src_scales.len(),
-        src_slots * n_kv,
-    )?;
-    dispatch::check_len(
-        "kv_fp8_paged copy dst_scales",
-        dst_scales.len(),
-        dst_slots * n_kv,
-    )?;
-    if (src_block + 1) * block_size > src_slots {
-        return Err(WgpuError::Shape(format!(
-            "kv_fp8_paged copy: src block {src_block} of size {block_size} needs {} slots; src has {src_slots}",
-            (src_block + 1) * block_size
-        )));
-    }
-    if (dst_block + 1) * block_size > dst_slots {
-        return Err(WgpuError::Shape(format!(
-            "kv_fp8_paged copy: dst block {dst_block} of size {block_size} needs {} slots; dst has {dst_slots}",
-            (dst_block + 1) * block_size
-        )));
-    }
-    check_device(ctx)?;
-
-    let pairs = block_size * n_kv;
-    let params = KvCopyParams {
-        src_block: src_block as u32,
-        dst_block: dst_block as u32,
-        block_size: block_size as u32,
-        n_kv: n_kv as u32,
-        head_dim: head_dim as u32,
-        pairs: pairs as u32,
-        reserved0: 0,
-        reserved1: 0,
-    };
-    let groups = dispatch::workgroup_count_1d(ctx, pairs as u64, 1);
-
-    let src_words = bytes_to_words(src_fp8);
-    let dst_words = bytes_to_words(dst_fp8);
-    let src_buf = dispatch::storage_from_slice(ctx, "kv_fp8_paged.x_src", &src_words);
-    let src_sc_buf = dispatch::storage_from_slice(ctx, "kv_fp8_paged.x_src_scales", src_scales);
-    let dst_buf = dispatch::storage_from_slice(ctx, "kv_fp8_paged.x_dst", &dst_words);
-    let dst_sc_buf = dispatch::storage_from_slice(ctx, "kv_fp8_paged.x_dst_scales", dst_scales);
-    let params_buf = dispatch::uniform_from(ctx, "kv_fp8_paged.x_params", &params);
-    dispatch::run(
-        ctx,
-        "nv_kernels_copy_kv_block_fp8_x",
-        &compose(WGSL),
-        COPY_CROSS_ENTRY,
-        &[
-            (14, &src_buf),
-            (15, &src_sc_buf),
-            (16, &dst_buf),
-            (17, &dst_sc_buf),
-            (18, &params_buf),
-        ],
-        groups,
-    )?;
-    let got: Vec<u32> = dispatch::read_back(ctx, &dst_buf, dst_words.len())?;
-    words_to_bytes(&got, dst_fp8);
-    let got_scales: Vec<f32> = dispatch::read_back(ctx, &dst_sc_buf, dst_scales.len())?;
-    dst_scales.copy_from_slice(&got_scales);
-    Ok(())
-}
-
 pub fn cpu_quantize_kv_fp8_paged(
     x: &[u16],
     out: &mut [u8],
@@ -524,62 +431,33 @@ pub fn cpu_copy_kv_block_fp8(
     }
 }
 
-pub fn cpu_copy_kv_block_fp8_into(
-    src_fp8: &[u8],
-    src_scales: &[f32],
-    dst_fp8: &mut [u8],
-    dst_scales: &mut [f32],
-    src_block: usize,
-    dst_block: usize,
-    block_size: usize,
-    n_kv: usize,
-    head_dim: usize,
-) {
-    if src_block == dst_block {
-        return;
-    }
-    for slot_in_block in 0..block_size {
-        let src_slot = src_block * block_size + slot_in_block;
-        let dst_slot = dst_block * block_size + slot_in_block;
-        for kv_head in 0..n_kv {
-            let src_base = (src_slot * n_kv + kv_head) * head_dim;
-            let dst_base = (dst_slot * n_kv + kv_head) * head_dim;
-            dst_fp8[dst_base..dst_base + head_dim]
-                .copy_from_slice(&src_fp8[src_base..src_base + head_dim]);
-            dst_scales[dst_slot * n_kv + kv_head] = src_scales[src_slot * n_kv + kv_head];
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn paged_slot_maps_through_the_table() {
-        let table = [4i32, 0, 2];
-        assert_eq!(paged_slot(&table, 8, 0), 32);
-        assert_eq!(paged_slot(&table, 8, 7), 39);
-        assert_eq!(paged_slot(&table, 8, 8), 0);
-        assert_eq!(paged_slot(&table, 8, 15), 7);
-        assert_eq!(paged_slot(&table, 8, 16), 16);
-    }
-
-    #[test]
-    fn table_bounds_are_checked() {
-        let table = [1i32, 0];
-        assert!(check_table("t", &table, 4, 0, 8, 8).is_ok());
-        assert!(check_table("t", &table, 4, 0, 9, 8).is_err());
-        assert!(check_table("t", &table, 4, 0, 8, 7).is_err());
-        assert!(check_table("t", &[-1i32], 4, 0, 4, 8).is_err());
-        assert!(check_table("t", &table, 0, 0, 4, 8).is_err());
-        assert!(check_table("t", &[-1i32, 0], 4, 4, 4, 8).is_ok());
-        assert!(check_table("t", &[-1i32, 0], 4, 3, 4, 8).is_err());
-    }
-
-    #[test]
-    fn slot_count_rejects_ragged_lengths() {
-        assert!(slot_count(10, 4, "x").is_err());
-        assert_eq!(slot_count(12, 4, "x").unwrap(), 3);
+    fn paged_slots_map_through_a_bounds_checked_table_and_reject_ragged_lengths() {
+        {
+            let table = [4i32, 0, 2];
+            assert_eq!(paged_slot(&table, 8, 0), 32);
+            assert_eq!(paged_slot(&table, 8, 7), 39);
+            assert_eq!(paged_slot(&table, 8, 8), 0);
+            assert_eq!(paged_slot(&table, 8, 15), 7);
+            assert_eq!(paged_slot(&table, 8, 16), 16);
+        }
+        {
+            let table = [1i32, 0];
+            assert!(check_table("t", &table, 4, 0, 8, 8).is_ok());
+            assert!(check_table("t", &table, 4, 0, 9, 8).is_err());
+            assert!(check_table("t", &table, 4, 0, 8, 7).is_err());
+            assert!(check_table("t", &[-1i32], 4, 0, 4, 8).is_err());
+            assert!(check_table("t", &table, 0, 0, 4, 8).is_err());
+            assert!(check_table("t", &[-1i32, 0], 4, 4, 4, 8).is_ok());
+            assert!(check_table("t", &[-1i32, 0], 4, 3, 4, 8).is_err());
+        }
+        {
+            assert!(slot_count(10, 4, "x").is_err());
+            assert_eq!(slot_count(12, 4, "x").unwrap(), 3);
+        }
     }
 }

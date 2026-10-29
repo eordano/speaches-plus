@@ -1,0 +1,52 @@
+{
+  "name": "020-chat-guided-schema-keywords",
+  "family": "020-chat-completions",
+  "description": "response_format=json_schema using the keywords guided decoding enforces beyond plain types: oneOf, integer bounds, string length, string pattern, array item counts, an optional property and additionalProperties:false. Asserts the content validates against the schema; before the keywords were compiled into the grammar, oneOf, minLength/maxLength and minItems/maxItems were silently dropped and replies violated them.",
+  "endpoint": {"method": "POST", "path": "/v1/chat/completions"},
+  "request_body": {
+    "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    "messages": [{"role": "user", "content": "Describe a square of side 4 cm, rate it from 1 to 5, give its three-letter code, a US ZIP code, and tag it with exactly five tags."}],
+    "temperature": 0.0,
+    "max_tokens": 400,
+    "chat_template_kwargs": {"enable_thinking": false},
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "shape_card",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "shape": {"oneOf": [
+              {"type": "object", "properties": {"kind": {"const": "circle"}, "r": {"type": "number", "minimum": 0}}, "required": ["kind", "r"], "additionalProperties": false},
+              {"type": "object", "properties": {"kind": {"const": "square"}, "side": {"type": "number", "minimum": 0}}, "required": ["kind", "side"], "additionalProperties": false}
+            ]},
+            "score": {"type": "integer", "minimum": 1, "maximum": 5},
+            "code": {"type": "string", "minLength": 3, "maxLength": 3},
+            "zip": {"type": "string", "pattern": "^[0-9]{5}$"},
+            "tags": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 3},
+            "note": {"type": ["string", "null"]}
+          },
+          "required": ["shape", "score", "code", "zip", "tags"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "stream": false
+  },
+  "expected_response": {
+    "status": 200,
+    "object": "chat.completion",
+    "choices": [{
+      "index": 0,
+      "finish_reason_in": ["stop"],
+      "message": {
+        "role": "assistant",
+        "content_is_json": true,
+        "content_json_matches_schema": "#/request_body/response_format/json_schema/schema"
+      }
+    }]
+  },
+  "comparison_strategy": "structural+jsonschema",
+  "skip_when_no_model": true
+}

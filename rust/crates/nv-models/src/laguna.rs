@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use nv_layers::linear::Linear;
 use nv_layers::mlp::Mlp;
@@ -6,15 +6,35 @@ use nv_layers::norm::RmsNorm;
 use nv_layers::rope::{Rope, RopeConfig, RopeKind};
 #[cfg(feature = "cuda")]
 use nv_weights::QuantScheme;
-use nv_weights::QuantizationConfig;
-use nv_weights::WeightLoader;
+use nv_weights::{QuantizationConfig, WeightLoader};
 use serde::Deserialize;
 
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
 use crate::gemma4::{Gemma4Cache, LayerType};
+#[cfg(feature = "cuda")]
+use crate::laguna_fp8::LagunaKvCacheFp8;
 use crate::CausalLm;
+#[cfg(feature = "cuda")]
+use candle_core::op::BackpropOp;
+#[cfg(feature = "cuda")]
+use candle_core::CudaStorage;
+#[cfg(feature = "cuda")]
+use candle_core::Storage;
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaStream;
+#[cfg(feature = "cuda")]
+use nv_layers::moe_grouped::MoeGroupedWeights;
+use serde_json::Value;
+#[cfg(feature = "cuda")]
+use std::collections::HashMap;
+use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
+#[cfg(feature = "cuda")]
+use std::sync::OnceLock;
+use std::time::Instant;
 
 #[cfg(feature = "cuda")]
 pub mod prefix;
@@ -136,18 +156,18 @@ fn de_gating<'de, D>(deserializer: D) -> std::result::Result<LagunaGating, D::Er
 where
     D: serde::Deserializer<'de>,
 {
-    let v = serde_json::Value::deserialize(deserializer)?;
+    let v = Value::deserialize(deserializer)?;
     match v {
-        serde_json::Value::Bool(false) => Ok(LagunaGating::None),
-        serde_json::Value::Bool(true) => Ok(LagunaGating::PerElement),
-        serde_json::Value::String(s) => match s.as_str() {
+        Value::Bool(false) => Ok(LagunaGating::None),
+        Value::Bool(true) => Ok(LagunaGating::PerElement),
+        Value::String(s) => match s.as_str() {
             "per-head" | "per_head" => Ok(LagunaGating::PerHead),
             "per-element" | "per_element" => Ok(LagunaGating::PerElement),
             other => Err(serde::de::Error::custom(format!(
                 "unknown gating mode {other:?}"
             ))),
         },
-        serde_json::Value::Null => Ok(LagunaGating::None),
+        Value::Null => Ok(LagunaGating::None),
         other => Err(serde::de::Error::custom(format!(
             "unsupported gating value {other}"
         ))),
@@ -158,11 +178,11 @@ fn de_token_ids<'de, D>(deserializer: D) -> std::result::Result<Vec<u32>, D::Err
 where
     D: serde::Deserializer<'de>,
 {
-    let v = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let v = Option::<Value>::deserialize(deserializer)?;
     match v {
-        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(serde_json::Value::Number(n)) => Ok(vec![n.as_u64().unwrap_or(0) as u32]),
-        Some(serde_json::Value::Array(a)) => Ok(a
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Number(n)) => Ok(vec![n.as_u64().unwrap_or(0) as u32]),
+        Some(Value::Array(a)) => Ok(a
             .into_iter()
             .filter_map(|x| x.as_u64())
             .map(|x| x as u32)
@@ -179,7 +199,7 @@ impl LagunaConfig {
     pub fn from_hf_json_str(s: &str) -> Result<Self> {
         let cfg: LagunaConfig = serde_json::from_str(s).context("deserialize laguna config")?;
         if cfg.layer_types.len() != cfg.num_hidden_layers {
-            anyhow::bail!(
+            bail!(
                 "laguna: layer_types len {} != num_hidden_layers {}",
                 cfg.layer_types.len(),
                 cfg.num_hidden_layers
@@ -187,7 +207,7 @@ impl LagunaConfig {
         }
         if let Some(heads) = &cfg.num_attention_heads_per_layer {
             if heads.len() != cfg.num_hidden_layers {
-                anyhow::bail!(
+                bail!(
                     "laguna: num_attention_heads_per_layer len {} != num_hidden_layers {}",
                     heads.len(),
                     cfg.num_hidden_layers
@@ -195,7 +215,7 @@ impl LagunaConfig {
             }
             for (i, &h) in heads.iter().enumerate() {
                 if h == 0 || h % cfg.num_key_value_heads != 0 {
-                    anyhow::bail!(
+                    bail!(
                         "laguna: layer {i} head count {h} not divisible by kv heads {}",
                         cfg.num_key_value_heads
                     );
@@ -204,7 +224,7 @@ impl LagunaConfig {
         }
         if let Some(mlp_types) = &cfg.mlp_layer_types {
             if mlp_types.len() != cfg.num_hidden_layers {
-                anyhow::bail!(
+                bail!(
                     "laguna: mlp_layer_types len {} != num_hidden_layers {}",
                     mlp_types.len(),
                     cfg.num_hidden_layers
@@ -546,24 +566,20 @@ impl LagunaAttnW8 {
         {
             return Ok(None);
         }
-        let dev = match x.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = x.device().clone() else {
+            return Ok(None);
         };
         use cudarc::driver::DevicePtr;
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let x_c = x.contiguous()?;
         let n_all = tw.n;
-        let mut out: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-            stream
-                .alloc::<half::bf16>(m * n_all)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut out: cudarc::driver::CudaSlice<half::bf16> =
+            unsafe { stream.alloc::<half::bf16>(m * n_all)? };
         {
             let (xs, xl) = x_c.storage_and_layout();
             let x_cuda = match &*xs {
-                candle_core::Storage::Cuda(st) => st,
-                _ => anyhow::bail!("w8 marlin qkv rows: x must be CUDA"),
+                Storage::Cuda(st) => st,
+                _ => bail!("w8 marlin qkv rows: x must be CUDA"),
             };
             let x_view = x_cuda
                 .as_cuda_slice::<half::bf16>()?
@@ -571,28 +587,16 @@ impl LagunaAttnW8 {
             let (xp, _gx) = x_view.device_ptr(&stream);
             nv_layers::linear::marlin_fp8_rows_gemm_into(&stream, tw, xp, m, &mut out)?;
         }
-        static W8_MARLIN_QKV_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+        static W8_MARLIN_QKV_FIRED_ONCE: Once = Once::new();
         W8_MARLIN_QKV_FIRED_ONCE.call_once(|| eprintln!("[laguna_w8_marlin_rows] fused qkv fired m={m} n={n_all} k={} gate_rows={gate_rows} (one Marlin launch for q|k|v|g)", self.q.k));
-        let mut qo: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-            stream
-                .alloc::<half::bf16>(m * self.q.n)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
-        let mut ko: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-            stream
-                .alloc::<half::bf16>(m * self.k.n)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
-        let mut vo: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-            stream
-                .alloc::<half::bf16>(m * self.v.n)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
-        let mut go: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-            stream
-                .alloc::<half::bf16>(m * gate_rows.max(1))
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut qo: cudarc::driver::CudaSlice<half::bf16> =
+            unsafe { stream.alloc::<half::bf16>(m * self.q.n)? };
+        let mut ko: cudarc::driver::CudaSlice<half::bf16> =
+            unsafe { stream.alloc::<half::bf16>(m * self.k.n)? };
+        let mut vo: cudarc::driver::CudaSlice<half::bf16> =
+            unsafe { stream.alloc::<half::bf16>(m * self.v.n)? };
+        let mut go: cudarc::driver::CudaSlice<half::bf16> =
+            unsafe { stream.alloc::<half::bf16>(m * gate_rows.max(1))? };
         {
             use cudarc::driver::DevicePtrMut;
             let (sp, _g0) = out.device_ptr(&stream);
@@ -620,16 +624,11 @@ impl LagunaAttnW8 {
                     n_all as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "w8 marlin qkv split rc={rc}");
+            ensure!(rc == 0, "w8 marlin qkv split rc={rc}");
         }
         let wrap = |s: cudarc::driver::CudaSlice<half::bf16>, n: usize| -> Tensor {
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(s, dev.clone());
-            Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
-                (m, n),
-                candle_core::op::BackpropOp::none(),
-                false,
-            )
+            let storage = CudaStorage::wrap_cuda_slice(s, dev.clone());
+            Tensor::from_storage(Storage::Cuda(storage), (m, n), BackpropOp::none(), false)
         };
         let (q, k, v) = (wrap(qo, self.q.n), wrap(ko, self.k.n), wrap(vo, self.v.n));
         let g = (gate_rows > 0).then(|| wrap(go, gate_rows));
@@ -638,7 +637,7 @@ impl LagunaAttnW8 {
     }
 
     pub(crate) fn scope_now(&self) -> u8 {
-        self.scope.load(std::sync::atomic::Ordering::Relaxed)
+        self.scope.load(Ordering::Relaxed)
     }
 
     pub(crate) fn slot_on(&self, bit: u8) -> bool {
@@ -651,7 +650,7 @@ impl LagunaAttnW8 {
 
     pub(crate) fn set_scope(&self, on: bool) {
         let v = if on { self.cfg_scope } else { 0 };
-        self.scope.store(v, std::sync::atomic::Ordering::Relaxed);
+        self.scope.store(v, Ordering::Relaxed);
     }
 
     pub(crate) fn is_fp8(&self) -> bool {
@@ -659,9 +658,8 @@ impl LagunaAttnW8 {
     }
 
     pub(crate) fn forward(&self, p: &LagunaProjW8, x: &Tensor, m: usize) -> Result<Option<Tensor>> {
-        let dev = match x.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = x.device().clone() else {
+            return Ok(None);
         };
         if x.dtype() != DType::BF16 || x.elem_count() != m * p.k {
             return Ok(None);
@@ -678,16 +676,13 @@ impl LagunaAttnW8 {
                 use cudarc::driver::DevicePtr;
                 let stream = nv_layers::cuda_stream::current_stream(&dev);
                 let x_c = x.contiguous()?;
-                let mut out: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-                    stream
-                        .alloc::<half::bf16>(m * p.n)
-                        .map_err(|e| anyhow::anyhow!(e))?
-                };
+                let mut out: cudarc::driver::CudaSlice<half::bf16> =
+                    unsafe { stream.alloc::<half::bf16>(m * p.n)? };
                 {
                     let (xs, xl) = x_c.storage_and_layout();
                     let x_cuda = match &*xs {
-                        candle_core::Storage::Cuda(st) => st,
-                        _ => anyhow::bail!("w8 marlin rows: x must be CUDA"),
+                        Storage::Cuda(st) => st,
+                        _ => bail!("w8 marlin rows: x must be CUDA"),
                     };
                     let x_view = x_cuda
                         .as_cuda_slice::<half::bf16>()?
@@ -695,13 +690,13 @@ impl LagunaAttnW8 {
                     let (xp, _gx) = x_view.device_ptr(&stream);
                     nv_layers::linear::marlin_fp8_rows_gemm_into(&stream, tw, xp, m, &mut out)?;
                 }
-                static W8_MARLIN_ROWS_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+                static W8_MARLIN_ROWS_FIRED_ONCE: Once = Once::new();
                 W8_MARLIN_ROWS_FIRED_ONCE.call_once(|| eprintln!("[laguna_w8_marlin_rows] fired m={m} n={} k={} (attention projection rows on the fp8 Marlin twin)", p.n, p.k));
-                let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+                let storage = CudaStorage::wrap_cuda_slice(out, dev);
                 return Ok(Some(Tensor::from_storage(
-                    candle_core::Storage::Cuda(storage),
+                    Storage::Cuda(storage),
                     (1usize, m, p.n),
-                    candle_core::op::BackpropOp::none(),
+                    BackpropOp::none(),
                     false,
                 )));
             }
@@ -750,11 +745,6 @@ impl LagunaAttention {
             gate.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h()?;
         (weights.len() == hidden.checked_mul(n_q)? && scales.len() == n_q)
             .then_some((weights, scales))
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn m1_w8_active(&self) -> bool {
-        self.w8.as_ref().map(|w| w.scope_now()).unwrap_or(0) != 0
     }
 
     #[cfg(feature = "cuda")]
@@ -875,7 +865,7 @@ pub struct LagunaMoe {
     pub experts: Vec<Mlp>,
     pub shared_expert: Mlp,
     #[cfg(feature = "cuda")]
-    pub grouped: std::sync::Mutex<Option<Option<Arc<nv_layers::moe_grouped::MoeGroupedWeights>>>>,
+    pub grouped: std::sync::Mutex<Option<Option<Arc<MoeGroupedWeights>>>>,
     #[cfg(feature = "cuda")]
     pub train_stacks: std::sync::Mutex<Option<Arc<nv_layers::moe_train::MarlinMoeTrainStacks>>>,
 }
@@ -892,30 +882,6 @@ impl LagunaMoe {
             logits = scaled.tanh()?.affine(self.softcap as f64, 0.0)?;
         }
         let scores = candle_nn::ops::sigmoid(&logits)?;
-        if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_ROUTE_HOST_GPU_SORT") {
-            let selection = scores.broadcast_add(&self.selection_bias)?;
-            let (_, sorted_idx) = selection.sort_last_dim(false)?;
-            let top_idx = sorted_idx.narrow(1, 0, self.top_k)?.contiguous()?;
-            let mut top_weights = scores.gather(&top_idx, 1)?.contiguous()?;
-            if self.norm_topk {
-                let sums = top_weights.sum_keepdim(1)?;
-                top_weights = top_weights.broadcast_div(&sums)?;
-            }
-
-            let routing = Tensor::cat(
-                &[
-                    &top_idx.to_dtype(DType::F32)?.flatten_all()?,
-                    &top_weights.flatten_all()?,
-                ],
-                0,
-            )?;
-            let routing_host: Vec<f32> = routing.to_vec1()?;
-            let (idx_half, w_half) = routing_host.split_at(n_tokens * self.top_k);
-            return Ok((
-                idx_half.iter().map(|x| *x as u32).collect(),
-                w_half.to_vec(),
-            ));
-        }
         self.topk_host_matching_device_kernel_ties_break_to_lower_expert_index(&scores, n_tokens)
     }
 
@@ -927,7 +893,7 @@ impl LagunaMoe {
         let e = self.num_experts;
         let k = self.top_k;
         let scores_host: Vec<f32> = scores.flatten_all()?.to_vec1()?;
-        anyhow::ensure!(
+        ensure!(
             scores_host.len() == n_tokens * e,
             "route_host scores len {} != {n_tokens}x{e}",
             scores_host.len()
@@ -975,13 +941,13 @@ impl LagunaMoe {
     }
 
     pub fn forward(&self, x_flat: &Tensor) -> Result<Tensor> {
-        anyhow::ensure!(
+        ensure!(
             self.num_experts > 0 && self.experts.len() == self.num_experts,
             "LagunaMoe.forward: individual routed experts unavailable; grouped-only loading forbids ungrouped fallback"
         );
         let dims = x_flat.dims();
         if dims.len() != 2 {
-            anyhow::bail!("LagunaMoe.forward: expected [tokens, hidden], got {dims:?}");
+            bail!("LagunaMoe.forward: expected [tokens, hidden], got {dims:?}");
         }
         let n_tokens = dims[0];
         let hidden = dims[1];
@@ -1051,16 +1017,14 @@ pub struct Laguna {
     #[cfg(feature = "cuda")]
     moe_decode_ctx: std::sync::Mutex<Option<nv_layers::moe_grouped::GroupedDecodeContext>>,
     #[cfg(feature = "cuda")]
-    moe_verify_ctx: std::sync::Mutex<
-        std::collections::HashMap<usize, nv_layers::moe_grouped::GroupedDecodeContext>,
-    >,
+    moe_verify_ctx: std::sync::Mutex<HashMap<usize, nv_layers::moe_grouped::GroupedDecodeContext>>,
     #[cfg(feature = "cuda")]
     moe_graphs: std::sync::Mutex<Option<Option<crate::laguna_graph::LagunaMoeGraphs>>>,
 
     #[cfg(feature = "cuda")]
     moe_union_samples: std::sync::Mutex<Vec<(usize, usize)>>,
     #[cfg(feature = "cuda")]
-    union_probe: std::sync::atomic::AtomicBool,
+    union_probe: AtomicBool,
     #[cfg(feature = "cuda")]
     batch_moe_fused_dispatches: std::sync::atomic::AtomicUsize,
 
@@ -1070,23 +1034,18 @@ pub struct Laguna {
     lm_head_fp8: Option<LagunaLmHeadFp8>,
     #[cfg(feature = "cuda")]
     lm_head_fp8_spec_off: bool,
-    device_verify_routing: std::sync::atomic::AtomicBool,
-    host_moe: std::sync::atomic::AtomicBool,
+    device_verify_routing: AtomicBool,
     attn_w8_shape: bool,
     prefill_chunk: usize,
     #[cfg(test)]
     test_moe_host_fallbacks: std::sync::atomic::AtomicUsize,
-    #[cfg(all(test, feature = "cuda"))]
-    test_prefill_gpu_routes: std::sync::atomic::AtomicUsize,
-    #[cfg(all(test, feature = "cuda"))]
-    test_prefill_gpu_dispatches: std::sync::atomic::AtomicUsize,
 }
 
 fn parse_prefill_chunk(value: &str) -> Result<usize> {
     let chunk: usize = value
         .parse()
         .context("NV_LAGUNA_PREFILL_CHUNK must be 256, 512, 1024, 2048, 4096 or 8192")?;
-    anyhow::ensure!(
+    ensure!(
         matches!(chunk, 256 | 512 | 1024 | 2048 | 4096 | 8192),
         "NV_LAGUNA_PREFILL_CHUNK must be 256, 512, 1024, 2048, 4096 or 8192, got {chunk}"
     );
@@ -1097,7 +1056,7 @@ const PREFILL_CHUNK_DEFAULT_1024_USER_SIGNOFF_20260912_CORPUS_INSTRUMENT_RULED_2
 
 fn prefill_chunk_default_1024_user_signoff_20260912_unset_is_1024_and_256_restores_the_reference_width(
 ) -> Result<usize> {
-    match std::env::var("NV_LAGUNA_PREFILL_CHUNK") {
+    match env::var("NV_LAGUNA_PREFILL_CHUNK") {
         Ok(value) => parse_prefill_chunk(&value),
         Err(std::env::VarError::NotPresent) => Ok(PREFILL_CHUNK_DEFAULT_1024_USER_SIGNOFF_20260912_CORPUS_INSTRUMENT_RULED_256_RESTORES_THE_REFERENCE_WIDTH),
         Err(e) => Err(e).context("NV_LAGUNA_PREFILL_CHUNK must be valid UTF-8"),
@@ -1116,26 +1075,12 @@ fn canonical_tail_prefill_len(remaining: usize, chunk: usize) -> usize {
     }
 }
 
-#[cfg(feature = "cuda")]
-fn prefill_gpu_routing_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_LAGUNA_PREFILL_ROUTE_GPU",
-    )
-}
-
-#[cfg(feature = "cuda")]
-fn prefill_gpu_dispatch_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_LAGUNA_PREFILL_DISPATCH_GPU",
-    )
-}
-
 fn grouped_only_from_env() -> Result<bool> {
-    match std::env::var("NV_LAGUNA_GROUPED_ONLY") {
+    match env::var("NV_LAGUNA_GROUPED_ONLY") {
         Err(std::env::VarError::NotPresent) => Ok(false),
         Ok(v) if v == "0" => Ok(false),
         Ok(v) if v == "1" => Ok(true),
-        _ => anyhow::bail!("NV_LAGUNA_GROUPED_ONLY must be unset, 0, or 1"),
+        _ => bail!("NV_LAGUNA_GROUPED_ONLY must be unset, 0, or 1"),
     }
 }
 
@@ -1144,14 +1089,13 @@ fn prebuild_grouped_and_release_routed_experts(
     moe: &mut LagunaMoe,
     hidden: usize,
     inter: usize,
-    stream: &Arc<cudarc::driver::CudaStream>,
+    stream: &Arc<CudaStream>,
 ) -> Result<usize> {
-    anyhow::ensure!(
+    ensure!(
         (hidden, inter, moe.num_experts, moe.top_k) == (2048, 512, 256, 8)
             && moe.experts.len() == moe.num_experts,
         "grouped-only residency requires the Laguna XS packed 2048/512/256/8 expert layout"
     );
-    let folded = nv_layers::moe_grouped::folded_shared_enabled();
     let mut released_bytes = 0usize;
     for (e, mlp) in moe
         .experts
@@ -1164,7 +1108,7 @@ fn prebuild_grouped_and_release_routed_experts(
             (mlp.up_proj(), inter, hidden),
             (mlp.down_proj(), hidden, inter),
         ] {
-            anyhow::ensure!(
+            ensure!(
                 (linear.out_features(), linear.in_features()) == (n, k)
                     && linear.bias().is_none()
                     && !linear.has_lora(),
@@ -1173,7 +1117,7 @@ fn prebuild_grouped_and_release_routed_experts(
             let (w, scales, alpha, input_global) = linear.nvfp4_parts().with_context(|| {
                 format!("grouped-only expert {e}: packed NVFP4 storage required")
             })?;
-            anyhow::ensure!(
+            ensure!(
                 w.len() == n * k / 2
                     && scales.len() == n * (k / 16)
                     && alpha.is_finite()
@@ -1192,27 +1136,22 @@ fn prebuild_grouped_and_release_routed_experts(
         .grouped
         .get_mut()
         .map_err(|e| anyhow::anyhow!("grouped mutex poisoned: {e}"))?;
-    anyhow::ensure!(
+    ensure!(
         slot.is_none(),
         "grouped-only release must precede grouped consumers and capture"
     );
-    let bank = if folded {
-        nv_layers::moe_grouped::MoeGroupedWeights::build_from_experts_folding_shared_as_a_fixed_extra_tile(
-            &moe.experts, &moe.shared_expert, hidden, inter, stream,
-        )?
-    } else {
-        nv_layers::moe_grouped::MoeGroupedWeights::build_from_experts(
-            &moe.experts,
-            hidden,
-            inter,
-            stream,
-        )?
-    };
-    anyhow::ensure!(
+    let bank = MoeGroupedWeights::build_from_experts_folding_shared_as_a_fixed_extra_tile(
+        &moe.experts,
+        &moe.shared_expert,
+        hidden,
+        inter,
+        stream,
+    )?;
+    ensure!(
         bank.num_experts == moe.num_experts
             && bank.hidden_size == hidden
             && bank.intermediate_size == inter
-            && bank.folded_shared == folded,
+            && bank.folded_shared,
         "grouped-only prebuild returned inconsistent metadata"
     );
     stream
@@ -1224,10 +1163,6 @@ fn prebuild_grouped_and_release_routed_experts(
         .synchronize()
         .context("grouped-only original allocation release")?;
     Ok(released_bytes)
-}
-
-fn host_moe_env() -> bool {
-    nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_HOST_MOE")
 }
 
 #[cfg(feature = "cuda")]
@@ -1287,7 +1222,7 @@ fn attn_w8_spec_env() -> AttnW8Spec {
     let mut shape = false;
     let mut scope = 0u8;
     for key in ["NV_LAGUNA_ATTN_W8", "NV_LAGUNA_ATTN_FP8"] {
-        if let Ok(v) = std::env::var(key) {
+        if let Ok(v) = env::var(key) {
             let s = parse_attn_w8_spec(&v);
             shape |= s.shape;
             scope |= s.scope;
@@ -1305,7 +1240,7 @@ fn attn_w8_shape_env() -> bool {
 
 pub fn laguna_arm_key_explicitly_off(key: &str) -> bool {
     matches!(
-        std::env::var(key).ok().as_deref(),
+        env::var(key).ok().as_deref(),
         Some("0") | Some("off") | Some("false") | Some("no")
     )
 }
@@ -1315,43 +1250,24 @@ pub fn attn_w8_int8_arm_was_chosen_explicitly_and_therefore_outranks_the_fp8_def
         && !laguna_arm_key_explicitly_off("NV_LAGUNA_ATTN_W8")
 }
 
-pub fn attn_fp8_default_on_since_round_82_set_the_key_to_0_for_the_pre_round_82_bf16_projections(
-) -> bool {
-    !laguna_arm_key_explicitly_off("NV_LAGUNA_ATTN_FP8")
-        && !attn_w8_int8_arm_was_chosen_explicitly_and_therefore_outranks_the_fp8_default()
-}
-
 pub fn attn_quant_gate_check() -> Result<()> {
     if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_ATTN_W8")
         && nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_ATTN_FP8")
     {
-        anyhow::bail!("NV_LAGUNA_ATTN_W8 and NV_LAGUNA_ATTN_FP8 are mutually exclusive; unset one");
+        bail!("NV_LAGUNA_ATTN_W8 and NV_LAGUNA_ATTN_FP8 are mutually exclusive; unset one");
     }
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LmHeadFp8Mode {
-    ForceOff,
-    ForceOn,
-    DefaultScoped,
-}
-
-pub fn lmhead_fp8_mode() -> LmHeadFp8Mode {
-    match std::env::var("NV_LAGUNA_LMHEAD_FP8") {
-        Err(_) => LmHeadFp8Mode::DefaultScoped,
-        Ok(v) if v == "0" => LmHeadFp8Mode::ForceOff,
-        Ok(_) => LmHeadFp8Mode::ForceOn,
-    }
+pub fn lmhead_fp8_forced_on_for_the_spec_tier_too() -> bool {
+    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_LMHEAD_FP8")
 }
 
 pub fn lmhead_quant_gate_check() -> Result<()> {
-    if std::env::var_os("NV_LAGUNA_LMHEAD_INT8").is_some()
-        && lmhead_fp8_mode() == LmHeadFp8Mode::ForceOn
+    if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_LMHEAD_INT8")
+        && lmhead_fp8_forced_on_for_the_spec_tier_too()
     {
-        anyhow::bail!(
-            "NV_LAGUNA_LMHEAD_INT8 and NV_LAGUNA_LMHEAD_FP8 are mutually exclusive; unset one"
-        );
+        bail!("NV_LAGUNA_LMHEAD_INT8 and NV_LAGUNA_LMHEAD_FP8 are mutually exclusive; unset one");
     }
     Ok(())
 }
@@ -1371,9 +1287,6 @@ pub(crate) struct LagunaLmHeadFp8 {
 }
 
 pub const MAX_VERIFY_MOE_TOKENS: usize = 16;
-
-#[cfg(all(test, feature = "cuda"))]
-pub(crate) mod moe_fusion_validation;
 
 impl Laguna {
     pub fn config(&self) -> &LagunaConfig {
@@ -1415,13 +1328,12 @@ impl Laguna {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
             use half::bf16;
 
-            let dev = match &self.device {
-                Device::Cuda(d) => d.clone(),
-                _ => anyhow::bail!("FP8 Laguna embedding requires CUDA"),
+            let Device::Cuda(dev) = self.device.clone() else {
+                bail!("FP8 Laguna embedding requires CUDA")
             };
             let tokens = tokens.flatten_all()?.to_dtype(DType::U32)?.contiguous()?;
             let count = tokens.elem_count();
-            anyhow::ensure!(
+            ensure!(
                 count <= i32::MAX as usize
                     && embed.hidden <= i32::MAX as usize
                     && embed.vocab <= i32::MAX as usize,
@@ -1431,16 +1343,12 @@ impl Laguna {
                 .checked_mul(embed.hidden)
                 .context("FP8 embedding output size overflow")?;
             let stream = nv_layers::cuda_stream::current_stream(&dev);
-            let mut out = unsafe {
-                stream
-                    .alloc::<bf16>(output_elems)
-                    .map_err(|e| anyhow::anyhow!(e))?
-            };
+            let mut out = unsafe { stream.alloc::<bf16>(output_elems)? };
             let rc = {
                 let (ts, tl) = tokens.storage_and_layout();
                 let tc = match &*ts {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("FP8 Laguna embedding tokens must be CUDA"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("FP8 Laguna embedding tokens must be CUDA"),
                 };
                 let token_slice = tc.as_cuda_slice::<u32>()?;
                 let token_view = token_slice.slice(tl.start_offset()..);
@@ -1461,12 +1369,12 @@ impl Laguna {
                     )
                 }
             };
-            anyhow::ensure!(rc == 0, "gather_rows_e4m3_bf16 returned {rc}");
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+            ensure!(rc == 0, "gather_rows_e4m3_bf16 returned {rc}");
+            let storage = CudaStorage::wrap_cuda_slice(out, dev);
             return Ok(Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
+                Storage::Cuda(storage),
                 (count, embed.hidden),
-                candle_core::op::BackpropOp::none(),
+                BackpropOp::none(),
                 false,
             ));
         }
@@ -1475,19 +1383,6 @@ impl Laguna {
             .map_err(Into::into)
     }
 
-    #[cfg(all(test, feature = "cuda"))]
-    pub(crate) fn embed_fp8_weight_and_scales(
-        &self,
-    ) -> Option<(
-        &cudarc::driver::CudaSlice<u8>,
-        &cudarc::driver::CudaSlice<f32>,
-        usize,
-        usize,
-    )> {
-        self.embed_fp8
-            .as_ref()
-            .map(|e| (&e.bytes, &e.row_scales, e.vocab, e.hidden))
-    }
     pub fn lm_head(&self) -> &Linear {
         &self.lm_head
     }
@@ -1555,10 +1450,6 @@ impl Laguna {
         }
     }
 
-    pub fn lm_head_from_prenorm(&self, hidden: &Tensor) -> Result<Tensor> {
-        self.lm_head_from_prenorm_scoped(hidden, false)
-    }
-
     pub fn lm_head_from_prenorm_scoped(&self, hidden: &Tensor, spec_tier: bool) -> Result<Tensor> {
         #[cfg(not(feature = "cuda"))]
         let _ = spec_tier;
@@ -1593,9 +1484,8 @@ impl Laguna {
         hidden: &Tensor,
         t: usize,
     ) -> Result<Tensor> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("int8 lm_head requires cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("int8 lm_head requires cuda")
         };
         let hflat = hidden.reshape((t, self.config.hidden_size))?;
         let rstd = crate::gemma4_e4b::rstd_op(&hflat, self.config.rms_norm_eps as f32)?;
@@ -1619,9 +1509,8 @@ impl Laguna {
         hidden: &Tensor,
         t: usize,
     ) -> Result<Tensor> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("fp8 lm_head requires cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("fp8 lm_head requires cuda")
         };
         let hflat = hidden.reshape((t, self.config.hidden_size))?;
         let rstd = crate::gemma4_e4b::rstd_op(&hflat, self.config.rms_norm_eps as f32)?;
@@ -1657,13 +1546,8 @@ impl Laguna {
         lmhead_quant_gate_check()?;
         let prefill_chunk = prefill_chunk_default_1024_user_signoff_20260912_unset_is_1024_and_256_restores_the_reference_width()?;
         let grouped_only = grouped_only_from_env()?;
-        let host_moe = host_moe_env();
         if grouped_only {
-            anyhow::ensure!(
-                !host_moe,
-                "grouped-only loading requires NV_LAGUNA_HOST_MOE unset, including no =0"
-            );
-            anyhow::ensure!(
+            ensure!(
                 matches!(qconfig.scheme, nv_weights::QuantScheme::Nvfp4)
                     && (config.hidden_size, config.moe_intermediate_size, config.num_experts,
                         config.num_experts_per_tok, config.shared_expert_intermediate_size)
@@ -1673,7 +1557,7 @@ impl Laguna {
             #[cfg(feature = "cuda")]
             {
                 let Device::Cuda(d) = device else {
-                    anyhow::bail!("grouped-only loading requires CUDA");
+                    bail!("grouped-only loading requires CUDA");
                 };
                 use cudarc::driver::sys::CUdevice_attribute as Attr;
                 let stream = d.cuda_stream();
@@ -1683,13 +1567,13 @@ impl Laguna {
                 let minor = stream
                     .context()
                     .attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
-                anyhow::ensure!(
+                ensure!(
                     (major, minor) == (12, 0),
                     "grouped-only loading requires SM120, got SM{major}{minor}"
                 );
             }
             #[cfg(not(feature = "cuda"))]
-            anyhow::bail!("grouped-only loading requires --features cuda");
+            bail!("grouped-only loading requires --features cuda");
         }
         let dtype = DType::BF16;
 
@@ -1702,27 +1586,27 @@ impl Laguna {
                         stream.clone(),
                     )?)))
                 }
-                _ => anyhow::bail!("laguna NVFP4 requires a CUDA device"),
+                _ => bail!("laguna NVFP4 requires a CUDA device"),
             },
             _ => None,
         };
         #[cfg(not(feature = "cuda"))]
         let nvfp4_runner: Nvfp4RunnerHandle = {
             if !matches!(qconfig.scheme, nv_weights::QuantScheme::None) {
-                anyhow::bail!("laguna quantized load requires --features cuda");
+                bail!("laguna quantized load requires --features cuda");
             }
             None
         };
 
         let weight_linears_fp8 = weight_linears_fp8_enabled();
-        anyhow::ensure!(
+        ensure!(
             !weight_linears_fp8 || matches!(qconfig.scheme, nv_weights::QuantScheme::Nvfp4),
             "NV_LAGUNA_WEIGHT_LINEARS_FP8 requires an NVFP4 checkpoint"
         );
         #[cfg(feature = "cuda")]
         let fp8_runner: Fp8RunnerHandle = if weight_linears_fp8 {
             let Device::Cuda(d) = device else {
-                anyhow::bail!("NV_LAGUNA_WEIGHT_LINEARS_FP8 requires CUDA");
+                bail!("NV_LAGUNA_WEIGHT_LINEARS_FP8 requires CUDA");
             };
             Some(Arc::new(Mutex::new(nv_quant::fp8::Fp8GemmRunner::new(
                 d.cuda_stream().clone(),
@@ -1732,7 +1616,7 @@ impl Laguna {
         };
         #[cfg(not(feature = "cuda"))]
         let fp8_runner: Fp8RunnerHandle = {
-            anyhow::ensure!(
+            ensure!(
                 !weight_linears_fp8,
                 "NV_LAGUNA_WEIGHT_LINEARS_FP8 requires --features cuda"
             );
@@ -1744,7 +1628,7 @@ impl Laguna {
             .context("load model.embed_tokens.weight")?;
         let ed = embed_weight.dims();
         if ed.len() != 2 || ed[0] != config.vocab_size || ed[1] != config.hidden_size {
-            anyhow::bail!(
+            bail!(
                 "laguna embed: expected [{}, {}], got {:?}",
                 config.vocab_size,
                 config.hidden_size,
@@ -1771,7 +1655,7 @@ impl Laguna {
                 let mut layer = layer;
                 if let LagunaFfn::Moe(moe) = &mut layer.ffn {
                     let Device::Cuda(d) = device else {
-                        anyhow::bail!("grouped-only CUDA device unavailable");
+                        bail!("grouped-only CUDA device unavailable");
                     };
                     let bytes = prebuild_grouped_and_release_routed_experts(
                         moe,
@@ -1800,7 +1684,7 @@ impl Laguna {
         }
         #[cfg(feature = "cuda")]
         if grouped_only {
-            anyhow::ensure!(
+            ensure!(
                 residency.0 > 0,
                 "grouped-only loading requires routed expert layers"
             );
@@ -1808,27 +1692,19 @@ impl Laguna {
         }
 
         #[cfg(feature = "cuda")]
-        if matches!(qconfig.scheme, QuantScheme::Nvfp4) && !host_moe && !grouped_only {
+        if matches!(qconfig.scheme, QuantScheme::Nvfp4) && !grouped_only {
             if let Device::Cuda(d) = device {
                 let stream = d.cuda_stream();
                 for (i, layer) in layers.iter().enumerate() {
                     if let LagunaFfn::Moe(moe) = &layer.ffn {
-                        let built = if nv_layers::moe_grouped::folded_shared_enabled() {
-                            nv_layers::moe_grouped::MoeGroupedWeights::build_from_experts_folding_shared_as_a_fixed_extra_tile(
+                        let built =
+                            MoeGroupedWeights::build_from_experts_folding_shared_as_a_fixed_extra_tile(
                                 &moe.experts,
                                 &moe.shared_expert,
                                 config.hidden_size,
                                 config.moe_intermediate_size,
                                 &stream,
-                            )
-                        } else {
-                            nv_layers::moe_grouped::MoeGroupedWeights::build_from_experts(
-                                &moe.experts,
-                                config.hidden_size,
-                                config.moe_intermediate_size,
-                                &stream,
-                            )
-                        };
+                            );
                         match built {
                             Ok(b) => {
                                 *moe.grouped.lock().map_err(|e| {
@@ -1865,14 +1741,14 @@ impl Laguna {
         };
         #[cfg(feature = "cuda")]
         let lm_head_i8 = if !weight_linears_fp8
-            && std::env::var_os("NV_LAGUNA_LMHEAD_INT8").is_some()
-            && matches!(device, Device::Cuda(_))
+            && nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_LMHEAD_INT8")
+            && device.is_cuda()
         {
             let (wq, row_scale) =
                 nv_layers::lm_head_resident_quant::rowquant_i8_dev(&lm_head_weight)?;
             let max_m = nv_kernels::cuda::gemv_i8_normed_mk_max_m(config.hidden_size as i32).max(0)
                 as usize;
-            anyhow::ensure!(max_m >= 1, "int8 lm_head: unsupported hidden size");
+            ensure!(max_m >= 1, "int8 lm_head: unsupported hidden size");
             Some(LagunaLmHeadI8 {
                 wq,
                 row_scale,
@@ -1882,24 +1758,21 @@ impl Laguna {
             None
         };
         #[cfg(feature = "cuda")]
-        let lm_head_fp8 = if !weight_linears_fp8
-            && lm_head_i8.is_none()
-            && lmhead_fp8_mode() != LmHeadFp8Mode::ForceOff
-            && matches!(device, Device::Cuda(_))
-        {
-            let (wq, row_scale) =
-                nv_layers::lm_head_resident_quant::rowquant_e4m3_dev(&lm_head_weight)?;
-            let max_m = nv_kernels::cuda::gemv_i8_normed_mk_max_m(config.hidden_size as i32).max(0)
-                as usize;
-            anyhow::ensure!(max_m >= 1, "fp8 lm_head: unsupported hidden size");
-            Some(LagunaLmHeadFp8 {
-                wq,
-                row_scale,
-                max_m,
-            })
-        } else {
-            None
-        };
+        let lm_head_fp8 =
+            if !weight_linears_fp8 && lm_head_i8.is_none() && device.is_cuda() {
+                let (wq, row_scale) =
+                    nv_layers::lm_head_resident_quant::rowquant_e4m3_dev(&lm_head_weight)?;
+                let max_m = nv_kernels::cuda::gemv_i8_normed_mk_max_m(config.hidden_size as i32)
+                    .max(0) as usize;
+                ensure!(max_m >= 1, "fp8 lm_head: unsupported hidden size");
+                Some(LagunaLmHeadFp8 {
+                    wq,
+                    row_scale,
+                    max_m,
+                })
+            } else {
+                None
+            };
         let lm_head = load_linear_from_tensor_maybe_fp8(lm_head_weight, &fp8_runner, device)?;
 
         #[cfg(feature = "cuda")]
@@ -1964,13 +1837,13 @@ impl Laguna {
             #[cfg(feature = "cuda")]
             moe_decode_ctx: std::sync::Mutex::new(None),
             #[cfg(feature = "cuda")]
-            moe_verify_ctx: std::sync::Mutex::new(std::collections::HashMap::new()),
+            moe_verify_ctx: std::sync::Mutex::new(HashMap::new()),
             #[cfg(feature = "cuda")]
             moe_graphs: std::sync::Mutex::new(None),
             #[cfg(feature = "cuda")]
             moe_union_samples: std::sync::Mutex::new(Vec::new()),
             #[cfg(feature = "cuda")]
-            union_probe: std::sync::atomic::AtomicBool::new(ck_profile_enabled()),
+            union_probe: AtomicBool::new(ck_profile_enabled()),
             #[cfg(feature = "cuda")]
             batch_moe_fused_dispatches: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "cuda")]
@@ -1978,17 +1851,12 @@ impl Laguna {
             #[cfg(feature = "cuda")]
             lm_head_fp8,
             #[cfg(feature = "cuda")]
-            lm_head_fp8_spec_off: lmhead_fp8_mode() == LmHeadFp8Mode::DefaultScoped,
-            device_verify_routing: std::sync::atomic::AtomicBool::new(false),
-            host_moe: std::sync::atomic::AtomicBool::new(host_moe),
+            lm_head_fp8_spec_off: !lmhead_fp8_forced_on_for_the_spec_tier_too(),
+            device_verify_routing: AtomicBool::new(false),
             attn_w8_shape: attn_w8_shape_env(),
             prefill_chunk,
             #[cfg(test)]
             test_moe_host_fallbacks: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(all(test, feature = "cuda"))]
-            test_prefill_gpu_routes: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(all(test, feature = "cuda"))]
-            test_prefill_gpu_dispatches: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -2011,11 +1879,8 @@ impl Laguna {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn new_kv_cache_fp8(
-        &self,
-        max_seq_len: usize,
-    ) -> Result<crate::laguna_fp8::LagunaKvCacheFp8> {
-        crate::laguna_fp8::LagunaKvCacheFp8::new_with_prefill_chunk(
+    pub fn new_kv_cache_fp8(&self, max_seq_len: usize) -> Result<LagunaKvCacheFp8> {
+        LagunaKvCacheFp8::new_with_prefill_chunk(
             &self.config,
             max_seq_len,
             &self.device,
@@ -2027,20 +1892,11 @@ impl Laguna {
     pub fn forward(&self, tokens: &Tensor, positions: &Tensor) -> Result<Tensor> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!("Laguna.forward: tokens must be [1, seq], got {:?}", dims);
+            bail!("Laguna.forward: tokens must be [1, seq], got {:?}", dims);
         }
         let seq = dims[1];
         let mut cache = self.new_kv_cache(seq.max(1))?;
         self.forward_with_cache(tokens, positions, &mut cache)
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn moe_graph_stats(&self) -> Option<(usize, u64, u64)> {
-        let slot = self.moe_graphs.lock().ok()?;
-        match slot.as_ref() {
-            Some(Some(g)) => Some((g.layers_cached(), g.captures(), g.replays())),
-            _ => None,
-        }
     }
 
     pub fn forward_with_cache<C: Gemma4Cache>(
@@ -2083,30 +1939,7 @@ impl Laguna {
         )
     }
 
-    pub fn prefill_fused_normrope_enabled() -> bool {
-        Self::prefill_fused_normrope_default_on_user_signoff_20260912_bitwise_unset_is_on_and_0_restores_the_unfused_launches()
-    }
-
-    pub fn prefill_fused_normrope_default_on_user_signoff_20260912_bitwise_unset_is_on_and_0_restores_the_unfused_launches(
-    ) -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            "NV_LAGUNA_PREFILL_FUSED_NORMROPE",
-        )
-    }
-
-    pub fn prefill_fused_gate_enabled() -> bool {
-        Self::prefill_fused_gate_default_on_user_signoff_20260912_bitwise_unset_is_on_and_0_restores_the_unfused_launches()
-    }
-
-    pub fn prefill_fused_gate_default_on_user_signoff_20260912_bitwise_unset_is_on_and_0_restores_the_unfused_launches(
-    ) -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            "NV_LAGUNA_PREFILL_FUSED_GATE",
-        )
-    }
-
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn prefill_fused_qk_normrope(
         &self,
         attn: &LagunaAttention,
@@ -2142,7 +1975,7 @@ impl Laguna {
         let positions = positions.contiguous()?;
         let cos = rope.cos().contiguous()?;
         let sin = rope.sin().contiguous()?;
-        anyhow::ensure!(
+        ensure!(
             cos.dims().last() == Some(&(rotary_dim / 2)),
             "fused normrope: rope table half {:?} does not match rotary_dim {rotary_dim}",
             cos.dims()
@@ -2159,13 +1992,13 @@ impl Laguna {
                 .map_err(|e| anyhow::anyhow!("fused normrope k alloc: {e:?}"))?
         };
         fn ptr_of<'a, T: candle_core::cuda_backend::CudaDType + cudarc::driver::DeviceRepr + 'a>(
-            storage: &'a candle_core::Storage,
+            storage: &'a Storage,
             offset: usize,
-            stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
+            stream: &'a std::sync::Arc<CudaStream>,
         ) -> Result<(u64, cudarc::driver::SyncOnDrop<'a>)> {
             let cuda = match storage {
-                candle_core::Storage::Cuda(c) => c,
-                _ => anyhow::bail!("fused normrope: tensor is not on CUDA"),
+                Storage::Cuda(c) => c,
+                _ => bail!("fused normrope: tensor is not on CUDA"),
             };
             Ok(cuda.as_cuda_slice::<T>()?.slice(offset..).view_ptr(stream))
         }
@@ -2186,7 +2019,7 @@ impl Laguna {
                 attn.q_norm.fp8_e4m3_weight_and_scale(),
                 attn.k_norm.fp8_e4m3_weight_and_scale(),
             ) {
-                anyhow::ensure!(
+                ensure!(
                     qh == head_dim
                         && kh == head_dim
                         && qw.len() == head_dim
@@ -2254,15 +2087,12 @@ impl Laguna {
                 }
             }
         };
-        anyhow::ensure!(rc == 0, "fused prefill normrope launch failed rc={rc}");
+        ensure!(rc == 0, "fused prefill normrope launch failed rc={rc}");
         let wrap = |slice: cudarc::driver::CudaSlice<bf16>, heads: usize| -> Result<Tensor> {
             Ok(Tensor::from_storage(
-                candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(
-                    slice,
-                    dev.clone(),
-                )),
+                Storage::Cuda(CudaStorage::wrap_cuda_slice(slice, dev.clone())),
                 (1usize, seq, heads, head_dim),
-                candle_core::op::BackpropOp::none(),
+                BackpropOp::none(),
                 false,
             ))
         };
@@ -2288,7 +2118,7 @@ impl Laguna {
         }
         let attn_c = attn_out.contiguous()?;
         let gate_c = gate.contiguous()?;
-        anyhow::ensure!(
+        ensure!(
             attn_c.elem_count() == seq * n_q * head_dim && gate_c.elem_count() == seq * n_q,
             "fused gate: shape mismatch"
         );
@@ -2300,13 +2130,13 @@ impl Laguna {
         };
         let rc = {
             fn ptr_of<'a>(
-                storage: &'a candle_core::Storage,
+                storage: &'a Storage,
                 offset: usize,
-                stream: &'a std::sync::Arc<cudarc::driver::CudaStream>,
+                stream: &'a std::sync::Arc<CudaStream>,
             ) -> Result<(u64, cudarc::driver::SyncOnDrop<'a>)> {
                 let cuda = match storage {
-                    candle_core::Storage::Cuda(c) => c,
-                    _ => anyhow::bail!("fused gate: tensor is not on CUDA"),
+                    Storage::Cuda(c) => c,
+                    _ => bail!("fused gate: tensor is not on CUDA"),
                 };
                 Ok(cuda
                     .as_cuda_slice::<bf16>()?
@@ -2330,16 +2160,15 @@ impl Laguna {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "fused prefill gate launch failed rc={rc}");
+        ensure!(rc == 0, "fused prefill gate launch failed rc={rc}");
         Ok(Some(Tensor::from_storage(
-            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(out, dev.clone())),
+            Storage::Cuda(CudaStorage::wrap_cuda_slice(out, dev.clone())),
             (1usize, seq, n_q, head_dim),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         )))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn prefill_with_cache_aux_scoped<C: Gemma4Cache>(
         &self,
         tokens: &Tensor,
@@ -2369,11 +2198,11 @@ impl Laguna {
     ) -> Result<(Tensor, Vec<Tensor>)> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!("Laguna.forward: tokens must be [1, seq], got {:?}", dims);
+            bail!("Laguna.forward: tokens must be [1, seq], got {:?}", dims);
         }
         let seq = dims[1];
         if positions.dims() != [seq] {
-            anyhow::bail!(
+            bail!(
                 "Laguna.forward: positions must be [{}], got {:?}",
                 seq,
                 positions.dims()
@@ -2381,7 +2210,7 @@ impl Laguna {
         }
         for &li in aux_layers {
             if li >= self.layers.len() {
-                anyhow::bail!(
+                bail!(
                     "Laguna.forward_with_cache_aux: aux layer {} out of range ({} layers)",
                     li,
                     self.layers.len()
@@ -2426,7 +2255,7 @@ impl Laguna {
 
         let prof =
             seq == 1 && nv_config::env_arm_present_at_all_reread_every_call("NV_MOE_DECODE_PROF");
-        let sync = |label: &str, t: &mut std::time::Instant| {
+        let sync = |label: &str, t: &mut Instant| {
             if prof {
                 #[cfg(feature = "cuda")]
                 if let Device::Cuda(d) = &self.device {
@@ -2436,10 +2265,10 @@ impl Laguna {
                     "[laguna_layer_prof] l{idx} {label}={:.3}ms",
                     t.elapsed().as_secs_f64() * 1e3
                 );
-                *t = std::time::Instant::now();
+                *t = Instant::now();
             }
         };
-        let mut t = std::time::Instant::now();
+        let mut t = Instant::now();
 
         let family_attn = match layer.kind {
             LayerType::FullAttention => "prefill_attention_full_layer",
@@ -2467,8 +2296,7 @@ impl Laguna {
         let layer = &self.layers[idx];
         #[cfg(feature = "cuda")]
         if seq == 1
-            && matches!(self.device, Device::Cuda(_))
-            && !self.host_moe()
+            && self.device.is_cuda()
             && crate::laguna_graph::graph_enabled()
         {
             if let LagunaFfn::Moe(moe) = &layer.ffn {
@@ -2501,32 +2329,11 @@ impl Laguna {
     }
 
     pub fn set_device_verify_routing(&self, on: bool) {
-        self.device_verify_routing
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn set_host_moe(&self, on: bool) -> Result<()> {
-        if on {
-            anyhow::ensure!(
-                self.layers.iter().all(|layer| match &layer.ffn {
-                    LagunaFfn::Moe(moe) => moe.experts.len() == moe.num_experts && moe.num_experts > 0,
-                    LagunaFfn::Dense(_) => true,
-                }),
-                "host MoE is unavailable after grouped-only release; reload with NV_LAGUNA_GROUPED_ONLY=0"
-            );
-        }
-        self.host_moe
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
-    }
-
-    pub fn host_moe(&self) -> bool {
-        self.host_moe.load(std::sync::atomic::Ordering::Relaxed)
+        self.device_verify_routing.store(on, Ordering::Relaxed);
     }
 
     pub fn device_verify_routing(&self) -> bool {
-        self.device_verify_routing
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.device_verify_routing.load(Ordering::Relaxed)
     }
 
     fn moe_forward(
@@ -2537,16 +2344,13 @@ impl Laguna {
         n_tokens: usize,
     ) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
-        if matches!(self.device, Device::Cuda(_)) && !self.host_moe() {
+        if self.device.is_cuda() {
             if n_tokens == 1 {
                 if let Some(out) = self.moe_forward_decode_grouped(layer_idx, moe, x_flat)? {
                     return Ok(out);
                 }
             } else {
-                if n_tokens <= MAX_VERIFY_MOE_TOKENS
-                    && self.device_verify_routing()
-                    && !nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_HOST_VERIFY")
-                {
+                if n_tokens <= MAX_VERIFY_MOE_TOKENS && self.device_verify_routing() {
                     match self.moe_forward_verify_grouped(layer_idx, moe, x_flat, n_tokens, false) {
                         Ok(Some(out)) => return Ok(out),
                         Ok(None) => {}
@@ -2569,12 +2373,11 @@ impl Laguna {
         }
         let _ = n_tokens;
         #[cfg(test)]
-        self.test_moe_host_fallbacks
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.test_moe_host_fallbacks.fetch_add(1, Ordering::Relaxed);
         let out = moe.forward(x_flat)?;
         let finite_probe = out.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?;
         if !finite_probe.is_finite() {
-            anyhow::bail!(
+            bail!(
                 "laguna host-MoE fallback at layer {layer_idx} produced non-finite output \
                  (sum {finite_probe}); refusing to emit NaN logits. This failure has been \
                  observed under GPU memory pressure (co-tenant holding ~43 GiB); free VRAM \
@@ -2587,7 +2390,7 @@ impl Laguna {
     #[cfg(feature = "cuda")]
     fn prepared_moe_context<'a>(
         &self,
-        map: &'a mut std::collections::HashMap<usize, nv_layers::moe_grouped::GroupedDecodeContext>,
+        map: &'a mut HashMap<usize, nv_layers::moe_grouped::GroupedDecodeContext>,
         n_tokens: usize,
         folds_shared: bool,
         dev: &candle_core::CudaDevice,
@@ -2612,7 +2415,7 @@ impl Laguna {
                 )?)
             }
         };
-        anyhow::ensure!(
+        ensure!(
             ctx.folds_shared() == folds_shared,
             "prepared grouped context must match the fixed opt-in shared-fold policy"
         );
@@ -2628,11 +2431,8 @@ impl Laguna {
         n_tokens: usize,
         fused_batched_decode: bool,
     ) -> Result<Option<Tensor>> {
-        #[cfg(test)]
-        moe_fusion_validation::capture_input(layer_idx, x_flat, n_tokens)?;
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = self.device.clone() else {
+            return Ok(None);
         };
         let grouped = match self.grouped_weights(moe)? {
             Some(w) => w,
@@ -2649,7 +2449,7 @@ impl Laguna {
         let routed = if fused_batched_decode {
             use cudarc::driver::DevicePtr;
 
-            anyhow::ensure!(
+            ensure!(
                 matches!(n_tokens, 2 | 3 | 6)
                     && x_flat.dtype() == DType::BF16
                     && x_flat.is_contiguous()
@@ -2658,7 +2458,7 @@ impl Laguna {
                 x_flat.dims(),
                 x_flat.dtype()
             );
-            anyhow::ensure!(
+            ensure!(
                 logits.dtype() == DType::BF16
                     && logits.is_contiguous()
                     && logits.elem_count() == n_tokens * self.config.num_experts,
@@ -2673,8 +2473,8 @@ impl Laguna {
 
             let (logits_storage, logits_layout) = logits.storage_and_layout();
             let logits_cuda = match &*logits_storage {
-                candle_core::Storage::Cuda(storage) => storage,
-                _ => anyhow::bail!("Laguna B2 fused router logits must be CUDA"),
+                Storage::Cuda(storage) => storage,
+                _ => bail!("Laguna B2 fused router logits must be CUDA"),
             };
             let logits_slice = logits_cuda.as_cuda_slice::<half::bf16>()?;
             let (logits_ptr, _logits_guard) = logits_slice.device_ptr(&stream);
@@ -2686,8 +2486,8 @@ impl Laguna {
 
             let (x_storage, x_layout) = x_flat.storage_and_layout();
             let x_cuda = match &*x_storage {
-                candle_core::Storage::Cuda(storage) => storage,
-                _ => anyhow::bail!("Laguna B2 fused input must be CUDA"),
+                Storage::Cuda(storage) => storage,
+                _ => bail!("Laguna B2 fused input must be CUDA"),
             };
             let x_slice = x_cuda.as_cuda_slice::<half::bf16>()?;
             let (x_ptr, _x_guard) = x_slice.device_ptr(&stream);
@@ -2697,8 +2497,8 @@ impl Laguna {
 
             let (bias_storage, bias_layout) = bias.storage_and_layout();
             let bias_cuda = match &*bias_storage {
-                candle_core::Storage::Cuda(storage) => storage,
-                _ => anyhow::bail!("Laguna B2 fused selection bias must be CUDA"),
+                Storage::Cuda(storage) => storage,
+                _ => bail!("Laguna B2 fused selection bias must be CUDA"),
             };
             let bias_slice = bias_cuda.as_cuda_slice::<f32>()?;
             let (bias_ptr, _bias_guard) = bias_slice.device_ptr(&stream);
@@ -2717,13 +2517,13 @@ impl Laguna {
                 None,
                 None,
             )?;
-            anyhow::ensure!(
+            ensure!(
                 ctx.last_call_used_fused_small_m_route_and_chain(),
                 "Laguna B2 fused routed MoE inner fused route/chain was not selected"
             );
             let routed = ctx.copy_scattered_f32_into_owned_tensor(&self.device, &stream)?;
             self.batch_moe_fused_dispatches
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed);
             routed
         } else {
             nv_layers::moe_grouped::forward_grouped_decode(
@@ -2744,10 +2544,9 @@ impl Laguna {
                 layer_idx, moe, x_flat, ctx, n_tokens, &dev,
             )?;
         }
-        if self.union_probe.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.union_probe.load(Ordering::Relaxed) {
             let stream = nv_layers::cuda_stream::current_stream(&dev);
-            #[allow(deprecated)]
-            if let Ok(ids) = stream.memcpy_dtov(&ctx.topk_ids) {
+            if let Ok(ids) = stream.clone_dtoh(&ctx.topk_ids) {
                 let mut seen = std::collections::HashSet::new();
                 for &e in &ids {
                     seen.insert(e);
@@ -2776,9 +2575,8 @@ impl Laguna {
     ) -> Result<()> {
         let stream = nv_layers::cuda_stream::current_stream(dev);
         stream.synchronize().ok();
-        #[allow(deprecated)]
         let dev_ids: Vec<i32> = stream
-            .memcpy_dtov(&ctx.topk_ids)
+            .clone_dtoh(&ctx.topk_ids)
             .map_err(|e| anyhow::anyhow!("route_ab_probe topk_ids copy: {e:?}"))?;
         let (host_ids, _host_w) = moe.route_host(x_flat, n_tokens)?;
         let k = moe.top_k;
@@ -2826,33 +2624,17 @@ impl Laguna {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn drain_union_samples(&self) -> Vec<(usize, usize)> {
-        match self.moe_union_samples.lock() {
-            Ok(mut s) => std::mem::take(&mut *s),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn set_union_probe(&self, on: bool) {
-        self.union_probe
-            .store(on, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[cfg(feature = "cuda")]
     pub fn take_batch_moe_fused_dispatches(&self) -> usize {
-        self.batch_moe_fused_dispatches
-            .swap(0, std::sync::atomic::Ordering::Relaxed)
+        self.batch_moe_fused_dispatches.swap(0, Ordering::Relaxed)
     }
 
     #[cfg(feature = "cuda")]
     pub(crate) fn grouped_weights(
         &self,
         moe: &LagunaMoe,
-    ) -> Result<Option<Arc<nv_layers::moe_grouped::MoeGroupedWeights>>> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+    ) -> Result<Option<Arc<MoeGroupedWeights>>> {
+        let Device::Cuda(dev) = self.device.clone() else {
+            return Ok(None);
         };
         let mut slot = moe
             .grouped
@@ -2862,7 +2644,7 @@ impl Laguna {
             let bank = slot.as_ref().and_then(Option::as_ref).context(
                 "grouped-only bank unavailable; released routed experts cannot be rebuilt or used as fallback",
             )?;
-            anyhow::ensure!(
+            ensure!(
                 bank.num_experts == moe.num_experts
                     && bank.hidden_size == self.config.hidden_size
                     && bank.intermediate_size == self.config.moe_intermediate_size,
@@ -2872,22 +2654,13 @@ impl Laguna {
         }
         if slot.is_none() {
             let stream = nv_layers::cuda_stream::current_stream(&dev);
-            let built = if nv_layers::moe_grouped::folded_shared_enabled() {
-                nv_layers::moe_grouped::MoeGroupedWeights::build_from_experts_folding_shared_as_a_fixed_extra_tile(
-                    &moe.experts,
-                    &moe.shared_expert,
-                    self.config.hidden_size,
-                    self.config.moe_intermediate_size,
-                    &stream,
-                )
-            } else {
-                nv_layers::moe_grouped::MoeGroupedWeights::build_from_experts(
-                    &moe.experts,
-                    self.config.hidden_size,
-                    self.config.moe_intermediate_size,
-                    &stream,
-                )
-            };
+            let built = MoeGroupedWeights::build_from_experts_folding_shared_as_a_fixed_extra_tile(
+                &moe.experts,
+                &moe.shared_expert,
+                self.config.hidden_size,
+                self.config.moe_intermediate_size,
+                &stream,
+            );
             *slot = Some(match built {
                 Ok(b) => Some(Arc::new(b)),
                 Err(e) => {
@@ -2906,136 +2679,42 @@ impl Laguna {
         x_flat: &Tensor,
         n_tokens: usize,
     ) -> Result<Option<Tensor>> {
-        const MIN_TILE: usize = nv_quant::nvfp4::MIN_TILE;
-
         let grouped = match self.grouped_weights(moe)? {
             Some(w) => w,
             None => return Ok(None),
         };
         let k = moe.top_k;
-        if prefill_gpu_routing_enabled() && prefill_gpu_dispatch_enabled() {
-            let logits = moe.gate.forward(x_flat)?;
-            let routing =
-                nv_layers::moe_grouped::route_topk_and_plan_padded_on_device_for_prefill_dispatch(
-                    &logits,
-                    Some(&moe.selection_bias),
-                    n_tokens,
-                    moe.num_experts,
-                    k,
-                    1,
-                    moe.softcap,
-                    moe.norm_topk,
-                    1.0,
-                    &self.device,
-                )?;
-            #[cfg(test)]
-            {
-                self.test_prefill_gpu_routes
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.test_prefill_gpu_dispatches
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            let mut acc = match nv_layers::moe_grouped::forward_grouped_device_routing(
-                &grouped,
-                &grouped,
-                x_flat,
-                &routing,
+        let logits = moe.gate.forward(x_flat)?;
+        let routing =
+            nv_layers::moe_grouped::route_topk_and_plan_padded_on_device_for_prefill_dispatch(
+                &logits,
+                Some(&moe.selection_bias),
                 n_tokens,
+                moe.num_experts,
                 k,
+                1,
+                moe.softcap,
+                moe.norm_topk,
+                1.0,
                 &self.device,
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    if moe.experts.is_empty() {
-                        return Err(e)
-                            .context("grouped-only device prefill failed; fallback disabled");
-                    }
-                    eprintln!(
-                        "[laguna] device-planned grouped MoE prefill failed, host fallback: {e}"
-                    );
-                    return Ok(None);
+            )?;
+        let mut acc = match nv_layers::moe_grouped::forward_grouped_device_routing(
+            &grouped,
+            &grouped,
+            x_flat,
+            &routing,
+            n_tokens,
+            k,
+            &self.device,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                if moe.experts.is_empty() {
+                    return Err(e).context("grouped-only device prefill failed; fallback disabled");
                 }
-            };
-            if moe.routed_scaling != 1.0 {
-                acc = acc.affine(moe.routed_scaling as f64, 0.0)?;
+                eprintln!("[laguna] device-planned grouped MoE prefill failed, host fallback: {e}");
+                return Ok(None);
             }
-            let shared = moe.shared_expert.forward(x_flat)?.to_dtype(DType::F32)?;
-            return Ok(Some(acc.add(&shared)?));
-        }
-        let (ids, weights) = if prefill_gpu_routing_enabled() {
-            let logits = moe.gate.forward(x_flat)?;
-            let routed =
-                nv_layers::moe_grouped::route_topk_device_then_copy_compact_for_prefill_dispatch(
-                    &logits,
-                    Some(&moe.selection_bias),
-                    n_tokens,
-                    moe.num_experts,
-                    k,
-                    1,
-                    moe.softcap,
-                    moe.norm_topk,
-                    1.0,
-                    &self.device,
-                )?;
-            #[cfg(test)]
-            self.test_prefill_gpu_routes
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            routed
-        } else {
-            moe.route_host(x_flat, n_tokens)?
-        };
-
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        let mut start = 0usize;
-        while start < n_tokens {
-            let len = self.prefill_chunk.min(n_tokens - start);
-            ranges.push((start, len));
-            start += len;
-        }
-        ranges.reverse();
-
-        let mut outs: Vec<Tensor> = Vec::new();
-        let mut counts = vec![0u32; moe.num_experts];
-        while let Some((start, len)) = ranges.pop() {
-            if len > MIN_TILE {
-                counts.iter_mut().for_each(|c| *c = 0);
-                for &e in &ids[start * k..(start + len) * k] {
-                    counts[e as usize] += 1;
-                }
-                if counts.iter().any(|&c| c as usize > MIN_TILE) {
-                    let half = len / 2;
-                    ranges.push((start + half, len - half));
-                    ranges.push((start, half));
-                    continue;
-                }
-            }
-            let x_sub = x_flat.narrow(0, start, len)?;
-            match nv_layers::moe_grouped::forward_grouped(
-                &grouped,
-                &grouped,
-                &x_sub,
-                &ids[start * k..(start + len) * k],
-                &weights[start * k..(start + len) * k],
-                len,
-                k,
-                &self.device,
-            ) {
-                Ok(t) => outs.push(t),
-                Err(e) => {
-                    if moe.experts.is_empty() {
-                        return Err(e).context("grouped-only prefill failed; fallback disabled");
-                    }
-                    eprintln!("[laguna] grouped MoE prefill failed, host fallback: {e}");
-                    return Ok(None);
-                }
-            }
-        }
-
-        let mut acc = if outs.len() == 1 {
-            outs.pop().unwrap()
-        } else {
-            let refs: Vec<&Tensor> = outs.iter().collect();
-            Tensor::cat(&refs, 0)?
         };
         if moe.routed_scaling != 1.0 {
             acc = acc.affine(moe.routed_scaling as f64, 0.0)?;
@@ -3052,9 +2731,8 @@ impl Laguna {
         norm: &RmsNorm,
         after_attn: &Tensor,
     ) -> Result<Option<Tensor>> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = self.device.clone() else {
+            return Ok(None);
         };
         let grouped = match self.grouped_weights(moe)? {
             Some(w) => w,
@@ -3107,7 +2785,7 @@ impl Laguna {
             );
         }
         if let Some(Some(graphs)) = g_slot.as_mut() {
-            anyhow::ensure!(
+            ensure!(
                 !moe.experts.is_empty() || !graphs.failed(),
                 "grouped-only MoE graph is retired; uncaptured fallback disabled"
             );
@@ -3143,9 +2821,8 @@ impl Laguna {
         moe: &LagunaMoe,
         x_flat: &Tensor,
     ) -> Result<Option<Tensor>> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = self.device.clone() else {
+            return Ok(None);
         };
         let grouped = match self.grouped_weights(moe)? {
             Some(w) => w,
@@ -3181,17 +2858,17 @@ impl Laguna {
         let _ = layer_idx;
 
         let prof = nv_config::env_arm_present_at_all_reread_every_call("NV_MOE_DECODE_PROF");
-        let sync = |label: &str, t: &mut std::time::Instant| {
+        let sync = |label: &str, t: &mut Instant| {
             if prof {
                 let _ = dev.cuda_stream().synchronize();
                 eprintln!(
                     "[laguna_moe_prof] {label}={:.3}ms",
                     t.elapsed().as_secs_f64() * 1e3
                 );
-                *t = std::time::Instant::now();
+                *t = Instant::now();
             }
         };
-        let mut t = std::time::Instant::now();
+        let mut t = Instant::now();
         let logits = moe.gate.forward(x_flat)?;
         sync("gate_fwd", &mut t);
         let routed = nv_layers::moe_grouped::forward_grouped_decode(
@@ -3234,10 +2911,8 @@ impl Laguna {
         let n_kv = self.config.num_key_value_heads;
 
         #[cfg(feature = "cuda")]
-        let want_fused_normrope = seq > 1
-            && self.dtype == DType::BF16
-            && matches!(self.device, Device::Cuda(_))
-            && Self::prefill_fused_normrope_enabled();
+        let want_fused_normrope =
+            seq > 1 && self.dtype == DType::BF16 && self.device.is_cuda();
         #[cfg(not(feature = "cuda"))]
         let want_fused_normrope = false;
         let q_raw = attn.proj_q(x, seq)?;
@@ -3280,7 +2955,7 @@ impl Laguna {
         let fused_normrope: Option<(Tensor, Tensor)> = None;
         let (q_rot, k_rot) = match fused_normrope {
             Some(pair) => {
-                static PREFILL_FUSED_NORMROPE_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+                static PREFILL_FUSED_NORMROPE_FIRED_ONCE: Once = Once::new();
                 PREFILL_FUSED_NORMROPE_FIRED_ONCE.call_once(|| eprintln!("[laguna_prefill_fused] normrope=on rows={seq} n_q={n_q} n_kv={n_kv} rotary_dim={rotary_dim} rot_scale={rot_scale} (q/k rmsnorm + partial rope + scale + bf16 in one launch per row-head)"));
                 pair
             }
@@ -3341,13 +3016,11 @@ impl Laguna {
 
         #[cfg(feature = "cuda")]
         let fused_gate = match (&attn.g_proj, self.config.gating) {
-            (Some(g_proj), LagunaGating::PerHead)
-                if seq > 1 && Self::prefill_fused_gate_enabled() =>
-            {
+            (Some(g_proj), LagunaGating::PerHead) if seq > 1 => {
                 let g = g_proj.forward(x)?;
                 let fused = self.prefill_fused_gate(&attn_out, &g, seq, n_q, head_dim)?;
                 if fused.is_some() {
-                    static PREFILL_FUSED_GATE_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+                    static PREFILL_FUSED_GATE_FIRED_ONCE: Once = Once::new();
                     PREFILL_FUSED_GATE_FIRED_ONCE.call_once(|| eprintln!("[laguna_prefill_fused] gate=on rows={seq} n_q={n_q} (softplus gate x attention in one launch per row-head)"));
                 }
                 fused
@@ -3387,14 +3060,13 @@ impl Laguna {
         caches: &mut [&mut C],
     ) -> Result<Tensor> {
         let b = caches.len();
-        anyhow::ensure!(
+        ensure!(
             matches!(b, 1 | 2)
                 && tokens.dtype() == DType::U32
                 && positions.dtype() == DType::I32
                 && tokens.elem_count() == b
                 && positions.elem_count() == b
-                && !self.host_moe()
-                && !self.union_probe.load(std::sync::atomic::Ordering::Relaxed),
+                && !self.union_probe.load(Ordering::Relaxed),
             "prepared B2 decode requires one or two CUDA rows and device MoE routing"
         );
         let mut hidden = self
@@ -3451,7 +3123,7 @@ impl Laguna {
         &self,
         tokens: &Tensor,
         positions: &Tensor,
-        caches: &mut [&mut crate::laguna_fp8::LagunaKvCacheFp8],
+        caches: &mut [&mut LagunaKvCacheFp8],
         rows: usize,
         aux_layers: &[usize],
     ) -> Result<(Tensor, Vec<Tensor>)> {
@@ -3459,7 +3131,7 @@ impl Laguna {
         let m = b
             .checked_mul(rows)
             .ok_or_else(|| anyhow::anyhow!("batch verify row overflow"))?;
-        anyhow::ensure!(
+        ensure!(
             matches!(b, 1 | 2)
                 && matches!(rows, 1 | 3)
                 && m <= MAX_VERIFY_MOE_TOKENS
@@ -3467,11 +3139,10 @@ impl Laguna {
                 && positions.dtype() == DType::I32
                 && tokens.elem_count() == m
                 && positions.elem_count() == m
-                && !self.host_moe()
-                && !self.union_probe.load(std::sync::atomic::Ordering::Relaxed),
+                && !self.union_probe.load(Ordering::Relaxed),
             "prepared speculative B2 requires CUDA M1/M2/M3/M6 and device MoE routing"
         );
-        anyhow::ensure!(
+        ensure!(
             !aux_layers.is_empty()
                 && aux_layers.iter().all(|&i| i < self.layers.len())
                 && aux_layers
@@ -3480,7 +3151,7 @@ impl Laguna {
                     .all(|(i, v)| !aux_layers[..i].contains(v)),
             "batch verify auxiliary layers must be unique valid target layers"
         );
-        static FUSED_M3_M6: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static FUSED_M3_M6: OnceLock<bool> = OnceLock::new();
         let fused_moe = m == 2
             || (matches!(m, 3 | 6)
                 && *FUSED_M3_M6.get_or_init(|| {
@@ -3551,10 +3222,10 @@ impl Laguna {
     ) -> Result<Tensor> {
         let b = tokens.len();
         if b == 0 {
-            anyhow::bail!("Laguna.forward_decode_batched: empty batch");
+            bail!("Laguna.forward_decode_batched: empty batch");
         }
         if positions.len() != b || caches.len() != b {
-            anyhow::bail!(
+            bail!(
                 "Laguna.forward_decode_batched: ragged batch tokens={} positions={} caches={}",
                 b,
                 positions.len(),
@@ -3572,7 +3243,7 @@ impl Laguna {
         for (i, cache) in caches.iter_mut().enumerate() {
             let len = cache.current_len();
             if len != positions[i] {
-                anyhow::bail!(
+                bail!(
                     "Laguna.forward_decode_batched: lane {i} cache len {len} != position {}",
                     positions[i]
                 );
@@ -3624,11 +3295,7 @@ impl Laguna {
         b: usize,
     ) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
-        if b > 1
-            && b <= MAX_VERIFY_MOE_TOKENS
-            && matches!(self.device, Device::Cuda(_))
-            && !self.host_moe()
-        {
+        if b > 1 && b <= MAX_VERIFY_MOE_TOKENS && self.device.is_cuda() {
             if let LagunaFfn::Moe(moe) = &self.layers[idx].ffn {
                 let normed_mlp = self.layers[idx]
                     .post_attention_layernorm
@@ -3665,9 +3332,9 @@ impl Laguna {
 
     #[cfg(feature = "cuda")]
     fn b2_fused_tail_opt_in() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var("NV_LAGUNA_B2_FUSED_TAIL")
+            env::var("NV_LAGUNA_B2_FUSED_TAIL")
                 .map(|v| v == "1")
                 .unwrap_or(false)
         })
@@ -3675,7 +3342,7 @@ impl Laguna {
 
     #[cfg(feature = "cuda")]
     fn prepared_shared_fold_opt_in() -> bool {
-        static LATCHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static LATCHED: OnceLock<bool> = OnceLock::new();
         *LATCHED.get_or_init(|| {
             nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_PREPARED_SHARED_FOLD")
         })
@@ -3696,9 +3363,8 @@ impl Laguna {
         if !Self::b2_fused_tail_opt_in() || !matches!(m, 1 | 2 | 3 | 6) {
             return Ok(None);
         }
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = self.device.clone() else {
+            return Ok(None);
         };
         let grouped = match self.grouped_weights(moe)? {
             Some(w) => w,
@@ -3709,7 +3375,7 @@ impl Laguna {
             return Ok(None);
         }
         let hidden = self.config.hidden_size;
-        anyhow::ensure!(
+        ensure!(
             x_flat.dtype() == DType::BF16
                 && x_flat.is_contiguous()
                 && x_flat.elem_count() == m * hidden
@@ -3718,7 +3384,7 @@ impl Laguna {
                 && residual.elem_count() == m * hidden,
             "prepared fused MoE tail requires contiguous BF16 ({m},{hidden}) input and residual"
         );
-        static FUSED_TAIL_FIRED_ONCE: std::sync::Once = std::sync::Once::new();
+        static FUSED_TAIL_FIRED_ONCE: Once = Once::new();
         FUSED_TAIL_FIRED_ONCE.call_once(|| eprintln!("[laguna_b2_fused_tail] prepared routed MoE rows={m} through the fused small-M route/chain on the folded bank and moe_unpermute_scatter_tail (residual added in the scatter, no separate f32 copy/cast/add)"));
         let mut map = self
             .moe_verify_ctx
@@ -3727,7 +3393,7 @@ impl Laguna {
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let ctx = self.prepared_moe_context(&mut map, m, folds_shared, &dev)?;
         let logits = moe.gate.forward(x_flat)?;
-        anyhow::ensure!(
+        ensure!(
             logits.dtype() == DType::BF16 && logits.elem_count() == m * self.config.num_experts,
             "prepared fused MoE tail requires BF16 ({m},E) router logits"
         );
@@ -3742,8 +3408,8 @@ impl Laguna {
         let bias_ptr = {
             let (st, l) = bias.storage_and_layout();
             let cuda = match &*st {
-                candle_core::Storage::Cuda(c) => c,
-                _ => anyhow::bail!("prepared fused MoE tail: selection bias not CUDA"),
+                Storage::Cuda(c) => c,
+                _ => bail!("prepared fused MoE tail: selection bias not CUDA"),
             };
             let slice = cuda.as_cuda_slice::<f32>()?;
             let view = slice.slice(l.start_offset()..);
@@ -3763,18 +3429,12 @@ impl Laguna {
             None,
             None,
         )?;
-        anyhow::ensure!(
+        ensure!(
             ctx.last_call_used_fused_small_m_route_and_chain(),
             "prepared fused MoE tail: the fused small-M route/chain was not selected for rows={m}"
         );
-        let zero_shared: CudaSlice<f32> = stream
-            .alloc_zeros::<f32>(m * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let mut out: CudaSlice<bf16> = unsafe {
-            stream
-                .alloc::<bf16>(m * hidden)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let zero_shared: CudaSlice<f32> = stream.alloc_zeros::<f32>(m * hidden)?;
+        let mut out: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * hidden)? };
         {
             let (zp, _g0) = zero_shared.device_ptr(&stream);
             let resid_ptr = bf16_ptr(residual, &stream, m * hidden)?;
@@ -3785,16 +3445,16 @@ impl Laguna {
         }
         if count_as_fused_dispatch {
             self.batch_moe_fused_dispatches
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed);
         }
         Ok(Some(wrap_bf16(out, (1usize, m, hidden), &dev)))
     }
 
     #[cfg(feature = "cuda")]
     fn b2_fused_rows_opt_in() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var("NV_LAGUNA_B2_FUSED_ROWS")
+            env::var("NV_LAGUNA_B2_FUSED_ROWS")
                 .map(|v| v == "1")
                 .unwrap_or(false)
         })
@@ -3802,7 +3462,7 @@ impl Laguna {
 
     #[cfg(feature = "cuda")]
     fn spec_fused_rows_opt_in() -> bool {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
             nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_SPEC_FUSED_ROWS")
         })
@@ -3835,9 +3495,8 @@ impl Laguna {
         let hd = self.config.head_dim;
         let n_q = attn.num_heads;
         let n_kv = self.config.num_key_value_heads;
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = self.device.clone() else {
+            return Ok(None);
         };
         let Some((pq, pk, pv, is_fp8)) = attn.m1_qkv_w8_fused(hidden, n_q, n_kv, hd) else {
             return Ok(None);
@@ -3877,28 +3536,18 @@ impl Laguna {
             return Ok(None);
         }
         if speculative {
-            static FIRED: std::sync::Once = std::sync::Once::new();
+            static FIRED: Once = Once::new();
             FIRED.call_once(|| eprintln!("[laguna_spec_fused_rows] shared prepared attention rows={b} qkvg_normed_rows_rstd_fused=true qk_normrope_rows=true gated_o=true fp8_norm_weights={}", layer.input_layernorm.fp8_e4m3_active()));
         } else {
-            static FIRED: std::sync::Once = std::sync::Once::new();
+            static FIRED: Once = Once::new();
             FIRED.call_once(|| eprintln!("[laguna_b2_fused_rows] shared prepared attention rows={b} qkvg_normed_rows_rstd_fused=true qk_normrope_rows=true gated_o=true fp8_norm_weights={}", layer.input_layernorm.fp8_e4m3_active()));
         }
         let s = nv_layers::cuda_stream::current_stream(&dev);
         let x_ptr = bf16_ptr(x_raw, &s, b * hidden)?;
-        let mut q_raw: CudaSlice<bf16> = unsafe {
-            s.alloc::<bf16>(b * n_q * hd)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
-        let mut k_raw: CudaSlice<bf16> = unsafe {
-            s.alloc::<bf16>(b * n_kv * hd)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
-        let mut v_dev: CudaSlice<bf16> = unsafe {
-            s.alloc::<bf16>(b * n_kv * hd)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
-        let mut g_dev: CudaSlice<bf16> =
-            unsafe { s.alloc::<bf16>(b * n_q).map_err(|e| anyhow::anyhow!(e))? };
+        let mut q_raw: CudaSlice<bf16> = unsafe { s.alloc::<bf16>(b * n_q * hd)? };
+        let mut k_raw: CudaSlice<bf16> = unsafe { s.alloc::<bf16>(b * n_kv * hd)? };
+        let mut v_dev: CudaSlice<bf16> = unsafe { s.alloc::<bf16>(b * n_kv * hd)? };
+        let mut g_dev: CudaSlice<bf16> = unsafe { s.alloc::<bf16>(b * n_q)? };
         {
             let (bq, sq) = (w8_bytes_ptr(pq, &s), w8_scale_ptr(pq, &s));
             let (bk, sk) = (w8_bytes_ptr(pk, &s), w8_scale_ptr(pk, &s));
@@ -3914,7 +3563,7 @@ impl Laguna {
                     if let Some((norm_weight, norm_scale, width)) =
                         layer.input_layernorm.fp8_e4m3_weight_and_scale()
                     {
-                        anyhow::ensure!(width == hidden && norm_weight.len() == hidden && norm_scale.len() == 1,
+                        ensure!(width == hidden && norm_weight.len() == hidden && norm_scale.len() == 1,
                             "prepared attention FP8 input norm storage does not match hidden={hidden}");
                         let (wn, _norm_read) = norm_weight.device_ptr(&s);
                         let (sn, _norm_scale_read) = norm_scale.device_ptr(&s);
@@ -3999,7 +3648,7 @@ impl Laguna {
                     )
                 }
             };
-            anyhow::ensure!(
+            ensure!(
                 rc == 0,
                 "prepared B2 fused rows qkvg gemv rc={rc} layer {layer_idx} rows {b}"
             );
@@ -4010,8 +3659,8 @@ impl Laguna {
         let f32_ptr = |t: &Tensor| -> Result<u64> {
             let (st, l) = t.storage_and_layout();
             let cuda = match &*st {
-                candle_core::Storage::Cuda(c) => c,
-                _ => anyhow::bail!("prepared B2 fused rows: rope table not CUDA"),
+                Storage::Cuda(c) => c,
+                _ => bail!("prepared B2 fused rows: rope table not CUDA"),
             };
             let slice = cuda.as_cuda_slice::<f32>()?;
             let view = slice.slice(l.start_offset()..);
@@ -4023,22 +3672,16 @@ impl Laguna {
         let pos_ptr = {
             let (st, l) = positions.storage_and_layout();
             let cuda = match &*st {
-                candle_core::Storage::Cuda(c) => c,
-                _ => anyhow::bail!("prepared B2 fused rows: positions not CUDA"),
+                Storage::Cuda(c) => c,
+                _ => bail!("prepared B2 fused rows: positions not CUDA"),
             };
             let slice = cuda.as_cuda_slice::<i32>()?;
             let view = slice.slice(l.start_offset()..l.start_offset() + b);
             let (p, _g) = view.device_ptr(&s);
             p
         };
-        let mut q_rot: CudaSlice<bf16> = unsafe {
-            s.alloc::<bf16>(b * n_q * hd)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
-        let mut k_rot: CudaSlice<bf16> = unsafe {
-            s.alloc::<bf16>(b * n_kv * hd)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut q_rot: CudaSlice<bf16> = unsafe { s.alloc::<bf16>(b * n_q * hd)? };
+        let mut k_rot: CudaSlice<bf16> = unsafe { s.alloc::<bf16>(b * n_kv * hd)? };
         {
             let (qi, _g1) = q_raw.device_ptr(&s);
             let (ki, _g2) = k_raw.device_ptr(&s);
@@ -4050,7 +3693,7 @@ impl Laguna {
                     attn.k_norm.fp8_e4m3_weight_and_scale(),
                 ) {
                     (Some((qw, qs, qh)), Some((kw, ks, kh))) => {
-                        anyhow::ensure!(
+                        ensure!(
                             qh == hd
                                 && kh == hd
                                 && qw.len() == hd
@@ -4110,12 +3753,10 @@ impl Laguna {
                             b as i32,
                         )
                     }
-                    _ => anyhow::bail!(
-                        "prepared attention Q/K norms must use the same weight format"
-                    ),
+                    _ => bail!("prepared attention Q/K norms must use the same weight format"),
                 }
             };
-            anyhow::ensure!(
+            ensure!(
                 rc == 0,
                 "prepared fused rows normrope rc={rc} layer {layer_idx} rows={b}"
             );
@@ -4136,10 +3777,7 @@ impl Laguna {
             attn_out.to_dtype(DType::BF16)?.contiguous()?
         };
         let a_ptr = bf16_ptr(&attn_out, &s, b * n_q * hd)?;
-        let mut o_out: CudaSlice<bf16> = unsafe {
-            s.alloc::<bf16>(b * hidden)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut o_out: CudaSlice<bf16> = unsafe { s.alloc::<bf16>(b * hidden)? };
         {
             let (wo, so) = (w8_bytes_ptr(o8, &s), w8_scale_ptr(o8, &s));
             let (gp, _g0) = g_dev.device_ptr(&s);
@@ -4160,7 +3798,7 @@ impl Laguna {
                     b as i32,
                 )
             };
-            anyhow::ensure!(
+            ensure!(
                 rc == 0,
                 "prepared B2 fused rows gated o_proj gemv rc={rc} layer {layer_idx} rows {b}"
             );
@@ -4284,7 +3922,7 @@ impl Laguna {
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
-        caches: &mut [&mut crate::laguna_fp8::LagunaKvCacheFp8],
+        caches: &mut [&mut LagunaKvCacheFp8],
         b: usize,
         rows_per_lane: usize,
     ) -> Result<Vec<Tensor>> {
@@ -4328,7 +3966,7 @@ impl Laguna {
         layer_idx: usize,
         x: &Tensor,
         positions: &Tensor,
-        caches: &mut [&mut crate::laguna_fp8::LagunaKvCacheFp8],
+        caches: &mut [&mut LagunaKvCacheFp8],
         b: usize,
         rows_per_lane: usize,
     ) -> Result<Tensor> {
@@ -4419,7 +4057,6 @@ impl LagunaEmbedding for Laguna {
 }
 
 impl LagunaLayer {
-    #[allow(clippy::too_many_arguments)]
     fn from_loader(
         config: &LagunaConfig,
         idx: usize,
@@ -4523,12 +4160,8 @@ impl LagunaLayer {
         #[cfg(feature = "cuda")]
         let w8 = {
             let fp8 =
-                attn_fp8_default_on_since_round_82_set_the_key_to_0_for_the_pre_round_82_bf16_projections();
-            if (fp8
-                || attn_w8_int8_arm_was_chosen_explicitly_and_therefore_outranks_the_fp8_default())
-                && matches!(device, Device::Cuda(_))
-                && dtype == DType::BF16
-            {
+                !attn_w8_int8_arm_was_chosen_explicitly_and_therefore_outranks_the_fp8_default();
+            if device.is_cuda() && dtype == DType::BF16 {
                 let gate_weight_for_the_fused_marlin_twin = match config.gating {
                     LagunaGating::PerHead if fp8 && nv_layers::linear::marlin_fp8_rows_env_on() => {
                         Some(load_linear_weight(
@@ -4731,7 +4364,6 @@ impl LagunaLayer {
 
 pub(crate) const SLIDING_COMPACT_SLACK: usize = 256;
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn sliding_write_at(
     k_buf: &Tensor,
     v_buf: &Tensor,
@@ -4760,9 +4392,7 @@ pub(crate) fn sliding_write_at(
         stored = keep;
     }
     if stored + t > cap {
-        anyhow::bail!(
-            "laguna kv: sliding layer {layer} write of {t} tokens exceeds capacity {cap}"
-        );
+        bail!("laguna kv: sliding layer {layer} write of {t} tokens exceeds capacity {cap}");
     }
     let end = stored + t;
     let k_updated = k_buf.slice_assign(&[0..1, stored..end, 0..n_kv, 0..head_dim], k_new)?;
@@ -4848,10 +4478,8 @@ impl LagunaKvCache {
         dtype: DType,
         prefill_chunk: usize,
     ) -> Result<Self> {
-        let ring = cfg!(feature = "cuda")
-            && matches!(device, Device::Cuda(_))
-            && dtype == DType::BF16
-            && !nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_HOST_KV");
+        let ring =
+            cfg!(feature = "cuda") && device.is_cuda() && dtype == DType::BF16;
         Self::new_with_mode_and_prefill_chunk(
             config,
             max_seq_len,
@@ -4889,7 +4517,7 @@ impl LagunaKvCache {
         ring: bool,
         prefill_chunk: usize,
     ) -> Result<Self> {
-        anyhow::ensure!(
+        ensure!(
             matches!(prefill_chunk, 256 | 512 | 1024 | 2048 | 4096 | 8192),
             "invalid Laguna prefill capacity {prefill_chunk}"
         );
@@ -4923,19 +4551,18 @@ impl LagunaKvCache {
 
         #[cfg(feature = "cuda")]
         let ring_state = if ring {
-            let dev = match device {
-                Device::Cuda(d) => d.clone(),
-                _ => anyhow::bail!("LagunaKvCache ring mode requires a CUDA device"),
+            let Device::Cuda(dev) = device.clone() else {
+                bail!("LagunaKvCache ring mode requires a CUDA device")
             };
             if dtype != DType::BF16 {
-                anyhow::bail!("LagunaKvCache ring mode requires BF16, got {dtype:?}");
+                bail!("LagunaKvCache ring mode requires BF16, got {dtype:?}");
             }
             let mut s_cap = 0usize;
             let mut s_window = 0usize;
             for (cap, window) in layer_caps.iter().zip(layer_windows.iter()) {
                 if let Some(w) = window {
                     if s_cap != 0 && (s_cap != *cap || s_window != *w) {
-                        anyhow::bail!(
+                        bail!(
                             "LagunaKvCache ring mode requires uniform sliding layers \
                              (cap {}/{} window {}/{})",
                             s_cap,
@@ -4949,9 +4576,7 @@ impl LagunaKvCache {
                 }
             }
             let stream = nv_layers::cuda_stream::current_stream(&dev);
-            let meta_dev = stream
-                .alloc_zeros::<i32>(4)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let meta_dev = stream.alloc_zeros::<i32>(4)?;
             Some(LagunaKvRing {
                 dev,
                 meta_dev,
@@ -4969,7 +4594,7 @@ impl LagunaKvCache {
         };
         #[cfg(not(feature = "cuda"))]
         if ring {
-            anyhow::bail!("LagunaKvCache ring mode requires the cuda feature");
+            bail!("LagunaKvCache ring mode requires the cuda feature");
         }
 
         Ok(Self {
@@ -5010,11 +4635,11 @@ impl LagunaKvCache {
             .ring
             .as_ref()
             .context("BF16 handoff requires a CUDA ring cache")?;
-        anyhow::ensure!(
+        ensure!(
             !ring.ring_attn,
             "BF16 handoff requires compacting sliding storage; NV_LAGUNA_RING_ATTN is unsupported"
         );
-        anyhow::ensure!(
+        ensure!(
             self.current_len > 0
                 && self.current_len <= self.max_seq_len
                 && ring.full_stored == self.current_len
@@ -5022,7 +4647,7 @@ impl LagunaKvCache {
                 && ring.s_stored <= self.current_len,
             "BF16 handoff requires a completed, nonempty cache frontier"
         );
-        anyhow::ensure!(
+        ensure!(
             self.layers.len() == self.layer_windows.len()
                 && self.layers.len() == self.layer_stored.len()
                 && self.layers.len() == self.layer_caps.len(),
@@ -5039,7 +4664,7 @@ impl LagunaKvCache {
             } else {
                 self.max_seq_len
             };
-            anyhow::ensure!(
+            ensure!(
                 self.layer_stored[layer] == stored && self.layer_caps[layer] == cap,
                 "BF16 handoff layer {layer} is not initialized through the committed frontier"
             );
@@ -5106,7 +4731,7 @@ impl LagunaKvCache {
             return Ok(());
         }
         if n > self.current_len {
-            anyhow::bail!(
+            bail!(
                 "LagunaKvCache.rollback: n {} > current_len {}",
                 n,
                 self.current_len
@@ -5114,7 +4739,7 @@ impl LagunaKvCache {
         }
         for (layer, stored) in self.layer_stored.iter_mut().enumerate() {
             if *stored < n {
-                anyhow::bail!(
+                bail!(
                     "LagunaKvCache.rollback: layer {layer} stored {} < n {}",
                     *stored,
                     n
@@ -5125,7 +4750,7 @@ impl LagunaKvCache {
         #[cfg(feature = "cuda")]
         if let Some(ring) = self.ring.as_mut() {
             if ring.full_stored < n || (ring.s_cap > 0 && ring.s_stored < n) {
-                anyhow::bail!(
+                bail!(
                     "LagunaKvCache.rollback: ring stored underflow (full {}, sliding {}, n {})",
                     ring.full_stored,
                     ring.s_stored,
@@ -5192,7 +4817,6 @@ impl LagunaKvCache {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn ring_prepare_decode_meta(
     cache_name: &str,
     ring_name: &str,
@@ -5207,10 +4831,10 @@ pub(crate) fn ring_prepare_decode_meta(
     mut shift_windowed_layers: impl FnMut(usize, usize) -> Result<()>,
 ) -> Result<()> {
     if n_total < write_pos {
-        anyhow::bail!("{cache_name}.prepare_for_decode: n_total {n_total} < write_pos {write_pos}");
+        bail!("{cache_name}.prepare_for_decode: n_total {n_total} < write_pos {write_pos}");
     }
     if n_total > max_seq_len {
-        anyhow::bail!(
+        bail!(
             "{cache_name}.prepare_for_decode: n_total {n_total} exceeds max_seq_len {max_seq_len}"
         );
     }
@@ -5227,7 +4851,7 @@ pub(crate) fn ring_prepare_decode_meta(
             *s_stored = keep;
         }
         if *s_stored + n_new > s_cap {
-            anyhow::bail!("{ring_name}: write of {n_new} tokens exceeds sliding capacity {s_cap}");
+            bail!("{ring_name}: write of {n_new} tokens exceeds sliding capacity {s_cap}");
         }
         slot = *s_stored;
         *s_stored += n_new;
@@ -5241,7 +4865,7 @@ pub(crate) fn ring_prepare_decode_meta(
 
 #[cfg(feature = "cuda")]
 pub(crate) fn shift_rows_launch(
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    stream: &std::sync::Arc<CudaStream>,
     buf: &Tensor,
     shift: usize,
     keep: usize,
@@ -5251,8 +4875,8 @@ pub(crate) fn shift_rows_launch(
     use cudarc::driver::DevicePtr;
     let (st, l) = buf.storage_and_layout();
     let cuda = match &*st {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("kv shift: buffer must be on CUDA"),
+        Storage::Cuda(s) => s,
+        _ => bail!("kv shift: buffer must be on CUDA"),
     };
     let slice = cuda
         .as_cuda_slice::<half::bf16>()?
@@ -5273,7 +4897,7 @@ pub(crate) fn shift_rows_launch(
             )
         };
         if rc != 0 {
-            anyhow::bail!("kv_shift_bf16 rc={rc}");
+            bail!("kv_shift_bf16 rc={rc}");
         }
         off += n;
     }
@@ -5281,9 +4905,8 @@ pub(crate) fn shift_rows_launch(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn ring_append_launch(
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    stream: &std::sync::Arc<CudaStream>,
     src: &Tensor,
     dst: &Tensor,
     meta_dev: &cudarc::driver::CudaSlice<i32>,
@@ -5297,12 +4920,12 @@ pub(crate) fn ring_append_launch(
     let (src_st, src_l) = src.storage_and_layout();
     let (dst_st, dst_l) = dst.storage_and_layout();
     let src_cuda = match &*src_st {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("ring append: src must be on CUDA"),
+        Storage::Cuda(s) => s,
+        _ => bail!("ring append: src must be on CUDA"),
     };
     let dst_cuda = match &*dst_st {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("ring append: dst must be on CUDA"),
+        Storage::Cuda(s) => s,
+        _ => bail!("ring append: dst must be on CUDA"),
     };
     let src_slice = src_cuda
         .as_cuda_slice::<half::bf16>()?
@@ -5327,7 +4950,7 @@ pub(crate) fn ring_append_launch(
         )
     };
     if rc != 0 {
-        anyhow::bail!("kv_ring_append_bf16 rc={rc}");
+        bail!("kv_ring_append_bf16 rc={rc}");
     }
     Ok(())
 }
@@ -5385,13 +5008,13 @@ impl Gemma4Cache for LagunaKvCache {
         let head_dim = self.head_dim;
         let dims = k_new.dims();
         if dims.len() != 4 || dims[0] != 1 || dims[2] != n_kv || dims[3] != head_dim {
-            anyhow::bail!(
+            bail!(
                 "LagunaKvCache.write_at layer {layer}: expected [1, t, {n_kv}, {head_dim}], got {:?}",
                 dims
             );
         }
         if v_new.dims() != dims {
-            anyhow::bail!(
+            bail!(
                 "LagunaKvCache.write_at: k/v shape mismatch k={:?} v={:?}",
                 dims,
                 v_new.dims()
@@ -5425,7 +5048,7 @@ impl Gemma4Cache for LagunaKvCache {
         let start = self.pending_write_pos;
         let end = start + t;
         if end > self.max_seq_len {
-            anyhow::bail!(
+            bail!(
                 "LagunaKvCache.write_at: end {} exceeds max_seq_len {}",
                 end,
                 self.max_seq_len
@@ -5440,7 +5063,7 @@ impl Gemma4Cache for LagunaKvCache {
     }
     fn view(&mut self, layer: usize, _len: usize) -> Result<(Tensor, Tensor)> {
         if layer >= self.layers.len() {
-            anyhow::bail!("LagunaKvCache.view: layer {layer} out of range");
+            bail!("LagunaKvCache.view: layer {layer} out of range");
         }
         #[cfg(feature = "cuda")]
         if let Some(ring) = self.ring.as_ref() {
@@ -5471,22 +5094,22 @@ impl Gemma4Cache for LagunaKvCache {
         if !nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_PREFILL_FLASHINFER") {
             return Ok(None);
         }
-        anyhow::ensure!(
+        ensure!(
             layer < self.layers.len(),
             "Laguna full-prefill layer {layer} out of range"
         );
-        anyhow::ensure!(
+        ensure!(
             sliding_window.is_none(),
             "Laguna full-prefill FlashInfer route only supports full attention"
         );
-        anyhow::ensure!(
+        ensure!(
             self.n_kv == 8 && self.head_dim == 128 && n_q == 48,
             "Laguna full-prefill FlashInfer route requires 48 Q heads, 8 KV heads and head dimension 128, got {n_q}/{}/{}",
             self.n_kv,
             self.head_dim
         );
         let expected_scale = (self.head_dim as f32).powf(-0.5);
-        anyhow::ensure!(
+        ensure!(
             (scaling - expected_scale).abs() <= f32::EPSILON,
             "Laguna full-prefill FlashInfer route requires scale {expected_scale}, got {scaling}"
         );
@@ -5495,7 +5118,7 @@ impl Gemma4Cache for LagunaKvCache {
             Some(ring) => ring.full_stored,
             None => self.layer_stored[layer],
         };
-        anyhow::ensure!(
+        ensure!(
             kv_len >= seq,
             "Laguna full-prefill KV length {kv_len} is shorter than query length {seq}"
         );
@@ -5517,9 +5140,6 @@ impl Gemma4Cache for LagunaKvCache {
         scaling: f32,
     ) -> Result<Option<Tensor>> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
-        if !crate::laguna_step_graph::m1_flash_enabled() {
-            return Ok(None);
-        }
         let head_dim = self.head_dim;
         let n_kv = self.n_kv;
         if head_dim != 128 || n_kv == 0 || !n_q.is_multiple_of(n_kv) || !matches!(n_q / n_kv, 6 | 8)
@@ -5534,7 +5154,7 @@ impl Gemma4Cache for LagunaKvCache {
         }
         let expected = n_q * head_dim;
         let total: usize = q_rot.dims().iter().product();
-        anyhow::ensure!(
+        ensure!(
             total == expected,
             "try_decode_attention_gqa layer {layer}: expected {expected} elements, got {:?}",
             q_rot.dims()
@@ -5554,16 +5174,12 @@ impl Gemma4Cache for LagunaKvCache {
         let ring = self.ring.as_ref().unwrap();
         let (scratch, fan_in) = self.gqa_bufs.as_mut().unwrap();
 
-        let mut out = unsafe {
-            stream
-                .alloc::<half::bf16>(expected)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut out = unsafe { stream.alloc::<half::bf16>(expected)? };
         let q_c = q_rot.contiguous()?;
         let (q_st, ql) = q_c.storage_and_layout();
         let q_cuda = match &*q_st {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("q_rot must be on CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("q_rot must be on CUDA"),
         };
         let q_view = q_cuda
             .as_cuda_slice::<half::bf16>()?
@@ -5572,12 +5188,12 @@ impl Gemma4Cache for LagunaKvCache {
         let (k_st, kl) = k_buf.storage_and_layout();
         let (v_st, vl) = v_buf.storage_and_layout();
         let k_cuda = match &*k_st {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("kv ring buffers must be on CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("kv ring buffers must be on CUDA"),
         };
         let v_cuda = match &*v_st {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("kv ring buffers must be on CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("kv ring buffers must be on CUDA"),
         };
         let k_view = k_cuda
             .as_cuda_slice::<half::bf16>()?
@@ -5617,13 +5233,13 @@ impl Gemma4Cache for LagunaKvCache {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "laguna_flash_decode_gqa rc={rc}");
+        ensure!(rc == 0, "laguna_flash_decode_gqa rc={rc}");
         drop(q_st);
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+        let storage = CudaStorage::wrap_cuda_slice(out, dev);
         let tensor = candle_core::Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, 1usize, n_q, head_dim),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         Ok(Some(tensor))
@@ -5658,23 +5274,19 @@ impl Gemma4Cache for LagunaKvCache {
             let expected = n_q * head_dim;
             let total: usize = q_rot.dims().iter().product();
             if total != expected {
-                anyhow::bail!(
+                bail!(
                     "LagunaKvCache.try_decode_attention_ring layer {layer}: expected {expected} \
                      elements, got dims {:?}",
                     q_rot.dims()
                 );
             }
             let stream = nv_layers::cuda_stream::current_stream(&ring.dev);
-            let mut out = unsafe {
-                stream
-                    .alloc::<half::bf16>(expected)
-                    .map_err(|e| anyhow::anyhow!(e))?
-            };
+            let mut out = unsafe { stream.alloc::<half::bf16>(expected)? };
             let q_c = q_rot.contiguous()?;
             let (q_st, ql) = q_c.storage_and_layout();
             let q_cuda = match &*q_st {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("q_rot must be on CUDA"),
+                Storage::Cuda(s) => s,
+                _ => bail!("q_rot must be on CUDA"),
             };
             let q_view = q_cuda
                 .as_cuda_slice::<half::bf16>()?
@@ -5683,12 +5295,12 @@ impl Gemma4Cache for LagunaKvCache {
             let (k_st, kl) = k_buf.storage_and_layout();
             let (v_st, vl) = v_buf.storage_and_layout();
             let k_cuda = match &*k_st {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("kv ring buffers must be on CUDA"),
+                Storage::Cuda(s) => s,
+                _ => bail!("kv ring buffers must be on CUDA"),
             };
             let v_cuda = match &*v_st {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("kv ring buffers must be on CUDA"),
+                Storage::Cuda(s) => s,
+                _ => bail!("kv ring buffers must be on CUDA"),
             };
             let k_view = k_cuda
                 .as_cuda_slice::<half::bf16>()?
@@ -5722,15 +5334,15 @@ impl Gemma4Cache for LagunaKvCache {
                 }
             };
             if rc != 0 {
-                anyhow::bail!("attention_bf16_decode_ring rc={rc}");
+                bail!("attention_bf16_decode_ring rc={rc}");
             }
             drop(q_st);
             let dev = ring.dev.clone();
-            let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+            let storage = CudaStorage::wrap_cuda_slice(out, dev);
             let tensor = candle_core::Tensor::from_storage(
-                candle_core::Storage::Cuda(storage),
+                Storage::Cuda(storage),
                 (1usize, 1usize, n_q, head_dim),
-                candle_core::op::BackpropOp::none(),
+                BackpropOp::none(),
                 false,
             );
             Ok(Some(tensor))
@@ -5773,7 +5385,6 @@ impl CausalLm for LoadedLaguna {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_partial_rope_scaled(
     q: &Tensor,
     k: &Tensor,
@@ -5831,7 +5442,6 @@ pub(crate) fn softplus_f32(x: &Tensor) -> Result<Tensor> {
     relu.add(&log1p).map_err(Into::into)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention(
     q: &Tensor,
     k: &Tensor,
@@ -5844,7 +5454,7 @@ pub(crate) fn attention(
     window: Option<usize>,
 ) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
-    if matches!(q.device(), Device::Cuda(_)) {
+    if q.device().is_cuda() {
         use nv_layers::attn::{flash_attn_windowed, AttnConfig};
         let cfg = AttnConfig {
             num_heads: n_q,
@@ -5860,7 +5470,6 @@ pub(crate) fn attention(
     sdpa_windowed(q, k, v, n_q, n_kv, head_dim, seq_q, scale, window)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn sdpa_windowed(
     q: &Tensor,
     k: &Tensor,
@@ -5956,7 +5565,7 @@ fn load_laguna_rmsnorm(
     let weight = weights
         .get(name, dtype)
         .with_context(|| format!("load {name}"))?;
-    anyhow::ensure!(
+    ensure!(
         weight.dims() == [dim],
         "{name}: expected [{dim}], got {:?}",
         weight.dims()
@@ -5982,7 +5591,7 @@ fn load_linear_weight(
         .with_context(|| format!("load {name}"))?;
     let d = w.dims();
     if d.len() != 2 || d[0] != out_features || d[1] != in_features {
-        anyhow::bail!(
+        bail!(
             "linear {name}: expected [{}, {}], got {:?}",
             out_features,
             in_features,
@@ -6002,18 +5611,15 @@ pub(crate) fn load_linear_from_tensor_maybe_fp8(
         let (weight_u8, weight_scale_dev) =
             nv_layers::lm_head_resident_quant::rowquant_e4m3_dev(&weight)?;
         let (out_features, in_features) = weight.dims2()?;
-        anyhow::ensure!(
+        ensure!(
             weight_u8.len() == weight.elem_count() && weight_scale_dev.len() == out_features,
             "Laguna FP8 linear requires one byte per weight and one scale per output row"
         );
         let Device::Cuda(dev) = device else {
-            anyhow::bail!("Laguna FP8 linear requires CUDA");
+            bail!("Laguna FP8 linear requires CUDA");
         };
         let stream = nv_layers::cuda_stream::current_stream(dev);
-        #[allow(deprecated)]
-        let weight_scale_rows = stream
-            .memcpy_dtov(&weight_scale_dev)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let weight_scale_rows = stream.clone_dtoh(&weight_scale_dev)?;
         return Linear::new_fp8_e4m3_row_scales_without_the_cublaslt_probe(
             weight_u8,
             weight_scale_rows,
@@ -6029,7 +5635,6 @@ pub(crate) fn load_linear_from_tensor_maybe_fp8(
     Linear::new(weight, None)
 }
 
-#[allow(clippy::too_many_arguments)]
 #[cfg(feature = "cuda")]
 const SHARED_EXPERT_GEMV_ROWS_8_MATCHES_THE_VERIFY_BLOCK_AND_THE_MROWS_LADDER: usize = 8;
 
@@ -6073,10 +5678,6 @@ fn load_linear_expert(
         device,
     )
 }
-
-#[cfg(all(test, feature = "cuda"))]
-#[path = "laguna/grouped_residency_tests.rs"]
-mod grouped_residency_tests;
 
 #[cfg(test)]
 mod tests {
@@ -6129,22 +5730,6 @@ mod tests {
     }"#;
 
     #[test]
-    fn config_parses() {
-        let cfg = LagunaConfig::from_hf_json_str(TEST_CONFIG).unwrap();
-        assert_eq!(cfg.num_hidden_layers, 4);
-        assert_eq!(cfg.gating, LagunaGating::PerHead);
-        assert_eq!(cfg.layer_kind(0), LayerType::FullAttention);
-        assert_eq!(cfg.layer_kind(1), LayerType::SlidingAttention);
-        assert!(!cfg.is_moe_layer(0));
-        assert!(cfg.is_moe_layer(1));
-        assert_eq!(cfg.rotary_dim_full(), 4);
-        assert_eq!(cfg.rotary_dim_sliding(), 8);
-        assert_eq!(cfg.eos_token_id, vec![2, 24]);
-        assert!((cfg.full_attention_factor() - 1.3465736).abs() < 1e-6);
-        assert!((cfg.moe_routed_scaling_factor - 2.5).abs() < 1e-6);
-    }
-
-    #[test]
     fn yarn_inv_freq_interpolates_low_frequencies() {
         let params = LagunaRopeParams {
             rope_theta: 500000.0,
@@ -6176,26 +5761,6 @@ mod tests {
         );
         for w in yarn.windows(2) {
             assert!(w[1] < w[0], "inv_freq must be strictly decreasing");
-        }
-    }
-
-    #[test]
-    fn softplus_matches_reference() {
-        let device = Device::Cpu;
-        let xs = vec![-30.0f32, -2.0, -0.5, 0.0, 0.5, 2.0, 30.0, 90.0];
-        let t = Tensor::from_vec(xs.clone(), xs.len(), &device).unwrap();
-        let out = softplus_f32(&t).unwrap().to_vec1::<f32>().unwrap();
-        for (x, y) in xs.iter().zip(out.iter()) {
-            let expected = if *x > 20.0 {
-                *x
-            } else {
-                (1.0 + (*x as f64).exp()).ln() as f32
-            };
-            assert!(
-                (y - expected).abs() < 1e-4,
-                "softplus({x}) = {y}, expected {expected}"
-            );
-            assert!(y.is_finite());
         }
     }
 
@@ -6260,86 +5825,6 @@ mod tests {
     }
 
     #[test]
-    fn grouped_only_host_mode_refuses_without_changing_state() {
-        let device = Device::Cpu;
-        let cfg = LagunaConfig::from_hf_json_str(TEST_CONFIG).unwrap();
-        let mut model = build_tiny_model(&cfg, &device);
-        model.set_host_moe(false).unwrap();
-        model.set_host_moe(true).unwrap();
-        model.set_host_moe(false).unwrap();
-        let moe = model
-            .layers
-            .iter_mut()
-            .find_map(|l| match &mut l.ffn {
-                LagunaFfn::Moe(m) => Some(m),
-                _ => None,
-            })
-            .unwrap();
-        drop(std::mem::take(&mut moe.experts));
-        let error = model.set_host_moe(true).unwrap_err().to_string();
-        assert!(error.contains("host MoE is unavailable"), "{error}");
-        assert!(
-            !model.host_moe(),
-            "refused mode must not mutate the prior state"
-        );
-        model.set_host_moe(false).unwrap();
-    }
-
-    #[test]
-    fn moe_router_weights_are_unbiased_and_normalized() {
-        let device = Device::Cpu;
-        let moe = make_moe(&device);
-        let x = Tensor::from_vec(
-            (0..16)
-                .map(|i| (i as f32 * 0.3).cos())
-                .collect::<Vec<f32>>(),
-            (2usize, 8usize),
-            &device,
-        )
-        .unwrap();
-        let out = moe.forward(&x).unwrap();
-        assert_eq!(out.dims(), &[2, 8]);
-
-        let logits = moe.gate.forward(&x).unwrap().to_dtype(DType::F32).unwrap();
-        let scores = candle_nn::ops::sigmoid(&logits).unwrap();
-        let scores_host: Vec<Vec<f32>> = scores.to_vec2().unwrap();
-        for row in &scores_host {
-            let mut sorted: Vec<f32> = row.clone();
-            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
-            let top_sum: f32 = sorted[..2].iter().sum();
-            assert!(top_sum > 0.0);
-        }
-    }
-
-    #[test]
-    fn moe_selection_bias_changes_expert_choice_but_not_weight_source() {
-        let device = Device::Cpu;
-        let mut moe = make_moe(&device);
-        let x = Tensor::from_vec(
-            (0..8).map(|i| (i as f32 * 0.3).cos()).collect::<Vec<f32>>(),
-            (1usize, 8usize),
-            &device,
-        )
-        .unwrap();
-        let out_unbiased = moe.forward(&x).unwrap().to_vec2::<f32>().unwrap();
-
-        let bias =
-            Tensor::from_vec(vec![100.0f32, 100.0, 0.0, 0.0], (1usize, 4usize), &device).unwrap();
-        moe.selection_bias = bias;
-        let out_biased = moe.forward(&x).unwrap().to_vec2::<f32>().unwrap();
-
-        let diff: f32 = out_unbiased[0]
-            .iter()
-            .zip(out_biased[0].iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-        assert!(
-            diff > 1e-6,
-            "large selection bias must redirect routing to experts 0/1"
-        );
-    }
-
-    #[test]
     fn sdpa_windowed_masks_out_of_window_keys() {
         let device = Device::Cpu;
         let seq = 6usize;
@@ -6373,7 +5858,7 @@ mod tests {
     }
 
     #[test]
-    fn prefill_chunk_limits_and_canonical_tail_are_bounded() {
+    fn prefill_chunk_limits_canonical_tail_sliding_capacity_and_sliding_layer_storage_are_bounded() {
         for value in [
             "",
             "0",
@@ -6413,10 +5898,7 @@ mod tests {
                 }
             }
         }
-    }
 
-    #[test]
-    fn prefill_chunk_sliding_capacity_compacts_and_rejects_oversized_writes() {
         let cfg = LagunaConfig::from_hf_json_str(TEST_CONFIG).unwrap();
         let n_kv = cfg.num_key_value_heads;
         let hd = cfg.head_dim;
@@ -6462,10 +5944,7 @@ mod tests {
             16384
         )
         .is_err());
-    }
 
-    #[test]
-    fn kv_cache_sliding_layer_is_bounded() {
         let cfg = LagunaConfig::from_hf_json_str(TEST_CONFIG).unwrap();
         let device = Device::Cpu;
         let mut cache = LagunaKvCache::new(&cfg, 4096, &device, DType::F32).unwrap();
@@ -6487,6 +5966,7 @@ mod tests {
         assert!(cache.layer_stored[1] <= 8 + SLIDING_COMPACT_SLACK);
         let (k1, _) = cache.view(1, 600).unwrap();
         assert!(k1.dims()[1] <= 8 + SLIDING_COMPACT_SLACK);
+
     }
 
     #[test]
@@ -6519,7 +5999,9 @@ mod tests {
                 model.new_kv_cache(64).is_err(),
                 "serving guard must remain enforced"
             );
-            assert!(LagunaKvCache::new_with_mode(&cfg, 64, &Device::Cpu, DType::F32, false).is_err());
+            assert!(
+                LagunaKvCache::new_with_mode(&cfg, 64, &Device::Cpu, DType::F32, false).is_err()
+            );
         }
         let mut state = model.new_study_capture_state(0, 64).unwrap();
         let (tokens, calls, chunks) = model
@@ -6539,31 +6021,6 @@ mod tests {
             .all(|value| value.is_finite()));
         assert_eq!(std::env::var("NV_LAGUNA_FP8_KV").unwrap(), "1");
         assert_eq!(std::env::var("NV_LAGUNA_FP8_UNIT_SCALE").unwrap(), "1");
-    }
-
-    #[test]
-    fn tiny_model_forward_shapes() {
-        let cfg = LagunaConfig::from_hf_json_str(TEST_CONFIG).unwrap();
-        let device = Device::Cpu;
-        let model = build_tiny_model(&cfg, &device);
-        let tokens = Tensor::from_vec(vec![1u32, 5, 9], (1usize, 3usize), &device).unwrap();
-        let positions = Tensor::from_vec(vec![0u32, 1, 2], 3usize, &device).unwrap();
-        let mut cache = model.new_kv_cache(64).unwrap();
-        let logits = model
-            .forward_with_cache(&tokens, &positions, &mut cache)
-            .unwrap();
-        assert_eq!(logits.dims(), &[1, 3, cfg.vocab_size]);
-        assert_eq!(cache.current_len(), 3);
-
-        let next = Tensor::from_vec(vec![2u32], (1usize, 1usize), &device).unwrap();
-        let next_pos = Tensor::from_vec(vec![3u32], 1usize, &device).unwrap();
-        let logits2 = model
-            .forward_with_cache(&next, &next_pos, &mut cache)
-            .unwrap();
-        assert_eq!(logits2.dims(), &[1, 1, cfg.vocab_size]);
-        assert_eq!(cache.current_len(), 4);
-        let host = logits2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert!(host.iter().all(|x| x.is_finite()));
     }
 
     #[test]
@@ -6661,7 +6118,6 @@ mod tests {
         assert_eq!(reference.layer_windows, candidate.layer_windows);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn assert_prefill_head_omission(
         model: &Laguna,
         reference: &mut LagunaKvCache,
@@ -6816,550 +6272,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore = "loads Laguna NVFP4; set NV_LAGUNA_TEST=1, NV_LAGUNA_DIR and NV_LAGUNA_PREFILL_SKIP_INTERMEDIATE_HEAD=1"]
-    fn real_intermediate_prefill_heads_preserve_full_outputs_after_graph_reuse() {
-        assert_eq!(
-            std::env::var("NV_LAGUNA_TEST").as_deref(),
-            Ok("1"),
-            "real-weight gate must not silently skip"
-        );
-        assert!(
-            Laguna::prefill_skip_intermediate_head_enabled(),
-            "set NV_LAGUNA_PREFILL_SKIP_INTERMEDIATE_HEAD=1 to prove the omitted-head path engaged"
-        );
-        assert!(
-            std::env::var_os("NV_LAGUNA_HOST_MOE").is_none(),
-            "unset NV_LAGUNA_HOST_MOE to qualify the serving NVFP4 route"
-        );
-        let dir = std::path::PathBuf::from(
-            std::env::var("NV_LAGUNA_DIR").expect("pin the hydrated NVFP4 target"),
-        );
-        let device = Device::new_cuda(0).expect("CUDA");
-        let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
-        let cfg = LagunaConfig::from_hf_json_str(&raw).unwrap();
-        let quant = nv_weights::QuantizationConfig::from_hf_json_str(&raw).unwrap();
-        assert_eq!(
-            quant.scheme,
-            nv_weights::QuantScheme::Nvfp4,
-            "this gate requires the NVFP4 target checkpoint"
-        );
-        let weights = nv_weights::WeightLoader::open_dir(&dir, &device).unwrap();
-        let model = std::sync::Arc::new(
-            Laguna::from_loader_quantized(cfg, &weights, &quant, &device).unwrap(),
-        );
-        drop(weights);
-        assert!(model.lm_head_i8.is_none() && model.lm_head_fp8.is_some() && model.lm_head_fp8_spec_off, "qualify the default scoped FP8 head: unset NV_LAGUNA_LMHEAD_INT8 and NV_LAGUNA_LMHEAD_FP8");
-        assert_eq!(
-            model.prefill_chunk_tokens(),
-            256,
-            "head-skip gate is independent: unset NV_LAGUNA_PREFILL_CHUNK"
-        );
-        let mut reference = model.new_kv_cache(2048).unwrap();
-        let mut candidate = model.new_kv_cache(2048).unwrap();
-        for spec_tier in [false, true] {
-            for depth in [33, 513, 785] {
-                assert_prefill_head_omission(
-                    &model,
-                    &mut reference,
-                    &mut candidate,
-                    depth,
-                    256,
-                    spec_tier,
-                    true,
-                    "before_graph",
-                    3,
-                );
-            }
-        }
-        let mut baseline =
-            crate::laguna_step_graph::LagunaStepGraph::new(model.clone(), reference).unwrap();
-        let mut graph =
-            crate::laguna_step_graph::LagunaStepGraph::new(model.clone(), candidate).unwrap();
-        for token in [7, 11] {
-            assert_prefill_graph_step_bits(
-                &mut baseline,
-                &mut graph,
-                token,
-                model.config.vocab_size,
-            );
-        }
-        for spec_tier in [false, true] {
-            for depth in [33, 513, 785] {
-                assert_prefill_head_omission(
-                    &model,
-                    baseline.cache_mut(),
-                    graph.cache_mut(),
-                    depth,
-                    256,
-                    spec_tier,
-                    true,
-                    "after_graph",
-                    0,
-                );
-                for token in [7, 11, 23] {
-                    assert_prefill_graph_step_bits(
-                        &mut baseline,
-                        &mut graph,
-                        token,
-                        model.config.vocab_size,
-                    );
-                    assert_prefill_cache_bits(
-                        baseline.cache_mut(),
-                        graph.cache_mut(),
-                        model.layers.len(),
-                    );
-                }
-                eprintln!("LAGUNA-PREFILL-HEAD-GATE graph_replay_after_prefill=3 depth={depth} spec_tier={spec_tier} logits=bitwise visible_kv=bitwise");
-            }
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore = "loads Laguna NVFP4 once; set NV_LAGUNA_TEST=1 and NV_LAGUNA_DIR; keep host MoE and prefill-chunk overrides unset"]
-    fn real_prefill_gpu_router_preserves_aux_cache_and_logits() {
-        assert_eq!(
-            std::env::var("NV_LAGUNA_TEST").as_deref(),
-            Ok("1"),
-            "real-weight gate must not silently skip"
-        );
-        assert!(
-            std::env::var_os("NV_LAGUNA_HOST_MOE").is_none(),
-            "unset NV_LAGUNA_HOST_MOE to qualify grouped NVFP4 prefill"
-        );
-        assert!(
-            std::env::var_os("NV_LAGUNA_PREFILL_CHUNK").is_none(),
-            "the routing gate requires the qualified chunk-256 path"
-        );
-        let dir = std::path::PathBuf::from(
-            std::env::var("NV_LAGUNA_DIR").expect("pin the hydrated NVFP4 target"),
-        );
-        let device = Device::new_cuda(0).expect("CUDA");
-        let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
-        let cfg = LagunaConfig::from_hf_json_str(&raw).unwrap();
-        let quant = nv_weights::QuantizationConfig::from_hf_json_str(&raw).unwrap();
-        assert_eq!(
-            quant.scheme,
-            nv_weights::QuantScheme::Nvfp4,
-            "this gate requires the packed NVFP4 target"
-        );
-        let weights = nv_weights::WeightLoader::open_dir(&dir, &device).unwrap();
-        let model = Laguna::from_loader_quantized(cfg, &weights, &quant, &device).unwrap();
-        drop(weights);
-        assert_eq!(model.prefill_chunk_tokens(), 256);
-        if weight_linears_fp8_enabled() {
-            assert!(model.embed_weight.is_none());
-            let (embedding, scales, vocab, hidden) = model.embed_fp8_weight_and_scales().unwrap();
-            assert_eq!(
-                (vocab, hidden),
-                (model.config.vocab_size, model.config.hidden_size)
-            );
-            assert_eq!(embedding.len(), vocab * hidden);
-            assert_eq!(scales.len(), vocab);
-            assert!(model.final_norm.fp8_e4m3_active());
-            assert!(model
-                .layers
-                .iter()
-                .all(|layer| layer.input_layernorm.fp8_e4m3_active()
-                    && layer.post_attention_layernorm.fp8_e4m3_active()
-                    && layer.self_attn.q_norm.fp8_e4m3_active()
-                    && layer.self_attn.k_norm.fp8_e4m3_active()));
-            assert!(model.lm_head_i8.is_none() && model.lm_head_fp8.is_none());
-            let check = |linear: &Linear| {
-                assert!(
-                    linear.weight().is_none(),
-                    "FP8 linear retained BF16 weight backing"
-                );
-                let (bytes, scales) = linear
-                    .fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h()
-                    .expect("resident E4M3 weight and row scales");
-                assert_eq!(bytes.len(), linear.in_features() * linear.out_features());
-                assert_eq!(scales.len(), linear.out_features());
-            };
-            check(&model.lm_head);
-            for layer in &model.layers {
-                let attn = &layer.self_attn;
-                for linear in [&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj] {
-                    check(linear);
-                }
-                check(attn.g_proj.as_ref().expect("Laguna XS attention gate"));
-                assert!(
-                    attn.w8.is_some(),
-                    "FP8 loading dropped the fused attention buffers"
-                );
-                assert!(attn
-                    .fp8_gate_weight_and_scales(model.config.hidden_size, attn.num_heads)
-                    .is_some());
-                if let LagunaFfn::Moe(moe) = &layer.ffn {
-                    check(&moe.gate);
-                }
-            }
-            eprintln!("LAGUNA-WEIGHT-FP8-GATE attention_layers={} linear_weight_bits=8 fused_buffers_retained=true", model.layers.len());
-        }
-        let mut reference = model.new_kv_cache(2048).unwrap();
-        let mut candidate = model.new_kv_cache(2048).unwrap();
-        let mut dispatch_candidate = model.new_kv_cache(2048).unwrap();
-        let aux_layers: Vec<usize> = (0..model.layers.len()).collect();
-        let mut compared_chunks = 0usize;
-
-        for spec_tier in [false, true] {
-            model.set_device_verify_routing(spec_tier);
-            for depth in [33usize, 513] {
-                reference.reset();
-                candidate.reset();
-                dispatch_candidate.reset();
-                let mut offset = 0usize;
-                while offset < depth {
-                    let m = model.next_prefill_chunk_len(depth - offset);
-                    let ids: Vec<u32> = (offset..offset + m)
-                        .map(|i| ((31 * i + 17) % model.config.vocab_size) as u32)
-                        .collect();
-                    let tokens = Tensor::from_vec(ids, (1, m), &device).unwrap();
-                    let positions = Tensor::from_vec(
-                        (offset..offset + m).map(|p| p as i32).collect::<Vec<_>>(),
-                        m,
-                        &device,
-                    )
-                    .unwrap();
-
-                    std::env::set_var("NV_LAGUNA_PREFILL_ROUTE_GPU", "0");
-                    std::env::set_var("NV_LAGUNA_PREFILL_DISPATCH_GPU", "0");
-                    let (old_logits, old_aux) = model
-                        .forward_with_cache_aux_scoped(
-                            &tokens,
-                            &positions,
-                            &mut reference,
-                            &aux_layers,
-                            spec_tier,
-                        )
-                        .unwrap();
-                    let old_logits = old_logits.to_device(&Device::Cpu).unwrap();
-                    let old_aux: Vec<Tensor> = old_aux
-                        .iter()
-                        .map(|t| t.to_device(&Device::Cpu).unwrap())
-                        .collect();
-
-                    std::env::set_var("NV_LAGUNA_PREFILL_ROUTE_GPU", "1");
-                    let (new_logits, new_aux) = model
-                        .forward_with_cache_aux_scoped(
-                            &tokens,
-                            &positions,
-                            &mut candidate,
-                            &aux_layers,
-                            spec_tier,
-                        )
-                        .unwrap();
-                    assert_prefill_tensor_bits(
-                        &format!(
-                            "GPU prefill route logits tier={spec_tier} depth={depth} offset={offset}"
-                        ),
-                        &old_logits,
-                        &new_logits,
-                    );
-                    assert_eq!(old_aux.len(), new_aux.len());
-                    for (layer, (old, new)) in old_aux.iter().zip(&new_aux).enumerate() {
-                        assert_prefill_tensor_bits(
-                            &format!(
-                                "GPU prefill route aux layer={layer} tier={spec_tier} depth={depth} offset={offset}"
-                            ),
-                            old,
-                            new,
-                        );
-                    }
-                    assert_prefill_cache_bits(&mut reference, &mut candidate, model.layers.len());
-
-                    std::env::remove_var("NV_LAGUNA_PREFILL_DISPATCH_GPU");
-                    let (dispatch_logits, dispatch_aux) = model
-                        .forward_with_cache_aux_scoped(
-                            &tokens,
-                            &positions,
-                            &mut dispatch_candidate,
-                            &aux_layers,
-                            spec_tier,
-                        )
-                        .unwrap();
-                    let dispatch_logits = dispatch_logits.to_device(&Device::Cpu).unwrap();
-                    let dispatch_aux: Vec<Tensor> = dispatch_aux
-                        .iter()
-                        .map(|t| t.to_device(&Device::Cpu).unwrap())
-                        .collect();
-                    assert_prefill_tensor_bits(
-                        &format!(
-                            "GPU prefill dispatch logits tier={spec_tier} depth={depth} offset={offset}"
-                        ),
-                        &old_logits,
-                        &dispatch_logits,
-                    );
-                    assert_eq!(old_aux.len(), dispatch_aux.len());
-                    for (layer, (old, new)) in old_aux.iter().zip(&dispatch_aux).enumerate() {
-                        assert_prefill_tensor_bits(
-                            &format!(
-                                "GPU prefill dispatch aux layer={layer} tier={spec_tier} depth={depth} offset={offset}"
-                            ),
-                            old,
-                            new,
-                        );
-                    }
-                    assert_prefill_cache_bits(
-                        &mut reference,
-                        &mut dispatch_candidate,
-                        model.layers.len(),
-                    );
-                    offset += m;
-                    compared_chunks += 1;
-                }
-            }
-        }
-        std::env::remove_var("NV_LAGUNA_PREFILL_ROUTE_GPU");
-        std::env::remove_var("NV_LAGUNA_PREFILL_DISPATCH_GPU");
-        assert_eq!(
-            model
-                .test_moe_host_fallbacks
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "a grouped MoE failure fell back to host execution"
-        );
-        let device_routes = model
-            .test_prefill_gpu_routes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            device_routes > 0,
-            "the candidate GPU prefill router never engaged"
-        );
-        let device_dispatches = model
-            .test_prefill_gpu_dispatches
-            .load(std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            device_dispatches > 0,
-            "the candidate GPU prefill dispatch planner never engaged"
-        );
-        eprintln!(
-            "LAGUNA-PREFILL-GPU-ROUTE-GATE chunks={compared_chunks} device_route_calls={device_routes} device_dispatch_calls={device_dispatches} aux=bitwise visible_kv=bitwise logits=bitwise"
-        );
-    }
-
-    #[cfg(feature = "cuda")]
-    fn assert_prefill_graph_step_bits(
-        baseline: &mut crate::laguna_step_graph::LagunaStepGraph,
-        candidate: &mut crate::laguna_step_graph::LagunaStepGraph,
-        token: u32,
-        vocab: usize,
-    ) {
-        baseline.step(token).expect("baseline graph capture/replay");
-        let before = baseline.logits_host().unwrap();
-        candidate
-            .step(token)
-            .expect("candidate graph capture/replay");
-        let after = candidate.logits_host().unwrap();
-        assert_eq!(before.len(), vocab);
-        assert_eq!(after.len(), vocab);
-        let before = Tensor::from_vec(before, vocab, &Device::Cpu).unwrap();
-        let after = Tensor::from_vec(after, vocab, &Device::Cpu).unwrap();
-        assert_prefill_tensor_bits("retained graph continuation after prefill", &before, &after);
-    }
-
-    #[cfg(feature = "cuda")]
-    fn snapshot_aligned_prefill_cache(
-        cache: &mut LagunaKvCache,
-        tag: &str,
-    ) -> Vec<(String, Tensor)> {
-        let mut snapshots = Vec::new();
-        let len = cache.current_len();
-        for layer in 0..cache.layers.len() {
-            let (k, v) = cache.view(layer, len).unwrap();
-            let stored = k.dims()[1];
-            let keep = cache.layer_windows[layer].map_or(stored, |w| w.min(stored));
-            for (kind, values) in [("K", k), ("V", v)] {
-                snapshots.push((
-                    format!("{tag} layer={layer} {kind}"),
-                    values
-                        .narrow(1, stored - keep, keep)
-                        .unwrap()
-                        .to_device(&Device::Cpu)
-                        .unwrap(),
-                ));
-            }
-        }
-        snapshots
-    }
-
-    #[cfg(feature = "cuda")]
-    fn real_prefill_chunk_snapshots(
-        chunk: usize,
-        long_depth: usize,
-        baseline: bool,
-    ) -> Vec<(String, Tensor)> {
-        let dir = std::path::PathBuf::from(
-            std::env::var("NV_LAGUNA_DIR").expect("pin the hydrated NVFP4 target"),
-        );
-        let device = Device::new_cuda(0).expect("CUDA");
-        let raw = std::fs::read_to_string(dir.join("config.json")).unwrap();
-        let cfg = LagunaConfig::from_hf_json_str(&raw).unwrap();
-        let quant = nv_weights::QuantizationConfig::from_hf_json_str(&raw).unwrap();
-        assert_eq!(quant.scheme, nv_weights::QuantScheme::Nvfp4);
-        let weights = nv_weights::WeightLoader::open_dir(&dir, &device).unwrap();
-        let mut loaded = Laguna::from_loader_quantized(cfg, &weights, &quant, &device).unwrap();
-        drop(weights);
-        if baseline {
-            loaded.prefill_chunk = 256;
-        }
-        assert_eq!(loaded.prefill_chunk_tokens(), chunk);
-        assert!(
-            loaded.lm_head_i8.is_none()
-                && loaded.lm_head_fp8.is_some()
-                && loaded.lm_head_fp8_spec_off,
-            "qualify scoped FP8 head: unset NV_LAGUNA_LMHEAD_INT8 and NV_LAGUNA_LMHEAD_FP8"
-        );
-        let model = std::sync::Arc::new(loaded);
-        let cache = model.new_kv_cache(long_depth + 512).unwrap();
-        let mut graph =
-            crate::laguna_step_graph::LagunaStepGraph::new(model.clone(), cache).unwrap();
-        graph.step(7).expect("capture real graph before prefill");
-        graph.step(11).expect("replay real graph before prefill");
-        graph.synchronize().unwrap();
-        let aux_layers: Vec<_> = (0..model.layers.len()).collect();
-        let mut snapshots = Vec::new();
-        for spec_tier in [false, true] {
-            for (case, depth) in [33, long_depth, 33].into_iter().enumerate() {
-                let tag = format!("tier={spec_tier} case={case} depth={depth}");
-                graph.cache_mut().reset();
-                model.set_device_verify_routing(spec_tier);
-                let mut aux_chunks: Vec<Vec<Tensor>> =
-                    (0..aux_layers.len()).map(|_| Vec::new()).collect();
-                let mut offset = 0;
-                let mut final_logits = None;
-                while offset < depth {
-                    let m = model.next_prefill_chunk_len(depth - offset);
-                    let ids: Vec<_> = (offset..offset + m)
-                        .map(|i| ((31 * i + 17) % model.config.vocab_size) as u32)
-                        .collect();
-                    let tokens = Tensor::from_vec(ids, (1, m), &device).unwrap();
-                    let positions = Tensor::from_vec(
-                        (offset..offset + m).map(|p| p as i32).collect::<Vec<_>>(),
-                        m,
-                        &device,
-                    )
-                    .unwrap();
-                    let (logits, aux) = if baseline {
-                        let (logits, aux) = model
-                            .forward_with_cache_aux_scoped(
-                                &tokens,
-                                &positions,
-                                graph.cache_mut(),
-                                &aux_layers,
-                                spec_tier,
-                            )
-                            .unwrap();
-                        (Some(logits), aux)
-                    } else {
-                        model
-                            .prefill_with_cache_aux_scoped(
-                                &tokens,
-                                &positions,
-                                graph.cache_mut(),
-                                &aux_layers,
-                                spec_tier,
-                                offset + m == depth,
-                            )
-                            .unwrap()
-                    };
-                    assert_eq!(aux.len(), aux_layers.len());
-                    for (dest, values) in aux_chunks.iter_mut().zip(aux) {
-                        dest.push(values.to_device(&Device::Cpu).unwrap());
-                    }
-                    offset += m;
-                    if offset == depth {
-                        let logits = logits.expect("canonical final head is required");
-                        assert_eq!(
-                            logits.dims(),
-                            &[1, (depth - 1) % 256 + 1, model.config.vocab_size]
-                        );
-                        final_logits = Some(logits.to_device(&Device::Cpu).unwrap());
-                    }
-                }
-                for (layer, chunks) in aux_chunks.into_iter().enumerate() {
-                    snapshots.push((
-                        format!("{tag} full_aux={layer}"),
-                        Tensor::cat(&chunks, 1).unwrap(),
-                    ));
-                }
-                snapshots.extend(snapshot_aligned_prefill_cache(
-                    graph.cache_mut(),
-                    &format!("{tag} prefill"),
-                ));
-                let logits = final_logits.unwrap();
-                let last = logits
-                    .narrow(1, logits.dims()[1] - 1, 1)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap();
-                let mut token = crate::laguna_dflash::argmax_row(&last);
-                snapshots.push((format!("{tag} full_final_logits"), logits));
-                for step in 0..3 {
-                    snapshots.push((
-                        format!("{tag} graph_input={step}"),
-                        Tensor::from_vec(vec![token], 1, &Device::Cpu).unwrap(),
-                    ));
-                    graph
-                        .step(token)
-                        .expect("retained graph replay immediately after prefill");
-                    let values = graph.logits_host().unwrap();
-                    assert_eq!(values.len(), model.config.vocab_size);
-                    token = crate::laguna_dflash::argmax_row(&values);
-                    snapshots.push((
-                        format!("{tag} graph_logits={step}"),
-                        Tensor::from_vec(values, model.config.vocab_size, &Device::Cpu).unwrap(),
-                    ));
-                }
-                snapshots.extend(snapshot_aligned_prefill_cache(
-                    graph.cache_mut(),
-                    &format!("{tag} after_graph"),
-                ));
-                eprintln!("LAGUNA-PREFILL-CHUNK-GATE arm={} chunk={chunk} depth={depth} final_m={} spec_tier={spec_tier} graph_replay=3 aux_rows={depth}", if baseline { "reference" } else { "candidate" }, (depth - 1) % 256 + 1);
-            }
-        }
-        graph.synchronize().unwrap();
-        assert_eq!(model.test_moe_host_fallbacks.load(std::sync::atomic::Ordering::Relaxed), 0, "a grouped MoE failure fell back to host execution; this run cannot qualify the performance route");
-        snapshots
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore = "loads Laguna NVFP4 twice sequentially; set NV_LAGUNA_TEST=1, NV_LAGUNA_DIR, NV_LAGUNA_PREFILL_CHUNK=512/1024/2048 and NV_LAGUNA_PREFILL_SKIP_INTERMEDIATE_HEAD=1"]
-    fn real_prefill_chunk_preserves_aux_cache_logits_and_retained_graph() {
-        assert_eq!(
-            std::env::var("NV_LAGUNA_TEST").as_deref(),
-            Ok("1"),
-            "real-weight gate must not silently skip"
-        );
-        assert!(
-            Laguna::prefill_skip_intermediate_head_enabled(),
-            "set NV_LAGUNA_PREFILL_SKIP_INTERMEDIATE_HEAD=1"
-        );
-        assert!(
-            std::env::var_os("NV_LAGUNA_HOST_MOE").is_none(),
-            "unset NV_LAGUNA_HOST_MOE"
-        );
-        let chunk = prefill_chunk_default_1024_user_signoff_20260912_unset_is_1024_and_256_restores_the_reference_width().unwrap();
-        assert!(
-            matches!(chunk, 512 | 1024 | 2048),
-            "choose an opt-in candidate chunk"
-        );
-        let depth = 2 * chunk + 1;
-        let baseline = real_prefill_chunk_snapshots(256, depth, true);
-        let candidate = real_prefill_chunk_snapshots(chunk, depth, false);
-        assert_eq!(baseline.len(), candidate.len());
-        for ((name, expected), (actual_name, actual)) in baseline.iter().zip(&candidate) {
-            assert_eq!(name, actual_name);
-            assert_prefill_tensor_bits(name, expected, actual);
-        }
-        eprintln!("LAGUNA-PREFILL-CHUNK-GATE bitwise=passed reference_chunk=256 candidate_chunk={chunk} snapshot_count={} long_depth={depth}", baseline.len());
-    }
-
     fn build_tiny_model(cfg: &LagunaConfig, device: &Device) -> Laguna {
         let det = |n: usize, seed: f32| -> Vec<f32> {
             (0..n)
@@ -7505,14 +6417,9 @@ mod tests {
             #[cfg(feature = "cuda")]
             lm_head_fp8_spec_off: false,
             device_verify_routing: std::sync::atomic::AtomicBool::new(false),
-            host_moe: std::sync::atomic::AtomicBool::new(host_moe_env()),
             attn_w8_shape: false,
             prefill_chunk: 256,
             test_moe_host_fallbacks: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(feature = "cuda")]
-            test_prefill_gpu_routes: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(feature = "cuda")]
-            test_prefill_gpu_dispatches: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }

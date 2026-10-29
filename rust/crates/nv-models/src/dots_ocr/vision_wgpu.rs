@@ -1,9 +1,13 @@
+use bytemuck::bytes_of;
 use std::collections::HashMap;
+use std::env;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use wgpu::{BindGroup, Buffer, ComputePipeline, ErrorFilter};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
-use half::f16;
+use half::{bf16, f16};
 use nv_kernels::wgpu_backend::dispatch;
 use nv_kernels::wgpu_backend::kernels::gemm_coop_f16 as coop;
 use nv_kernels::wgpu_backend::{compose_enabled, WgpuContext};
@@ -11,6 +15,21 @@ use nv_weights::WeightLoader;
 
 use super::preprocess::{PreparedImage, MERGE_SIZE, PATCH_DIM};
 use super::vision::{vision_rope_tables, DotsVisionConfig};
+use crate::pod;
+
+macro_rules! bind_entries {
+    ($($b:expr),* $(,)?) => {
+        [$($b.as_entire_binding()),*]
+            .into_iter()
+            .enumerate()
+            .map(|(i, resource)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource,
+            })
+            .collect::<Vec<_>>()
+    };
+}
+pub(crate) use bind_entries;
 
 pub const DOTS_VISION_WGPU_STAGES_EVERY_WEIGHT_AS_F16_BECAUSE_THE_ONLY_GENERAL_LARGE_M_GEMM_IN_THIS_TREE_IS_COOP_MAT_F16: &str =
     "nv-kernels ships no general large-M bf16 GEMM: gemm_bf16_small_m::MAX_M is 9 and \
@@ -78,7 +97,7 @@ impl VisionWeightFmt {
     pub fn from_env() -> Self {
         let _ = DOTS_VISION_NVFP4_WEIGHT_ARM_IS_ENV_SELECTED_AND_ANY_VALUE_BUT_NVFP4_KEEPS_THE_F16_STAGING_BYTE_FOR_BYTE;
         let _ = DOTS_VISION_MLX_W4_ARM_SERVES_PACKED_NIBBLES_THROUGH_A_PER_USE_DEQUANT_BECAUSE_THE_COOP_GEMM_IS_COMPUTE_BOUND_AT_THESE_M;
-        match std::env::var(DOTS_VISION_WGPU_WQ_ENV).ok().as_deref() {
+        match env::var(DOTS_VISION_WGPU_WQ_ENV).ok().as_deref() {
             Some("nvfp4") => Self::Nvfp4Block16,
             Some("w4g32") => Self::MlxW4 {
                 gs: 32,
@@ -95,8 +114,6 @@ impl VisionWeightFmt {
     }
 }
 
-pub const DOTS_VISION_WGPU_MERGER_ENV: &str = "NV_DOTS_VISION_WGPU_MERGER";
-
 pub const DOTS_VISION_GPU_MERGER_IS_THE_DEFAULT_BECAUSE_THE_HOST_ROUND_TRIPS_WERE_THE_WHOLE_RESIDUAL_AND_THE_TOKEN_GATE_HELD: &str =
     "The host merger reads the whole trunk back, layer-norms and gelu_erf's it on the CPU between \
      the two merger GEMMs, and by deleted work those round trips are 0.288s of a 6.435s invoice \
@@ -109,9 +126,8 @@ pub const DOTS_VISION_GPU_MERGER_IS_THE_DEFAULT_BECAUSE_THE_HOST_ROUND_TRIPS_WER
      7.1.26 polynomial, the same function to every consumer but not the same bits, so the flip \
      gate was corpus token equality: all twelve stable pages hold CER and WER at exactly 0.0000, \
      every bistable keeps its standing trajectory and token count, mean CER 0.0736 \
-     byte-identical. NV_DOTS_VISION_WGPU_MERGER=host restores the host merger bit-for-bit. The \
-     gpu route requires post_norm because it reads the f16 post-trunk-norm buffer; a tower \
-     without one keeps the host merger.";
+     byte-identical. The gpu route requires post_norm because it reads the f16 post-trunk-norm \
+     buffer; a tower without one keeps the host merger.";
 
 enum BatchTrunkOut {
     Host(Vec<f32>),
@@ -123,50 +139,31 @@ enum TrunkOut {
     Gpu(super::decoder_wgpu_graph::VisionRowsGpu),
 }
 
-pub fn merger_gpu_arm() -> bool {
-    let _ = DOTS_VISION_GPU_MERGER_IS_THE_DEFAULT_BECAUSE_THE_HOST_ROUND_TRIPS_WERE_THE_WHOLE_RESIDUAL_AND_THE_TOKEN_GATE_HELD;
-    !matches!(
-        std::env::var(DOTS_VISION_WGPU_MERGER_ENV).ok().as_deref(),
-        Some("host") | Some("0")
-    )
-}
-
 pub const DOTS_VISION_WGPU_FITTED_PLANS_ENV: &str = "NV_DOTS_VISION_WGPU_FITTED_PLANS";
 
 pub const DOTS_VISION_M5_MAX_FITTED_PLANS_ADD_ONLY_THE_NARROW_N_ATTN_CTX_WINNER_THE_WIDTH_GATED_DEFAULT_CANNOT_EXPRESS: &str =
     "resolve_plan's width-gated default already serves tm8_tn4_sg4 to every shape wider than one \
      column band and the square tile to attn_ctx, the one narrow shape. On Apple M5 Max [Metal] \
      at 7400 rows the attn_ctx ladder prefers tm8_tn2_sg2 over that square, 7.89 -> 8.76 TFLOP/s \
-     (ladder tests/dots_ocr_vision_phase_profile.rs; arm spreads are within +-8 percent run to \
-     run, and this is the only shape whose winner repeats across ladders). \
+     (arm spreads are within +-8 percent run to run, and this is the only shape whose winner \
+     repeats across ladders). \
      NV_DOTS_VISION_WGPU_FITTED_PLANS=1 installs exactly that one shape row at forward time; the \
      install is bit-identity preserving because tm/tn/sg/ku never reorder the k loop.";
 
 pub const DOTS_VISION_WGPU_ATTN_ENV: &str = "NV_DOTS_VISION_WGPU_ATTN";
 
-pub const DOTS_VISION_PLAN_ENV: &str = "NV_DOTS_VISION_PLAN";
-
 pub const DOTS_VISION_WGPU_FLASH_PLAN_ENV: &str = "NV_DOTS_VISION_WGPU_FLASH_PLAN";
 
-pub const DOTS_VISION_ATTENTION_DEFAULTS_TO_ZMERGE_AND_SLAB_IS_THE_ESCAPE_THAT_REPRODUCES_THE_PRE_FLIP_RECORD_BIT_FOR_BIT: &str =
-    "zmerge is the default. slab is the arm every dots.ocr wgpu number published before this flip \
-     was measured on, and NV_DOTS_VISION_WGPU_ATTN=slab restores it bit for bit: a q x n_pad f32 \
-     score slab, a three-read row softmax that normalises by 1/z before storing f16 \
-     probabilities, and a merge pass. zmerge is the same slab and the same reduction order with \
-     the 1/z moved into the merge, which deletes one of the three reads and stops storing \
-     probabilities as f16 subnormals. flash never writes the slab: it is an online-softmax kernel \
-     whose rescaling is different arithmetic, not a reassociation, so it cannot be gated bitwise \
-     and is adjudicated on the per-layer parity table against the CPU F32 twin. On Apple M2 Ultra \
-     at 13600 patches zmerge is worth 0.259 s of an 8.272 s forward on top of the fitted plan, \
-     all of it out of the softmax phase, and it holds every fixture of the 070/071 set to the \
-     same CER, WER and generated-token count as slab -- mean CER 0.0736, the twelve stable pages \
-     still 0.0000 and the four bistable ones unmoved at 0.4544, 0.4204, 0.2414 and 0.0622. Since \
-     it is a reassociation and not different arithmetic, slab and zmerge are gated against each \
-     other on token equality rather than on bits.";
+pub const DOTS_VISION_ZMERGE_DEFERS_THE_SOFTMAX_NORM_INTO_THE_MERGE_SO_PROBABILITIES_ARE_NEVER_F16_SUBNORMALS: &str =
+    "zmerge is the slab fallback: a q x n_pad f32 score slab, a two-read row softmax that \
+     stores unnormalised f16 exponentials and their 1/z, and a merge pass that applies 1/z \
+     while copying the context to attn_x, so probabilities never land in f16 subnormals. \
+     flash never writes the slab: it is an online-softmax kernel whose rescaling is different \
+     arithmetic, not a reassociation, so it cannot be gated bitwise and is adjudicated on the \
+     per-layer parity table against the CPU F32 twin.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttnArm {
-    Slab,
     ZMerge,
     Flash,
     Steel,
@@ -175,7 +172,6 @@ pub enum AttnArm {
 impl AttnArm {
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Slab => "slab",
             Self::ZMerge => "zmerge",
             Self::Flash => "flash",
             Self::Steel => "steel",
@@ -183,9 +179,8 @@ impl AttnArm {
     }
 
     pub fn from_env() -> Self {
-        let _ = DOTS_VISION_ATTENTION_DEFAULTS_TO_ZMERGE_AND_SLAB_IS_THE_ESCAPE_THAT_REPRODUCES_THE_PRE_FLIP_RECORD_BIT_FOR_BIT;
-        match std::env::var(DOTS_VISION_WGPU_ATTN_ENV).ok().as_deref() {
-            Some("slab") => Self::Slab,
+        let _ = DOTS_VISION_ZMERGE_DEFERS_THE_SOFTMAX_NORM_INTO_THE_MERGE_SO_PROBABILITIES_ARE_NEVER_F16_SUBNORMALS;
+        match env::var(DOTS_VISION_WGPU_ATTN_ENV).ok().as_deref() {
             Some("flash") => Self::Flash,
             Some("steel") => Self::Steel,
             _ => Self::ZMerge,
@@ -252,17 +247,16 @@ pub const DOTS_VISION_PHASE_TIMING_IS_DRAIN_DISTORTED_BECAUSE_ATTRIBUTING_A_QUEU
 
 #[derive(Default)]
 pub struct PhaseLog {
-    at: Option<std::time::Instant>,
+    at: Option<Instant>,
     rows: Vec<(&'static str, f64, u64)>,
 }
 
 impl PhaseLog {
     pub fn from_env() -> Self {
         let _ = DOTS_VISION_PHASE_TIMING_IS_DRAIN_DISTORTED_BECAUSE_ATTRIBUTING_A_QUEUED_PASS_TO_A_PHASE_COSTS_A_DEVICE_WAIT_AT_EVERY_BOUNDARY;
-        let on =
-            std::env::var(DOTS_VISION_WGPU_PHASES_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
+        let on = env::var(DOTS_VISION_WGPU_PHASES_ENV).is_ok_and(|v| !v.is_empty() && v != "0");
         Self {
-            at: on.then(std::time::Instant::now),
+            at: on.then(Instant::now),
             rows: Vec::new(),
         }
     }
@@ -281,7 +275,7 @@ impl PhaseLog {
         };
         g.drain()?;
         let dt = at.elapsed().as_secs_f64();
-        self.at = Some(std::time::Instant::now());
+        self.at = Some(Instant::now());
         match self.rows.iter_mut().find(|r| r.0 == name) {
             Some(r) => {
                 r.1 += dt;
@@ -334,24 +328,18 @@ pub const DOTS_VISION_SPLITK_SERVES_ONLY_ATTN_CTX_BECAUSE_IT_IS_THE_ONE_OCCUPANC
      reassociation, so the gate was token equality across the fixture corpus, never bits: all \
      twelve stable pages hold CER and WER at exactly 0.0000 and every bistable keeps its \
      standing trajectory and token count (0.2414/0.4544@414/0.4204@284/0.0622@174). \
-     NV_DOTS_VISION_SPLITK=0 restores the plain single-dispatch kernel bit-for-bit; =<S> pins \
-     another split count. The scratch is one buffer reused by every ctx dispatch in the queue, \
+     NV_DOTS_VISION_SPLITK=<S> pins another split count. The scratch is one buffer reused by every ctx dispatch in the queue, \
      safe because the reduce that reads slot s is queued before the next ctx write and the \
      backend orders dispatches on the same buffer.";
 
 pub const DOTS_VISION_SPLITK_DEFAULT: u32 = 16;
 
-fn splitk_arm() -> Option<u32> {
-    match std::env::var(DOTS_VISION_SPLITK_ENV).ok().as_deref() {
-        Some("0") | Some("off") => None,
-        Some(v) => v
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|s| (2..=32).contains(s))
-            .or(Some(DOTS_VISION_SPLITK_DEFAULT)),
-        None => Some(DOTS_VISION_SPLITK_DEFAULT),
-    }
+fn splitk_arm() -> u32 {
+    env::var(DOTS_VISION_SPLITK_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|s| (2..=32).contains(s))
+        .unwrap_or(DOTS_VISION_SPLITK_DEFAULT)
 }
 
 pub const DOTS_VISION_SPLITK_KERNEL_IS_GENERATED_FOR_THE_8X8X8_TILE_ONLY_SO_A_WIDER_TILE_ADAPTER_TAKES_THE_PLAIN_COOP_ARM: u32 = 8;
@@ -360,16 +348,14 @@ pub const DOTS_VISION_SPLITK_FITTED_PLAN_IS_TM8_BECAUSE_THE_S16_LADDER_READS_15_
     CoopPlan { tm: 8, tn: 4, sg: 4, ku: 1 };
 
 pub const DOTS_VISION_STEEL_IS_THE_DEFAULT_WHERE_PASSTHROUGH_GRANTS_AND_ZMERGE_SERVES_EVERY_OTHER_ADAPTER: &str =
-    "With NV_DOTS_VISION_WGPU_ATTN unset the tower probes for the steel fused arm at forward      time -- head_dim 128 and a built passthrough pipeline, capability-checked never assumed --      and serves zmerge wherever the probe fails, which is every adapter without      PASSTHROUGH_SHADERS. Flip basis, invoice page under the flock: zmerge 6.151s +-0.006 to      steel 4.519s +-0.001 (minus 26.5 percent, against the rival tower's own measured 5.31s);      parity closest of every arm to the cpu f32 twin (4.4427e-2 vs the zmerge default's own      4.5656e-2); corpus token gate green with twelve stable zeros exact, bistables on their      standing trajectories and token counts, mean CER 0.0736 byte-identical, page mean 3717.0      ms. NV_DOTS_VISION_WGPU_ATTN=zmerge and =slab are the unchanged escapes, and the      slab-pipeline instruments (ablation bracket, split-k arms) pin zmerge explicitly so their      rows keep their meaning.";
+    "With NV_DOTS_VISION_WGPU_ATTN unset the tower probes for the steel fused arm at forward      time -- head_dim 128 and a built passthrough pipeline, capability-checked never assumed --      and serves zmerge wherever the probe fails, which is every adapter without      PASSTHROUGH_SHADERS. Flip basis, invoice page under the flock: zmerge 6.151s +-0.006 to      steel 4.519s +-0.001 (minus 26.5 percent, against the rival tower's own measured 5.31s);      parity closest of every arm to the cpu f32 twin (4.4427e-2 vs the zmerge default's own      4.5656e-2); corpus token gate green with twelve stable zeros exact, bistables on their      standing trajectories and token counts, mean CER 0.0736 byte-identical, page mean 3717.0      ms. NV_DOTS_VISION_WGPU_ATTN=zmerge forces the fallback, and the      slab-pipeline instruments (ablation bracket, split-k arms) pin zmerge explicitly so their      rows keep their meaning.";
 
 pub const DOTS_VISION_STEEL_GEMM_ENV: &str = "NV_DOTS_VISION_STEEL_GEMM";
 
 pub const DOTS_VISION_STEEL_GEMM_DEFAULTS_ON_WHERE_THE_BUILT_PASSTHROUGH_PIPELINE_PROBE_PASSES_BECAUSE_ZERO_OF_5222400_MERGED_FEATURES_MOVED: &str =
-    "Unset routes every servable F16 projection through the vendored steel GEMM (nt pattern, f32      output, real-row M -- see STEEL_GEMM_RIDES_THE_SAME_DRIVER_PATTERNS_THE_ATTENTION_PORT_PROVED)      at the ladder champion bm64_bn64_bk32_wm2_wn2: 1.25-1.40x over the coop incumbent on every      shape it can serve (~24 TFLOP/s vs coop's 17.4), invoice tower 4.586 -> 4.059s, corpus page      mean 2988.1 ms with the twelve stable fixtures exactly 0.0000. The gate class is bit equality,      not tokens: steel-nt and coop are the same ascending-k chain of 8x8 simdgroup MMAs with f32      accumulators, and 0 of 5,222,400 merged features differ in a single f32 bit. The probe is      gemm_steel itself, same class as the attention flip: it asks steel_gemm_pipelines for a BUILT      msl passthrough pipeline at forward time -- capability-checked, never assumed -- and answers      false so the coop kernel serves on any adapter that cannot build one, and per shape wherever      k_pad is not a multiple of the k-block (patch_proj k=784 keeps coop).      NV_DOTS_VISION_STEEL_GEMM=0 restores coop everywhere, trivially byte-identical; =1 pins the      fitted champion explicitly; a bm,bn,bk,wm,wn 5-tuple pins another ladder config.";
+    "Unset routes every servable F16 projection through the vendored steel GEMM (nt pattern, f32      output, real-row M -- see STEEL_GEMM_RIDES_THE_SAME_DRIVER_PATTERNS_THE_ATTENTION_PORT_PROVED)      at the ladder champion bm64_bn64_bk32_wm2_wn2: 1.25-1.40x over the coop incumbent on every      shape it can serve (~24 TFLOP/s vs coop's 17.4), invoice tower 4.586 -> 4.059s, corpus page      mean 2988.1 ms with the twelve stable fixtures exactly 0.0000. The gate class is bit equality,      not tokens: steel-nt and coop are the same ascending-k chain of 8x8 simdgroup MMAs with f32      accumulators, and 0 of 5,222,400 merged features differ in a single f32 bit. The probe is      gemm_steel itself, same class as the attention flip: it asks steel_gemm_pipelines for a BUILT      msl passthrough pipeline at forward time -- capability-checked, never assumed -- and answers      false so the coop kernel serves on any adapter that cannot build one, and per shape wherever      k_pad is not a multiple of the k-block (patch_proj k=784 keeps coop).      NV_DOTS_VISION_STEEL_GEMM=1 pins the fitted champion explicitly; a bm,bn,bk,wm,wn 5-tuple      pins another ladder config.";
 
 pub const DOTS_VISION_STEEL_GEMM_FITTED: (u32, u32, u32, u32, u32) = (64, 64, 32, 2, 2);
-
-pub const DOTS_VISENC_SHAPE_MAP_ENV: &str = "NV_DOTS_VISENC_SHAPE_MAP";
 
 pub const DOTS_VISENC_SHAPE_MAP_SERVES_THE_PER_SHAPE_CHAMPIONS_WHERE_NO_CFG_ENV_PINS: &str =
     "With the cfg envs unset the tower answers steel_gemm_cfg_for(rows, n) per projection and \
@@ -377,36 +363,20 @@ pub const DOTS_VISENC_SHAPE_MAP_SERVES_THE_PER_SHAPE_CHAMPIONS_WHERE_NO_CFG_ENV_
      serving the crop-shape champion maps everywhere the whole-page crowns are grid-starved; \
      every map arm is the certified bitwise class (bq moves only workgroup ownership at bk16, \
      gemm tiles remap the same ascending-k MMA chain, fused epilogues follow their cfg through \
-     pick_resadd/pick_gsilu). NV_DOTS_VISENC_SHAPE_MAP=0 restores the fixed champions \
-     everywhere, and a set NV_DOTS_VISION_STEEL_GEMM / NV_DOTS_VISION_STEEL_ATTN_CFG keeps its \
-     exact pin meaning over the map, so every ladder and bracket instrument keeps its row \
-     meaning.";
+     pick_resadd/pick_gsilu). A set NV_DOTS_VISION_STEEL_GEMM / NV_DOTS_VISION_STEEL_ATTN_CFG \
+     keeps its exact pin meaning over the map, so every ladder and bracket instrument keeps \
+     its row meaning.";
 
-fn shape_map_on() -> bool {
-    let _ = DOTS_VISENC_SHAPE_MAP_SERVES_THE_PER_SHAPE_CHAMPIONS_WHERE_NO_CFG_ENV_PINS;
-    std::env::var(DOTS_VISENC_SHAPE_MAP_ENV).ok().as_deref() != Some("0")
-}
-
-pub fn steel_gemm_cfg_serving(rows: usize, n: usize) -> Option<(u32, u32, u32, u32, u32)> {
+pub fn steel_gemm_cfg_serving(rows: usize, n: usize) -> (u32, u32, u32, u32, u32) {
     let _ = DOTS_VISION_STEEL_GEMM_DEFAULTS_ON_WHERE_THE_BUILT_PASSTHROUGH_PIPELINE_PROBE_PASSES_BECAUSE_ZERO_OF_5222400_MERGED_FEATURES_MOVED;
-    let Ok(v) = std::env::var(DOTS_VISION_STEEL_GEMM_ENV) else {
-        return Some(if shape_map_on() {
-            super::vision_attn_msl::steel_gemm_cfg_for(rows, n)
-        } else {
-            DOTS_VISION_STEEL_GEMM_FITTED
-        });
+    let _ = DOTS_VISENC_SHAPE_MAP_SERVES_THE_PER_SHAPE_CHAMPIONS_WHERE_NO_CFG_ENV_PINS;
+    let Ok(v) = env::var(DOTS_VISION_STEEL_GEMM_ENV) else {
+        return super::vision_attn_msl::steel_gemm_cfg_for(rows, n);
     };
-    let t = v.trim();
-    if t.is_empty() || t == "0" || t == "off" {
-        return None;
-    }
-    if t == "1" {
-        return Some(DOTS_VISION_STEEL_GEMM_FITTED);
-    }
-    let parts: Vec<u32> = t.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let parts: Vec<u32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
     match parts.as_slice() {
-        [bm, bn, bk, wm, wn] => Some((*bm, *bn, *bk, *wm, *wn)),
-        _ => Some(DOTS_VISION_STEEL_GEMM_FITTED),
+        [bm, bn, bk, wm, wn] => (*bm, *bn, *bk, *wm, *wn),
+        _ => DOTS_VISION_STEEL_GEMM_FITTED,
     }
 }
 
@@ -420,8 +390,6 @@ pub const STEEL_GEMM_SWIZZLE_REMAPS_TILE_OWNERSHIP_ONLY_SO_EVERY_SETTING_IS_BIT_
      The default stays 0 because the whole-forward wall at 13600 patches reads a wash (-0.0 to \
      -0.2 pct): the SLC already serves the cross-workgroup B re-reads on this adapter, the same \
      mechanism that nulled the v3ct column-tiled weights arm.";
-
-pub const DOTS_VISION_STEEL_FUSE_ENV: &str = "NV_DOTS_VISION_STEEL_FUSE";
 
 pub const DOTS_VISION_STEEL_FUSE_FOLDS_THE_ELEMENTWISE_CRUMBS_INTO_THE_PRODUCER_GEMM_STORE_BECAUSE_THE_CRUMB_PASSES_ARE_PURE_RE_READ_TRAFFIC: &str =
     "The deleted-work bracket prices the trunk crumbs at silu 45 ms, residual 41 ms on the \
@@ -442,21 +410,11 @@ pub const DOTS_VISION_STEEL_FUSE_FOLDS_THE_ELEMENTWISE_CRUMBS_INTO_THE_PRODUCER_
      census is 0-word at every layer, the batched crop path is 0-bit, and the corpus stamp \
      reads twelve zeros EXACT / mean CER 0.0700 EXACT / 1504 tokens at mean 2515.3-2515.4 ms \
      against the 2528-2532 pre-flip band (invoice tower 4.053 -> 4.019 s; ladder res -12 ms, \
-     silu -22 ms, additive). NV_DOTS_VISION_STEEL_FUSE=0 restores the shipped standalone \
-     passes; =res and =silu serve one side.";
+     silu -22 ms, additive).";
 
-fn steel_fuse_from_env() -> (bool, bool) {
+fn steel_fuse_on() -> bool {
     let _ = DOTS_VISION_STEEL_FUSE_FOLDS_THE_ELEMENTWISE_CRUMBS_INTO_THE_PRODUCER_GEMM_STORE_BECAUSE_THE_CRUMB_PASSES_ARE_PURE_RE_READ_TRAFFIC;
-    if std::env::var(DOTS_VISION_ABLATE_ENV).is_ok() {
-        return (false, false);
-    }
-    match std::env::var(DOTS_VISION_STEEL_FUSE_ENV).ok().as_deref() {
-        None => (true, true),
-        Some("0") | Some("") | Some("off") => (false, false),
-        Some("res") => (true, false),
-        Some("silu") => (false, true),
-        Some(_) => (true, true),
-    }
+    env::var(DOTS_VISION_ABLATE_ENV).is_err()
 }
 
 pub const DOTS_VISION_STEEL_ATTN_CFG_ENV: &str = "NV_DOTS_VISION_STEEL_ATTN_CFG";
@@ -471,19 +429,15 @@ pub const STEEL_ATTN_CFG_IS_OPT_IN_AND_LISTED_ONLY_SO_EVERY_SERVED_TILE_CARRIES_
      never on bits. The batched crop path always serves the default tile.";
 
 pub fn steel_attn_cfg_serving(n: usize) -> Result<super::vision_attn_msl::SteelAttnCfg> {
-    if std::env::var(DOTS_VISION_STEEL_ATTN_CFG_ENV).is_ok() {
+    if env::var(DOTS_VISION_STEEL_ATTN_CFG_ENV).is_ok() {
         return steel_attn_cfg_from_env();
     }
-    Ok(if shape_map_on() {
-        super::vision_attn_msl::steel_attn_cfg_for(n as u32)
-    } else {
-        super::vision_attn_msl::STEEL_ATTN_DEFAULT_CFG
-    })
+    Ok(super::vision_attn_msl::steel_attn_cfg_for(n as u32))
 }
 
 fn steel_attn_cfg_from_env() -> Result<super::vision_attn_msl::SteelAttnCfg> {
     let _ = STEEL_ATTN_CFG_IS_OPT_IN_AND_LISTED_ONLY_SO_EVERY_SERVED_TILE_CARRIES_THE_COMPILE_TIME_SMEM_AND_TQ_ASSERTS;
-    let Ok(v) = std::env::var(DOTS_VISION_STEEL_ATTN_CFG_ENV) else {
+    let Ok(v) = env::var(DOTS_VISION_STEEL_ATTN_CFG_ENV) else {
         return Ok(super::vision_attn_msl::STEEL_ATTN_DEFAULT_CFG);
     };
     let t = v.trim();
@@ -492,10 +446,10 @@ fn steel_attn_cfg_from_env() -> Result<super::vision_attn_msl::SteelAttnCfg> {
     }
     let parts: Vec<u32> = t.split(',').filter_map(|x| x.trim().parse().ok()).collect();
     let [bq, bk, wm, wn] = parts.as_slice() else {
-        anyhow::bail!("{DOTS_VISION_STEEL_ATTN_CFG_ENV}={v} is not bq,bk,wm,wn");
+        bail!("{DOTS_VISION_STEEL_ATTN_CFG_ENV}={v} is not bq,bk,wm,wn");
     };
     let cfg = (*bq, *bk, *wm, *wn);
-    anyhow::ensure!(
+    ensure!(
         super::vision_attn_msl::STEEL_ATTN_TILE_LADDER_CROWNS_THE_SHIPPED_TILE_EVERY_OTHER_ARM_LOSES_OR_WASHES_AT_13600_PATCHES
             .contains(&cfg),
         "{DOTS_VISION_STEEL_ATTN_CFG_ENV}={v} is not in the asserted ladder list"
@@ -505,26 +459,19 @@ fn steel_attn_cfg_from_env() -> Result<super::vision_attn_msl::SteelAttnCfg> {
 
 pub const DOTS_VISION_ABLATE_ENV: &str = "NV_DOTS_VISION_ABLATE";
 
-pub const DOTS_VISENC_PACK_ENV: &str = "NV_DOTS_VISENC_PACK";
-
 pub const DOTS_VISENC_PACK_ROWS_ENV: &str = "NV_DOTS_VISENC_PACK_ROWS";
 
 pub const DOTS_VISENC_PACK_ROWS_DEFAULT_16384_HOLDS_TRANSIENTS_AT_THE_PROVEN_WHOLE_PAGE_CLASS:
     usize = 16384;
 
-fn visenc_pack_rows() -> Option<usize> {
-    match std::env::var(DOTS_VISENC_PACK_ENV).ok().as_deref() {
-        Some("0") => None,
-        _ => Some(
-            std::env::var(DOTS_VISENC_PACK_ROWS_ENV)
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .filter(|r| *r > 0)
-                .unwrap_or(
-                    DOTS_VISENC_PACK_ROWS_DEFAULT_16384_HOLDS_TRANSIENTS_AT_THE_PROVEN_WHOLE_PAGE_CLASS,
-                ),
-        ),
-    }
+fn visenc_pack_rows() -> usize {
+    env::var(DOTS_VISENC_PACK_ROWS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|r| *r > 0)
+        .unwrap_or(
+            DOTS_VISENC_PACK_ROWS_DEFAULT_16384_HOLDS_TRANSIENTS_AT_THE_PROVEN_WHOLE_PAGE_CLASS,
+        )
 }
 
 pub const VISION_ABLATION_DELETES_WORK_BECAUSE_THE_DRAINED_PHASE_TABLE_CARRIES_A_1_36X_DISTORTION_AND_A_DISTORTED_INSTRUMENT_HAS_INVERTED_A_PHASE_MAP: &str =
@@ -543,7 +490,7 @@ pub const VISION_ABLATION_DELETES_WORK_BECAUSE_THE_DRAINED_PHASE_TABLE_CARRIES_A
 
 fn vis_ablated(part: &str) -> bool {
     let _ = VISION_ABLATION_DELETES_WORK_BECAUSE_THE_DRAINED_PHASE_TABLE_CARRIES_A_1_36X_DISTORTION_AND_A_DISTORTED_INSTRUMENT_HAS_INVERTED_A_PHASE_MAP;
-    std::env::var(DOTS_VISION_ABLATE_ENV).ok().as_deref() == Some(part)
+    env::var(DOTS_VISION_ABLATE_ENV).ok().as_deref() == Some(part)
 }
 
 pub const DOTS_VISION_COOP_PLAN_IS_BIT_IDENTITY_PRESERVING_BECAUSE_TM_TN_SG_KU_MOVE_WHICH_BLOCK_OWNS_A_TILE_NEVER_THE_K_ORDER: &str =
@@ -609,12 +556,30 @@ pub fn coop_source_acc(tile: u32, tm: u32, tn: u32, sg: u32, ku: u32, acc: CoopA
     let cols = tile * tn * sg;
     let entry = coop_entry_acc(tile, tm, tn, sg, ku, acc);
     let mut b = String::new();
-    writeln!(b, "alias CGA = coop_mat{t}x{t}<f16, A>;").unwrap();
-    writeln!(b, "alias CGB = coop_mat{t}x{t}<f16, B>;").unwrap();
-    writeln!(b, "alias CGC = coop_mat{t}x{t}<{cw}, C>;\n").unwrap();
-    b.push_str("struct CoopGemmParams {\n    n_rows: u32,\n    k_elems: u32,\n    m_rows: u32,\n    blocks_n: u32,\n    y_stride: u32,\n    groups_x: u32,\n    pad0: u32,\n    pad1: u32,\n};\n\n");
-    b.push_str("@group(0) @binding(0) var<storage, read> cg_w: array<f16>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> cg_x: array<f16>;\n");
+    writeln!(
+        b,
+        "alias CGA = coop_mat{t}x{t}<f16, A>;
+alias CGB = coop_mat{t}x{t}<f16, B>;
+alias CGC = coop_mat{t}x{t}<{cw}, C>;
+"
+    )
+    .unwrap();
+    b.push_str(
+        "struct CoopGemmParams {
+    n_rows: u32,
+    k_elems: u32,
+    m_rows: u32,
+    blocks_n: u32,
+    y_stride: u32,
+    groups_x: u32,
+    pad0: u32,
+    pad1: u32,
+};
+
+@group(0) @binding(0) var<storage, read> cg_w: array<f16>;
+@group(0) @binding(1) var<storage, read> cg_x: array<f16>;
+",
+    );
     writeln!(
         b,
         "@group(0) @binding(2) var<storage, read_write> cg_y: array<{cw}>;"
@@ -623,20 +588,29 @@ pub fn coop_source_acc(tile: u32, tm: u32, tn: u32, sg: u32, ku: u32, acc: CoopA
     b.push_str("@group(0) @binding(3) var<uniform> cg_p: CoopGemmParams;\n");
     writeln!(
         b,
-        "@group(0) @binding(4) var<storage, read> cg_zero: array<{cw}>;\n"
+        "@group(0) @binding(4) var<storage, read> cg_zero: array<{cw}>;
+
+@compute @workgroup_size({wg})
+fn {entry}("
     )
     .unwrap();
-    writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-    writeln!(b, "fn {entry}(").unwrap();
     b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) lidx: u32\n) {\n");
     writeln!(b, "    let sgid = lidx / {}u;", coop::SUBGROUP).unwrap();
-    b.push_str("    let block = wid.x + wid.y * cg_p.groups_x;\n");
-    b.push_str("    let bm = block / cg_p.blocks_n;\n");
-    b.push_str("    let bn = block - bm * cg_p.blocks_n;\n");
+    b.push_str(
+        "    let block = wid.x + wid.y * cg_p.groups_x;
+    let bm = block / cg_p.blocks_n;
+    let bn = block - bm * cg_p.blocks_n;
+",
+    );
     writeln!(b, "    let m0 = bm * {}u;", t * tm).unwrap();
     writeln!(b, "    let n0 = bn * {cols}u + sgid * {}u;", t * tn).unwrap();
-    b.push_str("    let kk = cg_p.k_elems;\n    let ys = cg_p.y_stride;\n");
-    b.push_str("    let mrows = cg_p.m_rows;\n    let nrows = cg_p.n_rows;\n");
+    b.push_str(
+        "    let kk = cg_p.k_elems;
+    let ys = cg_p.y_stride;
+    let mrows = cg_p.m_rows;
+    let nrows = cg_p.n_rows;
+",
+    );
     for r in 0..tm {
         writeln!(
             b,
@@ -792,10 +766,7 @@ pub const DOTS_VISION_COOP_PLAN_TM8_TN4_IS_FASTER_ON_EVERY_SHAPE_BUT_ATTN_CTX_WH
      narrow-n GEMM and a taller row block costs it more than the column band saves. Installed on \
      the seven winners the tower's full-resolution forward goes 8.688 -> 8.284 s, 1.049x, and the \
      page is bit-equal at 0 of 1267200 merged features, because tm/tn/sg/ku move which block owns \
-     a tile and never the k order. The harness arm is NV_DOTS_VISION_FITTED_PLAN in \
-     tests/dots_ocr_vision_phase_profile.rs and the bit-equality suite is \
-     the_fitted_coop_plan_moves_which_block_owns_a_tile_and_never_the_k_order_so_the_page_is_bit_equal. \
-     A blanket flip is not the win: it is the win minus a 0.91x regression on 29 percent of the \
+     a tile and never the k order. A blanket flip is not the win: it is the win minus a 0.91x regression on 29 percent of the \
      tower.";
 
 pub const DOTS_VISION_W4A16_KU_CEILING_IS_FOUR_BECAUSE_SOURCE_WQ16_STAGES_AT_MOST_FOUR_K_TILES:
@@ -933,7 +904,7 @@ impl FlashPlan {
     pub fn from_env() -> Self {
         let base =
             DOTS_VISION_FLASH_PLAN_DEFAULT_IS_THE_WIDEST_KEY_BAND_A_49152_BYTE_WORKGROUP_ADMITS_AT_64_QUERY_ROWS;
-        let Ok(v) = std::env::var(DOTS_VISION_WGPU_FLASH_PLAN_ENV) else {
+        let Ok(v) = env::var(DOTS_VISION_WGPU_FLASH_PLAN_ENV) else {
             return base;
         };
         let f: Vec<usize> = v
@@ -954,18 +925,18 @@ impl FlashPlan {
     pub fn geometry(&self, tile: usize, hd: usize) -> Result<FlashGeometry> {
         let _ = DOTS_VISION_FLASH_IS_MEASURED_SLOWER_THAN_THE_SLAB_ON_AN_8X8_FRAGMENT_ADAPTER_AND_THE_WORKGROUP_BUDGET_IS_NOT_WHY;
         let t = tile;
-        anyhow::ensure!(
+        ensure!(
             t > 0 && self.bm.is_multiple_of(t) && self.bn.is_multiple_of(t) && hd.is_multiple_of(t),
             "flash plan {}: bm, bn and head_dim {hd} must all be multiples of the {t}-wide fragment",
             self.name()
         );
-        anyhow::ensure!(
+        ensure!(
             (1..=8).contains(&self.sg) && self.scs >= 1 && self.sg.is_multiple_of(self.scs),
             "flash plan {}: sg must be 1..8 and the score column split must divide it",
             self.name()
         );
         let wg = self.sg * (coop::SUBGROUP as usize);
-        anyhow::ensure!(
+        ensure!(
             wg.is_multiple_of(self.bm),
             "flash plan {}: a {wg}-invocation workgroup must cover {} rows an equal number of \
              lanes each",
@@ -976,7 +947,7 @@ impl FlashPlan {
         let cn = self.bn / t;
         let ht = hd / t;
         let srs = self.sg / self.scs;
-        anyhow::ensure!(
+        ensure!(
             rm.is_multiple_of(srs) && cn.is_multiple_of(self.scs) && ht.is_multiple_of(self.sg),
             "flash plan {}: the {rm}x{cn} score tile grid and the {ht} head-dim tiles must divide \
              across {} subgroups",
@@ -984,7 +955,7 @@ impl FlashPlan {
             self.sg
         );
         let nchunk = hd.div_ceil(self.bn).max(1);
-        anyhow::ensure!(
+        ensure!(
             rm.is_multiple_of(nchunk),
             "flash plan {}: {}",
             self.name(),
@@ -1007,7 +978,7 @@ impl FlashPlan {
             plan: *self,
         };
         let _ = DOTS_VISION_FLASH_ACCUMULATOR_IS_SPLIT_ACROSS_SUBGROUPS_BY_HEAD_DIM_BECAUSE_ONE_SUBGROUP_CANNOT_HOLD_A_BM_BY_128_F32_TILE;
-        anyhow::ensure!(
+        ensure!(
             g.acc_lane_dwords() <= coop::ACC_LANE_DWORD_BUDGET as usize,
             "flash plan {}: {} accumulator dwords per lane exceeds the {} the generator honours",
             self.name(),
@@ -1059,42 +1030,75 @@ impl FlashGeometry {
         let cells = bm * bn;
         let entry = self.entry();
         let mut b = String::new();
-        writeln!(b, "alias FQA = coop_mat{t}x{t}<f16, A>;").unwrap();
-        writeln!(b, "alias FQB = coop_mat{t}x{t}<f16, B>;").unwrap();
-        writeln!(b, "alias FQC = coop_mat{t}x{t}<f32, C>;\n").unwrap();
-        b.push_str("struct FlashP { n: u32, n_pad: u32, heads: u32, hd: u32, blocks_m: u32, blocks_n: u32, groups_x: u32, scale: f32 };\n");
-        b.push_str("@group(0) @binding(0) var<storage, read> fa_q: array<f16>;\n");
-        b.push_str("@group(0) @binding(1) var<storage, read> fa_k: array<f16>;\n");
-        b.push_str("@group(0) @binding(2) var<storage, read> fa_v: array<f16>;\n");
-        b.push_str("@group(0) @binding(3) var<storage, read_write> fa_o: array<f16>;\n");
-        b.push_str("@group(0) @binding(4) var<uniform> fa_p: FlashP;\n");
-        b.push_str("@group(0) @binding(5) var<storage, read> fa_zero: array<f32>;\n\n");
-        writeln!(b, "var<workgroup> fa_s: array<f32, {cells}>;").unwrap();
-        writeln!(b, "var<workgroup> fa_pr: array<f16, {cells}>;").unwrap();
-        writeln!(b, "var<workgroup> fa_mx: array<f32, {bm}>;").unwrap();
-        writeln!(b, "var<workgroup> fa_ln: array<f32, {bm}>;").unwrap();
-        writeln!(b, "var<workgroup> fa_al: array<f32, {bm}>;").unwrap();
-        writeln!(b, "var<workgroup> fa_red: array<f32, {wg}>;").unwrap();
+        writeln!(
+            b,
+            "alias FQA = coop_mat{t}x{t}<f16, A>;
+alias FQB = coop_mat{t}x{t}<f16, B>;
+alias FQC = coop_mat{t}x{t}<f32, C>;
+"
+        )
+        .unwrap();
+        b.push_str(
+            "struct FlashP { n: u32, n_pad: u32, heads: u32, hd: u32, blocks_m: u32, blocks_n: u32, groups_x: u32, scale: f32 };
+@group(0) @binding(0) var<storage, read> fa_q: array<f16>;
+@group(0) @binding(1) var<storage, read> fa_k: array<f16>;
+@group(0) @binding(2) var<storage, read> fa_v: array<f16>;
+@group(0) @binding(3) var<storage, read_write> fa_o: array<f16>;
+@group(0) @binding(4) var<uniform> fa_p: FlashP;
+@group(0) @binding(5) var<storage, read> fa_zero: array<f32>;
+
+",
+        );
+        writeln!(
+            b,
+            "var<workgroup> fa_s: array<f32, {cells}>;
+var<workgroup> fa_pr: array<f16, {cells}>;
+var<workgroup> fa_mx: array<f32, {bm}>;
+var<workgroup> fa_ln: array<f32, {bm}>;
+var<workgroup> fa_al: array<f32, {bm}>;
+var<workgroup> fa_red: array<f32, {wg}>;"
+        )
+        .unwrap();
         let _ = EVERY_WORKGROUP_TILE_THIS_KERNEL_COOP_LOADS_MUST_START_ON_A_16_BYTE_BOUNDARY_WHICH_MAKING_IT_AN_ARRAY_DOES_NOT_BY_ITSELF_ACHIEVE;
         writeln!(b, "var<workgroup> fa_need: array<u32, {wg}>;").unwrap();
         b.push_str(&format!("var<workgroup> fa_needv: array<u32, {}>;\n\n", FA_NEEDV_ELEMS_IS_FOUR_BECAUSE_FOUR_U32_IS_EXACTLY_THE_16_BYTE_COOP_LOAD_ALIGNMENT_QUANTUM));
-        writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-        writeln!(b, "fn {entry}(").unwrap();
-        b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) lidx: u32\n) {\n");
-        b.push_str("    let block = wid.x + wid.y * fa_p.groups_x;\n");
-        b.push_str("    let h = block / fa_p.blocks_m;\n");
-        b.push_str("    if (h >= fa_p.heads) { return; }\n");
-        b.push_str("    let bmi = block - h * fa_p.blocks_m;\n");
+        writeln!(
+            b,
+            "@compute @workgroup_size({wg})
+fn {entry}("
+        )
+        .unwrap();
+        b.push_str(
+            "    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) lidx: u32
+) {
+    let block = wid.x + wid.y * fa_p.groups_x;
+    let h = block / fa_p.blocks_m;
+    if (h >= fa_p.heads) { return; }
+    let bmi = block - h * fa_p.blocks_m;
+",
+        );
         writeln!(b, "    let m0 = bmi * {bm}u;").unwrap();
         b.push_str("    let np = fa_p.n_pad;\n");
-        writeln!(b, "    let hdw = {hd}u;").unwrap();
-        writeln!(b, "    let bnw = {bn}u;").unwrap();
-        b.push_str("    let dim = fa_p.heads * hdw;\n");
-        b.push_str("    let qbase = h * np * hdw;\n");
-        b.push_str("    let vbase = h * hdw * np;\n");
-        b.push_str("    let sgid = lidx / 32u;\n");
-        writeln!(b, "    let sgr = sgid / {scs}u;").unwrap();
-        writeln!(b, "    let sgc = sgid - sgr * {scs}u;").unwrap();
+        writeln!(
+            b,
+            "    let hdw = {hd}u;
+    let bnw = {bn}u;"
+        )
+        .unwrap();
+        b.push_str(
+            "    let dim = fa_p.heads * hdw;
+    let qbase = h * np * hdw;
+    let vbase = h * hdw * np;
+    let sgid = lidx / 32u;
+",
+        );
+        writeln!(
+            b,
+            "    let sgr = sgid / {scs}u;
+    let sgc = sgid - sgr * {scs}u;"
+        )
+        .unwrap();
         for i in 0..srm {
             writeln!(b, "    let srow{i} = (sgr * {srm}u + {i}u) * {t}u;").unwrap();
         }
@@ -1111,14 +1115,17 @@ impl FlashGeometry {
         }
         writeln!(
             b,
-            "    for (var r = lidx; r < {bm}u; r = r + {wg}u) {{ fa_mx[r] = -1.0e30; fa_ln[r] = 0.0; }}"
+            "    for (var r = lidx; r < {bm}u; r = r + {wg}u) {{ fa_mx[r] = -1.0e30; fa_ln[r] = 0.0; }}
+    let row = lidx / {lr}u;
+    let sub = lidx - row * {lr}u;"
         )
         .unwrap();
-        writeln!(b, "    let row = lidx / {lr}u;").unwrap();
-        writeln!(b, "    let sub = lidx - row * {lr}u;").unwrap();
-        b.push_str("    let sbase = row * bnw;\n");
-        b.push_str("    for (var kb = 0u; kb < fa_p.blocks_n; kb = kb + 1u) {\n");
-        b.push_str("        let j0 = kb * bnw;\n");
+        b.push_str(
+            "    let sbase = row * bnw;
+    for (var kb = 0u; kb < fa_p.blocks_n; kb = kb + 1u) {
+        let j0 = kb * bnw;
+",
+        );
         for i in 0..srm {
             for j in 0..scn {
                 writeln!(
@@ -1152,18 +1159,28 @@ impl FlashGeometry {
                 .unwrap();
             }
         }
-        b.push_str("        }\n");
-        b.push_str("        workgroupBarrier();\n");
-        b.push_str("        fa_need[lidx] = 0u;\n");
+        b.push_str(
+            "        }
+        workgroupBarrier();
+        fa_need[lidx] = 0u;
+",
+        );
         for i in 0..srm {
             for j in 0..scn {
-                writeln!(b, "        let sv{i}_{j} = c{i}_{j};").unwrap();
-                writeln!(b, "        let so{i}_{j} = srow{i} * bnw + scol{j};").unwrap();
-                writeln!(b, "        coopStoreT(sv{i}_{j}, &fa_s[so{i}_{j}], bnw);").unwrap();
+                writeln!(
+                    b,
+                    "        let sv{i}_{j} = c{i}_{j};
+        let so{i}_{j} = srow{i} * bnw + scol{j};
+        coopStoreT(sv{i}_{j}, &fa_s[so{i}_{j}], bnw);"
+                )
+                .unwrap();
             }
         }
-        b.push_str("        workgroupBarrier();\n");
-        b.push_str("        var mxv = -1.0e30;\n");
+        b.push_str(
+            "        workgroupBarrier();
+        var mxv = -1.0e30;
+",
+        );
         writeln!(
             b,
             "        for (var c = sub; c < bnw; c = c + {lr}u) {{ if (j0 + c < fa_p.n) {{ mxv = max(mxv, fa_s[sbase + c] * fa_p.scale); }} }}"
@@ -1171,41 +1188,52 @@ impl FlashGeometry {
         .unwrap();
         b.push_str("        fa_red[lidx] = mxv;\n        workgroupBarrier();\n");
         if lr > 1 {
-            writeln!(b, "        if (sub == 0u) {{").unwrap();
-            writeln!(b, "            var racc = fa_red[row * {lr}u];").unwrap();
             writeln!(
                 b,
-                "            for (var q = 1u; q < {lr}u; q = q + 1u) {{ racc = max(racc, fa_red[row * {lr}u + q]); }}"
+                "        if (sub == 0u) {{
+            var racc = fa_red[row * {lr}u];
+            for (var q = 1u; q < {lr}u; q = q + 1u) {{ racc = max(racc, fa_red[row * {lr}u + q]); }}
+            fa_red[row * {lr}u] = racc;"
             )
             .unwrap();
-            writeln!(b, "            fa_red[row * {lr}u] = racc;").unwrap();
             b.push_str("        }\n        workgroupBarrier();\n");
         }
         writeln!(b, "        let bmax = fa_red[row * {lr}u];").unwrap();
-        b.push_str("        let mold = fa_mx[row];\n");
-        b.push_str("        let mnew = max(mold, bmax);\n");
-        b.push_str("        let alpha = exp(mold - mnew);\n");
-        b.push_str("        var zsum = 0.0;\n");
-        writeln!(b, "        for (var c = sub; c < bnw; c = c + {lr}u) {{").unwrap();
-        b.push_str("            var pv = 0.0;\n");
         b.push_str(
-            "            if (j0 + c < fa_p.n) { pv = exp(fa_s[sbase + c] * fa_p.scale - mnew); }\n",
+            "        let mold = fa_mx[row];
+        let mnew = max(mold, bmax);
+        let alpha = exp(mold - mnew);
+        var zsum = 0.0;
+",
         );
-        b.push_str("            fa_pr[sbase + c] = f16(pv);\n");
-        b.push_str("            zsum = zsum + pv;\n        }\n");
-        b.push_str("        workgroupBarrier();\n");
-        b.push_str("        fa_red[lidx] = zsum;\n        workgroupBarrier();\n");
-        b.push_str("        if (sub == 0u) {\n            var zacc = 0.0;\n");
+        writeln!(b, "        for (var c = sub; c < bnw; c = c + {lr}u) {{").unwrap();
+        b.push_str(
+            "            var pv = 0.0;
+            if (j0 + c < fa_p.n) { pv = exp(fa_s[sbase + c] * fa_p.scale - mnew); }
+            fa_pr[sbase + c] = f16(pv);
+            zsum = zsum + pv;
+        }
+        workgroupBarrier();
+        fa_red[lidx] = zsum;
+        workgroupBarrier();
+        if (sub == 0u) {
+            var zacc = 0.0;
+",
+        );
         writeln!(
             b,
             "            for (var q = 0u; q < {lr}u; q = q + 1u) {{ zacc = zacc + fa_red[row * {lr}u + q]; }}"
         )
         .unwrap();
-        b.push_str("            fa_mx[row] = mnew;\n");
-        b.push_str("            fa_ln[row] = fa_ln[row] * alpha + zacc;\n");
-        b.push_str("            fa_al[row] = alpha;\n");
-        b.push_str("            if (alpha != 1.0) { fa_need[lidx] = 1u; }\n        }\n");
-        b.push_str("        workgroupBarrier();\n");
+        b.push_str(
+            "            fa_mx[row] = mnew;
+            fa_ln[row] = fa_ln[row] * alpha + zacc;
+            fa_al[row] = alpha;
+            if (alpha != 1.0) { fa_need[lidx] = 1u; }
+        }
+        workgroupBarrier();
+",
+        );
         writeln!(
             b,
             "        if (lidx == 0u) {{ var nf = 0u; for (var q = 0u; q < {wg}u; q = q + 1u) {{ nf = nf | fa_need[q]; }} fa_needv[0] = nf; }}"
@@ -1218,11 +1246,11 @@ impl FlashGeometry {
             for i in (ch * self.tpc)..((ch + 1) * self.tpc) {
                 for j in 0..ocn {
                     let off = (i - ch * self.tpc) * t;
-                    writeln!(b, "            let rv{i}_{j} = o{i}_{j};").unwrap();
-                    writeln!(b, "            let ro{i}_{j} = {off}u * hdw + ocol{j};").unwrap();
                     writeln!(
                         b,
-                        "            coopStoreT(rv{i}_{j}, &fa_s[ro{i}_{j}], hdw);"
+                        "            let rv{i}_{j} = o{i}_{j};
+            let ro{i}_{j} = {off}u * hdw + ocol{j};
+            coopStoreT(rv{i}_{j}, &fa_s[ro{i}_{j}], hdw);"
                     )
                     .unwrap();
                 }
@@ -1273,15 +1301,23 @@ impl FlashGeometry {
                 .unwrap();
             }
         }
-        b.push_str("        }\n    }\n");
-        b.push_str("    workgroupBarrier();\n");
+        b.push_str(
+            "        }
+    }
+    workgroupBarrier();
+",
+        );
         for ch in 0..self.nchunk {
             for i in (ch * self.tpc)..((ch + 1) * self.tpc) {
                 for j in 0..ocn {
                     let off = (i - ch * self.tpc) * t;
-                    writeln!(b, "    let ev{i}_{j} = o{i}_{j};").unwrap();
-                    writeln!(b, "    let eo{i}_{j} = {off}u * hdw + ocol{j};").unwrap();
-                    writeln!(b, "    coopStoreT(ev{i}_{j}, &fa_s[eo{i}_{j}], hdw);").unwrap();
+                    writeln!(
+                        b,
+                        "    let ev{i}_{j} = o{i}_{j};
+    let eo{i}_{j} = {off}u * hdw + ocol{j};
+    coopStoreT(ev{i}_{j}, &fa_s[eo{i}_{j}], hdw);"
+                    )
+                    .unwrap();
                 }
             }
             b.push_str("    workgroupBarrier();\n");
@@ -1291,30 +1327,37 @@ impl FlashGeometry {
                 self.rpc * hd
             )
             .unwrap();
-            b.push_str("        let rr = e / hdw;\n");
-            b.push_str("        let cc = e - rr * hdw;\n");
+            b.push_str(
+                "        let rr = e / hdw;
+        let cc = e - rr * hdw;
+",
+            );
             writeln!(b, "        let lrow = {}u + rr;", ch * self.rpc).unwrap();
-            b.push_str("        let grow = m0 + lrow;\n");
-            b.push_str("        if (grow < fa_p.n) { fa_o[grow * dim + h * hdw + cc] = f16(fa_s[e] / fa_ln[lrow]); }\n");
-            b.push_str("    }\n");
-            b.push_str("    workgroupBarrier();\n");
+            b.push_str(
+                "        let grow = m0 + lrow;
+        if (grow < fa_p.n) { fa_o[grow * dim + h * hdw + cc] = f16(fa_s[e] / fa_ln[lrow]); }
+    }
+    workgroupBarrier();
+",
+            );
         }
         b.push_str("}\n");
         compose_enabled(&coop::ENABLES, &b)
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct FlashP {
-    n: u32,
-    n_pad: u32,
-    heads: u32,
-    hd: u32,
-    blocks_m: u32,
-    blocks_n: u32,
-    groups_x: u32,
-    scale: f32,
+pod! {
+    #[derive(Debug)]
+    struct FlashP {
+        n: u32,
+        n_pad: u32,
+        heads: u32,
+        hd: u32,
+        blocks_m: u32,
+        blocks_n: u32,
+        groups_x: u32,
+        scale: f32,
+    }
 }
 
 pub const DOTS_VISION_M_ROW_FLASH_TRADES_QUERY_REUSE_FOR_NOT_MATERIALISING_SCORES_WHICH_IS_FREE_AT_SMALL_M_AND_COSTLY_AT_M_EQUALS_N: &str =
@@ -1340,35 +1383,60 @@ pub fn flash_m_source(m_rows: usize, hd: usize) -> String {
     let cells = m * hd;
     let entry = flash_m_entry(m_rows, hd);
     let mut b = String::new();
-    b.push_str("struct FmP { n: u32, n_pad: u32, heads: u32, tiles: u32, groups_x: u32, pad0: u32, pad1: u32, scale: f32 };\n");
-    b.push_str("@group(0) @binding(0) var<storage, read> fm_q: array<f16>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> fm_k: array<f16>;\n");
-    b.push_str("@group(0) @binding(2) var<storage, read> fm_v: array<f16>;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> fm_o: array<f16>;\n");
-    b.push_str("@group(0) @binding(4) var<uniform> fm_p: FmP;\n\n");
-    writeln!(b, "var<workgroup> fm_qs: array<f32, {cells}>;").unwrap();
-    writeln!(b, "var<workgroup> fm_ac: array<f32, {cells}>;").unwrap();
+    b.push_str(
+        "struct FmP { n: u32, n_pad: u32, heads: u32, tiles: u32, groups_x: u32, pad0: u32, pad1: u32, scale: f32 };
+@group(0) @binding(0) var<storage, read> fm_q: array<f16>;
+@group(0) @binding(1) var<storage, read> fm_k: array<f16>;
+@group(0) @binding(2) var<storage, read> fm_v: array<f16>;
+@group(0) @binding(3) var<storage, read_write> fm_o: array<f16>;
+@group(0) @binding(4) var<uniform> fm_p: FmP;
+
+",
+    );
+    writeln!(
+        b,
+        "var<workgroup> fm_qs: array<f32, {cells}>;
+var<workgroup> fm_ac: array<f32, {cells}>;"
+    )
+    .unwrap();
     writeln!(b, "var<workgroup> fm_am: array<f32, {}>;", 9 * m).unwrap();
     writeln!(b, "var<workgroup> fm_az: array<f32, {}>;\n", 9 * m).unwrap();
     b.push_str("@compute @workgroup_size(256)\n");
     writeln!(b, "fn {entry}(").unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_index) tid: u32\n) {\n");
-    b.push_str("    let block = wid.x + wid.y * fm_p.groups_x;\n");
-    b.push_str("    let h = block / fm_p.tiles;\n");
-    b.push_str("    if (h >= fm_p.heads) { return; }\n");
+    b.push_str(
+        "    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_index) tid: u32
+) {
+    let block = wid.x + wid.y * fm_p.groups_x;
+    let h = block / fm_p.tiles;
+    if (h >= fm_p.heads) { return; }
+",
+    );
     writeln!(b, "    let row0 = (block - h * fm_p.tiles) * {m}u;").unwrap();
-    b.push_str("    if (row0 >= fm_p.n) { return; }\n");
-    b.push_str("    let lane = tid & 31u;\n    let warp = tid >> 5u;\n");
-    writeln!(b, "    let qbase = h * fm_p.n_pad * {hd}u;").unwrap();
+    b.push_str(
+        "    if (row0 >= fm_p.n) { return; }
+    let lane = tid & 31u;
+    let warp = tid >> 5u;
+",
+    );
     writeln!(
         b,
-        "    for (var e = tid; e < {cells}u; e = e + 256u) {{\n        let r = e / {hd}u;\n        let qr = min(row0 + r, fm_p.n - 1u);\n        fm_qs[e] = f32(fm_q[qbase + qr * {hd}u + e - r * {hd}u]) * fm_p.scale;\n    }}"
+        "    let qbase = h * fm_p.n_pad * {hd}u;
+    for (var e = tid; e < {cells}u; e = e + 256u) {{
+        let r = e / {hd}u;
+        let qr = min(row0 + r, fm_p.n - 1u);
+        fm_qs[e] = f32(fm_q[qbase + qr * {hd}u + e - r * {hd}u]) * fm_p.scale;
+    }}"
     )
     .unwrap();
     b.push_str("    workgroupBarrier();\n    let d0 = lane * 4u;\n");
     for i in 0..g {
-        writeln!(b, "    var mv{i} = vec4<f32>(-3.4028235e38);").unwrap();
-        writeln!(b, "    var zv{i} = vec4<f32>(0.0);").unwrap();
+        writeln!(
+            b,
+            "    var mv{i} = vec4<f32>(-3.4028235e38);
+    var zv{i} = vec4<f32>(0.0);"
+        )
+        .unwrap();
         for c in 0..4 {
             writeln!(b, "    var av{i}_{c} = vec4<f32>(0.0);").unwrap();
         }
@@ -1400,10 +1468,14 @@ pub fn flash_m_source(m_rows: usize, hd: usize) -> String {
         writeln!(b, "        let vv{c} = f32(fm_v[kb + {c}u]);").unwrap();
     }
     for i in 0..g {
-        writeln!(b, "        let nm{i} = max(mv{i}, sv{i});").unwrap();
-        writeln!(b, "        let rs{i} = exp(mv{i} - nm{i});").unwrap();
-        writeln!(b, "        let ex{i} = exp(sv{i} - nm{i});").unwrap();
-        writeln!(b, "        zv{i} = fma(zv{i}, rs{i}, ex{i});").unwrap();
+        writeln!(
+            b,
+            "        let nm{i} = max(mv{i}, sv{i});
+        let rs{i} = exp(mv{i} - nm{i});
+        let ex{i} = exp(sv{i} - nm{i});
+        zv{i} = fma(zv{i}, rs{i}, ex{i});"
+        )
+        .unwrap();
         for c in 0..4 {
             writeln!(
                 b,
@@ -1413,8 +1485,11 @@ pub fn flash_m_source(m_rows: usize, hd: usize) -> String {
         }
         writeln!(b, "        mv{i} = nm{i};").unwrap();
     }
-    b.push_str("    }\n");
-    b.push_str("    if (lane == 0u) {\n");
+    b.push_str(
+        "    }
+    if (lane == 0u) {
+",
+    );
     for i in 0..g {
         for r in 0..4 {
             writeln!(
@@ -1445,8 +1520,12 @@ pub fn flash_m_source(m_rows: usize, hd: usize) -> String {
         "    for (var e = tid; e < {cells}u; e = e + 256u) {{ fm_ac[e] = 0.0; }}"
     )
     .unwrap();
-    b.push_str("    workgroupBarrier();\n");
-    b.push_str("    for (var w = 0u; w < 8u; w = w + 1u) {\n        if (warp == w) {\n");
+    b.push_str(
+        "    workgroupBarrier();
+    for (var w = 0u; w < 8u; w = w + 1u) {
+        if (warp == w) {
+",
+    );
     for i in 0..g {
         writeln!(
             b,
@@ -1477,17 +1556,18 @@ pub fn flash_m_source(m_rows: usize, hd: usize) -> String {
     compose_enabled(&["f16"], &b)
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct FmP {
-    n: u32,
-    n_pad: u32,
-    heads: u32,
-    tiles: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    scale: f32,
+pod! {
+    #[derive(Debug)]
+    struct FmP {
+        n: u32,
+        n_pad: u32,
+        heads: u32,
+        tiles: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+        scale: f32,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1517,7 +1597,7 @@ impl VisionGemmRoute {
 
     pub fn from_env_and_adapter(ctx: &WgpuContext) -> Self {
         if matches!(
-            std::env::var(DOTS_VISION_WGPU_GEMM_ENV).ok().as_deref(),
+            env::var(DOTS_VISION_WGPU_GEMM_ENV).ok().as_deref(),
             Some("scalar")
         ) {
             return Self::ScalarF16;
@@ -1592,7 +1672,7 @@ pub struct MlxW4Rows {
 }
 
 fn bf16_round(v: f32) -> f32 {
-    f32::from_bits((half::bf16::from_f32(v).to_bits() as u32) << 16)
+    f32::from_bits((bf16::from_f32(v).to_bits() as u32) << 16)
 }
 
 pub const MLX_W4_QUANTIZE_REQUANTIZES_AGAINST_THE_BF16_ROUNDED_SCALE_AND_BIAS_BECAUSE_THOSE_ARE_THE_VALUES_THE_DEQUANT_WILL_USE: &str =
@@ -1646,8 +1726,8 @@ pub fn mlx_w4_quantize_rows(w: &[f32], n: usize, k: usize, gs: usize) -> MlxW4Ro
                         let amax = grp.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                         let s = bf16_round((amax - amin) / 15.0);
                         let b = bf16_round(amin);
-                        sc_c[ri * groups + g] = half::bf16::from_f32(s).to_bits();
-                        bc[ri * groups + g] = half::bf16::from_f32(b).to_bits();
+                        sc_c[ri * groups + g] = bf16::from_f32(s).to_bits();
+                        bc[ri * groups + g] = bf16::from_f32(b).to_bits();
                         let inv = if s > 0.0 { 1.0 / s } else { 0.0 };
                         for (e, &v) in grp.iter().enumerate() {
                             let q = (((v - b) * inv).round().clamp(0.0, 15.0)) as u32;
@@ -1693,43 +1773,42 @@ pub const DOTS_VISION_NVFP4_STAGING_USES_THE_CLOSED_FORM_SCALE_SEARCH_BECAUSE_TH
      byte minimizing block reconstruction error, at load time and at no serving cost, where \
      quantize_rows takes the nearest byte unconditionally.";
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemmP {
-    n_rows: u32,
-    k_pad: u32,
-    m_rows: u32,
-    y_stride: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+pod! {
+    #[derive(Debug)]
+    struct GemmP {
+        n_rows: u32,
+        k_pad: u32,
+        m_rows: u32,
+        y_stride: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RowsP {
-    rows: u32,
-    cols: u32,
-    cols_pad: u32,
-    groups_x: u32,
-    scalar: f32,
-    zbase: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    #[derive(Debug)]
+    struct RowsP {
+        rows: u32,
+        cols: u32,
+        cols_pad: u32,
+        groups_x: u32,
+        scalar: f32,
+        zbase: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct SplitP {
-    rows: u32,
-    rows_pad: u32,
-    heads: u32,
-    head_dim: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
+    #[derive(Debug)]
+    struct SplitP {
+        rows: u32,
+        rows_pad: u32,
+        heads: u32,
+        head_dim: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 }
 
 const PRELUDE: &str = "
@@ -1905,53 +1984,6 @@ pub const DOTS_VISION_SOFTMAX_IS_BANDWIDTH_BOUND_AND_ZMERGE_IS_ALREADY_THE_FEWES
      0.740 GB per head-layer. The floor for a one-read one-write softmax is 559 GB, about 0.72 s, \
      so roughly 0.49 s sits behind that blocked structure and nowhere else.";
 
-const SOFTMAX_SRC: &str = "
-struct RowsP { rows: u32, cols: u32, cols_pad: u32, groups_x: u32, scalar: f32, pad0: u32, pad1: u32, pad2: u32 };
-@group(0) @binding(0) var<storage, read> sm_s: array<f32>;
-@group(0) @binding(1) var<storage, read_write> sm_o: array<f16>;
-@group(0) @binding(2) var<uniform> sm_p: RowsP;
-
-var<workgroup> sm_red: array<f32, 256>;
-
-@compute @workgroup_size(256)
-fn dv_softmax_rows(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let row = wid.x + wid.y * sm_p.groups_x;
-    if (row >= sm_p.rows) { return; }
-    let base = row * sm_p.cols_pad;
-    var m = -3.4028235e38;
-    for (var c = lid.x; c < sm_p.cols; c = c + 256u) {
-        m = max(m, sm_s[base + c] * sm_p.scalar);
-    }
-    sm_red[lid.x] = m;
-    workgroupBarrier();
-    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
-        if (lid.x < stride) { sm_red[lid.x] = max(sm_red[lid.x], sm_red[lid.x + stride]); }
-        workgroupBarrier();
-    }
-    let rowmax = sm_red[0];
-    workgroupBarrier();
-    var z = 0.0;
-    for (var c = lid.x; c < sm_p.cols; c = c + 256u) {
-        z = z + exp(sm_s[base + c] * sm_p.scalar - rowmax);
-    }
-    workgroupBarrier();
-    sm_red[lid.x] = z;
-    workgroupBarrier();
-    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
-        if (lid.x < stride) { sm_red[lid.x] = sm_red[lid.x] + sm_red[lid.x + stride]; }
-        workgroupBarrier();
-    }
-    let inv = 1.0 / sm_red[0];
-    for (var c = lid.x; c < sm_p.cols_pad; c = c + 256u) {
-        if (c < sm_p.cols) {
-            sm_o[base + c] = f16(exp(sm_s[base + c] * sm_p.scalar - rowmax) * inv);
-        } else {
-            sm_o[base + c] = f16(0.0);
-        }
-    }
-}
-";
-
 const SOFTMAX_Z_SRC: &str = "
 struct RowsP { rows: u32, cols: u32, cols_pad: u32, groups_x: u32, scalar: f32, zbase: u32, pad1: u32, pad2: u32 };
 @group(0) @binding(0) var<storage, read> sz_s: array<f32>;
@@ -2015,26 +2047,6 @@ fn dv_attn_merge_deferred_norm_f16(@builtin(workgroup_id) wid: vec3<u32>, @built
     let lane = rest - h * hd;
     let inv = mz_z[h * mz_p.rows_pad + row];
     mz_out[row * per_row + h * hd + lane] = f16(mz_ctx[h * mz_p.rows_pad * hd + row * hd + lane] * inv);
-}
-";
-
-const ATTN_MERGE_SRC: &str = "
-struct SplitP { rows: u32, rows_pad: u32, heads: u32, head_dim: u32, groups_x: u32, pad0: u32, pad1: u32, pad2: u32 };
-@group(0) @binding(0) var<storage, read> am_ctx: array<f32>;
-@group(0) @binding(1) var<storage, read_write> am_out: array<f16>;
-@group(0) @binding(2) var<uniform> am_p: SplitP;
-
-@compute @workgroup_size(256)
-fn dv_attn_merge_f16(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let i = dv_linear_index(wid, lid, am_p.groups_x);
-    let hd = am_p.head_dim;
-    let per_row = am_p.heads * hd;
-    if (i >= am_p.rows * per_row) { return; }
-    let row = i / per_row;
-    let rest = i - row * per_row;
-    let h = rest / hd;
-    let lane = rest - h * hd;
-    am_out[row * per_row + h * hd + lane] = f16(am_ctx[h * am_p.rows_pad * hd + row * hd + lane]);
 }
 ";
 
@@ -2194,24 +2206,24 @@ fn source_of(body: &str) -> String {
     compose_enabled(&["f16"], &format!("{PRELUDE}{body}"))
 }
 
-type QueuedPass = (Arc<wgpu::ComputePipeline>, wgpu::BindGroup, (u32, u32, u32));
+type QueuedPass = (Arc<ComputePipeline>, BindGroup, (u32, u32, u32));
 
 pub struct VisionGemm {
     ctx: &'static WgpuContext,
     route: VisionGemmRoute,
-    coop_zero: wgpu::Buffer,
-    _coop_zero16: wgpu::Buffer,
-    pipelines: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
+    coop_zero: Buffer,
+    _coop_zero16: Buffer,
+    pipelines: Mutex<HashMap<String, Arc<ComputePipeline>>>,
     uniforms: Mutex<
         HashMap<
             [u8; DOTS_VISION_UNIFORM_BLOCK_IS_EIGHT_U32_IN_EVERY_PARAM_STRUCT_SO_ITS_CONTENT_IS_THE_CACHE_KEY],
-            Arc<wgpu::Buffer>,
+            Arc<Buffer>,
         >,
     >,
     queued: Mutex<Vec<QueuedPass>>,
     plans: Mutex<HashMap<(usize, usize), CoopPlan>>,
-    uniforms_wide: Mutex<HashMap<Vec<u8>, Arc<wgpu::Buffer>>>,
-    splitk_scratch: Mutex<Option<(usize, Arc<wgpu::Buffer>)>>,
+    uniforms_wide: Mutex<HashMap<Vec<u8>, Arc<Buffer>>>,
+    splitk_scratch: Mutex<Option<(usize, Arc<Buffer>)>>,
     submits: std::sync::atomic::AtomicU64,
     dispatched: std::sync::atomic::AtomicU64,
     fused_steel: std::sync::atomic::AtomicU64,
@@ -2219,7 +2231,7 @@ pub struct VisionGemm {
 
 impl VisionGemm {
     pub fn new(ctx: &'static WgpuContext, route: VisionGemmRoute) -> Result<Self> {
-        anyhow::ensure!(
+        ensure!(
             ctx.caps.shader_f16,
             "{}",
             DOTS_VISION_WGPU_STAGES_EVERY_WEIGHT_AS_F16_BECAUSE_THE_ONLY_GENERAL_LARGE_M_GEMM_IN_THIS_TREE_IS_COOP_MAT_F16
@@ -2282,7 +2294,7 @@ impl VisionGemm {
 
     pub fn plan_for(&self, n: usize, k_pad: usize, m_pad: usize) -> Result<CoopPlan> {
         let VisionGemmRoute::Coop(g) = self.route else {
-            anyhow::bail!("plan_for is a cooperative-matrix concept; this route is scalar_f16");
+            bail!("plan_for is a cooperative-matrix concept; this route is scalar_f16");
         };
         self.resolve_plan(&g, n, k_pad, m_pad)
     }
@@ -2313,11 +2325,7 @@ impl VisionGemm {
         let square = DOTS_VISION_COOP_PLAN_IS_A_SQUARE_FRAGMENT_TILE_BECAUSE_TM_PLUS_TN_OPERAND_LOADS_FEED_TM_TIMES_TN_MULTIPLY_ADDS;
         let fitted = DOTS_VISION_COOP_PLAN_FITTED_TM8_TN4_SG4_IS_THE_DEFAULT_WHEREVER_THE_OUTPUT_IS_WIDER_THAN_ONE_COLUMN_BAND;
         let wider_than_one_band = n_pad > g.cols_per_workgroup(fitted.tn, fitted.sg) as usize;
-        let mut p = listed.unwrap_or(match std::env::var(DOTS_VISION_PLAN_ENV).ok().as_deref() {
-            Some("square") => square,
-            _ if wider_than_one_band => fitted,
-            _ => square,
-        });
+        let mut p = listed.unwrap_or(if wider_than_one_band { fitted } else { square });
         p.tm = p.tm.clamp(1, m_pad.div_ceil(tile).max(1) as u32);
         p.tn = p.tn.max(1);
         p.sg = p.sg.max(1);
@@ -2340,14 +2348,14 @@ impl VisionGemm {
                 p.tn /= 2;
             }
         }
-        anyhow::ensure!(
+        ensure!(
             g.acc_fits_a_register_file(p.tm, p.tn) && p.tm * p.tn <= 64,
             "coop plan {} at n={n} k={k_pad}: {} accumulator dwords per lane exceeds the register \
              budget the generator will honour",
             p.name(),
             g.acc_lane_dwords(p.tm, p.tn)
         );
-        anyhow::ensure!(
+        ensure!(
             (1..=8).contains(&p.sg)
                 && self.ctx.caps.max_compute_invocations_per_workgroup >= p.sg * coop::SUBGROUP,
             "coop plan {} needs a {}-invocation workgroup; this adapter allows {}",
@@ -2356,7 +2364,7 @@ impl VisionGemm {
             self.ctx.caps.max_compute_invocations_per_workgroup
         );
         let _ = DOTS_VISION_COOP_ROW_BLOCK_CEILING_IS_THE_TALLEST_TILE_THE_PLAN_LADDER_ASKS_FOR;
-        anyhow::ensure!(
+        ensure!(
             g.rows_per_block(p.tm) as usize <= DOTS_VISION_COOP_ROW_BLOCK_CEILING_ROWS,
             "coop plan {} at n={n} k={k_pad} asks for a {}-row block, past the {} rows every x \
              operand's slack is sized for: {}",
@@ -2368,7 +2376,7 @@ impl VisionGemm {
         let cols = g.cols_per_workgroup(p.tn, p.sg) as usize;
         let covered = n_pad.div_ceil(cols) * cols;
         let over_read = (covered - n_pad) * k_pad * g.ab.bytes() as usize;
-        anyhow::ensure!(
+        ensure!(
             cols <= n_pad && over_read <= DOTS_VISION_COOP_OUT_OF_RANGE_WEIGHT_READ_BUDGET_BYTES,
             "coop plan {} covers {covered} columns of an n={n} k={k_pad} operand in {cols}-column \
              bands, reading {over_read} bytes past its end: {}",
@@ -2383,12 +2391,12 @@ impl VisionGemm {
         label: &str,
         entry: &str,
         source: impl FnOnce() -> String,
-    ) -> Result<Arc<wgpu::ComputePipeline>> {
+    ) -> Result<Arc<ComputePipeline>> {
         if let Some(hit) = self.pipelines.lock().unwrap().get(entry) {
             return Ok(hit.clone());
         }
         let built = dispatch::cached_compute_pipeline(self.ctx, label, &source(), entry)
-            .map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
+            .map_err(|e| anyhow!("{entry}: {e}"))?;
         self.pipelines
             .lock()
             .unwrap()
@@ -2396,8 +2404,8 @@ impl VisionGemm {
         Ok(built)
     }
 
-    fn uniform<T: bytemuck::Pod>(&self, label: &str, value: &T) -> Arc<wgpu::Buffer> {
-        let bytes = bytemuck::bytes_of(value);
+    fn uniform<T: bytemuck::Pod>(&self, label: &str, value: &T) -> Arc<Buffer> {
+        let bytes = bytes_of(value);
         let mut key =
             [0u8; DOTS_VISION_UNIFORM_BLOCK_IS_EIGHT_U32_IN_EVERY_PARAM_STRUCT_SO_ITS_CONTENT_IS_THE_CACHE_KEY];
         key[..bytes.len()].copy_from_slice(bytes);
@@ -2414,7 +2422,7 @@ impl VisionGemm {
         label: &str,
         entry: &str,
         source: impl FnOnce() -> String,
-        bindings: &[(u32, &wgpu::Buffer, u64)],
+        bindings: &[(u32, &Buffer, u64)],
         groups: (u32, u32, u32),
     ) -> Result<()> {
         let pipeline = self.pipeline(label, entry, source)?;
@@ -2436,14 +2444,14 @@ impl VisionGemm {
         label: &str,
         body: &'static str,
         entry: &str,
-        bindings: &[(u32, &wgpu::Buffer, u64)],
+        bindings: &[(u32, &Buffer, u64)],
         groups: (u32, u32, u32),
     ) -> Result<()> {
         self.record(label, entry, || source_of(body), bindings, groups)
     }
 
-    fn uniform_wide<T: bytemuck::Pod>(&self, label: &str, value: &T) -> Arc<wgpu::Buffer> {
-        let bytes = bytemuck::bytes_of(value);
+    fn uniform_wide<T: bytemuck::Pod>(&self, label: &str, value: &T) -> Arc<Buffer> {
+        let bytes = bytes_of(value);
         if let Some(hit) = self.uniforms_wide.lock().unwrap().get(bytes) {
             return hit.clone();
         }
@@ -2455,12 +2463,51 @@ impl VisionGemm {
         made
     }
 
-    #[allow(clippy::too_many_arguments)]
+    fn steel_record(
+        &self,
+        pipeline: Arc<ComputePipeline>,
+        layout: &wgpu::BindGroupLayout,
+        label: &str,
+        [x, w, out]: [&Buffer; 3],
+        gate: Option<&Buffer>,
+        rows: usize,
+        n: usize,
+        k_pad: usize,
+        y_stride: usize,
+        cfg: (u32, u32, u32, u32, u32),
+    ) -> Result<()> {
+        let sl: u32 = env::var(DOTS_VISION_STEEL_GEMM_SWIZZLE_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+            .min(3);
+        let mut p = super::vision_attn_msl::steel_gemm_params(rows, n, k_pad, y_stride, cfg);
+        p.swizzle_log = sl as i32;
+        let pb = self.uniform_wide("dv-steel-gemm-p", &p);
+        let mut entries = bind_entries![x, w, out, pb];
+        if let Some(g) = gate {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 4,
+                resource: g.as_entire_binding(),
+            });
+        }
+        let bind = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &entries,
+            });
+        let (gx, gy, gz) = super::vision_attn_msl::steel_gemm_grid(rows, n, cfg);
+        self.record_prebuilt(pipeline, bind, (gx << sl, gy.div_ceil(1 << sl), gz))
+    }
+
     pub fn gemm_steel(
         &self,
-        w: &wgpu::Buffer,
-        x: &wgpu::Buffer,
-        y: &wgpu::Buffer,
+        w: &Buffer,
+        x: &Buffer,
+        y: &Buffer,
         rows: usize,
         n: usize,
         k_pad: usize,
@@ -2477,50 +2524,26 @@ impl VisionGemm {
             return Ok(false);
         };
         let _ = STEEL_GEMM_SWIZZLE_REMAPS_TILE_OWNERSHIP_ONLY_SO_EVERY_SETTING_IS_BIT_IDENTICAL;
-        let sl: u32 = std::env::var(DOTS_VISION_STEEL_GEMM_SWIZZLE_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-            .min(3);
-        let mut p = super::vision_attn_msl::steel_gemm_params(rows, n, k_pad, y_stride, cfg);
-        p.swizzle_log = sl as i32;
-        let pb = self.uniform_wide("dv-steel-gemm-p", &p);
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("dv-steel-gemm"),
-                layout: &pls.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: x.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: w.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: y.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: pb.as_entire_binding(),
-                    },
-                ],
-            });
-        let (gx, gy, gz) = super::vision_attn_msl::steel_gemm_grid(rows, n, cfg);
-        self.record_prebuilt(pipeline, bind, (gx << sl, gy.div_ceil(1 << sl), gz))?;
+        self.steel_record(
+            pipeline,
+            &pls.layout,
+            "dv-steel-gemm",
+            [x, w, y],
+            None,
+            rows,
+            n,
+            k_pad,
+            y_stride,
+            cfg,
+        )?;
         Ok(true)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn gemm_steel_resadd(
         &self,
-        w: &wgpu::Buffer,
-        x: &wgpu::Buffer,
-        xacc: &wgpu::Buffer,
+        w: &Buffer,
+        x: &Buffer,
+        xacc: &Buffer,
         rows: usize,
         n: usize,
         k_pad: usize,
@@ -2535,53 +2558,29 @@ impl VisionGemm {
         let Some(pipeline) = pls.pick_resadd(cfg) else {
             return Ok(false);
         };
-        let sl: u32 = std::env::var(DOTS_VISION_STEEL_GEMM_SWIZZLE_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-            .min(3);
-        let mut p = super::vision_attn_msl::steel_gemm_params(rows, n, k_pad, n, cfg);
-        p.swizzle_log = sl as i32;
-        let pb = self.uniform_wide("dv-steel-gemm-p", &p);
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("dv-steel-gemm-resadd"),
-                layout: &pls.resadd_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: x.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: w.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: xacc.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: pb.as_entire_binding(),
-                    },
-                ],
-            });
-        let (gx, gy, gz) = super::vision_attn_msl::steel_gemm_grid(rows, n, cfg);
-        self.record_prebuilt(pipeline, bind, (gx << sl, gy.div_ceil(1 << sl), gz))?;
+        self.steel_record(
+            pipeline,
+            &pls.resadd_layout,
+            "dv-steel-gemm-resadd",
+            [x, w, xacc],
+            None,
+            rows,
+            n,
+            k_pad,
+            n,
+            cfg,
+        )?;
         self.fused_steel
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn gemm_steel_gsilu(
         &self,
-        w: &wgpu::Buffer,
-        x: &wgpu::Buffer,
-        gate: &wgpu::Buffer,
-        act: &wgpu::Buffer,
+        w: &Buffer,
+        x: &Buffer,
+        gate: &Buffer,
+        act: &Buffer,
         rows: usize,
         n: usize,
         k_pad: usize,
@@ -2596,45 +2595,18 @@ impl VisionGemm {
         let Some(pipeline) = pls.pick_gsilu(cfg) else {
             return Ok(false);
         };
-        let sl: u32 = std::env::var(DOTS_VISION_STEEL_GEMM_SWIZZLE_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-            .min(3);
-        let mut p = super::vision_attn_msl::steel_gemm_params(rows, n, k_pad, n, cfg);
-        p.swizzle_log = sl as i32;
-        let pb = self.uniform_wide("dv-steel-gemm-p", &p);
-        let bind = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("dv-steel-gemm-gsilu"),
-                layout: &pls.gsilu_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: x.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: w.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: act.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: pb.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: gate.as_entire_binding(),
-                    },
-                ],
-            });
-        let (gx, gy, gz) = super::vision_attn_msl::steel_gemm_grid(rows, n, cfg);
-        self.record_prebuilt(pipeline, bind, (gx << sl, gy.div_ceil(1 << sl), gz))?;
+        self.steel_record(
+            pipeline,
+            &pls.gsilu_layout,
+            "dv-steel-gemm-gsilu",
+            [x, w, act],
+            Some(gate),
+            rows,
+            n,
+            k_pad,
+            n,
+            cfg,
+        )?;
         self.fused_steel
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
@@ -2642,8 +2614,8 @@ impl VisionGemm {
 
     pub fn record_prebuilt(
         &self,
-        pipeline: Arc<wgpu::ComputePipeline>,
-        group: wgpu::BindGroup,
+        pipeline: Arc<ComputePipeline>,
+        group: BindGroup,
         groups: (u32, u32, u32),
     ) -> Result<()> {
         let full = {
@@ -2663,10 +2635,7 @@ impl VisionGemm {
         if batch.is_empty() {
             return Ok(());
         }
-        let scope = self
-            .ctx
-            .device
-            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let scope = self.ctx.device.push_error_scope(ErrorFilter::Validation);
         let refs: Vec<dispatch::PassRef<'_>> = batch
             .iter()
             .map(|(p, g, wg)| (p.as_ref(), g, *wg))
@@ -2677,7 +2646,7 @@ impl VisionGemm {
         self.dispatched
             .fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
         if let Some(err) = dispatch::pop_scope(scope) {
-            anyhow::bail!("dots vision submit of {} passes: {err}", batch.len());
+            bail!("dots vision submit of {} passes: {err}", batch.len());
         }
         Ok(())
     }
@@ -2764,7 +2733,7 @@ impl VisionGemm {
                 self.queued.lock().unwrap().clear();
                 continue;
             }
-            let t0 = std::time::Instant::now();
+            let t0 = Instant::now();
             for _ in 0..reps {
                 self.gemm(label, &w, 0, &x, 0, &y, 0, m_pad, n, k_pad, n)?;
             }
@@ -2775,17 +2744,16 @@ impl VisionGemm {
         Ok(out)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn coop_acc_dispatch(
         &self,
         g: &coop::CoopGemm,
         plan: &CoopPlan,
         acc: CoopAcc,
-        w: &wgpu::Buffer,
+        w: &Buffer,
         w_off: u64,
-        x: &wgpu::Buffer,
-        y: &wgpu::Buffer,
-        zero: &wgpu::Buffer,
+        x: &Buffer,
+        y: &Buffer,
+        zero: &Buffer,
         m_pad: usize,
         n: usize,
         k_pad: usize,
@@ -2793,7 +2761,7 @@ impl VisionGemm {
         y_stride: usize,
     ) -> Result<()> {
         g.check_shape(m_pad as u32, n as u32, k_pad as u32)
-            .map_err(|e| anyhow::anyhow!("coop acc probe: {e}"))?;
+            .map_err(|e| anyhow!("coop acc probe: {e}"))?;
         let (bm, bn) = g.grid(m_pad as u32, n as u32, plan.tm, plan.tn, plan.sg);
         let groups = dispatch::workgroup_count_1d(self.ctx, (bm as u64) * (bn as u64), 1);
         let p = coop::CoopGemmParams {
@@ -2833,7 +2801,7 @@ impl VisionGemm {
         arms: &[(CoopPlan, CoopAcc)],
     ) -> Result<Vec<(CoopPlan, CoopAcc, f64)>> {
         let VisionGemmRoute::Coop(g) = self.route else {
-            anyhow::bail!("{label}: an accumulator-dtype ladder is a cooperative-matrix concept");
+            bail!("{label}: an accumulator-dtype ladder is a cooperative-matrix concept");
         };
         let _ = DOTS_VISION_GEMM_LADDER_OPERANDS_ARE_DEVICE_ZEROS_BECAUSE_A_COOPERATIVE_MATRIX_RATE_IS_NOT_DATA_DEPENDENT;
         let reps = repeats.max(1);
@@ -2878,7 +2846,7 @@ impl VisionGemm {
                 self.queued.lock().unwrap().clear();
                 continue;
             }
-            let t0 = std::time::Instant::now();
+            let t0 = Instant::now();
             for _ in 0..reps {
                 self.coop_acc_dispatch(&g, &plan, *acc, &w, 0, &x, y, zero, m_pad, n, k_pad, 0, n)?;
             }
@@ -2889,7 +2857,6 @@ impl VisionGemm {
         Ok(out)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn time_flash_m(
         &self,
         n: usize,
@@ -2899,7 +2866,7 @@ impl VisionGemm {
         m_rows: usize,
         repeats: usize,
     ) -> Result<f64> {
-        anyhow::ensure!(
+        ensure!(
             m_rows.is_multiple_of(4) && hd.is_multiple_of(4),
             "an M-row flash groups four query rows per vec4 and four head dims per lane, so M={m_rows} and head_dim={hd} must both be multiples of four"
         );
@@ -2934,7 +2901,7 @@ impl VisionGemm {
         let _ = A_COOP_ACC_ARM_IS_TIMED_TO_A_READBACK_WHOSE_BYTE_COUNT_IS_A_MULTIPLE_OF_FOUR_BECAUSE_A_TWO_BYTE_COPY_IS_REFUSED_NOT_SLOW;
         one(self)?;
         self.read_f16(&o, 2)?;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         for _ in 0..reps {
             one(self)?;
         }
@@ -2954,11 +2921,11 @@ impl VisionGemm {
         Ok(())
     }
 
-    pub fn f32_buf(&self, label: &str, elems: usize) -> wgpu::Buffer {
+    pub fn f32_buf(&self, label: &str, elems: usize) -> Buffer {
         dispatch::storage_zeroed(self.ctx, label, (elems.max(1) * 4) as u64)
     }
 
-    pub fn f16_buf(&self, label: &str, elems: usize) -> wgpu::Buffer {
+    pub fn f16_buf(&self, label: &str, elems: usize) -> Buffer {
         dispatch::storage_zeroed(self.ctx, label, (elems.max(1) * 2) as u64)
     }
 
@@ -2972,32 +2939,31 @@ impl VisionGemm {
         }
     }
 
-    pub fn upload_f32(&self, label: &str, v: &[f32]) -> wgpu::Buffer {
+    pub fn upload_f32(&self, label: &str, v: &[f32]) -> Buffer {
         dispatch::storage_from_slice(self.ctx, label, v)
     }
 
-    pub fn read_f32(&self, buf: &wgpu::Buffer, len: usize) -> Result<Vec<f32>> {
+    pub fn read_f32(&self, buf: &Buffer, len: usize) -> Result<Vec<f32>> {
         self.flush()?;
-        dispatch::read_back(self.ctx, buf, len).map_err(|e| anyhow::anyhow!("read_back f32: {e}"))
+        dispatch::read_back(self.ctx, buf, len).map_err(|e| anyhow!("read_back f32: {e}"))
     }
 
-    pub fn read_f16(&self, buf: &wgpu::Buffer, len: usize) -> Result<Vec<f32>> {
+    pub fn read_f16(&self, buf: &Buffer, len: usize) -> Result<Vec<f32>> {
         self.flush()?;
-        let bits: Vec<u16> = dispatch::read_back(self.ctx, buf, len)
-            .map_err(|e| anyhow::anyhow!("read_back f16: {e}"))?;
+        let bits: Vec<u16> =
+            dispatch::read_back(self.ctx, buf, len).map_err(|e| anyhow!("read_back f16: {e}"))?;
         Ok(bits.iter().map(|&b| f16::from_bits(b).to_f32()).collect())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn gemm_splitk(
         &self,
         g: &coop::CoopGemm,
         splits: u32,
-        w: &wgpu::Buffer,
+        w: &Buffer,
         w_off: u64,
-        x: &wgpu::Buffer,
+        x: &Buffer,
         x_off: u64,
-        y: &wgpu::Buffer,
+        y: &Buffer,
         y_off: u64,
         m_pad: usize,
         n: usize,
@@ -3075,11 +3041,11 @@ impl VisionGemm {
     pub fn gemm(
         &self,
         label: &str,
-        w: &wgpu::Buffer,
+        w: &Buffer,
         w_off: u64,
-        x: &wgpu::Buffer,
+        x: &Buffer,
         x_off: u64,
-        y: &wgpu::Buffer,
+        y: &Buffer,
         y_off: u64,
         m_pad: usize,
         n: usize,
@@ -3089,15 +3055,24 @@ impl VisionGemm {
         match self.route {
             VisionGemmRoute::Coop(g) => {
                 g.check_shape(m_pad as u32, n as u32, k_pad as u32)
-                    .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+                    .map_err(|e| anyhow!("{label}: {e}"))?;
                 if label == "attn_ctx"
                     && g.tile == DOTS_VISION_SPLITK_KERNEL_IS_GENERATED_FOR_THE_8X8X8_TILE_ONLY_SO_A_WIDER_TILE_ADAPTER_TAKES_THE_PLAIN_COOP_ARM
                 {
-                    if let Some(s) = splitk_arm() {
-                        return self.gemm_splitk(
-                            &g, s, w, w_off, x, x_off, y, y_off, m_pad, n, k_pad, y_stride,
-                        );
-                    }
+                    return self.gemm_splitk(
+                        &g,
+                        splitk_arm(),
+                        w,
+                        w_off,
+                        x,
+                        x_off,
+                        y,
+                        y_off,
+                        m_pad,
+                        n,
+                        k_pad,
+                        y_stride,
+                    );
                 }
                 let plan = self
                     .resolve_plan(&g, n, k_pad, m_pad)
@@ -3153,15 +3128,14 @@ impl VisionGemm {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn gemm_w4a16(
         &self,
         label: &str,
-        w4: &wgpu::Buffer,
-        sf: &wgpu::Buffer,
-        x: &wgpu::Buffer,
+        w4: &Buffer,
+        sf: &Buffer,
+        x: &Buffer,
         x_off: u64,
-        y: &wgpu::Buffer,
+        y: &Buffer,
         y_off: u64,
         m_pad: usize,
         n: usize,
@@ -3169,18 +3143,18 @@ impl VisionGemm {
         y_stride: usize,
     ) -> Result<()> {
         let VisionGemmRoute::Coop(g) = self.route else {
-            anyhow::bail!(
+            bail!(
                 "{label}: {}",
                 DOTS_VISION_NVFP4_ARM_NEEDS_THE_16X16_COOP_ROUTE_BECAUSE_SOURCE_W4A16_STAGES_ONE_16_CODE_BLOCK_PER_K_TILE_ROW
             );
         };
-        anyhow::ensure!(
+        ensure!(
             g.tile == 16,
             "{label}: {}",
             DOTS_VISION_NVFP4_ARM_NEEDS_THE_16X16_COOP_ROUTE_BECAUSE_SOURCE_W4A16_STAGES_ONE_16_CODE_BLOCK_PER_K_TILE_ROW
         );
         g.check_shape(m_pad as u32, n as u32, k_pad as u32)
-            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+            .map_err(|e| anyhow!("{label}: {e}"))?;
         let mut plan = self
             .resolve_plan(&g, n, k_pad, m_pad)
             .with_context(|| label.to_string())?;
@@ -3189,7 +3163,7 @@ impl VisionGemm {
         {
             plan.ku = DOTS_VISION_W4A16_KU_CEILING_IS_FOUR_BECAUSE_SOURCE_WQ16_STAGES_AT_MOST_FOUR_K_TILES;
         }
-        anyhow::ensure!(
+        ensure!(
             coop::wq16_act_stage_elems(coop::WqAct::F16, plan.tm, plan.tn, plan.sg, plan.ku)
                 <= coop::W4A16_STAGE_BUDGET_F16_IS_HALF_THE_48K_WORKGROUP_LIMIT,
             "{label}: w4a16 plan {} stages more f16 than the workgroup budget admits",
@@ -3225,20 +3199,20 @@ impl VisionGemm {
     }
 
     pub fn flash_geometry(&self, plan: &FlashPlan, hd: usize) -> Result<FlashGeometry> {
-        anyhow::ensure!(
+        ensure!(
             self.route.is_coop(),
             "the fused attention is a cooperative-matrix kernel; this route is scalar_f16 and \
              keeps the slab arm"
         );
         let g = plan.geometry(self.tile(), hd)?;
-        anyhow::ensure!(
+        ensure!(
             g.workgroup_bytes() <= self.ctx.caps.max_compute_workgroup_storage_size as usize,
             "flash plan {} needs {} bytes of workgroup storage; this adapter allows {}",
             plan.name(),
             g.workgroup_bytes(),
             self.ctx.caps.max_compute_workgroup_storage_size
         );
-        anyhow::ensure!(
+        ensure!(
             g.wg <= self.ctx.caps.max_compute_invocations_per_workgroup as usize,
             "flash plan {} needs a {}-invocation workgroup; this adapter allows {}",
             plan.name(),
@@ -3248,14 +3222,13 @@ impl VisionGemm {
         Ok(g)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn flash_attention(
         &self,
         geom: &FlashGeometry,
-        q: &wgpu::Buffer,
-        k: &wgpu::Buffer,
-        v: &wgpu::Buffer,
-        out: &wgpu::Buffer,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        out: &Buffer,
         n: usize,
         n_pad: usize,
         heads: usize,
@@ -3295,19 +3268,16 @@ impl VisionGemm {
     fn project(
         &self,
         lin: &WgpuLin,
-        x: &wgpu::Buffer,
-        y: &wgpu::Buffer,
+        x: &Buffer,
+        y: &Buffer,
         rows: usize,
         m_pad: usize,
-        w4_scratch: Option<&wgpu::Buffer>,
+        w4_scratch: Option<&Buffer>,
     ) -> Result<()> {
         match &lin.w {
             WgpuLinW::F16(w) => {
-                let steel = match steel_gemm_cfg_serving(rows, lin.n) {
-                    Some(cfg) => self.gemm_steel(w, x, y, rows, lin.n, lin.k_pad, lin.n, cfg)?,
-                    None => false,
-                };
-                if !steel {
+                let cfg = steel_gemm_cfg_serving(rows, lin.n);
+                if !self.gemm_steel(w, x, y, rows, lin.n, lin.k_pad, lin.n, cfg)? {
                     self.gemm(
                         "projection",
                         w,
@@ -3376,13 +3346,12 @@ impl VisionGemm {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn dequant_w4_into(
         &self,
-        words: &wgpu::Buffer,
-        scales: &wgpu::Buffer,
-        biases: &wgpu::Buffer,
-        scratch: &wgpu::Buffer,
+        words: &Buffer,
+        scales: &Buffer,
+        biases: &Buffer,
+        scratch: &Buffer,
         n: usize,
         k: usize,
         k_pad: usize,
@@ -3408,10 +3377,10 @@ impl VisionGemm {
 
     fn layernorm_f16(
         &self,
-        x: &wgpu::Buffer,
-        w: &wgpu::Buffer,
-        b: &wgpu::Buffer,
-        y: &wgpu::Buffer,
+        x: &Buffer,
+        w: &Buffer,
+        b: &Buffer,
+        y: &Buffer,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -3428,7 +3397,7 @@ impl VisionGemm {
         )
     }
 
-    fn gelu_erf_f16(&self, x: &wgpu::Buffer, y: &wgpu::Buffer, count: usize) -> Result<()> {
+    fn gelu_erf_f16(&self, x: &Buffer, y: &Buffer, count: usize) -> Result<()> {
         let groups = self.elementwise_groups(count);
         let p = self.rows_params(count, 1, 1, 0.0, groups.0);
         let pb = self.uniform("dv-gelu-p", &p);
@@ -3443,9 +3412,9 @@ impl VisionGemm {
 
     fn rmsnorm_to_f16(
         &self,
-        x: &wgpu::Buffer,
-        w: &wgpu::Buffer,
-        y: &wgpu::Buffer,
+        x: &Buffer,
+        w: &Buffer,
+        y: &Buffer,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -3464,8 +3433,8 @@ impl VisionGemm {
 
     fn rmsnorm_f32_inplace(
         &self,
-        x: &wgpu::Buffer,
-        w: &wgpu::Buffer,
+        x: &Buffer,
+        w: &Buffer,
         rows: usize,
         cols: usize,
         eps: f32,
@@ -3484,8 +3453,8 @@ impl VisionGemm {
 
     fn cast_pad(
         &self,
-        src: &wgpu::Buffer,
-        dst: &wgpu::Buffer,
+        src: &Buffer,
+        dst: &Buffer,
         rows: usize,
         cols: usize,
         cols_pad: usize,
@@ -3502,7 +3471,7 @@ impl VisionGemm {
         )
     }
 
-    fn add_into(&self, acc: &wgpu::Buffer, add: &wgpu::Buffer, count: usize) -> Result<()> {
+    fn add_into(&self, acc: &Buffer, add: &Buffer, count: usize) -> Result<()> {
         let groups = self.elementwise_groups(count);
         let p = self.rows_params(count, 1, 1, 0.0, groups.0);
         let pb = self.uniform("dv-add-p", &p);
@@ -3528,8 +3497,8 @@ pub fn probe_gemm_f16(
     let m_pad = pad_to(m, tile);
     let k_pad = pad_to(k, tile);
     let n_pad = pad_to(n, tile);
-    anyhow::ensure!(w.len() == n * k, "probe w is {} not {n}x{k}", w.len());
-    anyhow::ensure!(x.len() == m * k, "probe x is {} not {m}x{k}", x.len());
+    ensure!(w.len() == n * k, "probe w is {} not {n}x{k}", w.len());
+    ensure!(x.len() == m * k, "probe x is {} not {m}x{k}", x.len());
     let mut wp = vec![0f32; n_pad * k];
     wp[..n * k].copy_from_slice(w);
     let wb =
@@ -3556,7 +3525,7 @@ pub fn probe_gemm_w4a16(
     k: usize,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let tile = g.tile();
-    anyhow::ensure!(
+    ensure!(
         tile == 16,
         "{}",
         DOTS_VISION_NVFP4_ARM_NEEDS_THE_16X16_COOP_ROUTE_BECAUSE_SOURCE_W4A16_STAGES_ONE_16_CODE_BLOCK_PER_K_TILE_ROW
@@ -3564,8 +3533,8 @@ pub fn probe_gemm_w4a16(
     let m_pad = pad_to(m, tile);
     let k_pad = pad_to(k, tile);
     let n_pad = pad_to(n, tile);
-    anyhow::ensure!(w.len() == n * k, "probe w is {} not {n}x{k}", w.len());
-    anyhow::ensure!(x.len() == m * k, "probe x is {} not {m}x{k}", x.len());
+    ensure!(w.len() == n * k, "probe w is {} not {n}x{k}", w.len());
+    ensure!(x.len() == m * k, "probe x is {} not {m}x{k}", x.len());
     let mut wp = vec![0f32; n_pad * k];
     wp[..n * k].copy_from_slice(w);
     let (words, scales, q) = nvfp4_block16_rows_padded(&wp, n_pad, k, k_pad);
@@ -3612,7 +3581,7 @@ pub fn probe_flash_attention(
     hd: usize,
 ) -> Result<Vec<f32>> {
     let dim = heads * hd;
-    anyhow::ensure!(
+    ensure!(
         q.len() == n * dim && k.len() == n * dim && v.len() == n * dim,
         "probe_flash_attention wants three {n}x{dim} slabs"
     );
@@ -3644,30 +3613,30 @@ pub fn probe_flash_attention(
 }
 
 enum WgpuLinW {
-    F16(wgpu::Buffer),
+    F16(Buffer),
     Nvfp4Block16 {
-        words: wgpu::Buffer,
-        scales: wgpu::Buffer,
+        words: Buffer,
+        scales: Buffer,
     },
     MlxW4 {
-        words: wgpu::Buffer,
-        scales: wgpu::Buffer,
-        biases: wgpu::Buffer,
+        words: Buffer,
+        scales: Buffer,
+        biases: Buffer,
         gs: usize,
     },
 }
 
 struct WgpuLin {
     w: WgpuLinW,
-    bias: Option<wgpu::Buffer>,
+    bias: Option<Buffer>,
     n: usize,
     k: usize,
     k_pad: usize,
 }
 
 struct WgpuVisionBlock {
-    norm1: wgpu::Buffer,
-    norm2: wgpu::Buffer,
+    norm1: Buffer,
+    norm2: Buffer,
     qkv: WgpuLin,
     proj: WgpuLin,
     fc1: WgpuLin,
@@ -3678,8 +3647,8 @@ struct WgpuVisionBlock {
 struct WgpuMerger {
     ln_w: Vec<f32>,
     ln_b: Vec<f32>,
-    ln_w_dev: wgpu::Buffer,
-    ln_b_dev: wgpu::Buffer,
+    ln_w_dev: Buffer,
+    ln_b_dev: Buffer,
     fc0: WgpuLin,
     fc2: WgpuLin,
     context_dim: usize,
@@ -3691,11 +3660,11 @@ pub struct DotsVisionTowerWgpu {
     g: VisionGemm,
     wq: VisionWeightFmt,
     patch_proj: WgpuLin,
-    patch_norm: wgpu::Buffer,
+    patch_norm: Buffer,
     blocks: Vec<WgpuVisionBlock>,
-    post_trunk_norm: Option<wgpu::Buffer>,
+    post_trunk_norm: Option<Buffer>,
     merger: WgpuMerger,
-    w4_scratch: Option<wgpu::Buffer>,
+    w4_scratch: Option<Buffer>,
     visenc_packs: std::sync::atomic::AtomicU64,
 }
 
@@ -3728,7 +3697,7 @@ fn host_rows(weights: &WeightLoader, name: &str, expect: &[usize]) -> Result<Vec
     } else {
         t
     };
-    anyhow::ensure!(
+    ensure!(
         t.dims() == expect,
         "{name}: expected {expect:?}, got {:?}",
         t.dims()
@@ -3742,8 +3711,7 @@ impl DotsVisionTowerWgpu {
         prefix: &str,
         cfg: DotsVisionConfig,
     ) -> Result<Self> {
-        let ctx =
-            WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu adapter unavailable: {e}"))?;
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu adapter unavailable: {e}"))?;
         let route = VisionGemmRoute::from_env_and_adapter(ctx);
         Self::from_loader_route(weights, prefix, cfg, route)
     }
@@ -3764,10 +3732,9 @@ impl DotsVisionTowerWgpu {
         route: VisionGemmRoute,
         wq: VisionWeightFmt,
     ) -> Result<Self> {
-        let ctx =
-            WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu adapter unavailable: {e}"))?;
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu adapter unavailable: {e}"))?;
         if wq == VisionWeightFmt::Nvfp4Block16 {
-            anyhow::ensure!(
+            ensure!(
                 matches!(route, VisionGemmRoute::Coop(g) if g.tile == 16),
                 "{DOTS_VISION_WGPU_WQ_ENV}=nvfp4 on route {}: {}",
                 route.name(),
@@ -3777,7 +3744,7 @@ impl DotsVisionTowerWgpu {
         let g = VisionGemm::new(ctx, route)?;
         let tile = route.tile();
         let dim = cfg.embed_dim;
-        anyhow::ensure!(
+        ensure!(
             dim.is_multiple_of(cfg.num_attention_heads),
             "embed_dim {dim} is not divisible by {} heads",
             cfg.num_attention_heads
@@ -3840,7 +3807,7 @@ impl DotsVisionTowerWgpu {
                 k_pad,
             })
         };
-        let norm = |name: &str, n: usize| -> Result<wgpu::Buffer> {
+        let norm = |name: &str, n: usize| -> Result<Buffer> {
             Ok(dispatch::storage_from_slice(
                 ctx,
                 name,
@@ -3993,14 +3960,7 @@ impl DotsVisionTowerWgpu {
         self.forward_patches(&prep.patches, prep.grid_h, prep.grid_w)
     }
 
-    fn proj(
-        &self,
-        lin: &WgpuLin,
-        x: &wgpu::Buffer,
-        y: &wgpu::Buffer,
-        rows: usize,
-        m_pad: usize,
-    ) -> Result<()> {
+    fn proj(&self, lin: &WgpuLin, x: &Buffer, y: &Buffer, rows: usize, m_pad: usize) -> Result<()> {
         self.g
             .project(lin, x, y, rows, m_pad, self.w4_scratch.as_ref())
     }
@@ -4008,8 +3968,8 @@ impl DotsVisionTowerWgpu {
     fn proj_fused_resadd(
         &self,
         lin: &WgpuLin,
-        x: &wgpu::Buffer,
-        xacc: &wgpu::Buffer,
+        x: &Buffer,
+        xacc: &Buffer,
         rows: usize,
     ) -> Result<bool> {
         let WgpuLinW::F16(w) = &lin.w else {
@@ -4018,9 +3978,7 @@ impl DotsVisionTowerWgpu {
         if lin.bias.is_some() {
             return Ok(false);
         }
-        let Some(cfg) = steel_gemm_cfg_serving(rows, lin.n) else {
-            return Ok(false);
-        };
+        let cfg = steel_gemm_cfg_serving(rows, lin.n);
         self.g
             .gemm_steel_resadd(w, x, xacc, rows, lin.n, lin.k_pad, cfg)
     }
@@ -4028,9 +3986,9 @@ impl DotsVisionTowerWgpu {
     fn proj_fused_gsilu(
         &self,
         lin: &WgpuLin,
-        x: &wgpu::Buffer,
-        gate: &wgpu::Buffer,
-        act: &wgpu::Buffer,
+        x: &Buffer,
+        gate: &Buffer,
+        act: &Buffer,
         rows: usize,
     ) -> Result<bool> {
         let WgpuLinW::F16(w) = &lin.w else {
@@ -4039,16 +3997,13 @@ impl DotsVisionTowerWgpu {
         if lin.bias.is_some() {
             return Ok(false);
         }
-        let Some(cfg) = steel_gemm_cfg_serving(rows, lin.n) else {
-            return Ok(false);
-        };
+        let cfg = steel_gemm_cfg_serving(rows, lin.n);
         self.g
             .gemm_steel_gsilu(w, x, gate, act, rows, lin.n, lin.k_pad, cfg)
     }
 
     fn install_fitted_plans_when_asked(&self, n_pad: usize) {
-        if std::env::var(DOTS_VISION_WGPU_FITTED_PLANS_ENV).is_ok_and(|v| !v.is_empty() && v != "0")
-        {
+        if env::var(DOTS_VISION_WGPU_FITTED_PLANS_ENV).is_ok_and(|v| !v.is_empty() && v != "0") {
             self.apply_m5_fitted_plans(n_pad, true);
         }
     }
@@ -4098,19 +4053,16 @@ impl DotsVisionTowerWgpu {
     pub const ENCODE_RESIDENT_SERVES_ONLY_THE_GPU_MERGER_ARM_BECAUSE_ONLY_ITS_TRUNK_NEVER_TOUCHES_THE_HOST:
         &'static str =
         "encode_resident returns the merged features as bf16-packed words still on the shared wgpu \
-         device (the graph decoder's splice copies straight from them); every other arm -- host \
-         merger, missing post-norm, an ablation env -- computes on the host mid-merger, so the \
-         caller falls back to encode() and the shipped host handoff before any tower pass runs.";
+         device (the graph decoder's splice copies straight from them); a tower without \
+         post-norm or an ablation env computes on the host mid-merger, so the caller falls back \
+         to encode() and the host handoff before any tower pass runs.";
 
     pub fn encode_resident(
         &self,
         prep: &PreparedImage,
     ) -> Result<Option<super::decoder_wgpu_graph::VisionRowsGpu>> {
         let _ = Self::ENCODE_RESIDENT_SERVES_ONLY_THE_GPU_MERGER_ARM_BECAUSE_ONLY_ITS_TRUNK_NEVER_TOUCHES_THE_HOST;
-        if !merger_gpu_arm()
-            || self.post_trunk_norm.is_none()
-            || std::env::var(DOTS_VISION_ABLATE_ENV).is_ok()
-        {
+        if self.post_trunk_norm.is_none() || env::var(DOTS_VISION_ABLATE_ENV).is_ok() {
             return Ok(None);
         }
         let (out, _) =
@@ -4130,7 +4082,7 @@ impl DotsVisionTowerWgpu {
         resident: bool,
     ) -> Result<(TrunkOut, Vec<Vec<f32>>)> {
         let mut phases = PhaseLog::from_env();
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let out = self.forward_patches_traced_holding_every_transient(
             patches,
             grid_h,
@@ -4155,7 +4107,7 @@ impl DotsVisionTowerWgpu {
         ph: &mut PhaseLog,
     ) -> Result<(TrunkOut, Vec<Vec<f32>>)> {
         let n = grid_h * grid_w;
-        anyhow::ensure!(
+        ensure!(
             patches.len() == n * PATCH_DIM,
             "forward_patches: {} values is not {n} x {PATCH_DIM}",
             patches.len()
@@ -4168,7 +4120,7 @@ impl DotsVisionTowerWgpu {
         let inter = self.cfg.intermediate_size;
         let eps = self.cfg.rms_norm_eps as f32;
         let n_pad = pad_to(n, tile);
-        anyhow::ensure!(
+        ensure!(
             hd.is_multiple_of(tile),
             "head_dim {hd} is not a multiple of the {tile}-wide GEMM tile"
         );
@@ -4200,7 +4152,7 @@ impl DotsVisionTowerWgpu {
         let mut arm = AttnArm::from_env();
         let _ = DOTS_VISION_STEEL_IS_THE_DEFAULT_WHERE_PASSTHROUGH_GRANTS_AND_ZMERGE_SERVES_EVERY_OTHER_ADAPTER;
         let steel_cfg = steel_attn_cfg_serving(n)?;
-        if std::env::var(DOTS_VISION_WGPU_ATTN_ENV).is_err()
+        if env::var(DOTS_VISION_WGPU_ATTN_ENV).is_err()
             && hd == super::vision_attn_msl::HEAD_DIM as usize
             && super::vision_attn_msl::steel_pipelines_serving(
                 g.ctx,
@@ -4216,7 +4168,7 @@ impl DotsVisionTowerWgpu {
         let flash = match arm {
             AttnArm::Flash => match g.flash_geometry(&FlashPlan::from_env(), hd) {
                 Ok(geom) => Some(geom),
-                Err(why) => anyhow::bail!("{DOTS_VISION_WGPU_ATTN_ENV}=flash: {why}"),
+                Err(why) => bail!("{DOTS_VISION_WGPU_ATTN_ENV}=flash: {why}"),
             },
             _ => None,
         };
@@ -4237,7 +4189,7 @@ impl DotsVisionTowerWgpu {
 
         let qb = g.attention_query_block_rows(n_pad);
         let slabbed = !fused;
-        anyhow::ensure!(
+        ensure!(
             !slabbed || (qb * n_pad * 4) as u64 <= g.ctx.caps.max_storage_buffer_binding_size,
             "attention score slab {qb}x{n_pad} f32 exceeds the {} byte storage binding limit",
             g.ctx.caps.max_storage_buffer_binding_size
@@ -4251,14 +4203,7 @@ impl DotsVisionTowerWgpu {
                 1
             },
         );
-        let zinv = g.f32_buf(
-            "dv-zinv",
-            if arm == AttnArm::ZMerge {
-                heads * n_pad
-            } else {
-                1
-            },
-        );
+        let zinv = g.f32_buf("dv-zinv", if slabbed { heads * n_pad } else { 1 });
         let scale = 1.0f32 / (hd as f32).sqrt();
         let split_p = |groups_x: u32| SplitP {
             rows: n as u32,
@@ -4272,7 +4217,7 @@ impl DotsVisionTowerWgpu {
         };
 
         let msl = if arm == AttnArm::Steel {
-            anyhow::ensure!(
+            ensure!(
                 hd == super::vision_attn_msl::HEAD_DIM as usize,
                 "the steel attention kernel is instantiated at head_dim {}, not {hd}",
                 super::vision_attn_msl::HEAD_DIM
@@ -4311,40 +4256,7 @@ impl DotsVisionTowerWgpu {
             let bind = g.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("dv-steel-attn"),
                 layout: &pls.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: qh.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: kh.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: vt.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: attn_x.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: pb.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: mp.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 6,
-                        resource: dummy.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: dummy.as_entire_binding(),
-                    },
-                ],
+                entries: &bind_entries![qh, kh, vt, attn_x, pb, mp, dummy, dummy],
             });
             Some((
                 pls.pipeline.clone(),
@@ -4356,7 +4268,7 @@ impl DotsVisionTowerWgpu {
         };
 
         let mut layer_trace = Vec::new();
-        let fuse = steel_fuse_from_env();
+        let fuse = steel_fuse_on();
         ph.mark(g, "transient_alloc")?;
 
         for blk in self.blocks.iter() {
@@ -4428,8 +4340,7 @@ impl DotsVisionTowerWgpu {
                         }
                         ph.mark(g, "attn_scores_gemm")?;
                         let groups = g.row_groups(real);
-                        if vis_ablated("softmax") {
-                        } else if arm == AttnArm::ZMerge {
+                        if !vis_ablated("softmax") {
                             let p =
                                 g.rows_params_z(real, n, n_pad, scale, groups.0, h * n_pad + m0);
                             let pb = g.uniform("dv-softmaxz-p", &p);
@@ -4438,16 +4349,6 @@ impl DotsVisionTowerWgpu {
                                 SOFTMAX_Z_SRC,
                                 "dv_softmax_rows_deferred_norm",
                                 &[(0, &scores, 0), (1, &probs, 0), (2, &pb, 0), (3, &zinv, 0)],
-                                groups,
-                            )?;
-                        } else {
-                            let p = g.rows_params(real, n, n_pad, scale, groups.0);
-                            let pb = g.uniform("dv-softmax-p", &p);
-                            g.record_src(
-                                "nv_models_dots_vision_softmax",
-                                SOFTMAX_SRC,
-                                "dv_softmax_rows",
-                                &[(0, &scores, 0), (1, &probs, 0), (2, &pb, 0)],
                                 groups,
                             )?;
                         }
@@ -4474,21 +4375,12 @@ impl DotsVisionTowerWgpu {
 
                 let groups = g.elementwise_groups(n * heads * hd);
                 let pb = g.uniform("dv-merge-p", &split_p(groups.0));
-                if vis_ablated("attn_merge") {
-                } else if arm == AttnArm::ZMerge {
+                if !vis_ablated("attn_merge") {
                     g.record_src(
                         "nv_models_dots_vision_merge_z",
                         ATTN_MERGE_Z_SRC,
                         "dv_attn_merge_deferred_norm_f16",
                         &[(0, &ctxb, 0), (1, &attn_x, 0), (2, &pb, 0), (3, &zinv, 0)],
-                        groups,
-                    )?;
-                } else {
-                    g.record_src(
-                        "nv_models_dots_vision_merge",
-                        ATTN_MERGE_SRC,
-                        "dv_attn_merge_f16",
-                        &[(0, &ctxb, 0), (1, &attn_x, 0), (2, &pb, 0)],
                         groups,
                     )?;
                 }
@@ -4497,7 +4389,7 @@ impl DotsVisionTowerWgpu {
 
             let mut fused_res_attn = false;
             if !(vis_ablated("proj") || vis_ablated("proj_out")) {
-                fused_res_attn = fuse.0 && self.proj_fused_resadd(&blk.proj, &attn_x, &x, n)?;
+                fused_res_attn = fuse && self.proj_fused_resadd(&blk.proj, &attn_x, &x, n)?;
                 if !fused_res_attn {
                     self.proj(&blk.proj, &attn_x, &proj_y, n, n_pad)?;
                 }
@@ -4515,7 +4407,7 @@ impl DotsVisionTowerWgpu {
             let mut fused_silu = false;
             if !(vis_ablated("proj") || vis_ablated("proj_gateup")) {
                 self.proj(&blk.fc1, &xn, &gate_y, n, n_pad)?;
-                fused_silu = fuse.1 && self.proj_fused_gsilu(&blk.fc3, &xn, &gate_y, &act, n)?;
+                fused_silu = fuse && self.proj_fused_gsilu(&blk.fc3, &xn, &gate_y, &act, n)?;
                 if !fused_silu {
                     self.proj(&blk.fc3, &xn, &up_y, n, n_pad)?;
                 }
@@ -4536,7 +4428,7 @@ impl DotsVisionTowerWgpu {
             ph.mark(g, "silu_mul")?;
             let mut fused_res_mlp = false;
             if !(vis_ablated("proj") || vis_ablated("proj_down")) {
-                fused_res_mlp = fuse.0 && self.proj_fused_resadd(&blk.fc2, &act, &x, n)?;
+                fused_res_mlp = fuse && self.proj_fused_resadd(&blk.fc2, &act, &x, n)?;
                 if !fused_res_mlp {
                     self.proj(&blk.fc2, &act, &ff_y, n, n_pad)?;
                 }
@@ -4558,7 +4450,7 @@ impl DotsVisionTowerWgpu {
             g.drain()?;
             return Ok((TrunkOut::Host(merged_zeros()), layer_trace));
         }
-        if let (Some(norm), true) = (&self.post_trunk_norm, merger_gpu_arm()) {
+        if let Some(norm) = &self.post_trunk_norm {
             g.rmsnorm_to_f16(&x, norm, &xn, n, dim, eps)?;
             if vis_ablated("merger") {
                 g.flush()?;
@@ -4568,7 +4460,7 @@ impl DotsVisionTowerWgpu {
             if resident {
                 let (y, rows) = self.merger_forward_gpu_y(&xn, n)?;
                 let cols = self.merger.fc2.n;
-                anyhow::ensure!(
+                ensure!(
                     cols.is_multiple_of(2),
                     "merged rows are {cols} wide, bf16 pair packing needs an even width"
                 );
@@ -4592,13 +4484,7 @@ impl DotsVisionTowerWgpu {
             ph.mark(g, "merger")?;
             return Ok((TrunkOut::Host(merged), layer_trace));
         }
-        let trunk = match &self.post_trunk_norm {
-            Some(norm) => {
-                g.rmsnorm_to_f16(&x, norm, &xn, n, dim, eps)?;
-                g.read_f16(&xn, n * dim)?
-            }
-            None => g.read_f32(&x, n * dim)?,
-        };
+        let trunk = g.read_f32(&x, n * dim)?;
         ph.mark(g, "trunk_readback")?;
         if vis_ablated("merger") {
             return Ok((TrunkOut::Host(merged_zeros()), layer_trace));
@@ -4626,8 +4512,7 @@ impl DotsVisionTowerWgpu {
          is row-independent, so crops of DIFFERENT grids can concatenate their patch rows \
          through one trunk at the full-grid GEMM rate while attention and the rope split \
          keep dispatching per crop group at exactly the per-bucket parameters: the pack is \
-         addressing-only regrouping, the encode_batch bitwise class. DEFAULT ON: \
-         NV_DOTS_VISENC_PACK=0 restores the per-bucket plan byte-for-byte; \
+         addressing-only regrouping, the encode_batch bitwise class. \
          NV_DOTS_VISENC_PACK_ROWS caps a pack's patch rows to bound the f32 transients \
          (qkv/gate/up at rows x 4224) near the proven whole-page class. The pack still \
          refuses under the attn/steel-cfg/ablate instrument envs so their rows keep \
@@ -4644,7 +4529,7 @@ impl DotsVisionTowerWgpu {
         }
         let n = gh * gw;
         let hd = self.cfg.head_dim();
-        if std::env::var(DOTS_VISION_WGPU_ATTN_ENV).is_ok()
+        if env::var(DOTS_VISION_WGPU_ATTN_ENV).is_ok()
             || hd != super::vision_attn_msl::HEAD_DIM as usize
             || super::vision_attn_msl::steel_pipelines(
                 self.g.ctx,
@@ -4653,13 +4538,12 @@ impl DotsVisionTowerWgpu {
             )
             .is_err()
             || self.post_trunk_norm.is_none()
-            || !merger_gpu_arm()
         {
             return Ok(None);
         }
         let mut patches = Vec::with_capacity(bsz * n * PATCH_DIM);
         for p in preps {
-            anyhow::ensure!(
+            ensure!(
                 p.patches.len() == n * PATCH_DIM,
                 "encode_batch: a prepared image holds {} values, want {n} x {PATCH_DIM}",
                 p.patches.len()
@@ -4680,7 +4564,7 @@ impl DotsVisionTowerWgpu {
             BatchTrunkOut::Host(v) => v,
             BatchTrunkOut::Gpu(_) => unreachable!("resident=false never returns gpu crops"),
         };
-        anyhow::ensure!(
+        ensure!(
             merged.len().is_multiple_of(bsz),
             "batched merger produced {} values across {bsz} images",
             merged.len()
@@ -4694,22 +4578,19 @@ impl DotsVisionTowerWgpu {
         preps: &[PreparedImage],
     ) -> Result<Option<Vec<super::decoder_wgpu_graph::VisionRowsGpu>>> {
         let _ = Self::MIXED_GRID_PACKS_SHARE_ONE_TRUNK_BECAUSE_EVERY_TRUNK_PASS_IS_ROW_INDEPENDENT_AND_ATTENTION_STAYS_PER_CROP;
-        let Some(cap) = visenc_pack_rows() else {
-            return Ok(None);
-        };
+        let cap = visenc_pack_rows();
         if preps.len() < 2
-            || std::env::var(DOTS_VISION_ABLATE_ENV).is_ok()
-            || std::env::var(DOTS_VISION_WGPU_ATTN_ENV).is_ok()
-            || std::env::var(DOTS_VISION_STEEL_ATTN_CFG_ENV).is_ok()
+            || env::var(DOTS_VISION_ABLATE_ENV).is_ok()
+            || env::var(DOTS_VISION_WGPU_ATTN_ENV).is_ok()
+            || env::var(DOTS_VISION_STEEL_ATTN_CFG_ENV).is_ok()
             || self.cfg.head_dim() != super::vision_attn_msl::HEAD_DIM as usize
             || self.post_trunk_norm.is_none()
-            || !merger_gpu_arm()
         {
             return Ok(None);
         }
         for p in preps {
             let n = p.grid_h * p.grid_w;
-            anyhow::ensure!(
+            ensure!(
                 p.patches.len() == n * PATCH_DIM,
                 "encode_pack: a prepared image holds {} values, want {n} x {PATCH_DIM}",
                 p.patches.len()
@@ -4812,7 +4693,7 @@ impl DotsVisionTowerWgpu {
         let hd = self.cfg.head_dim();
         let inter = self.cfg.intermediate_size;
         let eps = self.cfg.rms_norm_eps as f32;
-        anyhow::ensure!(
+        ensure!(
             hd.is_multiple_of(tile),
             "head_dim {hd} is not a multiple of the {tile}-wide GEMM tile"
         );
@@ -4859,16 +4740,16 @@ impl DotsVisionTowerWgpu {
         let scale = 1.0f32 / (hd as f32).sqrt();
 
         struct GroupPlan {
-            pipeline: Arc<wgpu::ComputePipeline>,
-            bind: wgpu::BindGroup,
+            pipeline: Arc<ComputePipeline>,
+            bind: BindGroup,
             grid: (u32, u32, u32),
-            cos_b: wgpu::Buffer,
-            sin_b: wgpu::Buffer,
-            split_pb: Arc<wgpu::Buffer>,
+            cos_b: Buffer,
+            sin_b: Buffer,
+            split_pb: Arc<Buffer>,
             split_groups: (u32, u32, u32),
-            qh: wgpu::Buffer,
-            kh: wgpu::Buffer,
-            vt: wgpu::Buffer,
+            qh: Buffer,
+            kh: Buffer,
+            vt: Buffer,
             img_block: usize,
             row_start: usize,
             n: usize,
@@ -4917,7 +4798,7 @@ impl DotsVisionTowerWgpu {
             };
             let pb = dispatch::uniform_from(g.ctx, "dv-p-steel-p", &p);
             let o_off = (grp.row_start * dim * 2) as u64;
-            anyhow::ensure!(
+            ensure!(
                 o_off.is_multiple_of(256),
                 "pack attention output offset {o_off} is not 256-byte aligned"
             );
@@ -4996,7 +4877,7 @@ impl DotsVisionTowerWgpu {
             });
         }
 
-        let fuse = steel_fuse_from_env();
+        let fuse = steel_fuse_on();
         for blk in self.blocks.iter() {
             g.rmsnorm_to_f16(&x, &blk.norm1, &xn, nt, dim, eps)?;
             self.proj(&blk.qkv, &xn, &qkv_y, nt, nt_pad)?;
@@ -5022,13 +4903,13 @@ impl DotsVisionTowerWgpu {
                 }
                 g.record_prebuilt(pl.pipeline.clone(), pl.bind.clone(), pl.grid)?;
             }
-            if !(fuse.0 && self.proj_fused_resadd(&blk.proj, &attn_x, &x, nt)?) {
+            if !(fuse && self.proj_fused_resadd(&blk.proj, &attn_x, &x, nt)?) {
                 self.proj(&blk.proj, &attn_x, &proj_y, nt, nt_pad)?;
                 g.add_into(&x, &proj_y, nt * dim)?;
             }
             g.rmsnorm_to_f16(&x, &blk.norm2, &xn, nt, dim, eps)?;
             self.proj(&blk.fc1, &xn, &gate_y, nt, nt_pad)?;
-            if !(fuse.1 && self.proj_fused_gsilu(&blk.fc3, &xn, &gate_y, &act, nt)?) {
+            if !(fuse && self.proj_fused_gsilu(&blk.fc3, &xn, &gate_y, &act, nt)?) {
                 self.proj(&blk.fc3, &xn, &up_y, nt, nt_pad)?;
                 let groups = g.elementwise_groups(nt * inter);
                 let sp = g.rows_params(nt * inter, 1, 1, 0.0, groups.0);
@@ -5041,7 +4922,7 @@ impl DotsVisionTowerWgpu {
                     groups,
                 )?;
             }
-            if !(fuse.0 && self.proj_fused_resadd(&blk.fc2, &act, &x, nt)?) {
+            if !(fuse && self.proj_fused_resadd(&blk.fc2, &act, &x, nt)?) {
                 self.proj(&blk.fc2, &act, &ff_y, nt, nt_pad)?;
                 g.add_into(&x, &ff_y, nt * dim)?;
             }
@@ -5054,11 +4935,11 @@ impl DotsVisionTowerWgpu {
         g.rmsnorm_to_f16(&x, norm, &xn, nt, dim, eps)?;
         let (y, rows) = self.merger_forward_gpu_y(&xn, nt)?;
         let cols = self.merger.fc2.n;
-        anyhow::ensure!(
+        ensure!(
             rows == nt / (MERGE_SIZE * MERGE_SIZE),
             "packed merger produced {rows} rows across {nt} patches"
         );
-        anyhow::ensure!(
+        ensure!(
             cols.is_multiple_of(2),
             "merged rows are {cols} wide, bf16 pair packing needs an even width"
         );
@@ -5088,7 +4969,7 @@ impl DotsVisionTowerWgpu {
         preps: &[&PreparedImage],
     ) -> Result<Option<Vec<super::decoder_wgpu_graph::VisionRowsGpu>>> {
         let _ = Self::ENCODE_RESIDENT_SERVES_ONLY_THE_GPU_MERGER_ARM_BECAUSE_ONLY_ITS_TRUNK_NEVER_TOUCHES_THE_HOST;
-        if std::env::var(DOTS_VISION_ABLATE_ENV).is_ok() {
+        if env::var(DOTS_VISION_ABLATE_ENV).is_ok() {
             return Ok(None);
         }
         let Some((patches, gh, gw)) = self.batch_prelude(preps)? else {
@@ -5135,7 +5016,7 @@ impl DotsVisionTowerWgpu {
         let eps = self.cfg.rms_norm_eps as f32;
         let n_pad = pad_to(n, tile);
         let nt_pad = pad_to(nt, tile);
-        anyhow::ensure!(
+        ensure!(
             hd.is_multiple_of(tile),
             "head_dim {hd} is not a multiple of the {tile}-wide GEMM tile"
         );
@@ -5200,40 +5081,7 @@ impl DotsVisionTowerWgpu {
         let bind = g.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("dv-b-steel-attn"),
             layout: &pls.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: qh.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: kh.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: vt.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: attn_x.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: pb.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: mp.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: dummy.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: dummy.as_entire_binding(),
-                },
-            ],
+            entries: &bind_entries![qh, kh, vt, attn_x, pb, mp, dummy, dummy],
         });
         let single_grid = super::vision_attn_msl::steel_grid(heads as u32, n as u32);
         let grid = (single_grid.0, single_grid.1, bsz as u32);
@@ -5253,7 +5101,7 @@ impl DotsVisionTowerWgpu {
             },
         );
 
-        let fuse = steel_fuse_from_env();
+        let fuse = steel_fuse_on();
         for blk in self.blocks.iter() {
             g.rmsnorm_to_f16(&x, &blk.norm1, &xn, nt, dim, eps)?;
             self.proj(&blk.qkv, &xn, &qkv_y, nt, nt_pad)?;
@@ -5277,13 +5125,13 @@ impl DotsVisionTowerWgpu {
                 )?;
             }
             g.record_prebuilt(pls.pipeline.clone(), bind.clone(), grid)?;
-            if !(fuse.0 && self.proj_fused_resadd(&blk.proj, &attn_x, &x, nt)?) {
+            if !(fuse && self.proj_fused_resadd(&blk.proj, &attn_x, &x, nt)?) {
                 self.proj(&blk.proj, &attn_x, &proj_y, nt, nt_pad)?;
                 g.add_into(&x, &proj_y, nt * dim)?;
             }
             g.rmsnorm_to_f16(&x, &blk.norm2, &xn, nt, dim, eps)?;
             self.proj(&blk.fc1, &xn, &gate_y, nt, nt_pad)?;
-            if !(fuse.1 && self.proj_fused_gsilu(&blk.fc3, &xn, &gate_y, &act, nt)?) {
+            if !(fuse && self.proj_fused_gsilu(&blk.fc3, &xn, &gate_y, &act, nt)?) {
                 self.proj(&blk.fc3, &xn, &up_y, nt, nt_pad)?;
                 let groups = g.elementwise_groups(nt * inter);
                 let sp = g.rows_params(nt * inter, 1, 1, 0.0, groups.0);
@@ -5296,7 +5144,7 @@ impl DotsVisionTowerWgpu {
                     groups,
                 )?;
             }
-            if !(fuse.0 && self.proj_fused_resadd(&blk.fc2, &act, &x, nt)?) {
+            if !(fuse && self.proj_fused_resadd(&blk.fc2, &act, &x, nt)?) {
                 self.proj(&blk.fc2, &act, &ff_y, nt, nt_pad)?;
                 g.add_into(&x, &ff_y, nt * dim)?;
             }
@@ -5310,11 +5158,11 @@ impl DotsVisionTowerWgpu {
         if resident {
             let (y, rows) = self.merger_forward_gpu_y(&xn, nt)?;
             let cols = self.merger.fc2.n;
-            anyhow::ensure!(
+            ensure!(
                 rows.is_multiple_of(bsz),
                 "batched merger produced {rows} rows across {bsz} images"
             );
-            anyhow::ensure!(
+            ensure!(
                 cols.is_multiple_of(2),
                 "merged rows are {cols} wide, bf16 pair packing needs an even width"
             );
@@ -5340,7 +5188,7 @@ impl DotsVisionTowerWgpu {
         self.merger_forward_gpu(&xn, nt).map(BatchTrunkOut::Host)
     }
 
-    fn merger_forward_gpu(&self, xn: &wgpu::Buffer, n: usize) -> Result<Vec<f32>> {
+    fn merger_forward_gpu(&self, xn: &Buffer, n: usize) -> Result<Vec<f32>> {
         let (y, rows) = self.merger_forward_gpu_y(xn, n)?;
         let g = &self.g;
         if vis_ablated("merger_readback") {
@@ -5351,17 +5199,17 @@ impl DotsVisionTowerWgpu {
         g.read_f32(&y, rows * self.merger.fc2.n)
     }
 
-    fn merger_forward_gpu_y(&self, xn: &wgpu::Buffer, n: usize) -> Result<(wgpu::Buffer, usize)> {
+    fn merger_forward_gpu_y(&self, xn: &Buffer, n: usize) -> Result<(Buffer, usize)> {
         let _ = DOTS_VISION_GPU_MERGER_IS_THE_DEFAULT_BECAUSE_THE_HOST_ROUND_TRIPS_WERE_THE_WHOLE_RESIDUAL_AND_THE_TOKEN_GATE_HELD;
         let m = &self.merger;
         let g = &self.g;
-        anyhow::ensure!(
+        ensure!(
             n.is_multiple_of(m.merge_units),
             "PatchMerger: {n} patches not divisible by {}",
             m.merge_units
         );
         let hidden = m.context_dim * m.merge_units;
-        anyhow::ensure!(
+        ensure!(
             m.fc0.k_pad == hidden,
             "the gpu merger writes merge-grouped rows contiguously, which is only the fc0 operand \
              layout when k_pad {} equals the {hidden}-wide merged row",
@@ -5385,7 +5233,7 @@ impl DotsVisionTowerWgpu {
     fn merger_forward(&self, trunk: &[f32], n: usize) -> Result<Vec<f32>> {
         let m = &self.merger;
         let g = &self.g;
-        anyhow::ensure!(
+        ensure!(
             n.is_multiple_of(m.merge_units),
             "PatchMerger: {n} patches not divisible by {}",
             m.merge_units

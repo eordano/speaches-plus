@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
 use nv_layers::attn::{sdpa, AttnConfig};
 use nv_layers::linear::Linear;
@@ -8,7 +8,12 @@ use nv_weights::WeightLoader;
 use std::path::Path;
 
 use crate::eagle3_loader::{load_d2t, load_t2d, validate_d2t, validate_t2d};
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
 use nv_layers::weight_load::{load_linear, load_rmsnorm, load_tensor};
+use serde_json::Value;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DFlashLayerAttn {
@@ -57,7 +62,7 @@ pub struct DFlashRopeYarn {
 }
 
 impl DFlashRopeYarn {
-    fn from_rope_params_json(rp: &serde_json::Value) -> Option<Self> {
+    fn from_rope_params_json(rp: &Value) -> Option<Self> {
         let kind = rp
             .get("rope_type")
             .or_else(|| rp.get("type"))
@@ -114,7 +119,7 @@ pub const YARN_MSCALE_IS_FOLDED_INTO_THE_ROPE_TABLES_BECAUSE_SCALING_COS_AND_SIN
 
 pub const HEADLESS_DFLASH_DRAFTER_BORROWS_TARGET_EMBED_AND_LM_HEAD_AND_IS_DETECTED_FROM_THE_FILE_NOT_A_FLAG: &str = "RadixArk/Qwen3.8-27B-DSpark ships 62 tensors and none of them is embed_tokens.weight or lm_head.weight, while its config sets tie_word_embeddings=false. That is not a broken export: dflash.py::spec_generate builds the block's noise embedding from target.model.embed_tokens and reads draft logits through target.lm_head, so a DFlash/DSpark drafter is headless by construction and shares the target's vocabulary heads. Headless mode is therefore entered from the CONTENTS of the safetensors file -- neither head present and no tie flag -- never from an environment variable, so no checkpoint that loaded before can take a different path than it took before: every such checkpoint either ships the two tensors or sets the tie flag, and both of those branches are unchanged. In headless mode the caller MUST supply both the target embedding and the target lm_head; supplying the embedding alone and reusing it as the lm_head is wrong for this family because the target itself is untied (unsloth/Qwen3.8-27B-NVFP4 text_config.tie_word_embeddings=false, lm_head.weight is a separate F8_E4M3 [248320,5120] tensor with its own per-row scale)";
 
-fn dfc_opt_get<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+fn dfc_opt_get<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     v.get("dflash_config").and_then(|d| d.get(key))
 }
 
@@ -148,7 +153,7 @@ impl Default for DFlashSpeculatorConfig {
 
 impl DFlashSpeculatorConfig {
     pub fn from_hf_json_str(s: &str) -> Result<Self> {
-        let v: serde_json::Value = serde_json::from_str(s).context("parse dflash config json")?;
+        let v: Value = serde_json::from_str(s).context("parse dflash config json")?;
         if v.get("transformer_layer_config").is_some() {
             Self::from_speculators_json(&v)
         } else {
@@ -156,7 +161,7 @@ impl DFlashSpeculatorConfig {
         }
     }
 
-    fn from_speculators_json(v: &serde_json::Value) -> Result<Self> {
+    fn from_speculators_json(v: &Value) -> Result<Self> {
         let c = crate::eagle3_loader::parse_speculators_tlc(v)?;
         let mut cfg = Self {
             hidden_size: c.hidden_size,
@@ -208,7 +213,7 @@ impl DFlashSpeculatorConfig {
         cfg.validated()
     }
 
-    fn from_flat_json(v: &serde_json::Value) -> Result<Self> {
+    fn from_flat_json(v: &Value) -> Result<Self> {
         let usize_field = |key: &str| -> Result<usize> {
             v.get(key)
                 .and_then(|x| x.as_u64())
@@ -444,7 +449,6 @@ pub struct DFlashLayer {
 }
 
 impl DFlashLayer {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input_layernorm: RmsNorm,
         post_attention_layernorm: RmsNorm,
@@ -870,7 +874,7 @@ impl LoadedDFlashDrafter {
             && !weights.has("lm_head.weight")
             && !cfg.tied_embeddings;
         if headless {
-            anyhow::ensure!(
+            ensure!(
                 target_embed.is_some() && target_lm_head.is_some(),
                 "{}",
                 HEADLESS_DFLASH_DRAFTER_BORROWS_TARGET_EMBED_AND_LM_HEAD_AND_IS_DETECTED_FROM_THE_FILE_NOT_A_FLAG
@@ -1006,7 +1010,6 @@ impl LoadedDFlashDrafter {
         self.dspark.as_ref()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         cfg: DFlashSpeculatorConfig,
         device: Device,
@@ -1434,38 +1437,6 @@ impl LoadedDFlashDrafter {
         Ok(idx.into_iter().map(|d| self.d2t_map(d)).collect())
     }
 
-    pub fn draft_block_all_rows_with_conf(
-        &self,
-        ctx: &DFlashContextKv,
-        anchor: u32,
-    ) -> Result<(Vec<u32>, Vec<f32>, Vec<f32>)> {
-        let hidden = self.forward_block_hidden(ctx, anchor)?;
-        let logits = self.lm_head.forward(&hidden)?.to_dtype(DType::F32)?;
-        let rows: Vec<Vec<f32>> = logits
-            .reshape((self.cfg.query_rows(), self.cfg.draft_vocab_size))?
-            .to_vec2()?;
-        let mut ids = Vec::with_capacity(rows.len());
-        let mut top_prob = Vec::with_capacity(rows.len());
-        let mut margin = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut best = (0usize, f32::NEG_INFINITY);
-            let mut second = f32::NEG_INFINITY;
-            for (i, &v) in row.iter().enumerate() {
-                if v > best.1 {
-                    second = best.1;
-                    best = (i, v);
-                } else if v > second {
-                    second = v;
-                }
-            }
-            let denom: f32 = row.iter().map(|&v| (v - best.1).exp()).sum();
-            ids.push(self.d2t_map(best.0 as u32));
-            top_prob.push(1.0 / denom);
-            margin.push(best.1 - second);
-        }
-        Ok((ids, top_prob, margin))
-    }
-
     pub fn draft_block_dspark(
         &self,
         ctx: &DFlashContextKv,
@@ -1536,13 +1507,6 @@ fn dflash_quant_nvfp4_enabled() -> bool {
 }
 
 #[cfg(feature = "cuda")]
-fn dflash_quant_lmhead_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_DFLASH_QUANT_LMHEAD",
-    )
-}
-
-#[cfg(feature = "cuda")]
 fn nvfp4_quantizable(l: &Linear) -> bool {
     use nv_quant::nvfp4::{BLOCK_SIZE, MIN_TILE};
     l.weight().is_some()
@@ -1559,15 +1523,14 @@ fn maybe_quantize_dflash_nvfp4(
     device: &Device,
     dtype: DType,
 ) -> Result<(Vec<DFlashLayer>, Linear)> {
-    if !dflash_quant_nvfp4_enabled() || dtype != DType::BF16 || !matches!(device, Device::Cuda(_)) {
+    if !dflash_quant_nvfp4_enabled() || dtype != DType::BF16 || !device.is_cuda() {
         return Ok((layers, lm_head));
     }
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => unreachable!(),
+    let Device::Cuda(dev) = device.clone() else {
+        unreachable!()
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let runner = std::sync::Arc::new(std::sync::Mutex::new(
+    let runner = Arc::new(std::sync::Mutex::new(
         nv_quant::nvfp4::Nvfp4GemmRunner::new(stream)?,
     ));
     let quant = |l: &mut Linear, name: &str| -> Result<()> {
@@ -1592,20 +1555,14 @@ fn maybe_quantize_dflash_nvfp4(
         quant(&mut layer.up_proj, &format!("layers.{i}.up_proj"))?;
         quant(&mut layer.down_proj, &format!("layers.{i}.down_proj"))?;
     }
-    let lm_quant = dflash_quant_lmhead_enabled();
-    if lm_quant {
-        quant(&mut lm_head, "lm_head")?;
-    }
-    eprintln!(
-        "[dflash-quant] drafter transformer weights quantized to nvfp4 (lm_head {})",
-        if lm_quant { "nvfp4" } else { "bf16" }
-    );
+    quant(&mut lm_head, "lm_head")?;
+    eprintln!("[dflash-quant] drafter transformer weights and lm_head quantized to nvfp4");
     Ok((layers, lm_head))
 }
 
 #[cfg(feature = "cuda")]
 pub struct DFlashBlockGraph {
-    forked: std::sync::Arc<cudarc::driver::CudaStream>,
+    forked: Arc<cudarc::driver::CudaStream>,
     runner: nv_kernels::graph::CudaGraphRunner,
     cap: usize,
     m: usize,
@@ -1613,41 +1570,41 @@ pub struct DFlashBlockGraph {
     warmed: bool,
     ids_host: Vec<i32>,
     pos_host: Vec<i32>,
-    ids_buf: cudarc::driver::CudaSlice<i32>,
-    pos_buf: cudarc::driver::CudaSlice<i32>,
-    n_buf: cudarc::driver::CudaSlice<i32>,
-    mask_buf: cudarc::driver::CudaSlice<u8>,
-    mask_causal_buf: Option<cudarc::driver::CudaSlice<u8>>,
-    out_buf: cudarc::driver::CudaSlice<u32>,
-    draft_idx: cudarc::driver::CudaSlice<u32>,
-    amax_val: cudarc::driver::CudaSlice<f32>,
-    amax_idx: cudarc::driver::CudaSlice<i32>,
-    x_buf: cudarc::driver::CudaSlice<half::bf16>,
-    normed_buf: cudarc::driver::CudaSlice<half::bf16>,
-    q_buf: cudarc::driver::CudaSlice<half::bf16>,
-    k_buf: cudarc::driver::CudaSlice<half::bf16>,
-    v_buf: cudarc::driver::CudaSlice<half::bf16>,
-    attn_buf: cudarc::driver::CudaSlice<half::bf16>,
-    o_buf: cudarc::driver::CudaSlice<half::bf16>,
-    pa_buf: cudarc::driver::CudaSlice<half::bf16>,
-    nm_buf: cudarc::driver::CudaSlice<half::bf16>,
-    gate_buf: cudarc::driver::CudaSlice<half::bf16>,
-    up_buf: cudarc::driver::CudaSlice<half::bf16>,
-    act_buf: cudarc::driver::CudaSlice<half::bf16>,
-    mlp_buf: cudarc::driver::CudaSlice<half::bf16>,
-    logits_buf: cudarc::driver::CudaSlice<half::bf16>,
-    logits_f32: cudarc::driver::CudaSlice<f32>,
-    fp4_a: Option<cudarc::driver::CudaSlice<u8>>,
-    fp4_sc: Option<cudarc::driver::CudaSlice<u8>>,
-    fp4_ws: Option<cudarc::driver::CudaSlice<u8>>,
-    q_pad: Option<cudarc::driver::CudaSlice<half::bf16>>,
-    k_pad: Option<cudarc::driver::CudaSlice<half::bf16>>,
-    v_pad: Option<cudarc::driver::CudaSlice<half::bf16>>,
-    o_pad: Option<cudarc::driver::CudaSlice<half::bf16>>,
-    gate_pad: Option<cudarc::driver::CudaSlice<half::bf16>>,
-    up_pad: Option<cudarc::driver::CudaSlice<half::bf16>>,
-    mlp_pad: Option<cudarc::driver::CudaSlice<half::bf16>>,
-    lm_pad: Option<cudarc::driver::CudaSlice<half::bf16>>,
+    ids_buf: CudaSlice<i32>,
+    pos_buf: CudaSlice<i32>,
+    n_buf: CudaSlice<i32>,
+    mask_buf: CudaSlice<u8>,
+    mask_causal_buf: Option<CudaSlice<u8>>,
+    out_buf: CudaSlice<u32>,
+    draft_idx: CudaSlice<u32>,
+    amax_val: CudaSlice<f32>,
+    amax_idx: CudaSlice<i32>,
+    x_buf: CudaSlice<half::bf16>,
+    normed_buf: CudaSlice<half::bf16>,
+    q_buf: CudaSlice<half::bf16>,
+    k_buf: CudaSlice<half::bf16>,
+    v_buf: CudaSlice<half::bf16>,
+    attn_buf: CudaSlice<half::bf16>,
+    o_buf: CudaSlice<half::bf16>,
+    pa_buf: CudaSlice<half::bf16>,
+    nm_buf: CudaSlice<half::bf16>,
+    gate_buf: CudaSlice<half::bf16>,
+    up_buf: CudaSlice<half::bf16>,
+    act_buf: CudaSlice<half::bf16>,
+    mlp_buf: CudaSlice<half::bf16>,
+    logits_buf: CudaSlice<half::bf16>,
+    logits_f32: CudaSlice<f32>,
+    fp4_a: Option<CudaSlice<u8>>,
+    fp4_sc: Option<CudaSlice<u8>>,
+    fp4_ws: Option<CudaSlice<u8>>,
+    q_pad: Option<CudaSlice<half::bf16>>,
+    k_pad: Option<CudaSlice<half::bf16>>,
+    v_pad: Option<CudaSlice<half::bf16>>,
+    o_pad: Option<CudaSlice<half::bf16>>,
+    gate_pad: Option<CudaSlice<half::bf16>>,
+    up_pad: Option<CudaSlice<half::bf16>>,
+    mlp_pad: Option<CudaSlice<half::bf16>>,
+    lm_pad: Option<CudaSlice<half::bf16>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1741,9 +1698,8 @@ impl LoadedDFlashDrafter {
     pub fn new_block_graph(&self, cap: usize) -> Result<DFlashBlockGraph> {
         let fp4_flags = self.block_graph_eligible()?;
         let any_fp4 = fp4_flags.iter().any(|&f| f);
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => bail!("new_block_graph requires cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("new_block_graph requires cuda")
         };
         let cfg = &self.cfg;
         let m = cfg.query_rows();
@@ -1759,26 +1715,25 @@ impl LoadedDFlashDrafter {
         let dv = cfg.draft_vocab_size;
         let parts = nv_kernels::cuda::argmax_parts();
 
-        let raw_ctx: std::sync::Arc<cudarc::driver::CudaContext> =
-            dev.cuda_stream().context().clone();
-        let forked = raw_ctx.new_stream().map_err(|e| anyhow!(e))?;
+        let raw_ctx: Arc<cudarc::driver::CudaContext> = dev.cuda_stream().context().clone();
+        let forked = raw_ctx.new_stream()?;
 
-        let abf = |n: usize| -> Result<cudarc::driver::CudaSlice<half::bf16>> {
+        let abf = |n: usize| -> Result<CudaSlice<half::bf16>> {
             forked
                 .alloc_zeros::<half::bf16>(n)
                 .map_err(|e| anyhow!("block graph buf alloc ({n}): {e:?}"))
         };
-        let ids_buf = forked.alloc_zeros::<i32>(m).map_err(|e| anyhow!(e))?;
-        let pos_buf = forked.alloc_zeros::<i32>(m).map_err(|e| anyhow!(e))?;
-        let n_buf = forked.alloc_zeros::<i32>(1).map_err(|e| anyhow!(e))?;
-        let mut mask_buf = forked.alloc_zeros::<u8>(m * m).map_err(|e| anyhow!(e))?;
+        let ids_buf = forked.alloc_zeros::<i32>(m)?;
+        let pos_buf = forked.alloc_zeros::<i32>(m)?;
+        let n_buf = forked.alloc_zeros::<i32>(1)?;
+        let mut mask_buf = forked.alloc_zeros::<u8>(m * m)?;
         let mask_host = vec![1u8; m * m];
         forked
             .memcpy_htod(&mask_host[..], &mut mask_buf)
             .map_err(|e| anyhow!("mask htod: {e:?}"))?;
         let any_causal = (0..self.layers.len()).any(|i| cfg.layer_attn_for(i).causal);
         let mask_causal_buf = if any_causal {
-            let mut buf = forked.alloc_zeros::<u8>(m * m).map_err(|e| anyhow!(e))?;
+            let mut buf = forked.alloc_zeros::<u8>(m * m)?;
             let mut host = vec![0u8; m * m];
             for i in 0..m {
                 for j in 0..=i {
@@ -1792,14 +1747,10 @@ impl LoadedDFlashDrafter {
         } else {
             None
         };
-        let out_buf = forked.alloc_zeros::<u32>(md).map_err(|e| anyhow!(e))?;
-        let draft_idx = forked.alloc_zeros::<u32>(md).map_err(|e| anyhow!(e))?;
-        let amax_val = forked
-            .alloc_zeros::<f32>(md * parts)
-            .map_err(|e| anyhow!(e))?;
-        let amax_idx = forked
-            .alloc_zeros::<i32>(md * parts)
-            .map_err(|e| anyhow!(e))?;
+        let out_buf = forked.alloc_zeros::<u32>(md)?;
+        let draft_idx = forked.alloc_zeros::<u32>(md)?;
+        let amax_val = forked.alloc_zeros::<f32>(md * parts)?;
+        let amax_idx = forked.alloc_zeros::<i32>(md * parts)?;
         let x_buf = abf(m * h)?;
         let normed_buf = abf(m * h)?;
         let q_buf = abf(m * nh * hd)?;
@@ -1814,7 +1765,7 @@ impl LoadedDFlashDrafter {
         let act_buf = abf(m * inter)?;
         let mlp_buf = abf(m * h)?;
         let logits_buf = abf(md * dv)?;
-        let logits_f32 = forked.alloc_zeros::<f32>(md * dv).map_err(|e| anyhow!(e))?;
+        let logits_f32 = forked.alloc_zeros::<f32>(md * dv)?;
 
         let mpad = nv_quant::nvfp4::MIN_TILE;
         let (fp4_a, fp4_sc, fp4_ws) = if any_fp4 {
@@ -1822,29 +1773,20 @@ impl LoadedDFlashDrafter {
             let sc_bytes =
                 mpad.div_ceil(128) * 128 * (kmax / nv_quant::nvfp4::BLOCK_SIZE + 3).div_ceil(4) * 4;
             (
-                Some(
-                    forked
-                        .alloc_zeros::<u8>(mpad * kmax / 2)
-                        .map_err(|e| anyhow!(e))?,
-                ),
-                Some(forked.alloc_zeros::<u8>(sc_bytes).map_err(|e| anyhow!(e))?),
-                Some(
-                    forked
-                        .alloc_zeros::<u8>(nv_quant::nvfp4::WORKSPACE_BYTES)
-                        .map_err(|e| anyhow!(e))?,
-                ),
+                Some(forked.alloc_zeros::<u8>(mpad * kmax / 2)?),
+                Some(forked.alloc_zeros::<u8>(sc_bytes)?),
+                Some(forked.alloc_zeros::<u8>(nv_quant::nvfp4::WORKSPACE_BYTES)?),
             )
         } else {
             (None, None, None)
         };
-        let opt_abf =
-            |on: bool, n: usize| -> Result<Option<cudarc::driver::CudaSlice<half::bf16>>> {
-                if on {
-                    Ok(Some(abf(n)?))
-                } else {
-                    Ok(None)
-                }
-            };
+        let opt_abf = |on: bool, n: usize| -> Result<Option<CudaSlice<half::bf16>>> {
+            if on {
+                Ok(Some(abf(n)?))
+            } else {
+                Ok(None)
+            }
+        };
         let q_pad = opt_abf(fp4_flags[0], mpad * nh * hd)?;
         let k_pad = opt_abf(fp4_flags[1], mpad * nkv * hd)?;
         let v_pad = opt_abf(fp4_flags[2], mpad * nkv * hd)?;
@@ -1853,7 +1795,7 @@ impl LoadedDFlashDrafter {
         let up_pad = opt_abf(fp4_flags[5], mpad * inter)?;
         let mlp_pad = opt_abf(fp4_flags[6], mpad * h)?;
         let lm_pad = opt_abf(fp4_flags[7], mpad * dv)?;
-        forked.synchronize().map_err(|e| anyhow!(e))?;
+        forked.synchronize()?;
 
         let _ = self.d2t_map_dev_tensor()?;
         let runner = nv_kernels::graph::CudaGraphRunner::new(forked.clone());
@@ -1909,7 +1851,6 @@ impl LoadedDFlashDrafter {
         ctx: &DFlashContextKv,
         g: &mut DFlashBlockGraph,
         anchor: u32,
-        eager_body: bool,
     ) -> Result<Vec<u32>> {
         use crate::eagle3_loader::{chain_raw_bf16, chain_raw_f32, chain_raw_u32, chain_slice_ptr};
 
@@ -1937,18 +1878,15 @@ impl LoadedDFlashDrafter {
                 g.cap
             );
         }
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => bail!("draft_block_graphed requires cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("draft_block_graphed requires cuda")
         };
         let raw_ctx = dev.cuda_stream().context().clone();
         if raw_ctx.is_event_tracking() {
             unsafe { raw_ctx.disable_event_tracking() };
-            dev.cuda_stream().synchronize().map_err(|e| anyhow!(e))?;
+            dev.cuda_stream().synchronize()?;
         }
-        nv_layers::cuda_stream::current_stream(&dev)
-            .synchronize()
-            .map_err(|e| anyhow!(e))?;
+        nv_layers::cuda_stream::current_stream(&dev).synchronize()?;
 
         g.ids_host[0] = anchor as i32;
         for (i, p) in g.pos_host.iter_mut().enumerate() {
@@ -2092,7 +2030,7 @@ impl LoadedDFlashDrafter {
         let p_logits = chain_slice_ptr(&g.logits_buf, &fk);
         let p_logits_f32 = chain_slice_ptr(&g.logits_f32, &fk);
 
-        let opt_ptr = |o: &Option<cudarc::driver::CudaSlice<half::bf16>>, dflt: u64| -> u64 {
+        let opt_ptr = |o: &Option<CudaSlice<half::bf16>>, dflt: u64| -> u64 {
             o.as_ref().map(|s| chain_slice_ptr(s, &fk)).unwrap_or(dflt)
         };
         let p_qo = opt_ptr(&g.q_pad, p_q);
@@ -2123,8 +2061,7 @@ impl LoadedDFlashDrafter {
         let use_mk_gemm = std::env::var("NV_DFLASH_GEMM")
             .map(|v| v == "mk")
             .unwrap_or(false);
-        let splitk = nv_quant::matmul::splitk_enabled();
-        let body = |s: &std::sync::Arc<cudarc::driver::CudaStream>| -> Result<()> {
+        let body = |s: &Arc<cudarc::driver::CudaStream>| -> Result<()> {
             let cu = s.cu_stream() as *mut std::ffi::c_void;
             let gemm = |gw: &GW,
                         x: u64,
@@ -2152,7 +2089,7 @@ impl LoadedDFlashDrafter {
                                 k as i32,
                             )
                         };
-                        anyhow::ensure!(rc == 0, "{what} act quant rc={rc}");
+                        ensure!(rc == 0, "{what} act quant rc={rc}");
                         unsafe {
                             nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_streamk(
                                 cu,
@@ -2186,7 +2123,7 @@ impl LoadedDFlashDrafter {
                             mm as i32,
                         )
                     };
-                    anyhow::ensure!(rc == 0, "{what} rc={rc}");
+                    ensure!(rc == 0, "{what} rc={rc}");
                     return Ok(());
                 }
                 unsafe {
@@ -2200,7 +2137,7 @@ impl LoadedDFlashDrafter {
                         k as u64,
                         1.0,
                         0.0,
-                        splitk,
+                        true,
                     )
                 }
                 .map_err(|e| anyhow!("{what}: {e}"))
@@ -2217,7 +2154,7 @@ impl LoadedDFlashDrafter {
                         eps,
                     )
                 };
-                anyhow::ensure!(rc == 0, "{what} rc={rc}");
+                ensure!(rc == 0, "{what} rc={rc}");
                 Ok(())
             };
 
@@ -2232,7 +2169,7 @@ impl LoadedDFlashDrafter {
                     tv as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "block embed gather rc={rc}");
+            ensure!(rc == 0, "block embed gather rc={rc}");
 
             for l in lp.iter() {
                 rms(p_x, l.wil, p_normed, m, h, "block input_ln")?;
@@ -2255,11 +2192,11 @@ impl LoadedDFlashDrafter {
                         hd,
                     )
                 };
-                anyhow::ensure!(rc == 0, "block rope rc={rc}");
+                ensure!(rc == 0, "block rope rc={rc}");
                 let rc = unsafe {
                     nv_kernels::cuda::scale_inplace_bf16(cu, p_qo as *mut u16, scale, m * nh * hd)
                 };
-                anyhow::ensure!(rc == 0, "block q scale rc={rc}");
+                ensure!(rc == 0, "block q scale rc={rc}");
                 let rc = unsafe {
                     nv_kernels::cuda::kv_append_bf16(
                         cu,
@@ -2273,7 +2210,7 @@ impl LoadedDFlashDrafter {
                         hd as i32,
                     )
                 };
-                anyhow::ensure!(rc == 0, "block kv_append rc={rc}");
+                ensure!(rc == 0, "block kv_append rc={rc}");
                 let l_mask = if l.causal { p_mask_causal } else { p_mask };
                 let l_positions = if l.window > 0 {
                     p_pos as *const i32
@@ -2297,7 +2234,7 @@ impl LoadedDFlashDrafter {
                         l.window,
                     )
                 };
-                anyhow::ensure!(rc == 0, "block attn rc={rc}");
+                ensure!(rc == 0, "block attn rc={rc}");
                 gemm(&l.wo, p_attn, p_oo, h, nh * hd, m, "block o_proj")?;
                 let rc = unsafe {
                     nv_kernels::cuda::residual_add_scale_bf16(
@@ -2309,7 +2246,7 @@ impl LoadedDFlashDrafter {
                         m * h,
                     )
                 };
-                anyhow::ensure!(rc == 0, "block resid add rc={rc}");
+                ensure!(rc == 0, "block resid add rc={rc}");
                 rms(p_pa, l.wpl, p_nm, m, h, "block post_ln")?;
                 gemm(&l.wg, p_nm, p_gateo, inter, h, m, "block gate_proj")?;
                 gemm(&l.wu, p_nm, p_upo, inter, h, m, "block up_proj")?;
@@ -2322,7 +2259,7 @@ impl LoadedDFlashDrafter {
                         m * inter,
                     )
                 };
-                anyhow::ensure!(rc == 0, "block silu_mul rc={rc}");
+                ensure!(rc == 0, "block silu_mul rc={rc}");
                 gemm(&l.wd, p_act, p_mlpo, h, inter, m, "block down_proj")?;
                 let rc = unsafe {
                     nv_kernels::cuda::residual_add_scale_bf16(
@@ -2334,7 +2271,7 @@ impl LoadedDFlashDrafter {
                         m * h,
                     )
                 };
-                anyhow::ensure!(rc == 0, "block h add rc={rc}");
+                ensure!(rc == 0, "block h add rc={rc}");
             }
 
             rms(p_x, p_wn, p_normed, m, h, "block final norm")?;
@@ -2355,7 +2292,7 @@ impl LoadedDFlashDrafter {
                     (md * dv) as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "block logits cast rc={rc}");
+            ensure!(rc == 0, "block logits cast rc={rc}");
             let rc = unsafe {
                 nv_kernels::cuda::argmax_f32_rows(
                     cu,
@@ -2367,7 +2304,7 @@ impl LoadedDFlashDrafter {
                     p_didx as *mut u32,
                 )
             };
-            anyhow::ensure!(rc == 0, "block argmax rc={rc}");
+            ensure!(rc == 0, "block argmax rc={rc}");
             for i in 0..md {
                 let rc = unsafe {
                     nv_kernels::cuda::token_map_u32(
@@ -2377,23 +2314,14 @@ impl LoadedDFlashDrafter {
                         (p_out + (i as u64) * 4) as *mut u32,
                     )
                 };
-                anyhow::ensure!(rc == 0, "block d2t map rc={rc}");
+                ensure!(rc == 0, "block d2t map rc={rc}");
             }
             Ok(())
         };
 
-        if eager_body {
-            body(&fk)?;
-            fk.synchronize().map_err(|e| anyhow!(e))?;
-            let out: Vec<u32> = fk
-                .clone_dtoh(&g.out_buf)
-                .map_err(|e| anyhow!("block out d2h: {e:?}"))?;
-            return Ok(out);
-        }
-
         if !g.warmed {
             body(&fk)?;
-            fk.synchronize().map_err(|e| anyhow!(e))?;
+            fk.synchronize()?;
             g.warmed = true;
         }
         let mut token = 0xdf1a5du64;
@@ -2409,7 +2337,7 @@ impl LoadedDFlashDrafter {
         let t_run = std::time::Instant::now();
         g.runner.run(token, body)?;
         let launch_ms = t_run.elapsed().as_secs_f64() * 1000.0;
-        fk.synchronize().map_err(|e| anyhow!(e))?;
+        fk.synchronize()?;
         let gpu_ms = t_run.elapsed().as_secs_f64() * 1000.0;
         let out: Vec<u32> = fk
             .clone_dtoh(&g.out_buf)
@@ -2555,7 +2483,7 @@ mod tests {
     }"#;
 
     #[test]
-    fn config_parses_redhat_checkpoint_json() {
+    fn config_parses_redhat_checkpoint_json_and_the_speculators_schema_stays_full_non_causal() {
         let cfg = DFlashSpeculatorConfig::from_hf_json_str(REDHAT_CONFIG).expect("parse");
         assert_eq!(cfg.hidden_size, 5376);
         assert_eq!(cfg.target_hidden_size, 5376);
@@ -2572,17 +2500,18 @@ mod tests {
         assert_eq!(cfg.fc_in_dim(), 26880);
         assert_eq!(cfg.query_rows(), 9);
         assert!((cfg.rope_theta - 10000.0).abs() < 1e-3);
+        assert!(cfg.layer_attn.is_empty());
+        assert!(!cfg.any_masked_layer());
+        assert_eq!(cfg.layer_attn_for(0), DFlashLayerAttn::FULL_NON_CAUSAL);
+        assert!(!cfg.tied_embeddings);
+        assert_eq!(cfg.logit_softcap, None);
     }
 
     #[test]
-    fn block_input_ids_are_anchor_then_masks() {
+    fn block_input_ids_are_anchor_then_masks_and_a_draft_block_yields_block_size_valid_target_tokens(
+    ) {
         let d = tiny_drafter(4);
         assert_eq!(d.block_input_ids(7), vec![7, 3, 3, 3, 3]);
-    }
-
-    #[test]
-    fn draft_block_yields_block_size_valid_target_tokens() {
-        let d = tiny_drafter(4);
         let aux = tiny_aux(&d, 6);
         let positions: Vec<u32> = (0..6).collect();
         let out = d.draft_block_from_aux(&aux, &positions, 5).expect("draft");
@@ -2594,23 +2523,7 @@ mod tests {
     }
 
     #[test]
-    fn device_variant_matches_host_variant() {
-        let d = tiny_drafter(4);
-        let aux = tiny_aux(&d, 5);
-        let positions: Vec<u32> = (0..5).collect();
-        let proj = d.project_aux(&aux).expect("project");
-        let ctx = d.precompute_context_kv(&proj, &positions).expect("ctx kv");
-        let host = d.draft_block(&ctx, 2).expect("host draft");
-        let dev = d
-            .draft_block_dev(&ctx, 2)
-            .expect("dev draft")
-            .to_vec1::<u32>()
-            .expect("to host");
-        assert_eq!(host, dev);
-    }
-
-    #[test]
-    fn draft_is_deterministic_and_anchor_sensitive() {
+    fn draft_is_deterministic_anchor_sensitive_and_the_device_variant_matches_the_host_variant() {
         let d = tiny_drafter(4);
         let aux = tiny_aux(&d, 5);
         let positions: Vec<u32> = (0..5).collect();
@@ -2619,6 +2532,12 @@ mod tests {
         let a1 = d.draft_block(&ctx, 2).expect("draft");
         let a2 = d.draft_block(&ctx, 2).expect("draft again");
         assert_eq!(a1, a2);
+        let dev = d
+            .draft_block_dev(&ctx, 2)
+            .expect("dev draft")
+            .to_vec1::<u32>()
+            .expect("to host");
+        assert_eq!(a1, dev);
         let h1 = d.forward_block_hidden(&ctx, 2).expect("hidden anchor 2");
         let h2 = d.forward_block_hidden(&ctx, 9).expect("hidden anchor 9");
         let diff = h1
@@ -2639,39 +2558,8 @@ mod tests {
     }
 
     #[test]
-    fn block_attention_is_non_causal() {
-        let wide = tiny_drafter(4);
-        let narrow = tiny_drafter(1);
-        let aux = tiny_aux(&wide, 5);
-        let positions: Vec<u32> = (0..5).collect();
-        let proj = wide.project_aux(&aux).expect("project");
-        let ctx_w = wide.precompute_context_kv(&proj, &positions).expect("ctx");
-        let ctx_n = narrow
-            .precompute_context_kv(&proj, &positions)
-            .expect("ctx");
-        let h_w = wide.forward_block_hidden(&ctx_w, 2).expect("wide");
-        let h_n = narrow.forward_block_hidden(&ctx_n, 2).expect("narrow");
-        let row_w = h_w.narrow(0, 0, 1).unwrap();
-        let row_n = h_n.narrow(0, 0, 1).unwrap();
-        let diff = row_w
-            .sub(&row_n)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
-        assert!(
-            diff > 1e-5,
-            "anchor row must attend to later mask positions (non-causal), diff={diff}"
-        );
-    }
-
-    #[test]
-    fn context_kv_shapes_and_positions() {
+    fn context_kv_shapes_and_positions_incremental_append_and_capacity_growth_match_one_shot_and_bad_widths_are_rejected(
+    ) {
         let d = tiny_drafter(4);
         let aux = tiny_aux(&d, 7);
         let positions: Vec<u32> = (3..10).collect();
@@ -2692,105 +2580,98 @@ mod tests {
             .precompute_context_kv(&proj, &positions[..6])
             .expect_err("mismatched positions must fail");
         assert!(err.to_string().contains("positions"), "got: {err}");
-    }
-
-    #[test]
-    fn incremental_append_matches_one_shot_precompute() {
-        let d = tiny_drafter(4);
-        let aux = tiny_aux(&d, 9);
-        let positions: Vec<u32> = (0..9).collect();
-        let proj = d.project_aux(&aux).expect("project");
-        let full = d
-            .precompute_context_kv(&proj, &positions)
-            .expect("full ctx");
-
-        let mut inc = DFlashContextKv::empty();
-        for (start, len) in [(0usize, 4usize), (4, 2), (6, 3)] {
-            let rows = proj.narrow(0, start, len).unwrap();
-            d.append_context_kv(&mut inc, &rows, &positions[start..start + len])
-                .expect("append");
-        }
-        assert_eq!(inc.len(), full.len());
-        assert_eq!(inc.next_pos(), full.next_pos());
-        let n = inc.len();
-        for (a, b) in inc
-            .k
-            .iter()
-            .zip(full.k.iter())
-            .chain(inc.v.iter().zip(full.v.iter()))
         {
-            let a = a.narrow(1, 0, n).unwrap();
-            let b = b.narrow(1, 0, n).unwrap();
-            let diff = a
-                .sub(&b)
-                .unwrap()
-                .abs()
-                .unwrap()
-                .to_dtype(DType::F32)
-                .unwrap()
-                .max_all()
-                .unwrap()
-                .to_scalar::<f32>()
-                .unwrap();
-            assert_eq!(
-                diff, 0.0,
-                "append must be bit-identical to one-shot precompute"
-            );
+            let aux = tiny_aux(&d, 9);
+            let positions: Vec<u32> = (0..9).collect();
+            let proj = d.project_aux(&aux).expect("project");
+            let full = d
+                .precompute_context_kv(&proj, &positions)
+                .expect("full ctx");
+
+            let mut inc = DFlashContextKv::empty();
+            for (start, len) in [(0usize, 4usize), (4, 2), (6, 3)] {
+                let rows = proj.narrow(0, start, len).unwrap();
+                d.append_context_kv(&mut inc, &rows, &positions[start..start + len])
+                    .expect("append");
+            }
+            assert_eq!(inc.len(), full.len());
+            assert_eq!(inc.next_pos(), full.next_pos());
+            let n = inc.len();
+            for (a, b) in inc
+                .k
+                .iter()
+                .zip(full.k.iter())
+                .chain(inc.v.iter().zip(full.v.iter()))
+            {
+                let a = a.narrow(1, 0, n).unwrap();
+                let b = b.narrow(1, 0, n).unwrap();
+                let diff = a
+                    .sub(&b)
+                    .unwrap()
+                    .abs()
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap()
+                    .max_all()
+                    .unwrap()
+                    .to_scalar::<f32>()
+                    .unwrap();
+                assert_eq!(
+                    diff, 0.0,
+                    "append must be bit-identical to one-shot precompute"
+                );
+            }
+
+            let d1 = d.draft_block(&full, 3).expect("draft full");
+            let d2 = d.draft_block(&inc, 3).expect("draft inc");
+            assert_eq!(d1, d2);
+
+            let bad_rows = proj.narrow(0, 0, 2).unwrap();
+            let err = d
+                .append_context_kv(&mut inc, &bad_rows, &[11, 12])
+                .expect_err("gapped positions must fail");
+            assert!(err.to_string().contains("position"), "got: {err}");
         }
 
-        let d1 = d.draft_block(&full, 3).expect("draft full");
-        let d2 = d.draft_block(&inc, 3).expect("draft inc");
-        assert_eq!(d1, d2);
+        {
+            let n = 1100usize;
+            let aux = tiny_aux(&d, n);
+            let positions: Vec<u32> = (0..n as u32).collect();
+            let proj = d.project_aux(&aux).expect("project");
+            let full = d.precompute_context_kv(&proj, &positions).expect("full");
 
-        let bad_rows = proj.narrow(0, 0, 2).unwrap();
-        let err = d
-            .append_context_kv(&mut inc, &bad_rows, &[11, 12])
-            .expect_err("gapped positions must fail");
-        assert!(err.to_string().contains("position"), "got: {err}");
-    }
-
-    #[test]
-    fn capacity_growth_matches_one_shot() {
-        let d = tiny_drafter(4);
-        let n = 1100usize;
-        let aux = tiny_aux(&d, n);
-        let positions: Vec<u32> = (0..n as u32).collect();
-        let proj = d.project_aux(&aux).expect("project");
-        let full = d.precompute_context_kv(&proj, &positions).expect("full");
-
-        let mut inc = DFlashContextKv::empty();
-        for start in (0..n).step_by(150) {
-            let len = 150.min(n - start);
-            let rows = proj.narrow(0, start, len).unwrap();
-            d.append_context_kv(&mut inc, &rows, &positions[start..start + len])
-                .expect("append");
+            let mut inc = DFlashContextKv::empty();
+            for start in (0..n).step_by(150) {
+                let len = 150.min(n - start);
+                let rows = proj.narrow(0, start, len).unwrap();
+                d.append_context_kv(&mut inc, &rows, &positions[start..start + len])
+                    .expect("append");
+            }
+            assert_eq!(inc.len(), full.len());
+            assert!(inc.capacity() > 1024, "growth path must have triggered");
+            let d1 = d.draft_block(&full, 3).expect("draft full");
+            let d2 = d.draft_block(&inc, 3).expect("draft inc");
+            assert_eq!(d1, d2);
+            let f1 = full.fingerprint().expect("fp full");
+            let f2 = inc.fingerprint().expect("fp inc");
+            assert!((f1 - f2).abs() < 1e-3 * f1.abs().max(1.0), "{f1} vs {f2}");
         }
-        assert_eq!(inc.len(), full.len());
-        assert!(inc.capacity() > 1024, "growth path must have triggered");
-        let d1 = d.draft_block(&full, 3).expect("draft full");
-        let d2 = d.draft_block(&inc, 3).expect("draft inc");
-        assert_eq!(d1, d2);
-        let f1 = full.fingerprint().expect("fp full");
-        let f2 = inc.fingerprint().expect("fp inc");
-        assert!((f1 - f2).abs() < 1e-3 * f1.abs().max(1.0), "{f1} vs {f2}");
-    }
 
-    #[test]
-    fn rejects_wrong_aux_width_and_layer_count() {
-        let d = tiny_drafter(4);
-        let bad = Tensor::zeros((3usize, 5usize), DType::F32, &d.device).unwrap();
-        let err = d.project_aux(&bad).expect_err("wrong fc width");
-        assert!(err.to_string().contains("expected"), "got: {err}");
-        let aux = tiny_aux(&d, 4);
-        let proj = d.project_aux(&aux).unwrap();
-        let positions: Vec<u32> = (0..4).collect();
-        let mut ctx = d.precompute_context_kv(&proj, &positions).unwrap();
-        ctx.k.pop();
-        ctx.v.pop();
-        let err = d
-            .forward_block_hidden(&ctx, 1)
-            .expect_err("layer count mismatch must fail");
-        assert!(err.to_string().contains("layers"), "got: {err}");
+        {
+            let bad = Tensor::zeros((3usize, 5usize), DType::F32, &d.device).unwrap();
+            let err = d.project_aux(&bad).expect_err("wrong fc width");
+            assert!(err.to_string().contains("expected"), "got: {err}");
+            let aux = tiny_aux(&d, 4);
+            let proj = d.project_aux(&aux).unwrap();
+            let positions: Vec<u32> = (0..4).collect();
+            let mut ctx = d.precompute_context_kv(&proj, &positions).unwrap();
+            ctx.k.pop();
+            ctx.v.pop();
+            let err = d
+                .forward_block_hidden(&ctx, 1)
+                .expect_err("layer count mismatch must fail");
+            assert!(err.to_string().contains("layers"), "got: {err}");
+        }
     }
 
     fn bf_tensor(n: usize, shape: Vec<usize>, seed: f32, dev: &Device) -> Tensor {
@@ -2982,7 +2863,8 @@ mod tests {
     }"#;
 
     #[test]
-    fn config_parses_zlab_flat_checkpoint_json() {
+    fn config_parses_zlab_flat_checkpoint_json_within_bounds_and_the_causal_override_applies_to_all_layers(
+    ) {
         let cfg = DFlashSpeculatorConfig::from_hf_json_str(ZLAB_CONFIG).expect("parse");
         assert_eq!(cfg.hidden_size, 5376);
         assert_eq!(cfg.num_hidden_layers, 5);
@@ -3014,29 +2896,18 @@ mod tests {
         }
         assert_eq!(cfg.layer_attn[4], DFlashLayerAttn::FULL_NON_CAUSAL);
         assert!(cfg.any_masked_layer());
-    }
 
-    #[test]
-    fn config_redhat_speculators_schema_stays_full_non_causal() {
-        let cfg = DFlashSpeculatorConfig::from_hf_json_str(REDHAT_CONFIG).expect("parse");
-        assert!(cfg.layer_attn.is_empty());
-        assert!(!cfg.any_masked_layer());
-        assert_eq!(cfg.layer_attn_for(0), DFlashLayerAttn::FULL_NON_CAUSAL);
-        assert!(!cfg.tied_embeddings);
-        assert_eq!(cfg.logit_softcap, None);
-    }
-
-    #[test]
-    fn config_rejects_oversized_block_size() {
         let mut v: serde_json::Value = serde_json::from_str(ZLAB_CONFIG).unwrap();
-        v["block_size"] = serde_json::json!(100000);
-        let err = DFlashSpeculatorConfig::from_hf_json_str(&v.to_string()).unwrap_err();
-        assert!(err.to_string().contains("block_size"), "{err}");
+        v["block_size"] = serde_json::json!(200);
+        let cfg = DFlashSpeculatorConfig::from_hf_json_str(&v.to_string()).expect("parse");
+        assert_eq!(cfg.query_rows(), 201);
+        assert!(cfg.query_rows() > FP4_STAGING_ROWS);
 
-        let mut v: serde_json::Value = serde_json::from_str(REDHAT_CONFIG).unwrap();
-        v["block_size"] = serde_json::json!(100000);
-        let err = DFlashSpeculatorConfig::from_hf_json_str(&v.to_string()).unwrap_err();
-        assert!(err.to_string().contains("block_size"), "{err}");
+        let mut v: serde_json::Value = serde_json::from_str(ZLAB_CONFIG).unwrap();
+        v["dflash_config"]["causal"] = serde_json::Value::Bool(false);
+        let cfg = DFlashSpeculatorConfig::from_hf_json_str(&v.to_string()).expect("parse");
+        assert!(cfg.layer_attn.iter().all(|a| !a.causal));
+        assert!(cfg.layer_attn[0].sliding && !cfg.layer_attn[4].sliding);
     }
 
     #[test]
@@ -3063,15 +2934,15 @@ mod tests {
                 "{key}={bad}: {err}"
             );
         }
-    }
-
-    #[test]
-    fn config_within_bounds_still_parses() {
         let mut v: serde_json::Value = serde_json::from_str(ZLAB_CONFIG).unwrap();
-        v["block_size"] = serde_json::json!(200);
-        let cfg = DFlashSpeculatorConfig::from_hf_json_str(&v.to_string()).expect("parse");
-        assert_eq!(cfg.query_rows(), 201);
-        assert!(cfg.query_rows() > FP4_STAGING_ROWS);
+        v["block_size"] = serde_json::json!(100000);
+        let err = DFlashSpeculatorConfig::from_hf_json_str(&v.to_string()).unwrap_err();
+        assert!(err.to_string().contains("block_size"), "{err}");
+
+        let mut v: serde_json::Value = serde_json::from_str(REDHAT_CONFIG).unwrap();
+        v["block_size"] = serde_json::json!(100000);
+        let err = DFlashSpeculatorConfig::from_hf_json_str(&v.to_string()).unwrap_err();
+        assert!(err.to_string().contains("block_size"), "{err}");
     }
 
     #[test]
@@ -3081,15 +2952,6 @@ mod tests {
         assert!(draft_f32_enabled(Some("1")));
         assert!(draft_f32_enabled(Some("")));
         assert!(draft_f32_enabled(Some("true")));
-    }
-
-    #[test]
-    fn config_dflash_causal_override_applies_to_all_layers() {
-        let mut v: serde_json::Value = serde_json::from_str(ZLAB_CONFIG).unwrap();
-        v["dflash_config"]["causal"] = serde_json::Value::Bool(false);
-        let cfg = DFlashSpeculatorConfig::from_hf_json_str(&v.to_string()).expect("parse");
-        assert!(cfg.layer_attn.iter().all(|a| !a.causal));
-        assert!(cfg.layer_attn[0].sliding && !cfg.layer_attn[4].sliding);
     }
 
     fn causal_sliding_cfg(block_size: usize, window: usize) -> DFlashSpeculatorConfig {
@@ -3106,39 +2968,68 @@ mod tests {
     }
 
     #[test]
-    fn causal_layers_hide_future_mask_rows_from_anchor() {
-        let wide = tiny_drafter_from(causal_sliding_cfg(4, 4096));
-        let narrow = tiny_drafter_from(causal_sliding_cfg(1, 4096));
-        let aux = tiny_aux(&wide, 5);
-        let positions: Vec<u32> = (0..5).collect();
-        let proj = wide.project_aux(&aux).expect("project");
-        let ctx_w = wide.precompute_context_kv(&proj, &positions).expect("ctx");
-        let ctx_n = narrow
-            .precompute_context_kv(&proj, &positions)
-            .expect("ctx");
-        let h_w = wide.forward_block_hidden(&ctx_w, 2).expect("wide");
-        let h_n = narrow.forward_block_hidden(&ctx_n, 2).expect("narrow");
-        let diff = h_w
-            .narrow(0, 0, 1)
-            .unwrap()
-            .sub(&h_n.narrow(0, 0, 1).unwrap())
-            .unwrap()
-            .abs()
-            .unwrap()
-            .to_dtype(DType::F32)
-            .unwrap()
-            .max_all()
-            .unwrap()
-            .to_scalar::<f32>()
-            .unwrap();
-        assert!(
-            diff < 1e-5,
-            "causal anchor row must not see later mask rows, diff={diff}"
-        );
-    }
-
-    #[test]
-    fn sliding_window_hides_distant_context() {
+    fn full_layers_attend_non_causally_causal_layers_hide_future_mask_rows_and_the_window_hides_distant_context(
+    ) {
+        {
+            let wide = tiny_drafter(4);
+            let narrow = tiny_drafter(1);
+            let aux = tiny_aux(&wide, 5);
+            let positions: Vec<u32> = (0..5).collect();
+            let proj = wide.project_aux(&aux).expect("project");
+            let ctx_w = wide.precompute_context_kv(&proj, &positions).expect("ctx");
+            let ctx_n = narrow
+                .precompute_context_kv(&proj, &positions)
+                .expect("ctx");
+            let h_w = wide.forward_block_hidden(&ctx_w, 2).expect("wide");
+            let h_n = narrow.forward_block_hidden(&ctx_n, 2).expect("narrow");
+            let row_w = h_w.narrow(0, 0, 1).unwrap();
+            let row_n = h_n.narrow(0, 0, 1).unwrap();
+            let diff = row_w
+                .sub(&row_n)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff > 1e-5,
+                "anchor row must attend to later mask positions (non-causal), diff={diff}"
+            );
+        }
+        {
+            let wide = tiny_drafter_from(causal_sliding_cfg(4, 4096));
+            let narrow = tiny_drafter_from(causal_sliding_cfg(1, 4096));
+            let aux = tiny_aux(&wide, 5);
+            let positions: Vec<u32> = (0..5).collect();
+            let proj = wide.project_aux(&aux).expect("project");
+            let ctx_w = wide.precompute_context_kv(&proj, &positions).expect("ctx");
+            let ctx_n = narrow
+                .precompute_context_kv(&proj, &positions)
+                .expect("ctx");
+            let h_w = wide.forward_block_hidden(&ctx_w, 2).expect("wide");
+            let h_n = narrow.forward_block_hidden(&ctx_n, 2).expect("narrow");
+            let diff = h_w
+                .narrow(0, 0, 1)
+                .unwrap()
+                .sub(&h_n.narrow(0, 0, 1).unwrap())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .to_dtype(DType::F32)
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(
+                diff < 1e-5,
+                "causal anchor row must not see later mask rows, diff={diff}"
+            );
+        }
         let d = tiny_drafter_from(causal_sliding_cfg(4, 4));
         let n_ctx = 6usize;
         let aux_a = tiny_aux(&d, n_ctx);

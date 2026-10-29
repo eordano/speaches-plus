@@ -1,11 +1,11 @@
 #![cfg(feature = "cuda")]
 
-use anyhow::{Context, Result};
-use candle_core::{CudaDevice, DType, Device, Tensor};
+use anyhow::{bail, ensure, Context, Result};
+use candle_core::{CudaDevice, CudaStorage, DType, Device, Storage, Tensor};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::ffi::c_void;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::decoder::{
     detect_loop, select_next_token, DeepseekMoe, DeepseekOcrDecoder, DeepseekOcrDecoderConfig,
@@ -13,25 +13,24 @@ use super::decoder::{
     LOOP_CHECK_STRIDE,
 };
 use crate::laguna_fa2::{varlen_fwd_bf16, VarlenArgs};
+use candle_core::op::BackpropOp;
 use nv_kernels::graph::CudaGraphRunner;
 use nv_layers::attn::AttnConfig;
 use nv_layers::mlp::Mlp;
+use std::env;
+use std::sync::atomic::Ordering;
 
 pub(crate) fn kernel_decode_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NV_DSOCR_DECODE")
+        env::var("NV_DSOCR_DECODE")
             .map(|v| v == "kernel")
             .unwrap_or(false)
     })
 }
 
-pub fn graph_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_GRAPH")
-}
-
 fn init_lock() -> &'static std::sync::Mutex<()> {
-    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    static L: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
     L.get_or_init(|| std::sync::Mutex::new(()))
 }
 
@@ -42,27 +41,27 @@ pub(crate) fn lock_init() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn nullstream_arm() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NV_DSOCR_GRAPH_NULLSTREAM")
+        env::var("NV_DSOCR_GRAPH_NULLSTREAM")
             .map(|v| v == "1")
             .unwrap_or(false)
     })
 }
 
 pub(crate) fn graph_debug() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NV_DSOCR_GRAPH_DEBUG")
+        env::var("NV_DSOCR_GRAPH_DEBUG")
             .map(|v| v != "0")
             .unwrap_or(false)
     })
 }
 
 pub fn graph_prealloc_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("NV_DSOCR_GRAPH_PREALLOC")
+        env::var("NV_DSOCR_GRAPH_PREALLOC")
             .map(|v| v == "1")
             .unwrap_or(false)
     })
@@ -98,16 +97,16 @@ fn graph_mem_report(tag: &str, ordinal: usize) {
 pub(crate) fn cuda_dev(device: &Device) -> Result<CudaDevice> {
     match device {
         Device::Cuda(d) => Ok(d.clone()),
-        _ => anyhow::bail!("dsocr decode kernels require a CUDA device"),
+        _ => bail!("dsocr decode kernels require a CUDA device"),
     }
 }
 
 pub(crate) fn tensor_ptr_bf16(t: &Tensor, stream: &Arc<CudaStream>, len: usize) -> Result<u64> {
     let (st, l) = t.storage_and_layout();
-    anyhow::ensure!(l.is_contiguous(), "dsocr decode: tensor not contiguous");
+    ensure!(l.is_contiguous(), "dsocr decode: tensor not contiguous");
     let cuda = match &*st {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("dsocr decode: tensor not CUDA"),
+        Storage::Cuda(s) => s,
+        _ => bail!("dsocr decode: tensor not CUDA"),
     };
     let slice = cuda.as_cuda_slice::<bf16>()?;
     let view = slice.slice(l.start_offset()..l.start_offset() + len);
@@ -120,31 +119,31 @@ pub(crate) fn wrap_bf16(
     dims: &[usize],
     dev: &CudaDevice,
 ) -> Result<Tensor> {
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
+    let storage = CudaStorage::wrap_cuda_slice(slice, dev.clone());
     Ok(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         dims,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
 
 pub(crate) fn wrap_f32(slice: CudaSlice<f32>, dims: &[usize], dev: &CudaDevice) -> Result<Tensor> {
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
+    let storage = CudaStorage::wrap_cuda_slice(slice, dev.clone());
     Ok(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         dims,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
 
 fn tensor_ptr_f32(t: &Tensor, stream: &Arc<CudaStream>, len: usize) -> Result<u64> {
     let (st, l) = t.storage_and_layout();
-    anyhow::ensure!(l.is_contiguous(), "dsocr decode: tensor not contiguous");
+    ensure!(l.is_contiguous(), "dsocr decode: tensor not contiguous");
     let cuda = match &*st {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("dsocr decode: tensor not CUDA"),
+        Storage::Cuda(s) => s,
+        _ => bail!("dsocr decode: tensor not CUDA"),
     };
     let slice = cuda.as_cuda_slice::<f32>()?;
     let view = slice.slice(l.start_offset()..l.start_offset() + len);
@@ -154,10 +153,10 @@ fn tensor_ptr_f32(t: &Tensor, stream: &Arc<CudaStream>, len: usize) -> Result<u6
 
 pub(crate) fn tensor_ptr_u32(t: &Tensor, stream: &Arc<CudaStream>, len: usize) -> Result<u64> {
     let (st, l) = t.storage_and_layout();
-    anyhow::ensure!(l.is_contiguous(), "dsocr decode: tensor not contiguous");
+    ensure!(l.is_contiguous(), "dsocr decode: tensor not contiguous");
     let cuda = match &*st {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("dsocr decode: tensor not CUDA"),
+        Storage::Cuda(s) => s,
+        _ => bail!("dsocr decode: tensor not CUDA"),
     };
     let slice = cuda.as_cuda_slice::<u32>()?;
     let view = slice.slice(l.start_offset()..l.start_offset() + len);
@@ -205,7 +204,7 @@ fn cast_into<S: CastElem, D: CastElem>(
     let dev = cuda_dev(device)?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let n = t.elem_count();
-    anyhow::ensure!(
+    ensure!(
         out.elem_count() == n,
         "cast_{}_{} into: len mismatch {} vs {}",
         S::NAME,
@@ -223,7 +222,7 @@ fn cast_into<S: CastElem, D: CastElem>(
             n as i32,
         )
     };
-    anyhow::ensure!(rc == 0, "cast_{}_{} rc={rc}", S::NAME, D::NAME);
+    ensure!(rc == 0, "cast_{}_{} rc={rc}", S::NAME, D::NAME);
     Ok(())
 }
 
@@ -235,7 +234,7 @@ fn cast_alloc<S: CastElem, D: CastElem>(
     let dev = cuda_dev(device)?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let n = t.elem_count();
-    let raw = unsafe { stream.alloc::<D>(n).map_err(|e| anyhow::anyhow!(e))? };
+    let raw = unsafe { stream.alloc::<D>(n)? };
     let out = D::wrap(raw, t.dims(), &dev)?;
     cast_into::<S, D>(t, &out, device, kernel)?;
     Ok(out)
@@ -257,7 +256,6 @@ pub(crate) fn cast_f32_to_bf16_into(t: &Tensor, out: &Tensor, device: &Device) -
     cast_into::<f32, bf16>(t, out, device, nv_kernels::cuda::cast_f32_bf16)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn rope_apply_inplace_f32(
     q: &Tensor,
     k: &Tensor,
@@ -290,7 +288,7 @@ pub(crate) fn rope_apply_inplace_f32(
             head_dim,
         )
     };
-    anyhow::ensure!(rc == 0, "rope_f32 rc={rc}");
+    ensure!(rc == 0, "rope_f32 rc={rc}");
     Ok(())
 }
 
@@ -304,7 +302,7 @@ pub(crate) fn residual_add_scale_bf16_into(
     let dev = cuda_dev(device)?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let n = a.elem_count();
-    anyhow::ensure!(
+    ensure!(
         b.elem_count() == n && out.elem_count() == n,
         "residual into: shape mismatch a={:?} b={:?} out={:?}",
         a.dims(),
@@ -324,11 +322,10 @@ pub(crate) fn residual_add_scale_bf16_into(
             n,
         )
     };
-    anyhow::ensure!(rc == 0, "residual_add_scale_bf16 rc={rc}");
+    ensure!(rc == 0, "residual_add_scale_bf16 rc={rc}");
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn varlen_decode_attn(
     q: &Tensor,
     k_ptr: u64,
@@ -345,14 +342,8 @@ fn varlen_decode_attn(
     let dev = cuda_dev(device)?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let q_ptr = tensor_ptr_bf16(q, &stream, num_heads * head_dim)?;
-    let mut o: CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(num_heads * head_dim)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let lse: CudaSlice<f32> = stream
-        .alloc_zeros::<f32>(num_heads)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut o: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(num_heads * head_dim)? };
+    let lse: CudaSlice<f32> = stream.alloc_zeros::<f32>(num_heads)?;
     {
         let (op, _g1) = o.device_ptr_mut(&stream);
         let (lp, _g2) = lse.device_ptr(&stream);
@@ -382,7 +373,6 @@ fn varlen_decode_attn(
     wrap_bf16(o, &[1, 1, num_heads, head_dim], &dev)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn varlen_decode_attn_into(
     q: &Tensor,
     k_ptr: u64,
@@ -400,12 +390,12 @@ fn varlen_decode_attn_into(
 ) -> Result<()> {
     let dev = cuda_dev(device)?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    anyhow::ensure!(
+    ensure!(
         o_t.elem_count() == num_heads * head_dim && lse.len() == num_heads,
         "varlen into: buffer shape mismatch"
     );
     let q_ptr = tensor_ptr_bf16(q, &stream, num_heads * head_dim)?;
-    stream.memset_zeros(lse).map_err(|e| anyhow::anyhow!(e))?;
+    stream.memset_zeros(lse)?;
     let op = tensor_ptr_bf16(o_t, &stream, num_heads * head_dim)?;
     let (lp, _g) = lse.device_ptr(&stream);
     unsafe {
@@ -437,20 +427,10 @@ pub(crate) fn splitk_decode_supported(cfg: &DeepseekOcrDecoderConfig) -> bool {
     cfg.head_dim() == 128 && cfg.num_attention_heads == cfg.num_key_value_heads
 }
 
-pub(crate) fn splitk_decode_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("NV_DSOCR_ATTN_SPLITK")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-    })
-}
-
 pub(crate) fn splitk_scratch_elems(n_kv: usize) -> usize {
     nv_kernels::cuda::laguna_flash_decode_gqa_scratch_elems(n_kv as i32)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn splitk_decode_attn(
     q: &Tensor,
     k_ptr: u64,
@@ -466,11 +446,7 @@ fn splitk_decode_attn(
     let dev = cuda_dev(device)?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let q_ptr = tensor_ptr_bf16(q, &stream, num_heads * head_dim)?;
-    let mut o: CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(num_heads * head_dim)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut o: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(num_heads * head_dim)? };
     {
         let (op, _g1) = o.device_ptr_mut(&stream);
         let rc = unsafe {
@@ -491,12 +467,11 @@ fn splitk_decode_attn(
                 scale,
             )
         };
-        anyhow::ensure!(rc == 0, "dsocr splitk decode attn rc={rc}");
+        ensure!(rc == 0, "dsocr splitk decode attn rc={rc}");
     }
     wrap_bf16(o, &[1, 1, num_heads, head_dim], &dev)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn splitk_decode_attn_into(
     q: &Tensor,
     k_ptr: u64,
@@ -512,7 +487,7 @@ fn splitk_decode_attn_into(
 ) -> Result<()> {
     let dev = cuda_dev(device)?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    anyhow::ensure!(
+    ensure!(
         o_t.elem_count() == num_heads * head_dim,
         "splitk into: buffer shape mismatch"
     );
@@ -536,7 +511,7 @@ fn splitk_decode_attn_into(
             scale,
         )
     };
-    anyhow::ensure!(rc == 0, "dsocr splitk decode attn rc={rc}");
+    ensure!(rc == 0, "dsocr splitk decode attn rc={rc}");
     Ok(())
 }
 
@@ -549,14 +524,8 @@ pub(crate) fn decode_attention_eager(
     let dev = cuda_dev(q.device())?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let len = k.dims()[1];
-    #[allow(deprecated)]
-    let cu_q = stream
-        .memcpy_stod(&[0i32, 1i32])
-        .map_err(|e| anyhow::anyhow!(e))?;
-    #[allow(deprecated)]
-    let cu_k = stream
-        .memcpy_stod(&[0i32, len as i32])
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let cu_q = stream.clone_htod(&[0i32, 1i32])?;
+    let cu_k = stream.clone_htod(&[0i32, len as i32])?;
     let (cu_q_ptr, _g1) = cu_q.device_ptr(&stream);
     let (cu_k_ptr, _g2) = cu_k.device_ptr(&stream);
     let k_ptr = tensor_ptr_bf16(k, &stream, len * cfg.num_kv_heads * cfg.head_dim)?;
@@ -586,11 +555,6 @@ pub(crate) fn dense_decode_ffn(
     crate::gemma4::residual_add_scale_bf16_op(resid, &y, 1.0, device)
 }
 
-fn gemv_env_ok() -> bool {
-    !nv_config::env_arm_present_at_all_cached_first_read_wins!("NV_LINEAR_BF16_FORCE_CUBLAS")
-}
-
-#[allow(clippy::too_many_arguments)]
 fn linear_bf16_into_raw(
     w: &Tensor,
     wt: Option<&Tensor>,
@@ -602,20 +566,20 @@ fn linear_bf16_into_raw(
     k: usize,
     s: &Arc<CudaStream>,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         out.len() >= m * n,
         "moe prealloc linear: out {} < {m}x{n}",
         out.len()
     );
-    if m == 1 && gemv_env_ok() && k.is_multiple_of(2) {
+    if m == 1 && k.is_multiple_of(2) {
         let (ws, wl) = w.storage_and_layout();
-        anyhow::ensure!(
+        ensure!(
             wl.is_contiguous(),
             "moe prealloc linear: weight not contiguous"
         );
         let w_cuda = match &*ws {
-            candle_core::Storage::Cuda(c) => c,
-            _ => anyhow::bail!("moe prealloc linear: weight not CUDA"),
+            Storage::Cuda(c) => c,
+            _ => bail!("moe prealloc linear: weight not CUDA"),
         };
         let w_slice = w_cuda.as_cuda_slice::<bf16>()?;
         let w_view = w_slice.slice(wl.start_offset()..);
@@ -633,19 +597,19 @@ fn linear_bf16_into_raw(
                 k as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "moe prealloc gemv rc={rc}");
+        ensure!(rc == 0, "moe prealloc gemv rc={rc}");
         return Ok(());
     }
     let wt =
         wt.ok_or_else(|| anyhow::anyhow!("moe prealloc linear: gemm path without weight_t"))?;
     let (ws, wl) = wt.storage_and_layout();
-    anyhow::ensure!(
+    ensure!(
         wl.is_contiguous(),
         "moe prealloc linear: weight_t not contiguous"
     );
     let w_cuda = match &*ws {
-        candle_core::Storage::Cuda(c) => c,
-        _ => anyhow::bail!("moe prealloc linear: weight_t not CUDA"),
+        Storage::Cuda(c) => c,
+        _ => bail!("moe prealloc linear: weight_t not CUDA"),
     };
     let w_slice = w_cuda.as_cuda_slice::<bf16>()?;
     let gemm = nv_quant::matmul::TensorCoreGemm::new(s.clone())?;
@@ -664,7 +628,6 @@ fn linear_bf16_into_raw(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn linear_bf16_into(
     w: &Tensor,
     wt: Option<&Tensor>,
@@ -675,16 +638,16 @@ fn linear_bf16_into(
     k: usize,
     s: &Arc<CudaStream>,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         x.elem_count() == m * k,
         "moe prealloc linear: x {:?} != {m}x{k}",
         x.dims()
     );
     let (xs, xl) = x.storage_and_layout();
-    anyhow::ensure!(xl.is_contiguous(), "moe prealloc linear: x not contiguous");
+    ensure!(xl.is_contiguous(), "moe prealloc linear: x not contiguous");
     let x_cuda = match &*xs {
-        candle_core::Storage::Cuda(c) => c,
-        _ => anyhow::bail!("moe prealloc linear: x not CUDA"),
+        Storage::Cuda(c) => c,
+        _ => bail!("moe prealloc linear: x not CUDA"),
     };
     let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
     linear_bf16_into_raw(w, wt, x_slice, xl.start_offset(), out, m, n, k, s)
@@ -722,11 +685,11 @@ impl MoePrealloc {
         forked: &Arc<CudaStream>,
         max_b: usize,
     ) -> Result<Option<Self>> {
-        anyhow::ensure!(max_b > 0, "moe prealloc: max_b must be > 0");
+        ensure!(max_b > 0, "moe prealloc: max_b must be > 0");
         let cfg = model.config();
         let hidden = cfg.hidden_size;
         let e = cfg.n_routed_experts;
-        let need_wt = |k: usize| max_b > 1 || !gemv_env_ok() || !k.is_multiple_of(2);
+        let need_wt = |k: usize| max_b > 1 || !k.is_multiple_of(2);
         let eligible = |l: &nv_layers::Linear| -> bool {
             l.weight().is_some() && l.bias().is_none() && !l.has_lora()
         };
@@ -813,7 +776,7 @@ impl MoePrealloc {
         scores_f32: &mut CudaSlice<f32>,
         s: &Arc<CudaStream>,
     ) -> Result<()> {
-        anyhow::ensure!(b > 0 && b <= self.max_b, "moe prealloc: bad b={b}");
+        ensure!(b > 0 && b <= self.max_b, "moe prealloc: bad b={b}");
         let Self {
             layers,
             scores,
@@ -836,7 +799,7 @@ impl MoePrealloc {
             s,
         )?;
         let n = b * *e;
-        anyhow::ensure!(scores_f32.len() >= n, "moe prealloc: scores_f32 too small");
+        ensure!(scores_f32.len() >= n, "moe prealloc: scores_f32 too small");
         let (sp, _g1) = scores.device_ptr(s);
         let (dp, _g2) = scores_f32.device_ptr_mut(s);
         let rc = unsafe {
@@ -847,7 +810,7 @@ impl MoePrealloc {
                 n as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "moe gate cast rc={rc}");
+        ensure!(rc == 0, "moe gate cast rc={rc}");
         Ok(())
     }
 
@@ -859,7 +822,7 @@ impl MoePrealloc {
         shared_f32: &mut CudaSlice<f32>,
         s: &Arc<CudaStream>,
     ) -> Result<()> {
-        anyhow::ensure!(b > 0 && b <= self.max_b, "moe prealloc: bad b={b}");
+        ensure!(b > 0 && b <= self.max_b, "moe prealloc: bad b={b}");
         let Self {
             layers,
             sh_gate,
@@ -907,7 +870,7 @@ impl MoePrealloc {
                     b * *sh_inter,
                 )
             };
-            anyhow::ensure!(rc == 0, "moe shared silu rc={rc}");
+            ensure!(rc == 0, "moe shared silu rc={rc}");
         }
         linear_bf16_into_raw(
             &lp.sh_down_w,
@@ -921,7 +884,7 @@ impl MoePrealloc {
             s,
         )?;
         let n = b * *hidden;
-        anyhow::ensure!(shared_f32.len() >= n, "moe prealloc: shared_f32 too small");
+        ensure!(shared_f32.len() >= n, "moe prealloc: shared_f32 too small");
         let (sp, _g1) = sh_down.device_ptr(s);
         let (dp, _g2) = shared_f32.device_ptr_mut(s);
         let rc = unsafe {
@@ -932,7 +895,7 @@ impl MoePrealloc {
                 n as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "moe shared cast rc={rc}");
+        ensure!(rc == 0, "moe shared cast rc={rc}");
         Ok(())
     }
 }
@@ -963,35 +926,19 @@ impl DecodeScratch {
         hidden: usize,
         device: &Device,
     ) -> Result<Self> {
-        anyhow::ensure!(k > 0 && e > 0 && k <= e, "dsocr scratch: bad k={k} e={e}");
+        ensure!(k > 0 && e > 0 && k <= e, "dsocr scratch: bad k={k} e={e}");
         let dev = cuda_dev(device)?;
         let stream = nv_layers::cuda_stream::current_stream(&dev);
-        let seeds = stream
-            .alloc_zeros::<u64>(1)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let scores_f32 = stream
-            .alloc_zeros::<f32>(e)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let probs = stream
-            .alloc_zeros::<f32>(e)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let trash_token = stream
-            .alloc_zeros::<u32>(1)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let ids = stream
-            .alloc_zeros::<i32>(k)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let weights = stream
-            .alloc_zeros::<f32>(k)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let h_rows = stream
-            .alloc_zeros::<bf16>(k * inter)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let shared_f32 = stream
-            .alloc_zeros::<f32>(hidden)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let seeds = stream.alloc_zeros::<u64>(1)?;
+        let scores_f32 = stream.alloc_zeros::<f32>(e)?;
+        let probs = stream.alloc_zeros::<f32>(e)?;
+        let trash_token = stream.alloc_zeros::<u32>(1)?;
+        let ids = stream.alloc_zeros::<i32>(k)?;
+        let weights = stream.alloc_zeros::<f32>(k)?;
+        let h_rows = stream.alloc_zeros::<bf16>(k * inter)?;
+        let shared_f32 = stream.alloc_zeros::<f32>(hidden)?;
         let out = Tensor::zeros((1usize, 1usize, hidden), DType::BF16, device)?;
-        stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+        stream.synchronize()?;
         Ok(Self {
             k,
             e,
@@ -1028,11 +975,11 @@ pub(crate) fn moe_decode_ffn(
     let e = moe.num_experts();
     let hidden = scratch.hidden;
     let inter = scratch.inter;
-    anyhow::ensure!(
+    ensure!(
         k == scratch.k && e == scratch.e,
         "moe_decode_ffn: scratch shape mismatch"
     );
-    anyhow::ensure!(
+    ensure!(
         x_normed.elem_count() == hidden && resid.elem_count() == hidden,
         "moe_decode_ffn: expected single-token input"
     );
@@ -1051,7 +998,7 @@ pub(crate) fn moe_decode_ffn(
                     e as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "moe gate cast rc={rc}");
+            ensure!(rc == 0, "moe gate cast rc={rc}");
         }
     }
     {
@@ -1073,7 +1020,7 @@ pub(crate) fn moe_decode_ffn(
                 1.0,
             )
         };
-        anyhow::ensure!(rc == 0, "moe softmax rc={rc}");
+        ensure!(rc == 0, "moe softmax rc={rc}");
     }
     {
         let (pp, _g1) = scratch.probs.device_ptr(&stream);
@@ -1095,7 +1042,7 @@ pub(crate) fn moe_decode_ffn(
                 1.0,
             )
         };
-        anyhow::ensure!(rc == 0, "moe route rc={rc}");
+        ensure!(rc == 0, "moe route rc={rc}");
     }
     {
         let (pp, _g1) = scratch.probs.device_ptr(&stream);
@@ -1110,7 +1057,7 @@ pub(crate) fn moe_decode_ffn(
                 k as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "moe weight gather rc={rc}");
+        ensure!(rc == 0, "moe weight gather rc={rc}");
     }
 
     match moe_pre {
@@ -1127,7 +1074,7 @@ pub(crate) fn moe_decode_ffn(
                     hidden as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "moe shared cast rc={rc}");
+            ensure!(rc == 0, "moe shared cast rc={rc}");
         }
     }
 
@@ -1152,7 +1099,7 @@ pub(crate) fn moe_decode_ffn(
                 hidden as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "moe swiglu gemv rc={rc}");
+        ensure!(rc == 0, "moe swiglu gemv rc={rc}");
     }
     {
         let (ids_ptr, _g1) = scratch.ids.device_ptr(&stream);
@@ -1177,13 +1124,13 @@ pub(crate) fn moe_decode_ffn(
                 inter as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "moe down gemv tail rc={rc}");
+        ensure!(rc == 0, "moe down gemv tail rc={rc}");
     }
     Ok(scratch.out.clone())
 }
 
 pub fn graph_supported(model: &DeepseekOcrDecoder) -> std::result::Result<(), String> {
-    if !matches!(model.device(), Device::Cuda(_)) {
+    if !model.device().is_cuda() {
         return Err("device is not CUDA".into());
     }
     if model.dtype() != DType::BF16 {
@@ -1268,79 +1215,48 @@ impl PreallocBufs {
         let n_kv = cfg.num_key_value_heads;
         let hd = cfg.head_dim();
         let hidden = cfg.hidden_size;
-        anyhow::ensure!(
+        ensure!(
             model.rope().config().head_dim == hd,
             "dsocr prealloc: rope head_dim {} != cfg {}",
             model.rope().config().head_dim,
             hd
         );
         let tok_t = {
-            let slice = forked
-                .alloc_zeros::<u32>(1)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let st = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
-            Tensor::from_storage(
-                candle_core::Storage::Cuda(st),
-                (1usize,),
-                candle_core::op::BackpropOp::none(),
-                false,
-            )
+            let slice = forked.alloc_zeros::<u32>(1)?;
+            let st = CudaStorage::wrap_cuda_slice(slice, dev.clone());
+            Tensor::from_storage(Storage::Cuda(st), (1usize,), BackpropOp::none(), false)
         };
         let q_f32 = wrap_f32(
-            forked
-                .alloc_zeros::<f32>(n_heads * hd)
-                .map_err(|e| anyhow::anyhow!(e))?,
+            forked.alloc_zeros::<f32>(n_heads * hd)?,
             &[1, 1, n_heads, hd],
             dev,
         )?;
         let k_f32 = wrap_f32(
-            forked
-                .alloc_zeros::<f32>(n_kv * hd)
-                .map_err(|e| anyhow::anyhow!(e))?,
+            forked.alloc_zeros::<f32>(n_kv * hd)?,
             &[1, 1, n_kv, hd],
             dev,
         )?;
         let q_bf = wrap_bf16(
-            forked
-                .alloc_zeros::<bf16>(n_heads * hd)
-                .map_err(|e| anyhow::anyhow!(e))?,
+            forked.alloc_zeros::<bf16>(n_heads * hd)?,
             &[1, 1, n_heads, hd],
             dev,
         )?;
         let k_bf = wrap_bf16(
-            forked
-                .alloc_zeros::<bf16>(n_kv * hd)
-                .map_err(|e| anyhow::anyhow!(e))?,
+            forked.alloc_zeros::<bf16>(n_kv * hd)?,
             &[1, 1, n_kv, hd],
             dev,
         )?;
         let attn_o = wrap_bf16(
-            forked
-                .alloc_zeros::<bf16>(n_heads * hd)
-                .map_err(|e| anyhow::anyhow!(e))?,
+            forked.alloc_zeros::<bf16>(n_heads * hd)?,
             &[1, 1, n_heads, hd],
             dev,
         )?;
-        let attn_lse = forked
-            .alloc_zeros::<f32>(n_heads)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let resid_a = wrap_bf16(
-            forked
-                .alloc_zeros::<bf16>(hidden)
-                .map_err(|e| anyhow::anyhow!(e))?,
-            &[1, 1, hidden],
-            dev,
-        )?;
-        let resid_b = wrap_bf16(
-            forked
-                .alloc_zeros::<bf16>(hidden)
-                .map_err(|e| anyhow::anyhow!(e))?,
-            &[1, 1, hidden],
-            dev,
-        )?;
+        let attn_lse = forked.alloc_zeros::<f32>(n_heads)?;
+        let resid_a = wrap_bf16(forked.alloc_zeros::<bf16>(hidden)?, &[1, 1, hidden], dev)?;
+        let resid_b = wrap_bf16(forked.alloc_zeros::<bf16>(hidden)?, &[1, 1, hidden], dev)?;
         let cos_c = model.rope().cos().contiguous()?;
         let sin_c = model.rope().sin().contiguous()?;
-        anyhow::ensure!(
+        ensure!(
             cos_c.dtype() == DType::F32 && sin_c.dtype() == DType::F32,
             "dsocr prealloc: rope tables must be f32"
         );
@@ -1401,7 +1317,7 @@ unsafe impl Send for DsocrDecodeGraph {}
 impl DsocrDecodeGraph {
     pub fn new(model: Arc<DeepseekOcrDecoder>, cap: usize) -> Result<Self> {
         graph_supported(&model).map_err(|e| anyhow::anyhow!("dsocr graph unsupported: {e}"))?;
-        anyhow::ensure!(cap > 0, "dsocr graph: cap must be > 0");
+        ensure!(cap > 0, "dsocr graph: cap must be > 0");
         let device = model.device().clone();
         let dev = cuda_dev(&device)?;
         let cfg = model.config();
@@ -1429,32 +1345,17 @@ impl DsocrDecodeGraph {
         }
         let _ = nv_quant::matmul::TensorCoreGemm::new(forked.clone())?;
 
-        let tok_buf = forked
-            .alloc_zeros::<u32>(1)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let pos_buf = forked
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        #[allow(deprecated)]
-        let cu_q = forked
-            .memcpy_stod(&[0i32, 1i32])
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let cu_k = forked
-            .alloc_zeros::<i32>(2)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let tok_buf = forked.alloc_zeros::<u32>(1)?;
+        let pos_buf = forked.alloc_zeros::<i32>(1)?;
+        let cu_q = forked.clone_htod(&[0i32, 1i32])?;
+        let cu_k = forked.alloc_zeros::<i32>(2)?;
         let mut kv = Vec::with_capacity(cfg.num_hidden_layers);
         for _ in 0..cfg.num_hidden_layers {
-            let k = forked
-                .alloc_zeros::<bf16>(cap * n_kv * hd)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let v = forked
-                .alloc_zeros::<bf16>(cap * n_kv * hd)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let k = forked.alloc_zeros::<bf16>(cap * n_kv * hd)?;
+            let v = forked.alloc_zeros::<bf16>(cap * n_kv * hd)?;
             kv.push((k, v));
         }
-        let logits_buf = forked
-            .alloc_zeros::<f32>(cfg.vocab_size)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let logits_buf = forked.alloc_zeros::<f32>(cfg.vocab_size)?;
         let scratch = nv_layers::cuda_stream::with_stream(forked.clone(), || {
             DecodeScratch::new(
                 cfg.num_experts_per_tok,
@@ -1464,17 +1365,13 @@ impl DsocrDecodeGraph {
                 &device,
             )
         })?;
-        let splitk = splitk_decode_enabled() && splitk_decode_supported(cfg);
-        let attn_scratch = forked
-            .alloc_zeros::<f32>(if splitk {
-                splitk_scratch_elems(n_kv)
-            } else {
-                1
-            })
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let attn_fan_in = forked
-            .alloc_zeros::<u32>(if splitk { n_kv } else { 1 })
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let splitk = splitk_decode_supported(cfg);
+        let attn_scratch = forked.alloc_zeros::<f32>(if splitk {
+            splitk_scratch_elems(n_kv)
+        } else {
+            1
+        })?;
+        let attn_fan_in = forked.alloc_zeros::<u32>(if splitk { n_kv } else { 1 })?;
         let prealloc = if graph_prealloc_enabled() {
             Some(PreallocBufs::new(&model, &forked, &dev)?)
         } else {
@@ -1484,7 +1381,7 @@ impl DsocrDecodeGraph {
             eprintln!(
                 "[dsocr] decode attention: split-K (grid {}x{} blocks), heads {} hd {}",
                 n_kv,
-                std::env::var("NV_LAGUNA_M1_SPLITS")
+                env::var("NV_LAGUNA_M1_SPLITS")
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .filter(|v| *v == 8 || *v == 16 || *v == 32)
@@ -1493,16 +1390,7 @@ impl DsocrDecodeGraph {
                 hd
             );
         }
-        if splitk_decode_enabled() && !splitk {
-            eprintln!(
-                "[dsocr] NV_DSOCR_ATTN_SPLITK set but unsupported for this checkpoint \
-                 (head_dim {} must be 128, heads {} must equal kv heads {}); using varlen",
-                cfg.head_dim(),
-                cfg.num_attention_heads,
-                cfg.num_key_value_heads
-            );
-        }
-        forked.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+        forked.synchronize()?;
         let runner = CudaGraphRunner::new(forked.clone());
         Ok(Self {
             model,
@@ -1559,7 +1447,7 @@ impl DsocrDecodeGraph {
     pub fn load_kv_from_cache(&mut self, cache: &DeepseekOcrKvCache) -> Result<()> {
         let cfg = self.model.config();
         let len = cache.current_len();
-        anyhow::ensure!(
+        ensure!(
             len <= self.cap,
             "prefill length {len} exceeds graph capacity {}",
             self.cap
@@ -1577,10 +1465,10 @@ impl DsocrDecodeGraph {
                     continue;
                 }
                 let (st, l) = src_t.storage_and_layout();
-                anyhow::ensure!(l.is_contiguous(), "kv cache tensor not contiguous");
+                ensure!(l.is_contiguous(), "kv cache tensor not contiguous");
                 let cuda = match &*st {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("kv cache tensor not CUDA"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("kv cache tensor not CUDA"),
                 };
                 let slice = cuda.as_cuda_slice::<bf16>()?;
                 let view = slice.slice(l.start_offset()..l.start_offset() + n);
@@ -1598,17 +1486,16 @@ impl DsocrDecodeGraph {
     }
 
     pub fn step(&mut self, token: u32) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.cur_len < self.cap,
             "dsocr graph step overflows capacity {}",
             self.cap
         );
-        if self.pending.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.pending.load(Ordering::Relaxed) {
             self.forked
                 .synchronize()
                 .map_err(|e| anyhow::anyhow!("pending replay sync: {e:?}"))?;
-            self.pending
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.pending.store(false, Ordering::Relaxed);
         }
         self.host_tok[0] = token;
         self.host_pos[0] = self.cur_len as i32;
@@ -1682,25 +1569,15 @@ impl DsocrDecodeGraph {
                 .map_err(|e| anyhow::anyhow!("tok dtod: {e:?}"))?;
                 (p.tok_t.clone(), None)
             } else {
-                let tok_clone = tok_buf.try_clone().map_err(|e| anyhow::anyhow!(e))?;
-                let pos_clone = pos_buf.try_clone().map_err(|e| anyhow::anyhow!(e))?;
+                let tok_clone = tok_buf.try_clone()?;
+                let pos_clone = pos_buf.try_clone()?;
                 let tokens_t = {
-                    let st = candle_core::CudaStorage::wrap_cuda_slice(tok_clone, dev.clone());
-                    Tensor::from_storage(
-                        candle_core::Storage::Cuda(st),
-                        (1usize,),
-                        candle_core::op::BackpropOp::none(),
-                        false,
-                    )
+                    let st = CudaStorage::wrap_cuda_slice(tok_clone, dev.clone());
+                    Tensor::from_storage(Storage::Cuda(st), (1usize,), BackpropOp::none(), false)
                 };
                 let pos_t = {
-                    let st = candle_core::CudaStorage::wrap_cuda_slice(pos_clone, dev.clone());
-                    Tensor::from_storage(
-                        candle_core::Storage::Cuda(st),
-                        (1usize,),
-                        candle_core::op::BackpropOp::none(),
-                        false,
-                    )
+                    let st = CudaStorage::wrap_cuda_slice(pos_clone, dev.clone());
+                    Tensor::from_storage(Storage::Cuda(st), (1usize,), BackpropOp::none(), false)
                 };
                 (tokens_t, Some(pos_t))
             };
@@ -1764,7 +1641,7 @@ impl DsocrDecodeGraph {
                             hd as i32,
                         )
                     };
-                    anyhow::ensure!(rc == 0, "kv append rc={rc} layer {li}");
+                    ensure!(rc == 0, "kv append rc={rc} layer {li}");
                 }
                 let o = if splitk {
                     if let Some(p) = prealloc.as_mut() {
@@ -1853,7 +1730,7 @@ impl DsocrDecodeGraph {
                     vocab as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "logits cast rc={rc}");
+            ensure!(rc == 0, "logits cast rc={rc}");
             Ok(())
         };
 
@@ -1895,8 +1772,7 @@ impl DsocrDecodeGraph {
                 graph_mem_report("post-capture", forked.context().ordinal());
             }
         }
-        self.pending
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.pending.store(true, Ordering::Relaxed);
         self.cur_len += 1;
         Ok(())
     }
@@ -1912,8 +1788,7 @@ impl DsocrDecodeGraph {
         self.forked
             .synchronize()
             .map_err(|e| anyhow::anyhow!("logits forked sync: {e:?}"))?;
-        self.pending
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.pending.store(false, Ordering::Relaxed);
         Ok(out)
     }
 
@@ -1929,7 +1804,7 @@ impl DsocrDecodeGraph {
             .min(cfg_max)
             .min(self.cap);
         if prompt_tokens.len() >= max_len {
-            anyhow::bail!(
+            bail!(
                 "prompt length {} leaves no room to generate (max {})",
                 prompt_tokens.len(),
                 max_len

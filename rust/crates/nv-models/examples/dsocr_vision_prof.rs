@@ -74,31 +74,6 @@ fn main() -> Result<()> {
         preps.push((p.clone(), img));
     }
 
-    if std::env::var("NV_VIS_CHECK").is_ok() {
-        let (_, img) = &preps[0];
-        let prep = preprocess::prepare(img, res_mode)?;
-        let px = vis.to_pixels(&prep.global, 1, prep.global_size)?;
-        let a = vis
-            .sam()
-            .forward(&px)?
-            .flatten_all()?
-            .to_dtype(candle_core::DType::F32)?;
-        std::env::set_var("NV_SAM_FUSED", "0");
-        let b = vis
-            .sam()
-            .forward(&px)?
-            .flatten_all()?
-            .to_dtype(candle_core::DType::F32)?;
-        let d = (&a - &b)?.abs()?;
-        let maxd: f32 = d.max(0)?.to_scalar()?;
-        let mean: f32 = a.abs()?.mean(0)?.to_scalar()?;
-        println!(
-            "fused-vs-eager SAM feature max|d|={maxd:.6} mean|a|={mean:.6} rel={:.3e}",
-            maxd / mean
-        );
-        return Ok(());
-    }
-
     let mut acc = Acc::default();
     for round in 0..rounds + 1 {
         let warm = round == 0;

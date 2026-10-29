@@ -1,9 +1,6 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::dequant::{bytes_to_words, NVFP4_BLOCK_SIZE};
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
-use crate::wgpu_backend::qualify::GemmStrategy;
 use crate::wgpu_backend::{compose, Result, WgpuError};
 
 pub const WGSL: &str = include_str!("../../../wgsl/gemv_nvfp4.wgsl");
@@ -21,7 +18,6 @@ pub const GEMV_ENTRY: &str = "gemv_nvfp4_bf16";
 pub const SG_GEMV_ENTRY: &str = "gemv_nvfp4_bf16_sg";
 pub const SGU_GEMV_ENTRY: &str = "gemv_nvfp4_bf16_sgu";
 pub const SGW_GEMV_ENTRY: &str = "gemv_nvfp4_bf16_sgw";
-pub const SGQ_GEMV_ENTRY: &str = "gemv_nvfp4_bf16_sgq";
 pub const QUANTIZE_ENTRY: &str = "quantize_row_nvfp4_bf16";
 pub const WORKGROUP_SIZE: u32 = 256;
 pub const SG_WORKGROUP_SIZE: u32 = 128;
@@ -287,18 +283,6 @@ pub fn sgw_source(cfg: SgwConfig) -> String {
 pub const SGW_SHALLOW: SgwConfig = SgwConfig::new(128, 4, false, false);
 pub const SGW_DEEP: SgwConfig = SgwConfig::new(256, 2, false, false);
 
-pub fn select_sgw(ctx: &WgpuContext, _n: usize, k: usize) -> Option<SgwConfig> {
-    if !sg32_ok(ctx) {
-        return None;
-    }
-    let cfg = if blocks_per_lane(k) > SG_CROSSOVER_BLOCKS_PER_LANE {
-        SGW_DEEP
-    } else {
-        SGW_SHALLOW
-    };
-    cfg.supported(ctx).then_some(cfg)
-}
-
 pub fn gemv_params(alpha: f32, n: usize, k: usize, groups_x: u32) -> GemvParams {
     let k_blocks = k / NVFP4_BLOCK_SIZE;
     GemvParams {
@@ -319,10 +303,6 @@ pub fn k_tiles(k_blocks: usize) -> usize {
 
 pub fn swizzled_scale_len(n: usize, k_blocks: usize) -> usize {
     n.div_ceil(128) * 128 * k_tiles(k_blocks) * 4
-}
-
-pub fn coop_mat_capable(ctx: &WgpuContext) -> bool {
-    ctx.caps.gemm_strategy() == GemmStrategy::CoopMat
 }
 
 pub fn nvfp4_gemv_bf16(
@@ -459,152 +439,191 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sections_split_and_carry_their_entry_points() {
-        let (head, quant, sg, sgw) = split_sections();
-        assert!(head.contains(GEMV_ENTRY));
-        assert!(!head.contains(QUANTIZE_ENTRY));
-        assert!(quant.contains(QUANTIZE_ENTRY));
-        assert!(!quant.contains(GEMV_ENTRY));
-        assert!(!quant.contains(SG_GEMV_ENTRY));
-        assert!(sg.contains(SG_GEMV_ENTRY));
-        assert!(!sg.contains(SGW_GEMV_ENTRY));
-        assert!(sgw.contains(SGW_GEMV_ENTRY));
-    }
-
-    #[test]
-    fn legacy_sources_are_untouched_by_the_sgw_section() {
-        for src in [gemv_source(), quantize_source(), sg_gemv_source()] {
-            assert!(!src.contains(SGW_GEMV_ENTRY));
-            assert!(!src.contains("sgw_part"));
-            assert!(!src.contains("SGW_WG"));
+    fn every_section_carries_its_entries_and_the_dispatch_geometry_and_scale_len_match_the_layouts()
+    {
+        {
+            let (head, quant, sg, sgw) = split_sections();
+            assert!(head.contains(GEMV_ENTRY));
+            assert!(!head.contains(QUANTIZE_ENTRY));
+            assert!(quant.contains(QUANTIZE_ENTRY));
+            assert!(!quant.contains(GEMV_ENTRY));
+            assert!(!quant.contains(SG_GEMV_ENTRY));
+            assert!(sg.contains(SG_GEMV_ENTRY));
+            assert!(!sg.contains(SGW_GEMV_ENTRY));
+            assert!(sgw.contains(SGW_GEMV_ENTRY));
+        }
+        {
+            for src in [gemv_source(), quantize_source(), sg_gemv_source()] {
+                assert!(!src.contains(SGW_GEMV_ENTRY));
+                assert!(!src.contains("sgw_part"));
+                assert!(!src.contains("SGW_WG"));
+            }
+        }
+        {
+            assert!(gemv_source().contains("fn nvfp4_scale_byte_index("));
+            assert!(quantize_source().contains("fn ue4m3_decode("));
+        }
+        {
+            assert!(!gemv_source().contains("subgroup"));
+            assert!(!quantize_source().contains("subgroup"));
+        }
+        {
+            let src = sg_gemv_source();
+            assert!(src.contains(SG_GEMV_ENTRY));
+            assert!(src.contains(SGU_GEMV_ENTRY));
+            assert!(src.contains(GEMV_ENTRY));
+            assert!(src.contains("subgroupShuffleXor"));
+            assert!(src.contains("fn nvfp4_scale_byte_index("));
+            assert!(src.contains("@workgroup_size(128)"));
+        }
+        {
+            assert_eq!(GemvVariant::Tree.rows_per_group(), 1);
+            assert_eq!(GemvVariant::Sg.rows_per_group(), SG_ROWS_PER_GROUP);
+            assert_eq!(SG_WORKGROUP_SIZE / 32, SG_ROWS_PER_GROUP);
+            let p = gemv_params(1.5, 40, 5376, 7);
+            assert_eq!(p.k_blocks, 336);
+            assert_eq!(p.k_tiles, 84);
+            assert_eq!(p.w_row_words, 672);
+            assert_eq!(p.groups_x, 7);
+        }
+        {
+            assert_eq!(swizzled_scale_len(1, 8), 128 * 2 * 4);
+            assert_eq!(swizzled_scale_len(129, 4), 256 * 4);
         }
     }
 
     #[test]
-    fn sgw_ladder_configs_are_all_well_formed() {
-        for cfg in [SGW_SHALLOW, SGW_DEEP] {
-            assert!(cfg.valid(), "{cfg:?}");
-            assert_eq!(cfg.subgroups_per_row() * cfg.vwarps(), SGW_VWARPS);
+    fn sgw_ladder_configs_are_well_formed_and_the_source_substitutes_every_knob() {
+        {
+            for cfg in [SGW_SHALLOW, SGW_DEEP] {
+                assert!(cfg.valid(), "{cfg:?}");
+                assert_eq!(cfg.subgroups_per_row() * cfg.vwarps(), SGW_VWARPS);
+            }
+            assert_eq!(SgwConfig::new(256, 1, false, false).subgroups_per_row(), 8);
+            assert_eq!(SgwConfig::new(256, 1, false, false).vwarps(), 1);
+            assert_eq!(SgwConfig::new(128, 4, false, false).subgroups_per_row(), 1);
+            assert_eq!(SgwConfig::new(128, 4, false, false).vwarps(), 8);
+            assert!(!SgwConfig::new(256, 16, false, false).valid());
+            assert!(!SgwConfig::new(256, 1, false, true).valid());
         }
-        assert_eq!(SgwConfig::new(256, 1, false, false).subgroups_per_row(), 8);
-        assert_eq!(SgwConfig::new(256, 1, false, false).vwarps(), 1);
-        assert_eq!(SgwConfig::new(128, 4, false, false).subgroups_per_row(), 1);
-        assert_eq!(SgwConfig::new(128, 4, false, false).vwarps(), 8);
-        assert!(!SgwConfig::new(256, 16, false, false).valid());
-        assert!(!SgwConfig::new(256, 1, false, true).valid());
+        {
+            let cfg = SgwConfig::new(128, 2, true, true);
+            let src = sgw_source(cfg);
+            assert!(src.contains("const SGW_WG: u32 = 128u;"));
+            assert!(src.contains("const SGW_ROWS: u32 = 2u;"));
+            assert!(src.contains("const SGW_SGPR: u32 = 2u;"));
+            assert!(src.contains("const SGW_VW: u32 = 4u;"));
+            assert!(src.contains("const SGW_TILED: u32 = 1u;"));
+            assert!(src.contains("const SGW_STAGE: u32 = 1u;"));
+            assert!(src.contains("const SGW_STAGE_LEN: u32 = 256u;"));
+            assert!(src.contains("const SGW_PART_LEN: u32 = 4u;"));
+            assert!(src.contains("@workgroup_size(SGW_WG)"));
+            assert!(src.contains("fn nvfp4_scale_byte_index("));
+            assert!(src.contains("subgroupShuffleXor"));
+            assert_eq!(cfg.workgroup_storage_bytes(), 16 + 256 * 12);
+        }
     }
 
     #[test]
-    fn sgw_source_substitutes_every_knob() {
-        let cfg = SgwConfig::new(128, 2, true, true);
-        let src = sgw_source(cfg);
-        assert!(src.contains("const SGW_WG: u32 = 128u;"));
-        assert!(src.contains("const SGW_ROWS: u32 = 2u;"));
-        assert!(src.contains("const SGW_SGPR: u32 = 2u;"));
-        assert!(src.contains("const SGW_VW: u32 = 4u;"));
-        assert!(src.contains("const SGW_TILED: u32 = 1u;"));
-        assert!(src.contains("const SGW_STAGE: u32 = 1u;"));
-        assert!(src.contains("const SGW_STAGE_LEN: u32 = 256u;"));
-        assert!(src.contains("const SGW_PART_LEN: u32 = 4u;"));
-        assert!(src.contains("@workgroup_size(SGW_WG)"));
-        assert!(src.contains("fn nvfp4_scale_byte_index("));
-        assert!(src.contains("subgroupShuffleXor"));
-        assert_eq!(cfg.workgroup_storage_bytes(), 16 + 256 * 12);
-    }
-
-    #[test]
-    fn blocks_per_lane_matches_the_dispatch_stride() {
-        assert_eq!(blocks_per_lane(5376), 2);
-        assert_eq!(blocks_per_lane(8192), 2);
-        assert_eq!(blocks_per_lane(12288), 3);
-        assert_eq!(blocks_per_lane(21504), 6);
-        assert_eq!(blocks_per_lane(4096), 1);
-    }
-
-    #[test]
-    fn the_shape_gate_splits_the_gemma4_projections_where_it_was_measured() {
-        let sg_side = [5376usize, 8192];
-        let tree_side = [12288usize, 16384, 21504, 32768];
-        for k in sg_side {
-            assert!(
-                blocks_per_lane(k) <= SG_CROSSOVER_BLOCKS_PER_LANE,
-                "k={k} should land on the subgroup side of the gate"
-            );
+    fn the_shape_gate_and_the_sgq_offer_follow_blocks_per_lane_where_it_was_measured() {
+        {
+            assert_eq!(blocks_per_lane(5376), 2);
+            assert_eq!(blocks_per_lane(8192), 2);
+            assert_eq!(blocks_per_lane(12288), 3);
+            assert_eq!(blocks_per_lane(21504), 6);
+            assert_eq!(blocks_per_lane(4096), 1);
         }
-        for k in tree_side {
-            assert!(
-                blocks_per_lane(k) > SG_CROSSOVER_BLOCKS_PER_LANE,
-                "k={k} should land on the tree side of the gate"
-            );
+        {
+            let sg_side = [5376usize, 8192];
+            let tree_side = [12288usize, 16384, 21504, 32768];
+            for k in sg_side {
+                assert!(
+                    blocks_per_lane(k) <= SG_CROSSOVER_BLOCKS_PER_LANE,
+                    "k={k} should land on the subgroup side of the gate"
+                );
+            }
+            for k in tree_side {
+                assert!(
+                    blocks_per_lane(k) > SG_CROSSOVER_BLOCKS_PER_LANE,
+                    "k={k} should land on the tree side of the gate"
+                );
+            }
+            assert_eq!(SGW_SHALLOW.rows, SG_ROWS_PER_GROUP);
+            assert_eq!(SGW_SHALLOW.subgroups_per_row(), 1);
+            assert_eq!(SGW_SHALLOW.vwarps(), SGW_VWARPS);
+            assert_eq!(SGW_DEEP.subgroups_per_row(), 4);
+            assert_eq!(SGW_DEEP.vwarps(), 2);
         }
-        assert_eq!(SGW_SHALLOW.rows, SG_ROWS_PER_GROUP);
-        assert_eq!(SGW_SHALLOW.subgroups_per_row(), 1);
-        assert_eq!(SGW_SHALLOW.vwarps(), SGW_VWARPS);
-        assert_eq!(SGW_DEEP.subgroups_per_row(), 4);
-        assert_eq!(SGW_DEEP.vwarps(), 2);
+        {
+            assert!(sgq_shape_ok(5376));
+            assert!(sgq_shape_ok(8192));
+            assert!(sgq_shape_ok(21504));
+            assert!(!sgq_shape_ok(16 * 6));
+            assert!(!sgq_shape_ok(20));
+        }
     }
 
     #[test]
     fn the_hot_path_decodes_without_a_lookup_table() {
-        for src in [
-            gemv_source(),
-            sg_gemv_source(),
-            sgw_source(SGW_DEEP),
-            sgw_source(SGW_SHALLOW),
-        ] {
-            assert!(src.contains("fn gemv_e2m1_decode("));
-            assert!(src.contains("fn gemv_ue4m3_decode("));
-            assert!(src.contains("fn gemv_i8map("));
-            let helper = src
-                .split_once(
-                    "fn gemv_dot8_one_dot4_per_statement_msl_polyfill_locals_collide_when_inlined_together(",
-                )
-                .expect("dot8 helper")
-                .1
-                .split_once("\n}")
-                .expect("dot8 helper end")
-                .0;
-            assert!(
-                helper.contains("dot4I8Packed"),
-                "dot8's helper lost the packed integer dot"
-            );
-            let body = src.split_once("fn gemv_dot8(").expect("dot8").1;
-            let dot8 = body.split_once("\n}").expect("dot8 end").0;
-            assert!(
-                dot8.contains(
-                    "gemv_dot8_one_dot4_per_statement_msl_polyfill_locals_collide_when_inlined_together"
-                ),
-                "dot8 lost the packed integer dot"
-            );
-            assert!(dot8.contains("gemv_i8map"), "dot8 lost the swar nibble map");
-            assert!(
-                !dot8.contains("E2M1_TABLE"),
-                "dot8 regressed to a table lookup"
-            );
-            assert!(
-                !dot8.contains("gemv_e2m1_decode"),
-                "dot8 regressed to per-element float decode"
-            );
+        {
+            for src in [
+                gemv_source(),
+                sg_gemv_source(),
+                sgw_source(SGW_DEEP),
+                sgw_source(SGW_SHALLOW),
+            ] {
+                assert!(src.contains("fn gemv_e2m1_decode("));
+                assert!(src.contains("fn gemv_ue4m3_decode("));
+                assert!(src.contains("fn gemv_i8map("));
+                let helper = src
+                    .split_once(
+                        "fn gemv_dot8_one_dot4_per_statement_msl_polyfill_locals_collide_when_inlined_together(",
+                    )
+                    .expect("dot8 helper")
+                    .1
+                    .split_once("\n}")
+                    .expect("dot8 helper end")
+                    .0;
+                assert!(
+                    helper.contains("dot4I8Packed"),
+                    "dot8's helper lost the packed integer dot"
+                );
+                let body = src.split_once("fn gemv_dot8(").expect("dot8").1;
+                let dot8 = body.split_once("\n}").expect("dot8 end").0;
+                assert!(
+                    dot8.contains(
+                        "gemv_dot8_one_dot4_per_statement_msl_polyfill_locals_collide_when_inlined_together"
+                    ),
+                    "dot8 lost the packed integer dot"
+                );
+                assert!(dot8.contains("gemv_i8map"), "dot8 lost the swar nibble map");
+                assert!(
+                    !dot8.contains("E2M1_TABLE"),
+                    "dot8 regressed to a table lookup"
+                );
+                assert!(
+                    !dot8.contains("gemv_e2m1_decode"),
+                    "dot8 regressed to per-element float decode"
+                );
+            }
         }
-    }
-
-    #[test]
-    fn the_decode_block_is_marker_wrapped_and_swappable() {
-        let block = decode_block();
-        for f in [
-            "fn gemv_ue4m3_decode(",
-            "fn gemv_e2m1_decode(",
-            "fn gemv_i8map(",
-            "fn gemv_dot8(",
-        ] {
-            assert!(block.contains(f), "decode block lost {f}");
+        {
+            let block = decode_block();
+            for f in [
+                "fn gemv_ue4m3_decode(",
+                "fn gemv_e2m1_decode(",
+                "fn gemv_i8map(",
+                "fn gemv_dot8(",
+            ] {
+                assert!(block.contains(f), "decode block lost {f}");
+            }
+            for src in [gemv_source(), sg_gemv_source(), sgw_source(SGW_DEEP)] {
+                let swapped = with_decode(&src, "// swapped").expect("markers present");
+                assert!(!swapped.contains("fn gemv_i8map("));
+                assert!(swapped.contains(SG_GEMV_ENTRY) || swapped.contains(GEMV_ENTRY));
+            }
+            assert!(with_decode("no markers here", "x").is_none());
         }
-        for src in [gemv_source(), sg_gemv_source(), sgw_source(SGW_DEEP)] {
-            let swapped = with_decode(&src, "// swapped").expect("markers present");
-            assert!(!swapped.contains("fn gemv_i8map("));
-            assert!(swapped.contains(SG_GEMV_ENTRY) || swapped.contains(GEMV_ENTRY));
-        }
-        assert!(with_decode("no markers here", "x").is_none());
     }
 
     #[test]
@@ -619,55 +638,5 @@ mod tests {
         assert!(sgw.contains("let live_blocks = select(0u, blocks, row_live);"));
         assert!(sgw.contains("kb < live_blocks"));
         assert!(sgw.contains("let quads = select(0u, gemv_params.k_blocks >> 2u, row_live);"));
-    }
-
-    #[test]
-    fn sgq_is_only_offered_on_quad_aligned_k() {
-        assert!(sgq_shape_ok(5376));
-        assert!(sgq_shape_ok(8192));
-        assert!(sgq_shape_ok(21504));
-        assert!(!sgq_shape_ok(16 * 6));
-        assert!(!sgq_shape_ok(20));
-    }
-
-    #[test]
-    fn composed_sources_include_the_dequant_prelude() {
-        assert!(gemv_source().contains("fn nvfp4_scale_byte_index("));
-        assert!(quantize_source().contains("fn ue4m3_decode("));
-    }
-
-    #[test]
-    fn non_sg_sources_stay_free_of_subgroup_builtins() {
-        assert!(!gemv_source().contains("subgroup"));
-        assert!(!quantize_source().contains("subgroup"));
-    }
-
-    #[test]
-    fn sg_source_carries_both_entries_and_the_butterfly() {
-        let src = sg_gemv_source();
-        assert!(src.contains(SG_GEMV_ENTRY));
-        assert!(src.contains(SGU_GEMV_ENTRY));
-        assert!(src.contains(GEMV_ENTRY));
-        assert!(src.contains("subgroupShuffleXor"));
-        assert!(src.contains("fn nvfp4_scale_byte_index("));
-        assert!(src.contains("@workgroup_size(128)"));
-    }
-
-    #[test]
-    fn variant_dispatch_geometry_matches_the_shader_layout() {
-        assert_eq!(GemvVariant::Tree.rows_per_group(), 1);
-        assert_eq!(GemvVariant::Sg.rows_per_group(), SG_ROWS_PER_GROUP);
-        assert_eq!(SG_WORKGROUP_SIZE / 32, SG_ROWS_PER_GROUP);
-        let p = gemv_params(1.5, 40, 5376, 7);
-        assert_eq!(p.k_blocks, 336);
-        assert_eq!(p.k_tiles, 84);
-        assert_eq!(p.w_row_words, 672);
-        assert_eq!(p.groups_x, 7);
-    }
-
-    #[test]
-    fn swizzled_scale_len_matches_the_quant_layout() {
-        assert_eq!(swizzled_scale_len(1, 8), 128 * 2 * 4);
-        assert_eq!(swizzled_scale_len(129, 4), 256 * 4);
     }
 }

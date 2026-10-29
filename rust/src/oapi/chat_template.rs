@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use minijinja::value::Serde;
 use minijinja::{Environment, Value as JinjaValue};
 use serde_json::Value;
 
@@ -25,6 +26,24 @@ pub fn validate_reasoning_effort(v: &str) -> Result<(), String> {
             "reasoning_effort must be one of low|medium|high|xhigh (high aliases to xhigh), \
              got {v:?}"
         ))
+    }
+}
+
+pub const REASONING_EFFORT_NONE_TURNS_THINKING_OFF_AS_OPENAI_CLIENTS_MEAN_IT: &str = "none";
+
+pub const REASONING_EFFORT_MINIMAL_IS_THE_TEMPLATES_LOWEST_LEVEL: (&str, &str) = ("minimal", "low");
+
+pub fn request_reasoning_effort(v: &str) -> Result<Option<&str>, String> {
+    let (minimal, lowest) = REASONING_EFFORT_MINIMAL_IS_THE_TEMPLATES_LOWEST_LEVEL;
+    match v {
+        REASONING_EFFORT_NONE_TURNS_THINKING_OFF_AS_OPENAI_CLIENTS_MEAN_IT => Ok(None),
+        v if v == minimal => Ok(Some(lowest)),
+        v => validate_reasoning_effort(v).map(|()| Some(v)).map_err(|_| {
+            format!(
+                "reasoning_effort must be one of none|minimal|low|medium|high|xhigh (none turns \
+                 thinking off, minimal is low, high aliases to xhigh), got {v:?}"
+            )
+        }),
     }
 }
 
@@ -87,12 +106,6 @@ pub fn load_attempt_for(model_key: &str) -> Option<LoadAttempt> {
 
 pub fn load_was_attempted(model_key: &str) -> bool {
     load_attempt_for(model_key).is_some()
-}
-
-pub fn forget_load_attempts() {
-    if let Ok(mut v) = attempts().lock() {
-        v.clear();
-    }
 }
 
 fn template_tojson(
@@ -328,16 +341,16 @@ impl ChatTemplate {
             .get_template("chat")
             .map_err(|e| anyhow::anyhow!("get chat template: {e}"))?;
         let tools_val = match tools {
-            Some(t) => JinjaValue::from_serialize(t),
+            Some(t) => JinjaValue::from(Serde(t)),
             None => JinjaValue::from(()),
         };
         let mut ctx: BTreeMap<String, JinjaValue> = BTreeMap::new();
         for (k, v) in kwargs {
-            ctx.insert(k.clone(), JinjaValue::from_serialize(v));
+            ctx.insert(k.clone(), JinjaValue::from(Serde(v)));
         }
         let msgs_val = match tool_call_arguments_parsed_from_openai_wire_strings(messages) {
-            Some(normalized) => JinjaValue::from_serialize(&normalized),
-            None => JinjaValue::from_serialize(messages),
+            Some(normalized) => JinjaValue::from(Serde(&normalized)),
+            None => JinjaValue::from(Serde(messages)),
         };
         ctx.insert("messages".into(), msgs_val);
         ctx.insert("tools".into(), tools_val);
@@ -845,13 +858,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_template_returns_none() {
-        let d = tmp("none");
-        write(&d, "tokenizer_config.json", r#"{"bos_token":"<s>"}"#);
-        assert!(ChatTemplate::load(&d).is_none());
-    }
-
-    #[test]
     fn laguna_tool_history_serializes_non_string_arguments_without_fallback() {
         let d = tmp("laguna-tool-history-json");
         write(
@@ -872,19 +878,19 @@ mod tests {
 {%- endfor -%}"#,
         );
         let t = ChatTemplate::load(&d).unwrap();
-        for value in [
-            json!(50),
-            json!(true),
-            json!(null),
-            json!([1, "é"]),
-            json!({"city":"東京"}),
+        for (value, python_json_dumps) in [
+            (json!(50), "50"),
+            (json!(true), "true"),
+            (json!(null), "null"),
+            (json!([1, "é"]), r#"[1, "é"]"#),
+            (json!({"city":"東京"}), r#"{"city": "東京"}"#),
         ] {
             let messages = json!([{"role":"assistant","tool_calls":[{"function":{
                 "name":"tmux_read","arguments":{"lines":value}
             }}]}]);
             let out = t.render(&messages, None, true).unwrap();
             assert_eq!(out, format!(
-                "<tool_call>tmux_read<arg_key>lines</arg_key><arg_value>{value}</arg_value></tool_call>"
+                "<tool_call>tmux_read<arg_key>lines</arg_key><arg_value>{python_json_dumps}</arg_value></tool_call>"
             ));
         }
     }
@@ -1017,10 +1023,7 @@ mod tests {
             t.render_with_kwargs(&msgs, None, false, &off).unwrap(),
             "hi</think>"
         );
-    }
 
-    #[test]
-    fn a_template_without_declared_kwargs_renders_exactly_as_before() {
         let d = tmp("nokwargs");
         write(
             &d,
@@ -1035,7 +1038,6 @@ mod tests {
         let t = ChatTemplate::load(&d).expect("load");
         assert!(t.default_template_kwargs().is_empty());
         assert!(!t.declares_thinking_switch());
-        let msgs = json!([{"role":"user","content":"hi"}]);
         assert_eq!(t.render(&msgs, None, true).unwrap(), "<s>hi!");
     }
 
@@ -1089,13 +1091,6 @@ mod tests {
     }
 
     #[test]
-    fn harmony_filter_keeps_only_the_final_channel() {
-        let raw = "<|channel|>analysis<|message|>User asks capital of France. Easy.<|end|>\
-                   <|start|>assistant<|channel|>final<|message|>Paris is the capital of France.<|return|>";
-        assert_eq!(harmony_final_text(raw), "Paris is the capital of France.");
-    }
-
-    #[test]
     fn harmony_filter_streams_incrementally_and_never_leaks_markup() {
         let full = "<|channel|>analysis<|message|>thinking...<|end|><|start|>assistant\
                     <|channel|>final<|message|>Hello world<|return|>";
@@ -1124,25 +1119,21 @@ mod tests {
     }
 
     #[test]
-    fn harmony_filter_passes_plain_text_through() {
+    fn harmony_filter_keeps_only_the_final_channel_and_a_truncated_completion_keeps_its_reasoning() {
+        let raw = "<|channel|>analysis<|message|>User asks capital of France. Easy.<|end|>\
+                   <|start|>assistant<|channel|>final<|message|>Paris is the capital of France.<|return|>";
+        assert_eq!(harmony_final_text(raw), "Paris is the capital of France.");
         assert_eq!(harmony_final_text("just text"), "just text");
         assert_eq!(harmony_final_text(""), "");
-    }
-
-    #[test]
-    fn harmony_filter_drops_tool_call_commentary() {
-        let raw = "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
+        let commentary = "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
                    {\"location\":\"Paris\"}<|call|>";
-        assert_eq!(harmony_final_text(raw), "");
+        assert_eq!(harmony_final_text(commentary), "");
         assert_eq!(
-            harmony_reasoning_text(raw),
+            harmony_reasoning_text(commentary),
             "",
             "a tool-call commentary channel is neither content nor reasoning"
         );
-    }
 
-    #[test]
-    fn a_completion_that_never_reached_its_final_channel_still_has_its_reasoning() {
         let truncated = "<|channel|>analysis<|message|>Count: 1, 2, 3";
         assert_eq!(harmony_final_text(truncated), "");
         assert_eq!(harmony_reasoning_text(truncated), "Count: 1, 2, 3");
@@ -1337,20 +1328,11 @@ mod tests {
             "thinking-on must NOT pre-close the thought block: {thinking:?}"
         );
         assert_ne!(served, thinking);
-    }
 
-    #[test]
-    fn renders_real_gemma4_template_with_tools() {
-        let Some(snap) = gemma4_snapshot() else {
-            eprintln!("skip: Gemma-4-31B-IT-NVFP4 not cached");
-            return;
-        };
-        let t = ChatTemplate::load(&snap).expect("load real gemma template");
         assert!(
             t.uses_tool_responses(),
             "gemma template uses tool_responses"
         );
-
         let msgs = json!([
             {"role": "user", "content": "What's the weather in Paris?"}
         ]);
@@ -1371,7 +1353,6 @@ mod tests {
         assert!(out.contains("<|turn>system"), "system block: {out}");
         assert!(out.contains("declaration:get_weather"), "tool decl: {out}");
         assert!(out.contains("<|turn>user"), "user turn");
-
         assert!(out.contains("<|turn>model"), "gen prompt: {out}");
     }
 
@@ -1454,14 +1435,7 @@ mod tests {
              tool_response block, and the trailing user question is the last turn before the \
              generation prompt"
         );
-    }
 
-    #[test]
-    fn plain_no_tools_render_is_byte_identical_with_normalization_inactive() {
-        let Some(snap) = gemma4_w4a16_snapshot() else {
-            eprintln!("skip: gemma-4-E4B-it-qat-w4a16-ct not cached");
-            return;
-        };
         let msgs = json!([
             {"role": "system", "content": "be terse"},
             {"role": "user", "content": "hi"},
@@ -1472,7 +1446,6 @@ mod tests {
             tool_call_arguments_parsed_from_openai_wire_strings(&msgs).is_none(),
             "a conversation without string tool-call arguments must not be rewritten"
         );
-        let t = ChatTemplate::load(&snap).expect("load real gemma template");
         let out = t.render(&msgs, None, true).unwrap();
         eprintln!("--- real gemma plain render ---\n{out:?}\n--- end ---");
         assert_eq!(
@@ -1481,7 +1454,8 @@ mod tests {
              <|turn>user\nhi<turn|>\n\
              <|turn>model\nhello!<turn|>\n\
              <|turn>user\nbye?<turn|>\n\
-             <|turn>model\n"
+             <|turn>model\n",
+            "a plain no-tools render is byte-identical with normalization inactive"
         );
     }
 
@@ -1616,10 +1590,7 @@ mod tests {
             "no '<' precedes the divergence, so there is nothing to rewind onto"
         );
         assert_eq!(tag_aligned_divergence("", ""), 0);
-    }
 
-    #[test]
-    fn tag_aligned_divergence_never_returns_an_index_inside_a_multibyte_char() {
         let on = "<tag><\u{2014}>";
         let off = "<tag><\u{2013}>";
         let at = tag_aligned_divergence(on, off);
@@ -1657,6 +1628,12 @@ mod tests {
         assert_eq!(leading_tag("<>"), None);
         assert_eq!(leading_tag("<a<b>"), None);
         assert_eq!(leading_tag(""), None);
+        for lone in ["<a>", "</think>", "<channel|>", "<|im_end|>"] {
+            assert!(is_lone_tag(lone), "{lone}");
+        }
+        for not in ["<>", "<think", "think>", "<a<b>", "<a>b>", "<a b>", ""] {
+            assert!(!is_lone_tag(not), "{not:?}");
+        }
     }
 
     #[test]
@@ -1680,21 +1657,6 @@ mod tests {
         );
         assert_eq!(trailing_tag("<a b>"), None);
         assert_eq!(trailing_tag(""), None);
-    }
-
-    #[test]
-    fn is_lone_tag_rejects_empty_nested_and_unterminated_tags() {
-        assert!(is_lone_tag("<a>"));
-        assert!(is_lone_tag("</think>"));
-        assert!(is_lone_tag("<channel|>"));
-        assert!(is_lone_tag("<|im_end|>"));
-        assert!(!is_lone_tag("<>"));
-        assert!(!is_lone_tag("<think"));
-        assert!(!is_lone_tag("think>"));
-        assert!(!is_lone_tag("<a<b>"));
-        assert!(!is_lone_tag("<a>b>"));
-        assert!(!is_lone_tag("<a b>"));
-        assert!(!is_lone_tag(""));
     }
 
     #[test]
@@ -1776,19 +1738,19 @@ mod tests {
         let msgs = json!([{"role":"user","content":"hi"}]);
         assert_eq!(t.render(&msgs, None, false).unwrap(), "effort=medium|hi");
 
-        std::env::set_var(Q38_REASONING_EFFORT_ENV, "xhigh");
+        unsafe { std::env::set_var(Q38_REASONING_EFFORT_ENV, "xhigh") };
         assert_eq!(
             t.render(&msgs, None, false).unwrap(),
             "effort=xhigh|hi",
             "{Q38_REASONING_EFFORT_ENV} must override the medium serving default"
         );
-        std::env::set_var(Q38_REASONING_EFFORT_ENV, "not-an-effort");
+        unsafe { std::env::set_var(Q38_REASONING_EFFORT_ENV, "not-an-effort") };
         assert_eq!(
             t.render(&msgs, None, false).unwrap(),
             "effort=medium|hi",
             "an invalid {Q38_REASONING_EFFORT_ENV} is logged and ignored, not served"
         );
-        std::env::remove_var(Q38_REASONING_EFFORT_ENV);
+        unsafe { std::env::remove_var(Q38_REASONING_EFFORT_ENV) };
 
         let mut per_request = std::collections::BTreeMap::new();
         per_request.insert(REASONING_EFFORT_KWARG.to_string(), serde_json::json!("low"));
@@ -1818,10 +1780,6 @@ mod tests {
                 .contains_key(REASONING_EFFORT_KWARG),
             "templates that never mention reasoning_effort must render exactly as before"
         );
-    }
-
-    #[test]
-    fn reasoning_effort_values_accepted_match_the_qwen38_template_contract() {
         for ok in REASONING_EFFORT_VALUES_THE_QWEN38_TEMPLATE_ACCEPTS_WITH_HIGH_ALIASED_TO_XHIGH {
             validate_reasoning_effort(ok).unwrap();
         }

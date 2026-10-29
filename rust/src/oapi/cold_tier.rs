@@ -41,7 +41,12 @@ pub struct ColdSlot<T> {
 }
 
 impl<T: Send + Sync + 'static> ColdSlot<T> {
-    fn build(name: &'static str, estimate_bytes: u64, loader: Loader<T>, value: Option<Arc<T>>) -> Arc<Self> {
+    fn build(
+        name: &'static str,
+        estimate_bytes: u64,
+        loader: Loader<T>,
+        value: Option<Arc<T>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             name,
             estimate_bytes,
@@ -383,6 +388,7 @@ pub fn device_free_bytes() -> Option<u64> {
 #[cfg(feature = "cuda")]
 fn synchronize_device() {
     if let Some(ctx) = cuda_ctx() {
+        let _no_capture_in_flight = nv_kernels::capture_exclusion::no_capture_in_flight();
         let _ = ctx.synchronize();
     }
 }
@@ -440,50 +446,54 @@ mod tests {
         let slot = ColdSlot::build("t-fail", 1, counting_loader(loads.clone(), false), None);
         assert!(slot.get().await.is_none());
         assert!(slot.get().await.is_none());
-        assert_eq!(loads.load(Ordering::SeqCst), 1, "second call sits inside the retry window");
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "second call sits inside the retry window"
+        );
     }
 
     #[test]
-    fn a_resident_slot_is_loaded_from_the_start_and_evictable() {
+    fn resident_slots_failed_slots_and_a_deviceless_ensure_free_report_their_state() {
         let slot = ColdSlot::resident("t-res", Arc::new(Big(1)));
         assert!(slot.is_loaded());
         assert_eq!(slot.peek().map(|b| b.0), Some(1));
         assert!(slot.evict("test"));
         assert!(slot.peek().is_none());
+        {
+            let slot = ColdSlot::build("t-flag", 1, Arc::new(|| None::<Arc<Big>>), None);
+            assert!(!slot.load_failed());
+            assert!(!slot.load_blocking());
+            assert!(slot.load_failed());
+        }
+        {
+            let report = ensure_free(0, "test", None);
+            assert!(report.satisfied);
+            assert!(report.evicted.is_empty());
+        }
     }
 
     #[test]
-    fn idle_zero_disables_the_sweep() {
+    fn env_knobs_parse_idle_zero_disables_the_sweep_and_gib_rejects_garbage() {
         let _env = crate::oapi::lock_serializing_every_test_that_mutates_the_process_global_env();
-        std::env::set_var(IDLE_SECS_ENV, "0");
+        unsafe { std::env::set_var(IDLE_SECS_ENV, "0") };
         assert!(sweep_idle().is_empty());
-        std::env::remove_var(IDLE_SECS_ENV);
+        unsafe { std::env::remove_var(IDLE_SECS_ENV) };
+        {
+            unsafe { std::env::set_var(CHAT_MIN_FREE_GIB_ENV, "-1") };
+            assert_eq!(
+                chat_min_free_bytes(),
+                (DEFAULT_CHAT_MIN_FREE_GIB * GIB) as u64
+            );
+            unsafe { std::env::set_var(CHAT_MIN_FREE_GIB_ENV, "0.5") };
+            assert_eq!(chat_min_free_bytes(), (0.5 * GIB) as u64);
+            unsafe { std::env::set_var(CHAT_MIN_FREE_GIB_ENV, "nope") };
+            assert_eq!(
+                chat_min_free_bytes(),
+                (DEFAULT_CHAT_MIN_FREE_GIB * GIB) as u64
+            );
+            unsafe { std::env::remove_var(CHAT_MIN_FREE_GIB_ENV) };
+        }
     }
 
-    #[test]
-    fn a_failed_slot_reports_it_until_a_load_succeeds() {
-        let slot = ColdSlot::build("t-flag", 1, Arc::new(|| None::<Arc<Big>>), None);
-        assert!(!slot.load_failed());
-        assert!(!slot.load_blocking());
-        assert!(slot.load_failed());
-    }
-
-    #[test]
-    fn ensure_free_without_a_device_reports_nothing_and_evicts_nothing() {
-        let report = ensure_free(0, "test", None);
-        assert!(report.satisfied);
-        assert!(report.evicted.is_empty());
-    }
-
-    #[test]
-    fn gib_env_parsing_rejects_garbage_and_negatives() {
-        let _env = crate::oapi::lock_serializing_every_test_that_mutates_the_process_global_env();
-        std::env::set_var(CHAT_MIN_FREE_GIB_ENV, "-1");
-        assert_eq!(chat_min_free_bytes(), (DEFAULT_CHAT_MIN_FREE_GIB * GIB) as u64);
-        std::env::set_var(CHAT_MIN_FREE_GIB_ENV, "0.5");
-        assert_eq!(chat_min_free_bytes(), (0.5 * GIB) as u64);
-        std::env::set_var(CHAT_MIN_FREE_GIB_ENV, "nope");
-        assert_eq!(chat_min_free_bytes(), (DEFAULT_CHAT_MIN_FREE_GIB * GIB) as u64);
-        std::env::remove_var(CHAT_MIN_FREE_GIB_ENV);
-    }
 }

@@ -1,7 +1,7 @@
 #![cfg(feature = "cuda")]
 
-use anyhow::{Context, Result};
-use candle_core::{CudaDevice, DType, Tensor};
+use anyhow::{bail, ensure, Context, Result};
+use candle_core::{CudaDevice, DType, Storage, Tensor};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::ffi::c_void;
@@ -14,12 +14,6 @@ use nv_layers::moe_grouped::{
     forward_grouped_decode_into, GroupedDecodeContext, MoeGroupedWeights,
 };
 use nv_layers::norm::RmsNorm;
-
-fn tail_fuse_enabled() -> bool {
-    std::env::var("NV_MOE_TAIL_FUSE")
-        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
-}
 
 fn normgate_fuse_enabled() -> bool {
     std::env::var("NV_LAGUNA_MOE_NORMGATE_FUSE")
@@ -53,9 +47,8 @@ fn normgate_fused_rstd_normx_gemv(
         .weight()
         .ok_or_else(|| anyhow::anyhow!("normgate fuse: router gate has no dense weight"))?;
     let gw = crate::laguna_step_graph::bf16_ptr(gate_w, s, e * hidden)?;
-    let mut rstd: CudaSlice<f32> = unsafe { s.alloc::<f32>(1).map_err(|e| anyhow::anyhow!(e))? };
-    let mut logits_bf16: CudaSlice<bf16> =
-        unsafe { s.alloc::<bf16>(e).map_err(|e| anyhow::anyhow!(e))? };
+    let mut rstd: CudaSlice<f32> = unsafe { s.alloc::<f32>(1)? };
+    let mut logits_bf16: CudaSlice<bf16> = unsafe { s.alloc::<bf16>(e)? };
     let (xp, _g0) = ctx.resid_in.device_ptr(s);
     {
         let (rp, _g1) = rstd.device_ptr_mut(s);
@@ -68,7 +61,7 @@ fn normgate_fused_rstd_normx_gemv(
                 norm.eps() as f32,
             )
         };
-        anyhow::ensure!(rc == 0, "normgate rstd rc={rc}");
+        ensure!(rc == 0, "normgate rstd rc={rc}");
     }
     let (rp, _g2) = rstd.device_ptr(s);
     {
@@ -84,7 +77,7 @@ fn normgate_fused_rstd_normx_gemv(
                 1,
             )
         };
-        anyhow::ensure!(rc == 0, "normgate normx rc={rc}");
+        ensure!(rc == 0, "normgate normx rc={rc}");
     }
     {
         let (lp, _g4) = logits_bf16.device_ptr_mut(s);
@@ -100,7 +93,7 @@ fn normgate_fused_rstd_normx_gemv(
                 hidden as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "normgate router gemv rc={rc}");
+        ensure!(rc == 0, "normgate router gemv rc={rc}");
     }
     let (lp, _g5) = logits_bf16.device_ptr(s);
     let (dp, _g6) = ctx.logits_f32.device_ptr_mut(s);
@@ -113,7 +106,7 @@ fn normgate_fused_rstd_normx_gemv(
             e,
         )
     };
-    anyhow::ensure!(rc == 0, "normgate logits cast rc={rc}");
+    ensure!(rc == 0, "normgate logits cast rc={rc}");
     Ok(())
 }
 
@@ -122,12 +115,6 @@ pub fn graph_enabled() -> bool {
         .map(|v| {
             v == "1" || v == "2" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("full")
         })
-        .unwrap_or(false)
-}
-
-pub fn whole_step_graph_enabled() -> bool {
-    std::env::var("NV_LAGUNA_GRAPH")
-        .map(|v| v == "2" || v.eq_ignore_ascii_case("full"))
         .unwrap_or(false)
 }
 
@@ -189,13 +176,6 @@ impl LagunaMoeGraphs {
         }
     }
 
-    pub fn layers_cached(&self) -> usize {
-        self.runners
-            .iter()
-            .filter(|r| r.as_ref().map(|r| r.has_cached()).unwrap_or(false))
-            .count()
-    }
-
     pub fn captures(&self) -> u64 {
         self.captures
     }
@@ -222,20 +202,20 @@ impl LagunaMoeGraphs {
     ) -> Result<Tensor> {
         let hidden = w.hidden_size;
         let e = w.num_experts;
-        anyhow::ensure!(layer < self.runners.len(), "layer {layer} out of range");
-        anyhow::ensure!(
+        ensure!(layer < self.runners.len(), "layer {layer} out of range");
+        ensure!(
             resid.dims() == [1, hidden] && resid.dtype() == DType::BF16,
             "graph moe layer {layer}: expected [1, {hidden}] BF16 residual, got {:?} {:?}",
             resid.dims(),
             resid.dtype()
         );
-        anyhow::ensure!(
+        ensure!(
             ctx.n_tokens() == 1,
             "laguna graph forward_layer stages exactly one token's residual; a ctx built for \
              {} tokens would replay the captured body over uninitialized rows",
             ctx.n_tokens()
         );
-        anyhow::ensure!(
+        ensure!(
             ctx.hidden() == hidden && ctx.num_experts() == e,
             "graph moe layer {layer}: ctx shape mismatch"
         );
@@ -253,8 +233,8 @@ impl LagunaMoeGraphs {
             let x_c = resid.contiguous()?;
             let (xs, xl) = x_c.storage_and_layout();
             let x_cuda = match &*xs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("graph moe: residual must be CUDA"),
+                Storage::Cuda(s) => s,
+                _ => bail!("graph moe: residual must be CUDA"),
             };
             let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
             let x_view = x_slice.slice(xl.start_offset()..xl.start_offset() + hidden);
@@ -302,17 +282,13 @@ impl LagunaMoeGraphs {
                 .map_err(|e| anyhow::anyhow!("post-capture sync: {e:?}"))?;
         }
 
-        let mut out: CudaSlice<bf16> = unsafe {
-            legacy
-                .alloc::<bf16>(hidden)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut out: CudaSlice<bf16> = unsafe { legacy.alloc::<bf16>(hidden)? };
         legacy
             .memcpy_dtod(&ctx.out_bf16, &mut out)
             .map_err(|e| anyhow::anyhow!("out dtod: {e:?}"))?;
         let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev.clone());
         Ok(Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, hidden),
             candle_core::op::BackpropOp::none(),
             false,
@@ -320,7 +296,6 @@ impl LagunaMoeGraphs {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn moe_block_body(
     s: &Arc<CudaStream>,
     aux_gemm: &Arc<CudaStream>,
@@ -340,22 +315,21 @@ pub(crate) fn moe_block_body(
         None
     } else {
     let mut resid_copy: CudaSlice<bf16> = unsafe {
-        s.alloc::<bf16>(n * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
+        s.alloc::<bf16>(n * hidden)?
     };
     s.memcpy_dtod(&ctx.resid_in, &mut resid_copy)
         .map_err(|e| anyhow::anyhow!("resid_copy dtod: {e:?}"))?;
     let resid_t = {
         let storage = candle_core::CudaStorage::wrap_cuda_slice(resid_copy, dev2.clone());
         Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (n, hidden),
             candle_core::op::BackpropOp::none(),
             false,
         )
     };
     let x_t = norm.forward(&resid_t)?;
-    anyhow::ensure!(
+    ensure!(
         x_t.dtype() == DType::BF16 && x_t.elem_count() == n * hidden,
         "graph moe: unexpected norm output {:?} {:?}",
         x_t.dims(),
@@ -375,10 +349,10 @@ pub(crate) fn moe_block_body(
     } else {
     {
         let (ns, nl) = x_t.storage_and_layout();
-        anyhow::ensure!(nl.is_contiguous(), "graph moe: norm output not contiguous");
+        ensure!(nl.is_contiguous(), "graph moe: norm output not contiguous");
         let n_cuda = match &*ns {
-            candle_core::Storage::Cuda(st) => st,
-            _ => anyhow::bail!("graph moe: norm output must be CUDA"),
+            Storage::Cuda(st) => st,
+            _ => bail!("graph moe: norm output must be CUDA"),
         };
         let n_slice = n_cuda.as_cuda_slice::<bf16>()?;
         let n_view = n_slice.slice(nl.start_offset()..nl.start_offset() + n * hidden);
@@ -387,7 +361,7 @@ pub(crate) fn moe_block_body(
     }
 
     let logits_t = moe.gate.forward(&x_t)?;
-    anyhow::ensure!(
+    ensure!(
         logits_t.dtype() == DType::BF16 && logits_t.elem_count() == n * e,
         "graph moe: unexpected router logits {:?} {:?}",
         logits_t.dims(),
@@ -395,13 +369,13 @@ pub(crate) fn moe_block_body(
     );
     {
         let (ls, ll) = logits_t.storage_and_layout();
-        anyhow::ensure!(
+        ensure!(
             ll.is_contiguous(),
             "graph moe: router logits not contiguous"
         );
         let l_cuda = match &*ls {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("graph moe: logits must be CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("graph moe: logits must be CUDA"),
         };
         let l_slice = l_cuda.as_cuda_slice::<bf16>()?;
         let l_view = l_slice.slice(ll.start_offset()..ll.start_offset() + n * e);
@@ -416,7 +390,7 @@ pub(crate) fn moe_block_body(
                 n * e,
             )
         };
-        anyhow::ensure!(rc == 0, "logits cast rc={rc}");
+        ensure!(rc == 0, "logits cast rc={rc}");
     }
     }
     Some(x_t)
@@ -427,13 +401,13 @@ pub(crate) fn moe_block_body(
 
     let bias_ptr: u64 = {
         let (bs, bl) = moe.selection_bias.storage_and_layout();
-        anyhow::ensure!(
+        ensure!(
             bl.is_contiguous() && moe.selection_bias.dtype() == DType::F32,
             "graph moe: selection_bias must be contiguous F32"
         );
         let b_cuda = match &*bs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("graph moe: selection_bias must be CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("graph moe: selection_bias must be CUDA"),
         };
         let b_slice = b_cuda.as_cuda_slice::<f32>()?;
         let b_view = b_slice.slice(bl.start_offset()..bl.start_offset() + e);
@@ -458,20 +432,20 @@ pub(crate) fn moe_block_body(
             .ok_or_else(|| anyhow::anyhow!("unfolded shared expert needs the normed tensor"))?;
         nv_layers::cuda_stream::with_stream(aux_shared.clone(), || -> Result<()> {
             let shared_t = moe.shared_expert.forward_fused_cuda(x_t)?;
-            anyhow::ensure!(
+            ensure!(
                 shared_t.dtype() == DType::BF16 && shared_t.elem_count() == n * hidden,
                 "graph moe: unexpected shared expert output {:?} {:?}",
                 shared_t.dims(),
                 shared_t.dtype()
             );
             let (ss, sl) = shared_t.storage_and_layout();
-            anyhow::ensure!(
+            ensure!(
                 sl.is_contiguous(),
                 "graph moe: shared output not contiguous"
             );
             let s_cuda = match &*ss {
-                candle_core::Storage::Cuda(st) => st,
-                _ => anyhow::bail!("graph moe: shared output must be CUDA"),
+                Storage::Cuda(st) => st,
+                _ => bail!("graph moe: shared output must be CUDA"),
             };
             let s_slice = s_cuda.as_cuda_slice::<bf16>()?;
             let s_view = s_slice.slice(sl.start_offset()..sl.start_offset() + n * hidden);
@@ -485,7 +459,7 @@ pub(crate) fn moe_block_body(
                     (n * hidden) as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "shared cast rc={rc}");
+            ensure!(rc == 0, "shared cast rc={rc}");
             Ok(())
         })?;
         if let Some((p, li)) = prof {
@@ -498,7 +472,6 @@ pub(crate) fn moe_block_body(
         )
     };
 
-    let fuse_tail = tail_fuse_enabled();
     forward_grouped_decode_into(
         w,
         ctx,
@@ -507,7 +480,7 @@ pub(crate) fn moe_block_body(
         moe.softcap,
         moe.norm_topk,
         moe.routed_scaling,
-        !fuse_tail,
+        false,
         s,
         Some(aux_gemm),
         prof.and_then(|(p, li)| p.moe_grouped_prof_base(li, s)),
@@ -516,77 +489,29 @@ pub(crate) fn moe_block_body(
         s.wait(ev)
             .map_err(|e| anyhow::anyhow!("shared join wait: {e:?}"))?;
     }
-    if fuse_tail {
-        let top_k = ctx.tiles_per_token();
-        let (yp, _g1) = ctx.y_down.device_ptr(s);
-        let (wp, _g2) = ctx.topk_weights.device_ptr(s);
-        let (ip, _g3) = ctx.inv_perm.device_ptr(s);
-        let (sp, _g4) = ctx.shared_f32.device_ptr(s);
-        let (rp, _g5) = ctx.resid_in.device_ptr(s);
-        let (op, _g6) = ctx.out_bf16.device_ptr_mut(s);
-        let rc = unsafe {
-            nv_kernels::cuda::moe_unpermute_scatter_tail(
-                s.cu_stream() as *mut c_void,
-                yp as *const u16,
-                wp as *const f32,
-                ip as *const i32,
-                sp as *const f32,
-                rp as *const u16,
-                op as *mut u16,
-                n as i32,
-                top_k as i32,
-                hidden as i32,
-                hidden as i32,
-            )
-        };
-        anyhow::ensure!(rc == 0, "moe scatter+tail rc={rc}");
-    } else {
-        {
-            let (ap, _g1) = ctx.y_acc.device_ptr(s);
-            let (bp, _g2) = ctx.shared_f32.device_ptr(s);
-            let (yp, _g3) = ctx.out_f32.device_ptr_mut(s);
-            let rc = unsafe {
-                nv_kernels::cuda::add_scale_f32(
-                    s.cu_stream() as *mut c_void,
-                    ap as *const f32,
-                    bp as *const f32,
-                    yp as *mut f32,
-                    1.0,
-                    (n * hidden) as i32,
-                )
-            };
-            anyhow::ensure!(rc == 0, "routed+shared add rc={rc}");
-        }
-        {
-            let (fp, _g1) = ctx.out_f32.device_ptr(s);
-            let (bp, _g2) = ctx.ffn_bf16.device_ptr_mut(s);
-            let rc = unsafe {
-                nv_kernels::cuda::cast_f32_bf16(
-                    s.cu_stream() as *mut c_void,
-                    fp as *const f32,
-                    bp as *mut u16,
-                    (n * hidden) as i32,
-                )
-            };
-            anyhow::ensure!(rc == 0, "ffn cast rc={rc}");
-        }
-        {
-            let (ap, _g1) = ctx.resid_in.device_ptr(s);
-            let (bp, _g2) = ctx.ffn_bf16.device_ptr(s);
-            let (yp, _g3) = ctx.out_bf16.device_ptr_mut(s);
-            let rc = unsafe {
-                nv_kernels::cuda::residual_add_scale_bf16(
-                    s.cu_stream() as *mut c_void,
-                    ap as *const u16,
-                    bp as *const u16,
-                    yp as *mut u16,
-                    1.0,
-                    n * hidden,
-                )
-            };
-            anyhow::ensure!(rc == 0, "residual add rc={rc}");
-        }
-    }
+    let top_k = ctx.tiles_per_token();
+    let (yp, _g1) = ctx.y_down.device_ptr(s);
+    let (wp, _g2) = ctx.topk_weights.device_ptr(s);
+    let (ip, _g3) = ctx.inv_perm.device_ptr(s);
+    let (sp, _g4) = ctx.shared_f32.device_ptr(s);
+    let (rp, _g5) = ctx.resid_in.device_ptr(s);
+    let (op, _g6) = ctx.out_bf16.device_ptr_mut(s);
+    let rc = unsafe {
+        nv_kernels::cuda::moe_unpermute_scatter_tail(
+            s.cu_stream() as *mut c_void,
+            yp as *const u16,
+            wp as *const f32,
+            ip as *const i32,
+            sp as *const f32,
+            rp as *const u16,
+            op as *mut u16,
+            n as i32,
+            top_k as i32,
+            hidden as i32,
+            hidden as i32,
+        )
+    };
+    ensure!(rc == 0, "moe scatter+tail rc={rc}");
     Ok(())
 }
 

@@ -129,7 +129,7 @@ def main() -> int:
               f"{'; loose text' if not args.strict_text else ''})")
         return 0
 
-    print(f"[FAIL] traces diverge")
+    print("[FAIL] traces diverge")
     print(f"  A: {args.trace_a} ({len(can_a)} events)")
     print(f"  B: {args.trace_b} ({len(can_b)} events)")
     for i, (a, b) in enumerate(zip(can_a, can_b)):

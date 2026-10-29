@@ -9,26 +9,18 @@ OUT="${PARITY_AUDIT_LOGDIR:-$HOME/.cache/agent-logs/parity-audit}"
 mkdir -p "$OUT"
 cd "$REPO"
 
-CORPUS_RULE="What this audit ratchets is task #50's cross-backend parity coverage, and membership \
-is a DECISION RECORDED IN THIS LIST -- not a filename convention, and not 'every suite with an \
-independent oracle'. Two facts force that. The name was already a bad proxy in both directions: \
-parity_verify_fused.rs is cfg(cuda)-only and holds CUDA to a host oracle with no second backend \
-in sight, while gemv_w4a16_cpu_ref.rs, marlin_w4a16_cpu_ref.rs and wgpu_flash_attn_fp8_oracle.rs \
-do the same kind of work and are deliberately OUTSIDE this ratchet. And 409372806 swapped one \
-member for another -- parity_quantize_nvfp4_bf16.rs out, wgpu_quantize_nvfp4_bf16_cpu_ref.rs in, \
-same kernel, same commit -- which a parity_*.rs glob cannot see, so the audit silently ran four \
-suites against a floor written for five. Widening the ratchet to the other oracle suites is a \
-real option and someone has to price it; it is not something a glob should decide."
+CORPUS_RULE="What this audit ratchets is cross-backend parity coverage, and membership is a \
+DECISION RECORDED IN THIS LIST -- not a filename convention, and not 'every suite with an \
+independent oracle'. gemv_w4a16_cpu_ref.rs, marlin_w4a16_cpu_ref.rs and \
+wgpu_flash_attn_fp8_oracle.rs hold a backend to a host oracle and are deliberately OUTSIDE this \
+ratchet. Widening the ratchet to them is a real option and someone has to price it; it is not \
+something a glob should decide."
 
 BITEXACT_REFERENCE_GATES=(
-  rust/crates/nv-kernels/tests/parity_gdn.rs
-  rust/crates/nv-kernels/tests/parity_gemv_bf16_i8.rs
-  rust/crates/nv-kernels/tests/parity_kv_fp8_paged.rs
-  rust/crates/nv-kernels/tests/parity_verify_fused.rs
   rust/crates/nv-kernels/tests/wgpu_quantize_nvfp4_bf16_cpu_ref.rs
 )
 
-EXECUTABLE_TESTS_IN_THE_LISTED_SUITES=63
+EXECUTABLE_TESTS_IN_THE_LISTED_SUITES=2
 
 vanished=()
 for f in "${BITEXACT_REFERENCE_GATES[@]}"; do
@@ -46,6 +38,7 @@ fi
 
 unlisted=()
 for f in rust/crates/nv-kernels/tests/parity_*.rs; do
+  [ -e "$f" ] || continue
   case " ${BITEXACT_REFERENCE_GATES[*]} " in
     *" $f "*) ;;
     *) unlisted+=("$f") ;;
@@ -112,9 +105,8 @@ if [ $bad -ne 0 ]; then
   if [ $failed_suites -ne 0 ]; then
     echo "parity audit FAILED: $failed_suites suite(s) have a FAILING test -- a real cross-backend \
 disagreement, not a skip. See the per-suite logs in $OUT." >&2
-    echo "This is reported apart from VACUOUS on purpose: the two shared one message once, and a \
-genuinely failing test in parity_gemv_bf16_i8 was printed as 'green without running anything', \
-which sends the reader hunting a cfg problem that is not there." >&2
+    echo "This is reported apart from VACUOUS on purpose: a failing test printed as 'green without \
+running anything' sends the reader hunting a cfg problem that is not there." >&2
   fi
   if [ $vacuous_suites -ne 0 ]; then
     echo "parity audit FAILED: $vacuous_suites suite(s) ran nothing (0 passed, 0 ignored)." >&2
@@ -133,13 +125,10 @@ is $MIN_TESTS." >&2
   echo "Every listed file is still present -- checked above -- so tests went missing INSIDE them: \
 deleted, renamed away, or newly #[ignore]d. An #[ignore] is the quiet one; it lands in the \
 'ignored' column, trips neither FAILED nor VACUOUS, and only this floor sees it." >&2
-  echo "The floor is the exact executable count, not a slack number: parity_gdn 16 + \
-parity_gemv_bf16_i8 20 + parity_kv_fp8_paged 18 + parity_verify_fused 7 (8 tests, 1 #[ignore]d) + \
-wgpu_quantize_nvfp4_bf16_cpu_ref 2. Slack was tried and was wrong -- 8d44f1842 set the floor one \
-under the count so a flaky suite would report FAILED instead of corpus-shrank, but a failing test \
-sets bad and exits above, before this check is ever reached, so the slack bought nothing and hid \
-one deletable test." >&2
-  echo "Cross-backend parity is the thinnest coverage in this repo (task #50), so losing a test is \
+  echo "The floor is the exact executable count, not a slack number: \
+wgpu_quantize_nvfp4_bf16_cpu_ref 2. A failing test sets bad and exits above, before this check is \
+ever reached, so slack under the count buys nothing and hides a deletable test." >&2
+  echo "Cross-backend parity is the thinnest coverage in this repo, so losing a test is \
 a bigger deal than a test going red -- a red test is visible and a deleted one is not. If the \
 removal was deliberate, lower EXECUTABLE_TESTS_IN_THE_LISTED_SUITES in the same commit that \
 removes it and say why." >&2

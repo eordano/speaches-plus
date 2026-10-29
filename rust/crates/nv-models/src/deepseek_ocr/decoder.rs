@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 #[cfg(feature = "cuda")]
 use nv_layers::attn::flash_attn;
@@ -9,8 +9,6 @@ use nv_layers::norm::RmsNorm;
 use nv_layers::rope::{Rope, RopeConfig, RopeKind};
 use nv_layers::weight_load::{load_linear, load_rmsnorm};
 use nv_weights::WeightLoader;
-#[cfg(test)]
-use std::path::Path;
 
 #[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
@@ -345,7 +343,6 @@ pub struct GenerateOutcome {
 pub const PROMPT_GROUNDING_MARKDOWN: &str =
     "<image>\n<|grounding|>Convert the document to markdown.";
 pub const PROMPT_FREE_OCR: &str = "<image>\nFree OCR.";
-pub const PROMPT_PARSE_FIGURE: &str = "<image>\nParse the figure.";
 
 #[derive(Clone, Debug)]
 pub struct DeepseekOcrDecoderConfig {
@@ -398,17 +395,17 @@ impl DeepseekOcrDecoderConfig {
             |k: &str, d: bool| -> bool { field(k).and_then(|x| x.as_bool()).unwrap_or(d) };
 
         if get_b_or("use_mla", false) {
-            anyhow::bail!("use_mla=true checkpoints are not supported (this port is MHA-only)");
+            bail!("use_mla=true checkpoints are not supported (this port is MHA-only)");
         }
         if let Some(x) = field("kv_lora_rank") {
             if !x.is_null() {
-                anyhow::bail!("kv_lora_rank set -- MLA checkpoint, not supported");
+                bail!("kv_lora_rank set -- MLA checkpoint, not supported");
             }
         }
         let hidden_size = get_u("hidden_size")?;
         let num_attention_heads = get_u("num_attention_heads")?;
         if hidden_size % num_attention_heads != 0 {
-            anyhow::bail!(
+            bail!(
                 "hidden_size {hidden_size} not divisible by num_attention_heads {num_attention_heads}"
             );
         }
@@ -511,7 +508,7 @@ impl DeepseekOcrKvCache {
         let dims = k_new.dims();
         if dims.len() != 4 || dims[0] != 1 || dims[2] != self.n_kv_heads || dims[3] != self.head_dim
         {
-            anyhow::bail!(
+            bail!(
                 "KvCache.write_at: expected [1, t, {}, {}], got {:?}",
                 self.n_kv_heads,
                 self.head_dim,
@@ -521,7 +518,7 @@ impl DeepseekOcrKvCache {
         let t = dims[1];
         let end = start + t;
         if end > self.max_seq_len {
-            anyhow::bail!(
+            bail!(
                 "KvCache.write_at: end {} exceeds max_seq_len {}",
                 end,
                 self.max_seq_len
@@ -578,19 +575,19 @@ impl DeepseekMoe {
     ) -> Result<Self> {
         let gd = gate_weight.dims();
         if gd.len() != 2 {
-            anyhow::bail!("moe gate weight must be 2-D, got {:?}", gd);
+            bail!("moe gate weight must be 2-D, got {:?}", gd);
         }
         let num_experts = gd[0];
         let hidden = gd[1];
         if experts.len() != num_experts {
-            anyhow::bail!(
+            bail!(
                 "moe: {} experts loaded, gate expects {}",
                 experts.len(),
                 num_experts
             );
         }
         if top_k == 0 || top_k > num_experts {
-            anyhow::bail!("moe: top_k {} invalid for {} experts", top_k, num_experts);
+            bail!("moe: top_k {} invalid for {} experts", top_k, num_experts);
         }
         let gate_bf16 = Linear::new(gate_weight.to_dtype(DType::BF16)?, None)?;
         let gate_t_f32 = gate_weight.to_dtype(DType::F32)?.t()?.contiguous()?;
@@ -657,7 +654,7 @@ impl DeepseekMoe {
             ) else {
                 return Ok(false);
             };
-            if g.dtype() != DType::BF16 || !matches!(g.device(), Device::Cuda(_)) {
+            if g.dtype() != DType::BF16 || !g.device().is_cuda() {
                 return Ok(false);
             }
             if g.dims() != [inter, hidden]
@@ -701,7 +698,7 @@ impl DeepseekMoe {
         #[allow(unused_mut)]
         let mut overlapped: Option<Vec<f32>> = None;
         #[cfg(feature = "cuda")]
-        if moe_overlap_shared() && !prof::enabled() {
+        if !prof::enabled() {
             overlapped = read_probs_overlapped(&probs, || {
                 let t = self.shared.forward(&x_flat)?;
                 shared_early = Some(t.to_dtype(DType::F32)?);
@@ -732,22 +729,6 @@ impl DeepseekMoe {
 
         let acc = prof::span(prof::MOE_EXPERTS, &device, || -> Result<Tensor> {
             let mut acc = Tensor::zeros((n_tokens, self.hidden), DType::F32, &device)?;
-            if !moe_batch_gather() {
-                for e in 0..self.num_experts {
-                    let rows = &expert_rows[e];
-                    if rows.is_empty() {
-                        continue;
-                    }
-                    let m = rows.len();
-                    let idx_t = Tensor::from_vec(rows.clone(), m, &device)?;
-                    let gathered = x_flat.index_select(&idx_t, 0)?.contiguous()?;
-                    let y_e = self.experts[e].forward(&gathered)?.to_dtype(DType::F32)?;
-                    let w_t = Tensor::from_vec(expert_w[e].clone(), (m, 1), &device)?;
-                    acc = acc.index_add(&idx_t, &y_e.broadcast_mul(&w_t)?, 0)?;
-                }
-                return Ok(acc);
-            }
-
             let total: usize = expert_rows.iter().map(|r| r.len()).sum();
             if total == 0 {
                 return Ok(acc);
@@ -788,25 +769,6 @@ impl DeepseekMoe {
             Ok(y.reshape(in_dims)?.to_dtype(in_dtype)?)
         })
     }
-}
-
-pub(crate) fn moe_batch_gather() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            "NV_DSOCR_MOE_BATCH",
-        )
-    })
-}
-
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) fn moe_overlap_shared() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            "NV_DSOCR_MOE_OVERLAP",
-        )
-    })
 }
 
 #[cfg(feature = "cuda")]
@@ -934,9 +896,10 @@ mod probe_copy {
 
 #[cfg(feature = "cuda")]
 pub(crate) use probe_copy::read_overlapped as read_probs_overlapped;
+use std::sync::OnceLock;
 
 pub(crate) fn route_threads() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("NV_DSOCR_MOE_ROUTE_THREADS")
             .ok()
@@ -944,11 +907,6 @@ pub(crate) fn route_threads() -> usize {
             .filter(|n| *n > 0)
             .unwrap_or(1)
     })
-}
-
-fn route_legacy() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NV_DSOCR_MOE_ROUTE").as_deref() == Ok("sort"))
 }
 
 pub(crate) fn topk_stable_desc(row: &[f32], k: usize, ids: &mut [u32], vals: &mut [f32]) {
@@ -1013,33 +971,6 @@ pub(crate) fn route_topk(
     norm: bool,
     scale: f32,
 ) -> (Vec<Vec<u32>>, Vec<Vec<f32>>) {
-    if route_legacy() {
-        let mut rows: Vec<Vec<u32>> = vec![Vec::new(); e_count];
-        let mut ws: Vec<Vec<f32>> = vec![Vec::new(); e_count];
-        let mut order: Vec<usize> = Vec::with_capacity(e_count);
-        for n in 0..n_tokens {
-            let row = &probs[n * e_count..(n + 1) * e_count];
-            order.clear();
-            order.extend(0..e_count);
-            order.sort_by(|&a, &b| {
-                row[b]
-                    .partial_cmp(&row[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            let sel = &order[..k];
-            let denom = if norm {
-                sel.iter().map(|&e| row[e]).sum::<f32>().max(1e-20)
-            } else {
-                1.0
-            };
-            for &e in sel {
-                rows[e].push(n as u32);
-                ws[e].push(row[e] / denom * scale);
-            }
-        }
-        return (rows, ws);
-    }
-
     let nt = route_threads().min(n_tokens.div_ceil(64)).max(1);
     if nt == 1 {
         return route_chunk(probs, 0, n_tokens, e_count, k, norm, scale);
@@ -1112,7 +1043,6 @@ pub struct GenerateOptions {
 impl Default for GenerateOptions {
     fn default() -> Self {
         match std::env::var("NV_DSOCR_NGRAM").as_deref() {
-            Ok("hf20") => Self::hf20(),
             Ok("off") => Self {
                 no_repeat_ngram_size: None,
                 ngram_window: None,
@@ -1133,15 +1063,6 @@ impl GenerateOptions {
             ngram_window: Some(90),
             ngram_whitelist: vec![TD_OPEN_TOKEN_ID, TD_CLOSE_TOKEN_ID],
             seed: 0,
-        }
-    }
-
-    pub fn hf20() -> Self {
-        Self {
-            no_repeat_ngram_size: Some(20),
-            ngram_window: None,
-            ngram_whitelist: Vec::new(),
-            ..Self::recipe()
         }
     }
 }
@@ -1226,7 +1147,7 @@ impl LinearFactory for Nvfp4Factory {
             .with_context(|| format!("load {name}"))?;
         let d = w.dims();
         if d.len() != 2 || d[0] != out_features || d[1] != in_features {
-            anyhow::bail!(
+            bail!(
                 "linear {name}: expected [{}, {}], got {:?}",
                 out_features,
                 in_features,
@@ -1332,9 +1253,8 @@ impl DeepseekOcrDecoder {
         weights: &WeightLoader,
         device: &Device,
     ) -> Result<Self> {
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("from_loader_nvfp4 requires a CUDA device"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("from_loader_nvfp4 requires a CUDA device")
         };
         let runner = Arc::new(Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
             dev.cuda_stream(),
@@ -1360,7 +1280,7 @@ impl DeepseekOcrDecoder {
             .context("load model.embed_tokens.weight")?;
         let ed = embed_weight.dims();
         if ed.len() != 2 || ed[0] != config.vocab_size || ed[1] != hidden {
-            anyhow::bail!(
+            bail!(
                 "embedding shape mismatch: expected [{}, {}], got {:?}",
                 config.vocab_size,
                 hidden,
@@ -1418,7 +1338,7 @@ impl DeepseekOcrDecoder {
                     .with_context(|| format!("load {prefix}.mlp.gate.weight"))?;
                 let gd = gate_weight.dims();
                 if gd != [config.n_routed_experts, hidden] {
-                    anyhow::bail!(
+                    bail!(
                         "router {prefix}.mlp.gate.weight: expected [{}, {}], got {:?}",
                         config.n_routed_experts,
                         hidden,
@@ -1492,7 +1412,7 @@ impl DeepseekOcrDecoder {
             device,
         )?;
         #[cfg(feature = "cuda")]
-        if matches!(device, Device::Cuda(_)) && dtype == DType::BF16 {
+        if device.is_cuda() && dtype == DType::BF16 {
             for layer in layers.iter_mut() {
                 if let FeedForward::Moe(m) = &mut layer.ff {
                     let _ = m.stack_experts_cuda(hidden, config.moe_intermediate_size)?;
@@ -1524,11 +1444,11 @@ impl DeepseekOcrDecoder {
     ) -> Result<Tensor> {
         let seq = tokens.len();
         if seq == 0 {
-            anyhow::bail!("embed_tokens: empty token sequence");
+            bail!("embed_tokens: empty token sequence");
         }
         let n_img = tokens.iter().filter(|&&t| t == IMAGE_TOKEN_ID).count();
         if n_img > 0 && vision_features.is_none() {
-            anyhow::bail!("{n_img} image placeholder tokens but no vision features supplied");
+            bail!("{n_img} image placeholder tokens but no vision features supplied");
         }
         let lookup: Vec<u32> = tokens
             .iter()
@@ -1559,14 +1479,14 @@ impl DeepseekOcrDecoder {
         }
         let vd = v.dims().to_vec();
         if vd.len() != 2 || vd[1] != self.config.hidden_size {
-            anyhow::bail!(
+            bail!(
                 "vision features must be [N, {}], got {:?}",
                 self.config.hidden_size,
                 vd
             );
         }
         if vd[0] != n_img {
-            anyhow::bail!(
+            bail!(
                 "vision feature count {} != image placeholder count {}",
                 vd[0],
                 n_img
@@ -1632,7 +1552,7 @@ impl DeepseekOcrDecoder {
     ) -> Result<Tensor> {
         let dims = x.dims().to_vec();
         if dims.len() != 3 || dims[0] != 1 || dims[2] != self.config.hidden_size {
-            anyhow::bail!(
+            bail!(
                 "forward_embeds_hidden: expected [1, T, {}], got {:?}",
                 self.config.hidden_size,
                 dims
@@ -1642,7 +1562,7 @@ impl DeepseekOcrDecoder {
         let write_start = cache.current_len();
         let new_total = write_start + seq;
         if new_total > cache.max_seq_len() {
-            anyhow::bail!(
+            bail!(
                 "sequence overflows kv cache: {} + {} > {}",
                 write_start,
                 seq,
@@ -1744,7 +1664,7 @@ impl DeepseekOcrDecoder {
         #[cfg(feature = "cuda")]
         if seq == 1
             && self.dtype == DType::BF16
-            && matches!(self.device, Device::Cuda(_))
+            && self.device.is_cuda()
             && super::decoder_graph::kernel_decode_enabled()
         {
             if let Some(x_next) = self.try_decode_ffn(idx, &normed2, &x_after)? {
@@ -1837,7 +1757,7 @@ impl DeepseekOcrDecoder {
         let max_len =
             (prompt_tokens.len() + opts.max_new_tokens).min(self.config.max_position_embeddings);
         if prompt_tokens.len() >= max_len {
-            anyhow::bail!(
+            bail!(
                 "prompt length {} leaves no room to generate (max {})",
                 prompt_tokens.len(),
                 max_len
@@ -1890,7 +1810,7 @@ impl DeepseekOcrDecoder {
 
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &AttnConfig) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
-    if matches!(q.device(), Device::Cuda(_)) && q.dtype() == DType::BF16 {
+    if q.device().is_cuda() && q.dtype() == DType::BF16 {
         if q.dims()[1] == 1 && super::decoder_graph::kernel_decode_enabled() {
             return super::decoder_graph::decode_attention_eager(q, k, v, cfg);
         }
@@ -1974,7 +1894,7 @@ impl SplitMix64 {
 
 pub(crate) fn sample_token(logits: &[f32], temperature: f32, rng: &mut SplitMix64) -> Result<u32> {
     if logits.is_empty() {
-        anyhow::bail!("sample_token: empty logits");
+        bail!("sample_token: empty logits");
     }
     if temperature <= 0.0 {
         let mut best = 0usize;
@@ -1994,7 +1914,7 @@ pub(crate) fn sample_token(logits: &[f32], temperature: f32, rng: &mut SplitMix6
         .filter(|v| v.is_finite())
         .fold(f32::NEG_INFINITY, f32::max);
     if !max.is_finite() {
-        anyhow::bail!("sample_token: all logits are -inf");
+        bail!("sample_token: all logits are -inf");
     }
     let mut probs: Vec<f32> = logits
         .iter()
@@ -2008,7 +1928,7 @@ pub(crate) fn sample_token(logits: &[f32], temperature: f32, rng: &mut SplitMix6
         .collect();
     let z: f32 = probs.iter().sum();
     if z <= 0.0 {
-        anyhow::bail!("sample_token: zero probability mass");
+        bail!("sample_token: zero probability mass");
     }
     for p in probs.iter_mut() {
         *p /= z;
@@ -2079,14 +1999,6 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    #[test]
-    fn decoder_dtype_defaults_to_bf16() {
-        if nv_config::env_arm_present_at_all_reread_every_call("NV_DSOCR_DEC_DTYPE") {
-            return;
-        }
-        assert_eq!(env_decoder_dtype(), DType::BF16);
-    }
-
     const CONFIG_JSON: &str = r#"{
         "global_view_pos": "head",
         "language_config": {
@@ -2137,7 +2049,9 @@ mod tests {
     }"#;
 
     #[test]
-    fn config_parses_checkpoint_shape() {
+    fn config_parses_checkpoint_shape_and_rejects_mla() {
+        let mla = CONFIG_JSON.replace("\"use_mla\": false", "\"use_mla\": true");
+        assert!(DeepseekOcrDecoderConfig::from_hf_json_str(&mla).is_err());
         let c = DeepseekOcrDecoderConfig::from_hf_json_str(CONFIG_JSON).unwrap();
         assert_eq!(c.hidden_size, 1280);
         assert_eq!(c.num_hidden_layers, 12);
@@ -2163,12 +2077,6 @@ mod tests {
         for i in 1..12 {
             assert!(c.is_moe_layer(i));
         }
-    }
-
-    #[test]
-    fn config_rejects_mla() {
-        let raw = CONFIG_JSON.replace("\"use_mla\": false", "\"use_mla\": true");
-        assert!(DeepseekOcrDecoderConfig::from_hf_json_str(&raw).is_err());
     }
 
     fn det(n: usize, seed: f32) -> Vec<f32> {
@@ -2318,8 +2226,54 @@ mod tests {
     }
 
     #[test]
-    fn tiny_full_vs_incremental_forward_matches() {
+    fn tiny_full_vs_incremental_forward_matches_and_vision_rows_and_generate_behave() {
         let model = tiny_model();
+        let h = model.config().hidden_size;
+        let vis_tokens: Vec<u32> = vec![0, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 7, IMAGE_TOKEN_ID, 9];
+        let feats_host: Vec<f32> = (0..3 * h).map(|i| 1000.0 + i as f32).collect();
+        let feats = Tensor::from_vec(feats_host.clone(), (3, h), &Device::Cpu).unwrap();
+        let x = model
+            .embed_tokens_with_vision(&vis_tokens, Some(&feats))
+            .unwrap();
+        let x_host: Vec<f32> = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (fi, ti) in [(0usize, 1usize), (1, 2), (2, 4)] {
+            for d in 0..h {
+                assert_eq!(x_host[ti * h + d], feats_host[fi * h + d]);
+            }
+        }
+        let embed_row_7: Vec<f32> = model
+            .embed_weight
+            .narrow(0, 7, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for d in 0..h {
+            assert_eq!(x_host[3 * h + d], embed_row_7[d]);
+        }
+        assert!(model.embed_tokens_with_vision(&vis_tokens, None).is_err());
+        let wrong = Tensor::zeros((2, h), DType::F32, &Device::Cpu).unwrap();
+        assert!(model
+            .embed_tokens_with_vision(&vis_tokens, Some(&wrong))
+            .is_err());
+
+        let opts = GenerateOptions {
+            max_new_tokens: 8,
+            temperature: 0.0,
+            no_repeat_ngram_size: Some(20),
+            ngram_window: None,
+            ngram_whitelist: vec![],
+            seed: 0,
+        };
+        let out1 = model.generate(&[0, 5, 17], None, &opts).unwrap();
+        let out2 = model.generate(&[0, 5, 17], None, &opts).unwrap();
+        assert_eq!(out1, out2);
+        assert!(!out1.is_empty() && out1.len() <= 8);
+        for &t in &out1 {
+            assert!((t as usize) < model.vocab_size());
+        }
+
         let tokens: Vec<u32> = vec![0, 5, 17, 42, 9, 88];
 
         let mut cache_full = model.new_kv_cache(16).unwrap();
@@ -2453,61 +2407,6 @@ mod tests {
     }
 
     #[test]
-    fn vision_injection_replaces_placeholder_rows() {
-        let model = tiny_model();
-        let h = model.config().hidden_size;
-        let tokens: Vec<u32> = vec![0, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 7, IMAGE_TOKEN_ID, 9];
-        let feats_host: Vec<f32> = (0..3 * h).map(|i| 1000.0 + i as f32).collect();
-        let feats = Tensor::from_vec(feats_host.clone(), (3, h), &Device::Cpu).unwrap();
-        let x = model
-            .embed_tokens_with_vision(&tokens, Some(&feats))
-            .unwrap();
-        let x_host: Vec<f32> = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for (fi, ti) in [(0usize, 1usize), (1, 2), (2, 4)] {
-            for d in 0..h {
-                assert_eq!(x_host[ti * h + d], feats_host[fi * h + d]);
-            }
-        }
-        let embed_row_7: Vec<f32> = model
-            .embed_weight
-            .narrow(0, 7, 1)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap();
-        for d in 0..h {
-            assert_eq!(x_host[3 * h + d], embed_row_7[d]);
-        }
-
-        assert!(model.embed_tokens_with_vision(&tokens, None).is_err());
-        let wrong = Tensor::zeros((2, h), DType::F32, &Device::Cpu).unwrap();
-        assert!(model
-            .embed_tokens_with_vision(&tokens, Some(&wrong))
-            .is_err());
-    }
-
-    #[test]
-    fn tiny_generate_greedy_is_deterministic_and_respects_cache() {
-        let model = tiny_model();
-        let opts = GenerateOptions {
-            max_new_tokens: 8,
-            temperature: 0.0,
-            no_repeat_ngram_size: Some(20),
-            ngram_window: None,
-            ngram_whitelist: vec![],
-            seed: 0,
-        };
-        let out1 = model.generate(&[0, 5, 17], None, &opts).unwrap();
-        let out2 = model.generate(&[0, 5, 17], None, &opts).unwrap();
-        assert_eq!(out1, out2);
-        assert!(!out1.is_empty() && out1.len() <= 8);
-        for &t in &out1 {
-            assert!((t as usize) < model.vocab_size());
-        }
-    }
-
-    #[test]
     fn prompt_tokens_layout_matches_reference() {
         let encode =
             |s: &str| -> Result<Vec<u32>> { Ok(s.bytes().map(|b| 200 + b as u32).collect()) };
@@ -2529,43 +2428,38 @@ mod tests {
     }
 
     #[test]
-    fn no_repeat_ngram_bans_completion_tokens() {
+    fn ngram_bans_cover_completion_window_whitelist_and_short_window_cases() {
         assert!(banned_tokens_no_repeat_ngram(&[1, 2, 3], 4).is_empty());
         let seq = [7, 1, 2, 9, 5, 1, 2];
         assert_eq!(banned_tokens_no_repeat_ngram(&seq, 3), vec![9]);
         let seq2 = [1, 2, 3, 1, 2, 4, 1, 2];
         assert_eq!(banned_tokens_no_repeat_ngram(&seq2, 3), vec![3, 4]);
         assert_eq!(banned_tokens_no_repeat_ngram(&[5, 6, 5], 1), vec![5, 6, 5]);
-    }
 
-    #[test]
-    fn windowed_ngram_matches_unwindowed_when_window_covers_sequence() {
-        let seq = [1u32, 2, 3, 1, 2, 4, 1, 2];
+        for window in [None, Some(seq2.len()), Some(1000)] {
+            assert_eq!(
+                banned_tokens_windowed_ngram(&seq2, 3, window, &[]),
+                banned_tokens_no_repeat_ngram(&seq2, 3),
+                "window {window:?} covers the sequence"
+            );
+        }
+        let gapped = [1u32, 2, 3, 9, 9, 9, 9, 1, 2, 4, 1, 2];
+        for (window, want) in [(None, vec![3, 4]), (Some(5), vec![4]), (Some(2), vec![])] {
+            assert_eq!(
+                banned_tokens_windowed_ngram(&gapped, 3, window, &[]),
+                want,
+                "window {window:?}"
+            );
+        }
+        let short = [1u32, 2, 3, 1, 2, 3, 1, 2];
+        assert!(banned_tokens_windowed_ngram(&short, 3, Some(3), &[]).is_empty());
         assert_eq!(
-            banned_tokens_windowed_ngram(&seq, 3, None, &[]),
-            banned_tokens_no_repeat_ngram(&seq, 3)
+            banned_tokens_windowed_ngram(&short, 3, Some(6), &[]),
+            vec![3]
         );
-        assert_eq!(
-            banned_tokens_windowed_ngram(&seq, 3, Some(seq.len()), &[]),
-            banned_tokens_no_repeat_ngram(&seq, 3)
-        );
-        assert_eq!(
-            banned_tokens_windowed_ngram(&seq, 3, Some(1000), &[]),
-            banned_tokens_no_repeat_ngram(&seq, 3)
-        );
-    }
 
-    #[test]
-    fn windowed_ngram_ignores_matches_outside_window() {
-        let seq = [1u32, 2, 3, 9, 9, 9, 9, 1, 2, 4, 1, 2];
-        assert_eq!(banned_tokens_windowed_ngram(&seq, 3, None, &[]), vec![3, 4]);
-        assert_eq!(banned_tokens_windowed_ngram(&seq, 3, Some(5), &[]), vec![4]);
-        assert!(banned_tokens_windowed_ngram(&seq, 3, Some(2), &[]).is_empty());
-    }
-
-    #[test]
-    fn windowed_ngram_whitelist_exempts_tokens() {
-        let seq = [
+        let td = [TD_OPEN_TOKEN_ID, TD_CLOSE_TOKEN_ID];
+        let tagged = [
             1u32,
             2,
             TD_OPEN_TOKEN_ID,
@@ -2578,53 +2472,32 @@ mod tests {
             2,
         ];
         assert_eq!(
-            banned_tokens_windowed_ngram(&seq, 3, None, &[]),
-            vec![TD_OPEN_TOKEN_ID, TD_CLOSE_TOKEN_ID]
+            banned_tokens_windowed_ngram(&tagged, 3, None, &[]),
+            td.to_vec()
         );
-        assert!(banned_tokens_windowed_ngram(
-            &seq,
-            3,
-            None,
-            &[TD_OPEN_TOKEN_ID, TD_CLOSE_TOKEN_ID]
-        )
-        .is_empty());
-        let seq2 = [1u32, 2, TD_OPEN_TOKEN_ID, 5, 1, 2, 8, 7, 1, 2];
-        assert_eq!(
-            banned_tokens_windowed_ngram(&seq2, 3, None, &[TD_OPEN_TOKEN_ID, TD_CLOSE_TOKEN_ID]),
-            vec![8]
-        );
+        assert!(banned_tokens_windowed_ngram(&tagged, 3, None, &td).is_empty());
+        let mixed = [1u32, 2, TD_OPEN_TOKEN_ID, 5, 1, 2, 8, 7, 1, 2];
+        assert_eq!(banned_tokens_windowed_ngram(&mixed, 3, None, &td), vec![8]);
     }
 
     #[test]
-    fn windowed_ngram_window_shorter_than_ngram_bans_nothing() {
-        let seq = [1u32, 2, 3, 1, 2, 3, 1, 2];
-        assert!(banned_tokens_windowed_ngram(&seq, 3, Some(3), &[]).is_empty());
-        assert_eq!(banned_tokens_windowed_ngram(&seq, 3, Some(6), &[]), vec![3]);
-    }
+    fn select_next_token_applies_windowed_ban_and_sampler_respects_temperature_and_bans() {
+        let mut rng = SplitMix64::new(42);
+        let logits = vec![0.1f32, 3.0, -1.0, 2.9];
+        assert_eq!(sample_token(&logits, 0.0, &mut rng).unwrap(), 1);
+        let mut counts = [0usize; 4];
+        for _ in 0..2000 {
+            let t = sample_token(&logits, 1.0, &mut rng).unwrap();
+            counts[t as usize] += 1;
+        }
+        assert!(counts[1] > counts[0]);
+        assert!(counts[1] > counts[2]);
+        assert!(counts[3] > counts[2]);
+        let banned = vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 1.0, f32::NEG_INFINITY];
+        for _ in 0..50 {
+            assert_eq!(sample_token(&banned, 0.7, &mut rng).unwrap(), 2);
+        }
 
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn graph_supported_rejects_cpu_model() {
-        let model = tiny_model();
-        let err = crate::deepseek_ocr::decoder_graph::graph_supported(&model).unwrap_err();
-        assert!(err.contains("CUDA"), "unexpected reason: {err}");
-    }
-
-    #[test]
-    fn generate_options_presets_match_recipe_and_hf() {
-        let r = GenerateOptions::recipe();
-        assert_eq!(r.no_repeat_ngram_size, Some(30));
-        assert_eq!(r.ngram_window, Some(90));
-        assert_eq!(r.ngram_whitelist, vec![TD_OPEN_TOKEN_ID, TD_CLOSE_TOKEN_ID]);
-        assert_eq!(r.temperature, 0.0);
-        let h = GenerateOptions::hf20();
-        assert_eq!(h.no_repeat_ngram_size, Some(20));
-        assert_eq!(h.ngram_window, None);
-        assert!(h.ngram_whitelist.is_empty());
-    }
-
-    #[test]
-    fn select_next_token_applies_windowed_ban() {
         let mut rng = SplitMix64::new(0);
         let all = [9u32, 1, 2, 9, 1];
         let base = GenerateOptions {
@@ -2663,7 +2536,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_loop_flags_pure_repeat_and_backtracks_onset() {
+    fn detect_loop_flags_pure_mutated_and_final_repeats_and_ignores_clean_or_brief_bursts() {
         let prefix: Vec<u32> = (1000..1100).collect();
         let unit: Vec<u32> = vec![7, 88, 3, 501, 42, 9, 260];
         let mut seq = prefix.clone();
@@ -2682,10 +2555,7 @@ mod tests {
         let mut truncated = seq.clone();
         truncated.truncate(d.onset);
         assert_eq!(&truncated[..prefix.len()], &prefix[..]);
-    }
 
-    #[test]
-    fn detect_loop_flags_mutated_repeat() {
         let prefix: Vec<u32> = (2000..2120).collect();
         let unit: Vec<u32> = vec![11, 12, 13, 14, 15, 16, 17, 18, 19];
         let mut seq = prefix.clone();
@@ -2700,27 +2570,12 @@ mod tests {
         let d = detect_loop(&seq).expect("mutated repeat must be detected");
         assert_eq!(d.period % unit.len(), 0);
         assert!(
-            d.onset <= prefix.len() + 3 * unit.len(),
-            "onset {} too far past loop start {}",
+            d.onset >= prefix.len() && d.onset <= prefix.len() + 3 * unit.len(),
+            "onset {} not within the mutated loop start {}",
             d.onset,
             prefix.len()
         );
-        assert!(
-            d.onset >= prefix.len(),
-            "onset {} backtracked into clean prefix",
-            d.onset
-        );
-    }
 
-    #[test]
-    fn detect_loop_ignores_clean_sequences() {
-        assert!(detect_loop(&pseudo_random_seq(3000, 8000, 1)).is_none());
-        assert!(detect_loop(&pseudo_random_seq(3000, 60, 2)).is_none());
-        assert!(detect_loop(&pseudo_random_seq(100, 8000, 3)).is_none());
-    }
-
-    #[test]
-    fn detect_loop_truncates_at_final_loop_run_not_first() {
         let unit = [21u32, 22, 23, 24, 25, 26, 27];
         let mut seq = pseudo_random_seq(300, 8000, 6);
         for _ in 0..57 {
@@ -2733,21 +2588,15 @@ mod tests {
         }
         let d = detect_loop(&seq).expect("interleaved loop must be detected");
         assert!(
-            d.onset >= second_loop_start,
-            "onset {} cut real content before final loop run at {}",
+            d.onset >= second_loop_start && d.onset <= second_loop_start + 3 * unit.len(),
+            "onset {} must sit at the final loop run starting at {}",
             d.onset,
             second_loop_start
         );
-        assert!(
-            d.onset <= second_loop_start + 3 * unit.len(),
-            "onset {} too far into final loop run at {}",
-            d.onset,
-            second_loop_start
-        );
-    }
 
-    #[test]
-    fn detect_loop_ignores_brief_repetition_burst() {
+        assert!(detect_loop(&pseudo_random_seq(3000, 8000, 1)).is_none());
+        assert!(detect_loop(&pseudo_random_seq(3000, 60, 2)).is_none());
+        assert!(detect_loop(&pseudo_random_seq(100, 8000, 3)).is_none());
         let mut seq = pseudo_random_seq(1000, 8000, 4);
         let unit = [5u32, 6, 7, 8, 9];
         for _ in 0..30 {
@@ -2784,113 +2633,6 @@ mod tests {
         assert_eq!(strip_grounding_tokens(&[1, 2, 3]), vec![1, 2, 3]);
         let unclosed = vec![10, DET_OPEN_TOKEN_ID, 600, 601];
         assert_eq!(strip_grounding_tokens(&unclosed), vec![10]);
-    }
-
-    #[test]
-    #[ignore]
-    fn loopscan_saved_outputs() {
-        let tok_path = std::env::var("NV_LOOPSCAN_TOKENIZER").expect("NV_LOOPSCAN_TOKENIZER");
-        let dir = std::env::var("NV_LOOPSCAN_DIR").expect("NV_LOOPSCAN_DIR");
-        let tokenizer = nv_tokenizer::load_tokenizer(Path::new(&tok_path)).unwrap();
-        let mut files: Vec<std::path::PathBuf> = walk_txt(Path::new(&dir));
-        files.sort();
-        for f in files {
-            let text = std::fs::read_to_string(&f).unwrap();
-            let ids = tokenizer.encode(text.as_str(), false).unwrap();
-            let seq = ids.get_ids();
-            let mut max_periodic = 0f32;
-            let mut min_distinct = 1f32;
-            let mut c = LOOP_MIN_EVIDENCE;
-            while c <= seq.len() {
-                let w = LOOP_WINDOW.min(c);
-                if w >= LOOP_MIN_EVIDENCE {
-                    let start = c - w;
-                    for p in 1..=LOOP_MAX_PERIOD.min(w / 2) {
-                        let m = ((start + p)..c).filter(|&i| seq[i] == seq[i - p]).count();
-                        let r = m as f32 / (w - p) as f32;
-                        if r > max_periodic {
-                            max_periodic = r;
-                        }
-                    }
-                    let mut set = std::collections::HashSet::new();
-                    let n8 = w - 7;
-                    for i in start..(c - 7) {
-                        set.insert(&seq[i..i + 8]);
-                    }
-                    let dr = set.len() as f32 / n8 as f32;
-                    if dr < min_distinct {
-                        min_distinct = dr;
-                    }
-                }
-                if c == seq.len() {
-                    break;
-                }
-                c = (c + LOOP_CHECK_STRIDE).min(seq.len());
-            }
-            match detect_loop(seq) {
-                Some(d) => {
-                    if let Ok(outdir) = std::env::var("NV_LOOPSCAN_OUT") {
-                        let rel = f.strip_prefix(Path::new(&dir)).unwrap();
-                        let out = Path::new(&outdir).join(rel);
-                        std::fs::create_dir_all(out.parent().unwrap()).unwrap();
-                        let trunc = tokenizer.decode(&seq[..d.onset], true).unwrap();
-                        std::fs::write(out, trunc).unwrap();
-                    }
-                    println!(
-                        "LOOP {} tokens={} onset={} period={} kept={:.2} maxper={:.3} mindis={:.3}",
-                        f.display(),
-                        seq.len(),
-                        d.onset,
-                        d.period,
-                        d.onset as f64 / seq.len() as f64,
-                        max_periodic,
-                        min_distinct
-                    )
-                }
-                None => println!(
-                    "CLEAN {} tokens={} maxper={:.3} mindis={:.3}",
-                    f.display(),
-                    seq.len(),
-                    max_periodic,
-                    min_distinct
-                ),
-            }
-        }
-    }
-
-    fn walk_txt(dir: &Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return out;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                out.extend(walk_txt(&p));
-            } else if p.extension().map(|x| x == "txt").unwrap_or(false) {
-                out.push(p);
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn sampling_greedy_and_temperature() {
-        let mut rng = SplitMix64::new(42);
-        let logits = vec![0.1f32, 3.0, -1.0, 2.9];
-        assert_eq!(sample_token(&logits, 0.0, &mut rng).unwrap(), 1);
-        let mut counts = [0usize; 4];
-        for _ in 0..2000 {
-            let t = sample_token(&logits, 1.0, &mut rng).unwrap();
-            counts[t as usize] += 1;
-        }
-        assert!(counts[1] > counts[0]);
-        assert!(counts[1] > counts[2]);
-        assert!(counts[3] > counts[2]);
-        let banned = vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 1.0, f32::NEG_INFINITY];
-        for _ in 0..50 {
-            assert_eq!(sample_token(&banned, 0.7, &mut rng).unwrap(), 2);
-        }
     }
 
     fn route_sort_ref(

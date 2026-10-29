@@ -1,5 +1,6 @@
 #![cfg(feature = "cuda")]
 
+use anyhow::ensure;
 use std::ffi::c_void;
 
 pub type CudaStreamRaw = *mut c_void;
@@ -83,7 +84,7 @@ pub struct FlashFwdParams {
     pub seqlenq_ngroups_swapped: bool,
 }
 
-extern "C" {
+unsafe extern "C" {
 
     #[link_name = "_Z11run_mha_fwdR16Flash_fwd_paramsP11CUstream_st"]
     fn run_mha_fwd(params: *mut FlashFwdParams, stream: CudaStreamRaw);
@@ -112,88 +113,90 @@ pub struct VarlenArgs {
 }
 
 pub unsafe fn varlen_fwd_bf16(stream: CudaStreamRaw, a: &VarlenArgs) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        a.d.is_multiple_of(8) && a.d <= 256,
-        "fa2 shim: head dim {}",
-        a.d
-    );
-    anyhow::ensure!(
-        a.h.is_multiple_of(a.h_k),
-        "fa2 shim: h {} % h_k {}",
-        a.h,
-        a.h_k
-    );
+    unsafe {
+        ensure!(
+            a.d.is_multiple_of(8) && a.d <= 256,
+            "fa2 shim: head dim {}",
+            a.d
+        );
+        ensure!(
+            a.h.is_multiple_of(a.h_k),
+            "fa2 shim: h {} % h_k {}",
+            a.h,
+            a.h_k
+        );
 
-    let mut window_size_left = a
-        .window_size_left
-        .filter(|v| *v <= a.max_seqlen_k)
-        .map(|v| v as i32)
-        .unwrap_or(-1);
-    let mut window_size_right = a
-        .window_size_right
-        .filter(|v| *v <= a.max_seqlen_k)
-        .map(|v| v as i32)
-        .unwrap_or(-1);
-    let is_causal = window_size_left < 0 && window_size_right == 0;
-    if window_size_left < 0 && window_size_right >= 0 {
-        window_size_left = a.max_seqlen_k as i32;
+        let mut window_size_left = a
+            .window_size_left
+            .filter(|v| *v <= a.max_seqlen_k)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+        let mut window_size_right = a
+            .window_size_right
+            .filter(|v| *v <= a.max_seqlen_k)
+            .map(|v| v as i32)
+            .unwrap_or(-1);
+        let is_causal = window_size_left < 0 && window_size_right == 0;
+        if window_size_left < 0 && window_size_right >= 0 {
+            window_size_left = a.max_seqlen_k as i32;
+        }
+        if window_size_left >= 0 && window_size_right < 0 {
+            window_size_right = a.max_seqlen_k as i32;
+        }
+
+        let head_size = round_multiple(a.d, 8);
+        let head_size_rounded = round_multiple(head_size, 32);
+        let seqlen_q_rounded = round_multiple(a.max_seqlen_q, 128);
+        let seqlen_k_rounded = round_multiple(a.max_seqlen_k, 128);
+
+        let mut p: FlashFwdParams = std::mem::zeroed();
+        p.q_ptr = a.q_ptr as *mut c_void;
+        p.k_ptr = a.k_ptr as *mut c_void;
+        p.v_ptr = a.v_ptr as *mut c_void;
+        p.o_ptr = a.o_ptr as *mut c_void;
+        p.softmax_lse_ptr = a.lse_ptr as *mut c_void;
+        p.q_batch_stride = 0;
+        p.k_batch_stride = 0;
+        p.v_batch_stride = 0;
+        p.o_batch_stride = 0;
+        p.q_row_stride = (a.h * a.d) as i64;
+        p.k_row_stride = (a.h_k * a.d) as i64;
+        p.v_row_stride = (a.h_k * a.d) as i64;
+        p.o_row_stride = (a.h * a.d) as i64;
+        p.q_head_stride = a.d as i64;
+        p.k_head_stride = a.d as i64;
+        p.v_head_stride = a.d as i64;
+        p.o_head_stride = a.d as i64;
+        p.b = 1;
+        p.h = a.h as i32;
+        p.h_k = a.h_k as i32;
+        p.h_h_k_ratio = (a.h / a.h_k) as i32;
+        p.seqlen_q = a.max_seqlen_q as i32;
+        p.seqlen_k = a.max_seqlen_k as i32;
+        p.seqlen_q_rounded = seqlen_q_rounded as i32;
+        p.seqlen_k_rounded = seqlen_k_rounded as i32;
+        p.d = head_size as i32;
+        p.d_rounded = head_size_rounded as i32;
+        p.scale_softmax = a.softmax_scale;
+        p.scale_softmax_log2 = a.softmax_scale * std::f32::consts::LOG2_E;
+        p.softcap = 0.0;
+        p.p_dropout = 1.0;
+        p.p_dropout_in_uint8_t = 255;
+        p.rp_dropout = 1.0;
+        p.scale_softmax_rp_dropout = p.scale_softmax;
+        p.is_bf16 = true;
+        p.cu_seqlens_q = a.cu_seqlens_q as *mut i32;
+        p.cu_seqlens_k = a.cu_seqlens_k as *mut i32;
+        p.is_causal = is_causal;
+        p.window_size_left = window_size_left;
+        p.window_size_right = window_size_right;
+        p.is_seqlens_k_cumulative = true;
+        p.num_splits = 1;
+        p.unpadded_lse = true;
+
+        run_mha_fwd(&mut p, stream);
+        Ok(())
     }
-    if window_size_left >= 0 && window_size_right < 0 {
-        window_size_right = a.max_seqlen_k as i32;
-    }
-
-    let head_size = round_multiple(a.d, 8);
-    let head_size_rounded = round_multiple(head_size, 32);
-    let seqlen_q_rounded = round_multiple(a.max_seqlen_q, 128);
-    let seqlen_k_rounded = round_multiple(a.max_seqlen_k, 128);
-
-    let mut p: FlashFwdParams = std::mem::zeroed();
-    p.q_ptr = a.q_ptr as *mut c_void;
-    p.k_ptr = a.k_ptr as *mut c_void;
-    p.v_ptr = a.v_ptr as *mut c_void;
-    p.o_ptr = a.o_ptr as *mut c_void;
-    p.softmax_lse_ptr = a.lse_ptr as *mut c_void;
-    p.q_batch_stride = 0;
-    p.k_batch_stride = 0;
-    p.v_batch_stride = 0;
-    p.o_batch_stride = 0;
-    p.q_row_stride = (a.h * a.d) as i64;
-    p.k_row_stride = (a.h_k * a.d) as i64;
-    p.v_row_stride = (a.h_k * a.d) as i64;
-    p.o_row_stride = (a.h * a.d) as i64;
-    p.q_head_stride = a.d as i64;
-    p.k_head_stride = a.d as i64;
-    p.v_head_stride = a.d as i64;
-    p.o_head_stride = a.d as i64;
-    p.b = 1;
-    p.h = a.h as i32;
-    p.h_k = a.h_k as i32;
-    p.h_h_k_ratio = (a.h / a.h_k) as i32;
-    p.seqlen_q = a.max_seqlen_q as i32;
-    p.seqlen_k = a.max_seqlen_k as i32;
-    p.seqlen_q_rounded = seqlen_q_rounded as i32;
-    p.seqlen_k_rounded = seqlen_k_rounded as i32;
-    p.d = head_size as i32;
-    p.d_rounded = head_size_rounded as i32;
-    p.scale_softmax = a.softmax_scale;
-    p.scale_softmax_log2 = a.softmax_scale * std::f32::consts::LOG2_E;
-    p.softcap = 0.0;
-    p.p_dropout = 1.0;
-    p.p_dropout_in_uint8_t = 255;
-    p.rp_dropout = 1.0;
-    p.scale_softmax_rp_dropout = p.scale_softmax;
-    p.is_bf16 = true;
-    p.cu_seqlens_q = a.cu_seqlens_q as *mut i32;
-    p.cu_seqlens_k = a.cu_seqlens_k as *mut i32;
-    p.is_causal = is_causal;
-    p.window_size_left = window_size_left;
-    p.window_size_right = window_size_right;
-    p.is_seqlens_k_cumulative = true;
-    p.num_splits = 1;
-    p.unpadded_lse = true;
-
-    run_mha_fwd(&mut p, stream);
-    Ok(())
 }
 
 pub struct BatchDecodeArgs {
@@ -217,70 +220,72 @@ pub unsafe fn batch_decode_fwd_bf16(
     stream: CudaStreamRaw,
     a: &BatchDecodeArgs,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        a.d.is_multiple_of(8) && a.d <= 256,
-        "fa2 batch decode: head dim {}",
-        a.d
-    );
-    anyhow::ensure!(
-        a.h.is_multiple_of(a.h_k),
-        "fa2 batch decode: h {} % h_k {}",
-        a.h,
-        a.h_k
-    );
-    anyhow::ensure!(a.b > 0, "fa2 batch decode: b must be > 0");
+    unsafe {
+        ensure!(
+            a.d.is_multiple_of(8) && a.d <= 256,
+            "fa2 batch decode: head dim {}",
+            a.d
+        );
+        ensure!(
+            a.h.is_multiple_of(a.h_k),
+            "fa2 batch decode: h {} % h_k {}",
+            a.h,
+            a.h_k
+        );
+        ensure!(a.b > 0, "fa2 batch decode: b must be > 0");
 
-    let head_size = round_multiple(a.d, 8);
-    let head_size_rounded = round_multiple(head_size, 32);
-    let seqlen_q_rounded = round_multiple(1, 128);
-    let seqlen_k_rounded = round_multiple(a.max_seqlen_k, 128);
+        let head_size = round_multiple(a.d, 8);
+        let head_size_rounded = round_multiple(head_size, 32);
+        let seqlen_q_rounded = round_multiple(1, 128);
+        let seqlen_k_rounded = round_multiple(a.max_seqlen_k, 128);
 
-    let mut p: FlashFwdParams = std::mem::zeroed();
-    p.q_ptr = a.q_ptr as *mut c_void;
-    p.k_ptr = a.k_ptr as *mut c_void;
-    p.v_ptr = a.v_ptr as *mut c_void;
-    p.o_ptr = a.o_ptr as *mut c_void;
-    p.softmax_lse_ptr = a.lse_ptr as *mut c_void;
-    p.q_batch_stride = a.q_batch_stride as i64;
-    p.k_batch_stride = a.kv_batch_stride as i64;
-    p.v_batch_stride = a.kv_batch_stride as i64;
-    p.o_batch_stride = a.q_batch_stride as i64;
-    p.q_row_stride = (a.h * a.d) as i64;
-    p.k_row_stride = (a.h_k * a.d) as i64;
-    p.v_row_stride = (a.h_k * a.d) as i64;
-    p.o_row_stride = (a.h * a.d) as i64;
-    p.q_head_stride = a.d as i64;
-    p.k_head_stride = a.d as i64;
-    p.v_head_stride = a.d as i64;
-    p.o_head_stride = a.d as i64;
-    p.b = a.b as i32;
-    p.h = a.h as i32;
-    p.h_k = a.h_k as i32;
-    p.h_h_k_ratio = (a.h / a.h_k) as i32;
-    p.seqlen_q = 1;
-    p.seqlen_k = a.max_seqlen_k as i32;
-    p.seqlen_q_rounded = seqlen_q_rounded as i32;
-    p.seqlen_k_rounded = seqlen_k_rounded as i32;
-    p.d = head_size as i32;
-    p.d_rounded = head_size_rounded as i32;
-    p.scale_softmax = a.softmax_scale;
-    p.scale_softmax_log2 = a.softmax_scale * std::f32::consts::LOG2_E;
-    p.softcap = 0.0;
-    p.p_dropout = 1.0;
-    p.p_dropout_in_uint8_t = 255;
-    p.rp_dropout = 1.0;
-    p.scale_softmax_rp_dropout = p.scale_softmax;
-    p.is_bf16 = true;
-    p.cu_seqlens_q = std::ptr::null_mut();
-    p.cu_seqlens_k = std::ptr::null_mut();
-    p.seqused_k = a.seqused_k as *mut i32;
-    p.is_causal = true;
-    p.window_size_left = a.max_seqlen_k as i32;
-    p.window_size_right = 0;
-    p.is_seqlens_k_cumulative = true;
-    p.num_splits = 1;
-    p.unpadded_lse = false;
+        let mut p: FlashFwdParams = std::mem::zeroed();
+        p.q_ptr = a.q_ptr as *mut c_void;
+        p.k_ptr = a.k_ptr as *mut c_void;
+        p.v_ptr = a.v_ptr as *mut c_void;
+        p.o_ptr = a.o_ptr as *mut c_void;
+        p.softmax_lse_ptr = a.lse_ptr as *mut c_void;
+        p.q_batch_stride = a.q_batch_stride as i64;
+        p.k_batch_stride = a.kv_batch_stride as i64;
+        p.v_batch_stride = a.kv_batch_stride as i64;
+        p.o_batch_stride = a.q_batch_stride as i64;
+        p.q_row_stride = (a.h * a.d) as i64;
+        p.k_row_stride = (a.h_k * a.d) as i64;
+        p.v_row_stride = (a.h_k * a.d) as i64;
+        p.o_row_stride = (a.h * a.d) as i64;
+        p.q_head_stride = a.d as i64;
+        p.k_head_stride = a.d as i64;
+        p.v_head_stride = a.d as i64;
+        p.o_head_stride = a.d as i64;
+        p.b = a.b as i32;
+        p.h = a.h as i32;
+        p.h_k = a.h_k as i32;
+        p.h_h_k_ratio = (a.h / a.h_k) as i32;
+        p.seqlen_q = 1;
+        p.seqlen_k = a.max_seqlen_k as i32;
+        p.seqlen_q_rounded = seqlen_q_rounded as i32;
+        p.seqlen_k_rounded = seqlen_k_rounded as i32;
+        p.d = head_size as i32;
+        p.d_rounded = head_size_rounded as i32;
+        p.scale_softmax = a.softmax_scale;
+        p.scale_softmax_log2 = a.softmax_scale * std::f32::consts::LOG2_E;
+        p.softcap = 0.0;
+        p.p_dropout = 1.0;
+        p.p_dropout_in_uint8_t = 255;
+        p.rp_dropout = 1.0;
+        p.scale_softmax_rp_dropout = p.scale_softmax;
+        p.is_bf16 = true;
+        p.cu_seqlens_q = std::ptr::null_mut();
+        p.cu_seqlens_k = std::ptr::null_mut();
+        p.seqused_k = a.seqused_k as *mut i32;
+        p.is_causal = true;
+        p.window_size_left = a.max_seqlen_k as i32;
+        p.window_size_right = 0;
+        p.is_seqlens_k_cumulative = true;
+        p.num_splits = 1;
+        p.unpadded_lse = false;
 
-    run_mha_fwd(&mut p, stream);
-    Ok(())
+        run_mha_fwd(&mut p, stream);
+        Ok(())
+    }
 }

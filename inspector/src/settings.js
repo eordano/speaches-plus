@@ -35,7 +35,6 @@ export function setupSettings() {
     window.dispatchEvent(new Event('inspector:layoutChanged'));
   });
 
-  // Audio mode (STT vs Direct WAV).
   document.querySelectorAll('input[name="audio_mode"]').forEach(r => {
     r.addEventListener('change', () => {
       audioMode.dataset.mode = r.value;
@@ -53,7 +52,6 @@ export function setupSettings() {
     _promptTimer = setTimeout(() => send({ audio_direct_prompt: e.target.value }), 600);
   });
 
-  // VAD knobs.
   $('#vadThreshold').addEventListener('input', (e) => {
     const v = parseFloat(e.target.value);
     $('#vadThresholdVal').textContent = v.toFixed(2);
@@ -63,7 +61,6 @@ export function setupSettings() {
   numField('#vadSilence',   (n) => send({ turn_detection: { silence_duration_ms: n } }));
   numField('#vadBargeIn',   (n) => send({ turn_detection: { barge_in_delay_ms: n } }));
 
-  // Models.
   $('#modelStt').addEventListener('change', (e) => send({ input_audio_transcription: { model: e.target.value } }));
   $('#modelTts').addEventListener('change', (e) => {
     send({ speech_model: e.target.value });
@@ -89,7 +86,6 @@ export function setupSettings() {
     });
   }
 
-  // Pre-populate from session snapshot (called by new-session.js when the
   // server emits session.created).
   function populateSettings(session) {
     if (!session) return;
@@ -114,7 +110,6 @@ export function setupSettings() {
   }
   window.__inspectPopulateSettings = populateSettings;
 
-  // Catalog.
   fetchModelCatalog();
   enumerateDevices();
   ensureDevicePermission();

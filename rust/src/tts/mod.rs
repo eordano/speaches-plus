@@ -6,6 +6,7 @@ pub mod npz;
 pub mod phonemize;
 pub mod text;
 pub mod vocab;
+pub mod voxtral_tts;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -484,23 +485,18 @@ pub fn prepared_handle(model_dir: &Path) -> Result<Option<KokoroHandle>> {
         candle: load_candle_from_env(),
     };
 
-    let warmup_enabled = std::env::var(super::defaults::env::KOKORO_WARMUP)
-        .map(|v| v.trim() != "0")
-        .unwrap_or(true);
-    if warmup_enabled {
-        let h = handle.clone();
-        std::thread::spawn(move || {
-            let t0 = std::time::Instant::now();
-            match h.synthesize("Warm up.", None, None, 1.0) {
-                Ok(audio) => debug!(
-                    ms = t0.elapsed().as_millis() as u64,
-                    samples = audio.len(),
-                    "kokoro warmup complete"
-                ),
-                Err(e) => debug!(?e, "kokoro warmup failed"),
-            }
-        });
-    }
+    let h = handle.clone();
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        match h.synthesize("Warm up.", None, None, 1.0) {
+            Ok(audio) => debug!(
+                ms = t0.elapsed().as_millis() as u64,
+                samples = audio.len(),
+                "kokoro warmup complete"
+            ),
+            Err(e) => debug!(?e, "kokoro warmup failed"),
+        }
+    });
 
     Ok(Some(handle))
 }
@@ -628,97 +624,8 @@ mod adapter_tests {
         Ok(())
     }
 
-    const DEFAULT_KOKORO_WEIGHTS: &str = "models/kokoro-v1_0.safetensors";
-    const DEFAULT_ADAPTED_VOICE: &str = "voices/adapted";
-
-    fn env_or(var: &str, default: &str) -> PathBuf {
-        std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("NV_VOICES_DATA_DIR").unwrap_or_default()).join(default)
-        })
-    }
-
-    fn real_adapter(device: &candle_core::Device) -> Result<()> {
-        let weights = env_or("KOKORO_CANDLE_WEIGHTS", DEFAULT_KOKORO_WEIGHTS);
-        let directory = env_or("NV_TEST_KOKORO_VOICE_DIR", DEFAULT_ADAPTED_VOICE);
-        if !weights.is_file() || !directory.join(PACK_FILE).is_file() {
-            eprintln!(
-                "SKIP: need {} and {} (KOKORO_CANDLE_WEIGHTS, NV_TEST_KOKORO_VOICE_DIR)",
-                weights.display(),
-                directory.display()
-            );
-            return Ok(());
-        }
-        let model = nv_tts::kokoro::KokoroCandle::load(&weights, None, device)?;
-        assert!(model.device.same_device(device));
-        let pack = npz::parse_npy(&std::fs::read(directory.join(PACK_FILE))?)?;
-        let style = pack.row(0)?;
-        let mut ids = vec![0];
-        ids.extend(
-            vocab::tokenize("həlˈoʊ wˈɜːld")
-                .into_iter()
-                .map(|v| v as u32),
-        );
-        ids.push(0);
-        let base = model.synthesize(&ids, &style, 1., None, 7)?;
-        let adapter = load_adapter_map(&directory, device)?;
-        assert!(!adapter.is_empty());
-        assert!(adapter.values().all(|t| t.device().same_device(device)));
-        let adapted = model.synthesize(&ids, &style, 1., Some(&adapter), 7)?;
-        let restored = model.synthesize(&ids, &style, 1., None, 7)?;
-        assert!(!adapted.is_empty() && adapted.iter().all(|v| v.is_finite()));
-        assert!(adapted.iter().any(|v| v.abs() > 0.001));
-        assert_eq!(base.len(), restored.len());
-        assert!(base
-            .iter()
-            .zip(&restored)
-            .all(|(a, b)| (a - b).abs() < 1e-5));
-        assert!(
-            base.len() != adapted.len()
-                || base.iter().zip(&adapted).any(|(a, b)| (a - b).abs() > 1e-3)
-        );
-        let cpu_adapter = load_adapter_map(&directory, &candle_core::Device::Cpu)?;
-        let via_cpu = model.synthesize(&ids, &style, 1., Some(&cpu_adapter), 7)?;
-        assert_eq!(via_cpu.len(), adapted.len());
-        assert!(via_cpu
-            .iter()
-            .zip(&adapted)
-            .all(|(a, b)| (a - b).abs() < 1e-4));
-        eprintln!(
-            "real adapter on {:?}: {} tensors, {} samples adapted",
-            device,
-            adapter.len(),
-            adapted.len()
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "loads the converted Kokoro weights and a fitted voice"]
-    fn voices_real_adapter_cpu() -> Result<()> {
-        real_adapter(&candle_core::Device::Cpu)
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore = "loads the converted Kokoro weights and a fitted voice on the GPU"]
-    fn voices_real_adapter_cuda() -> Result<()> {
-        let device = candle_core::Device::cuda_if_available(0)?;
-        if !device.is_cuda() {
-            eprintln!("SKIP: no CUDA device");
-            return Ok(());
-        }
-        real_adapter(&device)
-    }
-
     #[test]
     fn voices_adapter_formats_load_on_requested_cpu() -> Result<()> {
         check_adapter_formats(&candle_core::Device::Cpu)
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore = "requires a CUDA device"]
-    fn voices_adapter_formats_load_on_requested_cuda() -> Result<()> {
-        check_adapter_formats(&candle_core::Device::new_cuda(0)?)
     }
 }

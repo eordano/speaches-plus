@@ -254,25 +254,24 @@ mod tests {
     }
 
     #[test]
-    fn preserves_split_utf8_and_json() {
+    fn capture_preserves_split_utf8_json_sse_and_binary() {
         let mut c = Capture::default();
         for byte in "{\"prompt\":\"蜂\"}".as_bytes() {
             c.append(&[*byte]);
         }
         assert_eq!(c.value(), json!({"prompt": "蜂"}));
+        {
+            let mut c = Capture::default();
+            c.append(b"data: {\"text\":\"hello\"}\n\n");
+            c.append(b"data: [DONE]\n\n");
+            assert_eq!(
+                c.value(),
+                json!("data: {\"text\":\"hello\"}\n\ndata: [DONE]\n\n")
+            );
+            let mut binary = Capture::default();
+            binary.append(&[0xff, 0x00]);
+            assert_eq!(binary.value(), json!({"encoding":"base64", "data":"/wA="}));
+        }
     }
 
-    #[test]
-    fn preserves_sse_and_binary() {
-        let mut c = Capture::default();
-        c.append(b"data: {\"text\":\"hello\"}\n\n");
-        c.append(b"data: [DONE]\n\n");
-        assert_eq!(
-            c.value(),
-            json!("data: {\"text\":\"hello\"}\n\ndata: [DONE]\n\n")
-        );
-        let mut binary = Capture::default();
-        binary.append(&[0xff, 0x00]);
-        assert_eq!(binary.value(), json!({"encoding":"base64", "data":"/wA="}));
-    }
 }

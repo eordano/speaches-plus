@@ -11,7 +11,6 @@ import (
 
 	"github.com/eordano/speaches-plus-go/internal/audio"
 	"github.com/eordano/speaches-plus-go/internal/stt"
-	"github.com/eordano/speaches-plus-go/internal/wire"
 )
 
 func base64Encode(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
@@ -629,10 +628,6 @@ func (p *sessionPipeline) emitSessionUpdated(sess session) {
 	p.dispatch(ev, ev.EventID)
 }
 
-func (p *sessionPipeline) emitError(code, message string) {
-	p.emitErrorTyped("invalid_request_error", code, message, "")
-}
-
 func (p *sessionPipeline) emitErrorCode(code, message string) {
 	p.emitErrorTyped(errorTypeFor(code), code, message, "")
 }
@@ -768,141 +763,6 @@ func (p *sessionPipeline) emitTranscriptionFailed(itemID, message string) {
 			Code:    "stt_failed",
 			Message: message,
 		},
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitInputAudioTranscriptionDelta(itemID, delta string) {
-	ev := transcriptionDeltaEvent{
-		EventID:    newEventID(),
-		Type:       SETInputAudioTranscriptionDelta,
-		ItemID:     itemID,
-		ContentIdx: 0,
-		Delta:      delta,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitConversationItemDone(item conversationItemDetail) {
-	ev := conversationItemDoneEvent{
-		EventID: newEventID(),
-		Type:    SETConversationItemDone,
-		Item:    item,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitConversationItemRetrieved(item conversationItemDetail) {
-	ev := conversationItemRetrievedEvent{
-		EventID: newEventID(),
-		Type:    SETConversationItemRetrieved,
-		Item:    item,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitResponseOutputTextDelta(respID, itemID string, outIdx, contIdx int, delta string) {
-	ev := responseOutputTextDeltaEvent{
-		EventID:      newEventID(),
-		Type:         SETResponseOutputTextDelta,
-		ResponseID:   respID,
-		ItemID:       itemID,
-		OutputIndex:  outIdx,
-		ContentIndex: contIdx,
-		Delta:        delta,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitResponseOutputTextDone(respID, itemID string, outIdx, contIdx int, text string) {
-	ev := responseOutputTextDoneEvent{
-		EventID:      newEventID(),
-		Type:         SETResponseOutputTextDone,
-		ResponseID:   respID,
-		ItemID:       itemID,
-		OutputIndex:  outIdx,
-		ContentIndex: contIdx,
-		Text:         text,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitResponseFunctionCallArgumentsDelta(respID, itemID string, outIdx int, callID, delta string) {
-	ev := responseFunctionCallArgumentsDeltaEvent{
-		EventID:     newEventID(),
-		Type:        SETResponseFunctionCallArgumentsDelta,
-		ResponseID:  respID,
-		ItemID:      itemID,
-		OutputIndex: outIdx,
-		CallID:      callID,
-		Delta:       delta,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitResponseFunctionCallArgumentsDone(respID, itemID string, outIdx int, callID, arguments string) {
-	ev := responseFunctionCallArgumentsDoneEvent{
-		EventID:     newEventID(),
-		Type:        SETResponseFunctionCallArgumentsDone,
-		ResponseID:  respID,
-		ItemID:      itemID,
-		OutputIndex: outIdx,
-		CallID:      callID,
-		Arguments:   arguments,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitResponseToolProgress(respID string, tools []wire.ToolProgressEntry) {
-	ev := responseToolProgressEvent{
-		EventID:    newEventID(),
-		Type:       SETResponseToolProgress,
-		ResponseID: respID,
-		Tools:      tools,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitResponseCancelledStandalone(respID string) {
-	ev := responseCancelledEvent{
-		EventID:    newEventID(),
-		Type:       SETResponseCancelled,
-		ResponseID: respID,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitOutputAudioBufferCleared() {
-	ev := outputAudioBufferClearedEvent{
-		EventID: newEventID(),
-		Type:    SETOutputAudioBufferCleared,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitOutputAudioBufferStarted(respID string) {
-	ev := outputAudioBufferStartedEvent{
-		EventID:    newEventID(),
-		Type:       SETOutputAudioBufferStarted,
-		ResponseID: respID,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitOutputAudioBufferStopped(respID string) {
-	ev := outputAudioBufferStoppedEvent{
-		EventID:    newEventID(),
-		Type:       SETOutputAudioBufferStopped,
-		ResponseID: respID,
-	}
-	p.dispatch(ev, ev.EventID)
-}
-
-func (p *sessionPipeline) emitRateLimitsUpdated(limits []rateLimitInfo) {
-	ev := rateLimitsUpdatedEvent{
-		EventID:    newEventID(),
-		Type:       SETRateLimitsUpdated,
-		RateLimits: limits,
 	}
 	p.dispatch(ev, ev.EventID)
 }

@@ -219,6 +219,7 @@ struct GdRmsParams {
 
 @compute @workgroup_size(128)
 fn rms_no_weight_bf16_f32(
+    #def b2
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
@@ -236,6 +237,7 @@ fn rms_no_weight_bf16_f32(
         partial = fma(v, v, partial);
     }
     let total = gd_block_sum(lid, partial);
+    #end
     let inv = inverseSqrt(gd_div_rn(total, f32(dim)) + gd_rms_p.eps);
     for (var d = lid; d < dim; d = d + GD_BLOCK) {
         gd_rms_y[base + d] = inv * bf16_decode(gd_rms_x[base + d]);
@@ -244,23 +246,7 @@ fn rms_no_weight_bf16_f32(
 
 @compute @workgroup_size(128)
 fn rmsnorm_bf16w_f32out(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let r = gd_row(wg, nwg);
-    if (r >= gd_rms_p.rows) {
-        return;
-    }
-    let lid = tid.x;
-    let dim = gd_rms_p.dim;
-    let base = r * dim;
-    var partial = 0.0;
-    for (var d = lid; d < dim; d = d + GD_BLOCK) {
-        let v = bf16_decode(gd_rms_x[base + d]);
-        partial = fma(v, v, partial);
-    }
-    let total = gd_block_sum(lid, partial);
+    #use b2
     let inv = inverseSqrt(gd_div_rn(total, f32(dim)) + gd_rms_p.eps);
     for (var d = lid; d < dim; d = d + GD_BLOCK) {
         let n = inv * bf16_decode(gd_rms_x[base + d]);
@@ -270,23 +256,7 @@ fn rmsnorm_bf16w_f32out(
 
 @compute @workgroup_size(128)
 fn rstd_bf16(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let r = gd_row(wg, nwg);
-    if (r >= gd_rms_p.rows) {
-        return;
-    }
-    let lid = tid.x;
-    let dim = gd_rms_p.dim;
-    let base = r * dim;
-    var partial = 0.0;
-    for (var d = lid; d < dim; d = d + GD_BLOCK) {
-        let v = bf16_decode(gd_rms_x[base + d]);
-        partial = fma(v, v, partial);
-    }
-    let total = gd_block_sum(lid, partial);
+    #use b2
     if (lid == 0u) {
         gd_rms_y[r] = inverseSqrt(gd_div_rn(total, f32(dim)) + gd_rms_p.eps);
     }
@@ -516,6 +486,7 @@ fn argmax_bf16_stage1(
     var i = i32(wg.x * GD_BLOCK + lid);
     while (i < n) {
         let v = bf16_decode(gd_am_logits[u32(i)]);
+        #def b1
         let finite = (v == v) && (abs(v) != gd_pos_inf());
         if (finite && (v > best || (v == best && i < bidx))) {
             best = v;
@@ -527,6 +498,7 @@ fn argmax_bf16_stage1(
     gd_am_idx[lid] = bidx;
     workgroupBarrier();
     for (var s = GD_BLOCK / 2u; s > 0u; s = s >> 1u) {
+        #def b3
         if (lid < s) {
             let ov = gd_am_val[lid + s];
             let oi = gd_am_idx[lid + s];
@@ -538,6 +510,8 @@ fn argmax_bf16_stage1(
         workgroupBarrier();
     }
     if (lid == 0u) {
+        #end
+        #end
         gd_am_part_val[wg.x] = gd_am_val[0];
         gd_am_part_idx[wg.x] = gd_am_idx[0];
     }
@@ -555,17 +529,7 @@ fn argmax_bf16_stage2(@builtin(local_invocation_id) tid: vec3<u32>) {
     }
     workgroupBarrier();
     for (var s = GD_ARGMAX_BLOCKS / 2u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            let ov = gd_am_val[lid + s];
-            let oi = gd_am_idx[lid + s];
-            if (ov > gd_am_val[lid] || (ov == gd_am_val[lid] && oi < gd_am_idx[lid])) {
-                gd_am_val[lid] = ov;
-                gd_am_idx[lid] = oi;
-            }
-        }
-        workgroupBarrier();
-    }
-    if (lid == 0u) {
+        #use b3
         let t = select(u32(gd_am_idx[0]), 0u, gd_am_idx[0] == 2147483647);
         gd_am_token[0] = t;
         if (gd_am_p.has_ring != 0u) {
@@ -602,28 +566,7 @@ fn argmax_f32_rows_stage1(
     var i = i32(wg.x * GD_BLOCK + lid);
     while (i < n) {
         let v = gd_amf_logits[rowbase + u32(i)];
-        let finite = (v == v) && (abs(v) != gd_pos_inf());
-        if (finite && (v > best || (v == best && i < bidx))) {
-            best = v;
-            bidx = i;
-        }
-        i = i + stride;
-    }
-    gd_am_val[lid] = best;
-    gd_am_idx[lid] = bidx;
-    workgroupBarrier();
-    for (var s = GD_BLOCK / 2u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            let ov = gd_am_val[lid + s];
-            let oi = gd_am_idx[lid + s];
-            if (ov > gd_am_val[lid] || (ov == gd_am_val[lid] && oi < gd_am_idx[lid])) {
-                gd_am_val[lid] = ov;
-                gd_am_idx[lid] = oi;
-            }
-        }
-        workgroupBarrier();
-    }
-    if (lid == 0u) {
+        #use b1
         gd_amf_part_val[row * GD_ARGMAX_BLOCKS + wg.x] = gd_am_val[0];
         gd_amf_part_idx[row * GD_ARGMAX_BLOCKS + wg.x] = gd_am_idx[0];
     }
@@ -644,17 +587,7 @@ fn argmax_f32_rows_stage2(
     gd_am_idx[lid] = gd_amf_part_idx[row * GD_ARGMAX_BLOCKS + lid];
     workgroupBarrier();
     for (var s = GD_ARGMAX_BLOCKS / 2u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            let ov = gd_am_val[lid + s];
-            let oi = gd_am_idx[lid + s];
-            if (ov > gd_am_val[lid] || (ov == gd_am_val[lid] && oi < gd_am_idx[lid])) {
-                gd_am_val[lid] = ov;
-                gd_am_idx[lid] = oi;
-            }
-        }
-        workgroupBarrier();
-    }
-    if (lid == 0u) {
+        #use b3
         gd_amf_out[row] = select(u32(gd_am_idx[0]), 0u, gd_am_idx[0] == 2147483647);
     }
 }
@@ -692,28 +625,7 @@ fn argmax_softcap_bf16_stage1(
             v = nv_tanhf(x * gd_amc_p.inv_cap) * gd_amc_p.cap;
         }
         gd_amc_logits[u32(i)] = v;
-        let finite = (v == v) && (abs(v) != gd_pos_inf());
-        if (finite && (v > best || (v == best && i < bidx))) {
-            best = v;
-            bidx = i;
-        }
-        i = i + stride;
-    }
-    gd_am_val[lid] = best;
-    gd_am_idx[lid] = bidx;
-    workgroupBarrier();
-    for (var s = GD_BLOCK / 2u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            let ov = gd_am_val[lid + s];
-            let oi = gd_am_idx[lid + s];
-            if (ov > gd_am_val[lid] || (ov == gd_am_val[lid] && oi < gd_am_idx[lid])) {
-                gd_am_val[lid] = ov;
-                gd_am_idx[lid] = oi;
-            }
-        }
-        workgroupBarrier();
-    }
-    if (lid == 0u) {
+        #use b1
         gd_amf_part_val[wg.x] = gd_am_val[0];
         gd_amf_part_idx[wg.x] = gd_am_idx[0];
     }

@@ -1,7 +1,6 @@
 use crate::dp::{frame_to_time_ms, viterbi_align, AlignError};
 use crate::{AlignedSegment, WordTiming};
 
-#[allow(clippy::too_many_arguments)]
 pub fn align_with_logprobs(
     log_probs: &[f32],
     t: usize,
@@ -93,7 +92,7 @@ mod tests {
     const FRAME_S: f32 = 0.01;
 
     #[test]
-    fn pipeline_single_segment_no_punct() {
+    fn pipeline_single_segment_without_punctuation_and_a_held_token_keeps_its_duration() {
         let v = 4;
         let vocab: Vec<String> = vec!["<blk>".into(), "hello".into(), "world".into(), "_".into()];
         let lp = make_logprobs(&[1, 0, 2, 2, 0], v);
@@ -112,6 +111,17 @@ mod tests {
 
         assert!(approx(s.start, s.words[0].start, 1e-6));
         assert!(approx(s.end, s.words[s.words.len() - 1].end, 1e-6));
+
+        let v = 3;
+        let vocab: Vec<String> = vec!["<blk>".into(), "aaa".into(), "_".into()];
+        let lp = make_logprobs(&[1, 1, 1], v);
+        let segs = align_with_logprobs(&lp, 3, v, &[1], 0, &vocab, HOP, SR).unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].words.len(), 1);
+        let w = &segs[0].words[0];
+        assert!(w.start >= 0.0);
+        assert!(w.end > w.start, "a held token has a nonzero duration");
+        assert!(w.end <= 3.0 * FRAME_S + 1e-6);
     }
 
     #[test]
@@ -141,35 +151,16 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_held_token_has_nonzero_duration() {
-        let v = 3;
-        let vocab: Vec<String> = vec!["<blk>".into(), "aaa".into(), "_".into()];
-        let lp = make_logprobs(&[1, 1, 1], v);
-        let segs = align_with_logprobs(&lp, 3, v, &[1], 0, &vocab, HOP, SR).unwrap();
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].words.len(), 1);
-        let w = &segs[0].words[0];
-
-        assert!(w.start >= 0.0);
-        assert!(w.end > w.start);
-        assert!(w.end <= 3.0 * FRAME_S + 1e-6);
-    }
-
-    #[test]
-    fn pipeline_vocab_size_mismatch_errors() {
+    fn pipeline_rejects_a_vocab_size_mismatch_and_propagates_dp_errors() {
         let v = 3;
         let vocab: Vec<String> = vec!["<blk>".into(), "x".into()];
         let lp = make_logprobs(&[1], v);
         let err = align_with_logprobs(&lp, 1, v, &[1], 0, &vocab, HOP, SR).unwrap_err();
         assert!(matches!(err, AlignError::ShapeMismatch { .. }));
-    }
-
-    #[test]
-    fn pipeline_propagates_dp_errors() {
-        let v = 3;
         let vocab: Vec<String> = vec!["<blk>".into(), "a".into(), "_".into()];
         let lp = make_logprobs(&[1, 1], v);
         let err = align_with_logprobs(&lp, 2, v, &[1, 1], 0, &vocab, HOP, SR).unwrap_err();
-        assert!(matches!(err, AlignError::TooFewFrames { .. }));
+        assert!(matches!(err, AlignError::TooFewFrames { .. }), "dp errors propagate");
     }
+
 }

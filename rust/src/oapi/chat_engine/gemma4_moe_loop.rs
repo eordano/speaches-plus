@@ -5,7 +5,6 @@ use super::*;
 const PREFILL_CHUNK: usize = 256;
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_sampling_gemma4_moe(
     model: Arc<nv_models::gemma4_moe::Gemma4Moe>,
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -177,11 +176,7 @@ pub(crate) async fn run_sampling_gemma4_moe(
         }
     }
 
-    let _ = tx
-        .send(ChatEvent::Done {
-            finish_reason,
-            completion_tokens,
-        })
-        .await;
+    let _ =
+        send_stopped_by_then_done(tx, &mut emitter, finish_reason, completion_tokens, None).await;
     Ok(())
 }

@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result};
 
@@ -112,22 +110,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn params_keep_the_sixteen_byte_uniform_layout() {
-        assert_eq!(std::mem::size_of::<NormBwdParams>(), 16);
-    }
-
-    #[test]
-    fn scratch_const_tracks_both_workgroup_arrays() {
-        assert_eq!(
-            WGSL.matches("var<workgroup>").count(),
-            2,
-            "a new var<workgroup> must be summed into SCRATCH_BYTES"
-        );
-        assert_eq!(SCRATCH_BYTES, 2048);
-    }
-
-    #[test]
-    fn source_declares_the_entry() {
-        assert!(compose(WGSL).contains("fn qlora_bwd_rmsnorm("));
+    fn params_scratch_and_entry_follow_the_shader_contract() {
+        {
+            assert_eq!(std::mem::size_of::<NormBwdParams>(), 16);
+        }
+        {
+            assert_eq!(
+                WGSL.matches("var<workgroup>").count(),
+                2,
+                "a new var<workgroup> must be summed into SCRATCH_BYTES"
+            );
+            assert_eq!(SCRATCH_BYTES, 2048);
+        }
+        {
+            assert!(compose(WGSL).contains("fn qlora_bwd_rmsnorm("));
+        }
     }
 }

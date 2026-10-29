@@ -1,5 +1,6 @@
 import { createRoot } from 'react-dom/client';
-import { createBrowserRouter, RouterProvider, Navigate } from 'react-router';
+import { createBrowserRouter, Navigate } from 'react-router';
+import { RouterProvider } from 'react-router/dom';
 import './styles.css';
 
 if (localStorage.getItem('nur-theme') === 'paper') document.documentElement.dataset.theme = 'paper';

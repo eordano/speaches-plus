@@ -221,45 +221,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_emojis_removes_supported_ranges() {
+    fn text_normalization_strips_emojis_and_markdown_and_collapses_whitespace() {
         assert_eq!(strip_emojis("hello 🌍 world"), "hello  world");
         assert_eq!(strip_emojis("😀😃😄 plain"), " plain");
         assert_eq!(strip_emojis("plain"), "plain");
         assert_eq!(strip_emojis("✂ scissors"), " scissors");
+        {
+            assert_eq!(strip_markdown_emphasis("**bold**"), "bold");
+            assert_eq!(strip_markdown_emphasis("*italic*"), "italic");
+            assert_eq!(strip_markdown_emphasis("__under__"), "under");
+            assert_eq!(strip_markdown_emphasis("_under_"), "under");
+            assert_eq!(
+                strip_markdown_emphasis("a **bold** and *italic* mix"),
+                "a bold and italic mix"
+            );
+        }
+        {
+            let out = normalize_for_tts("  hello\n\nworld\t\ttest\r\n");
+            assert_eq!(out, "hello world test");
+        }
     }
 
     #[test]
-    fn strip_markdown_handles_all_emphasis_styles() {
-        assert_eq!(strip_markdown_emphasis("**bold**"), "bold");
-        assert_eq!(strip_markdown_emphasis("*italic*"), "italic");
-        assert_eq!(strip_markdown_emphasis("__under__"), "under");
-        assert_eq!(strip_markdown_emphasis("_under_"), "under");
-        assert_eq!(
-            strip_markdown_emphasis("a **bold** and *italic* mix"),
-            "a bold and italic mix"
-        );
-    }
-
-    #[test]
-    fn normalize_collapses_whitespace_and_newlines() {
-        let out = normalize_for_tts("  hello\n\nworld\t\ttest\r\n");
-        assert_eq!(out, "hello world test");
-    }
-
-    #[test]
-    fn split_returns_single_chunk_for_short_text() {
+    fn split_returns_one_chunk_for_short_text_and_breaks_on_sentences() {
         assert_eq!(split_into_chunks("short", 100), vec!["short".to_string()]);
         assert!(split_into_chunks("", 100).is_empty());
-    }
-
-    #[test]
-    fn split_breaks_on_sentence_boundaries() {
-        let text = "First sentence. Second sentence. Third sentence.";
-        let chunks = split_into_chunks(text, 25);
-        for c in &chunks {
-            assert!(c.chars().count() <= 25, "chunk too long: {c:?}");
+        {
+            let text = "First sentence. Second sentence. Third sentence.";
+            let chunks = split_into_chunks(text, 25);
+            for c in &chunks {
+                assert!(c.chars().count() <= 25, "chunk too long: {c:?}");
+            }
+            assert!(!chunks.is_empty());
         }
-        assert!(!chunks.is_empty());
     }
 
     #[test]

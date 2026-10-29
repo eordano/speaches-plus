@@ -210,27 +210,25 @@ fn identify_links_shared_speaker_and_proposes_host_then_clips_flag_overlap() {
 }
 
 #[test]
-fn pick_sentences_keeps_mid_length_capitalised_sentences_without_years() {
+fn pick_sentences_filters_and_chunk_merging_shifts_words() {
     let texts = vec![
         "The data center build out this year is bigger than anything the industry has done before. In 2024 we saw nothing like it at all in the market. short one. lowercase sentence that is long enough to pass the word count filter easily.".to_string(),
     ];
     let out = stages::pick_sentences(&texts, 10);
     assert_eq!(out, ["The data center build out this year is bigger than anything the industry has done before."]);
-}
-
-#[test]
-fn chunk_merging_shifts_segment_nested_and_top_level_words() {
-    let mut merged = serde_json::json!({"text": "", "segments": []});
-    let chunk = serde_json::json!({"text": "Hello", "segments": [{
-        "start": 0.5, "end": 2.0, "text": "Hello", "words": [{"start": 0.5, "end": 1.5, "word": "Hello"}]
-    }], "words": [{"start": 0.5, "end": 1.5, "word": "Hello"}]});
-    stages::merge_transcript(&mut merged, &chunk, 0.0);
-    stages::merge_transcript(&mut merged, &chunk, 1500.0);
-    assert_eq!(merged["text"], "Hello Hello");
-    assert_eq!(merged["segments"][1]["start"], 1500.5);
-    assert_eq!(merged["segments"][1]["words"][0]["end"], 1501.5);
-    assert_eq!(merged["words"][1]["start"], 1500.5);
-    assert_eq!(merged["segments"][0]["words"][0]["start"], 0.5);
+        {
+        let mut merged = serde_json::json!({"text": "", "segments": []});
+        let chunk = serde_json::json!({"text": "Hello", "segments": [{
+            "start": 0.5, "end": 2.0, "text": "Hello", "words": [{"start": 0.5, "end": 1.5, "word": "Hello"}]
+        }], "words": [{"start": 0.5, "end": 1.5, "word": "Hello"}]});
+        stages::merge_transcript(&mut merged, &chunk, 0.0);
+        stages::merge_transcript(&mut merged, &chunk, 1500.0);
+        assert_eq!(merged["text"], "Hello Hello");
+        assert_eq!(merged["segments"][1]["start"], 1500.5);
+        assert_eq!(merged["segments"][1]["words"][0]["end"], 1501.5);
+        assert_eq!(merged["words"][1]["start"], 1500.5);
+        assert_eq!(merged["segments"][0]["words"][0]["start"], 0.5);
+        }
 }
 
 #[test]

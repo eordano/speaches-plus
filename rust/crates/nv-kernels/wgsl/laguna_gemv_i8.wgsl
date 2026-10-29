@@ -25,6 +25,7 @@ var<workgroup> lg8_pk_bits: array<u32, 8>;
 
 @compute @workgroup_size(256)
 fn lgw_gemv_i8g_experts(
+    #def b1
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
@@ -38,6 +39,7 @@ fn lgw_gemv_i8g_experts(
     let live = row < lg8_p.n_rows;
     let words = select(0u, lg8_p.k_elems >> 2u, live);
     let wbase = select(0u, e * lg8_p.w_e_stride_words + row * (lg8_p.k_elems >> 2u), live);
+    #end
     let sbase = select(0u, (e * lg8_p.n_rows + row) * lg8_p.groups_per_row, live);
     let gshift = lg8_p.group_shift;
     let xw_base = ((slot / max(lg8_p.x_slot_div, 1u)) * lg8_p.x_slot_stride_elems) >> 1u;
@@ -60,6 +62,7 @@ fn lgw_gemv_i8g_experts(
     acc = acc + subgroupShuffleXor(acc, 1u);
     if (lane == 0u) {
         lg8_pk_bits[sgid] = bf16_encode(acc) & 0xffffu;
+    #def b2
     }
     workgroupBarrier();
     if ((sgid & 1u) == 0u && lane == 0u && live) {
@@ -70,22 +73,11 @@ fn lgw_gemv_i8g_experts(
         lg8_y[slot * lg8_p.y_slot_stride_words + (row >> 1u)] = word;
     }
 }
+    #end
 
 @compute @workgroup_size(256)
 fn lgw_gemv_i8_experts(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let slot = wid.z;
-    var e = slot;
-    if (lg8_p.use_sel == 1u) {
-        e = lg8_sel[slot];
-    }
-    let row = (wid.x + wid.y * lg8_p.groups_x) * 8u + sgid;
-    let live = row < lg8_p.n_rows;
-    let words = select(0u, lg8_p.k_elems >> 2u, live);
-    let wbase = select(0u, e * lg8_p.w_e_stride_words + row * (lg8_p.k_elems >> 2u), live);
+    #use b1
     let xw_base = ((slot / max(lg8_p.x_slot_div, 1u)) * lg8_p.x_slot_stride_elems) >> 1u;
     var acc = 0.0;
     for (var i = lane; i < words; i = i + 32u) {
@@ -105,13 +97,4 @@ fn lgw_gemv_i8_experts(
     if (lane == 0u) {
         let sr = lg8_s[e * lg8_p.n_rows + select(0u, row, live)];
         lg8_pk_bits[sgid] = bf16_encode(acc * sr) & 0xffffu;
-    }
-    workgroupBarrier();
-    if ((sgid & 1u) == 0u && lane == 0u && live) {
-        var word = lg8_pk_bits[sgid];
-        if (row + 1u < lg8_p.n_rows) {
-            word = word | (lg8_pk_bits[sgid + 1u] << 16u);
-        }
-        lg8_y[slot * lg8_p.y_slot_stride_words + (row >> 1u)] = word;
-    }
-}
+    #use b2

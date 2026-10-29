@@ -5,11 +5,11 @@ import (
 )
 
 var knownV2NoopEvents = map[string]struct{}{
-	"output_audio_buffer.clear":         {},
-	"output_audio_buffer.append":        {},
-	"input_audio_buffer.dtmf.received":  {},
-	"transcription_session.update":      {},
-	"response.cancel_audio":             {},
+	"output_audio_buffer.clear":        {},
+	"output_audio_buffer.append":       {},
+	"input_audio_buffer.dtmf.received": {},
+	"transcription_session.update":     {},
+	"response.cancel_audio":            {},
 }
 
 func isKnownV2NoopEvent(t string) bool {

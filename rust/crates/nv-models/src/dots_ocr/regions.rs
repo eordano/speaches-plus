@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn expansion_adds_descender_margin_and_clamps_to_the_image() {
+    fn expansion_adds_descender_margin_clamps_to_the_image_and_stops_at_the_title_above() {
         let p = page(r#"[{"bbox":[0,0,100,100],"category":"Text"}]"#);
         let regs = plan_regions(&p, 102, 200, false);
         assert_eq!(regs.len(), 1);
@@ -286,10 +286,32 @@ mod tests {
             (b[3] - 108.0).abs() < 1e-3,
             "bottom margin 8% of height: {b:?}"
         );
+        let p = page(
+            r#"[{"bbox":[0,0,300,15],"category":"Title"},
+                {"bbox":[0,16,600,700],"category":"Text"}]"#,
+        );
+        let regs = plan_regions(&p, 1000, 1000, false);
+        assert_eq!(regs.len(), 2);
+        assert_eq!(regs[0].category.as_deref(), Some("Title"));
+        assert!(
+            (regs[1].bbox[1] - 15.0).abs() < 1e-3,
+            "body top margin must clip at the title bottom: {regs:?}"
+        );
+        assert!(
+            regs[1].bbox[3] > 700.0,
+            "the unopposed bottom margin survives: {regs:?}"
+        );
     }
 
     #[test]
-    fn touching_paragraph_bands_stay_separate_but_substantial_overlaps_merge() {
+    fn touching_bands_stay_separate_overlaps_merge_and_mixed_category_merges_lose_the_category() {
+        let p = page(
+            r#"[{"bbox":[10,10,100,50],"category":"Title"},
+                {"bbox":[12,12,102,52],"category":"Text"}]"#,
+        );
+        let regs = plan_regions(&p, 1000, 1000, false);
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs[0].category, None);
         let p = page(
             r#"[{"bbox":[10,10,100,50],"category":"Text"},
                 {"bbox":[10,48,100,90],"category":"Text"},
@@ -306,41 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn merged_regions_of_differing_categories_lose_the_category() {
-        let p = page(
-            r#"[{"bbox":[10,10,100,50],"category":"Title"},
-                {"bbox":[12,12,102,52],"category":"Text"}]"#,
-        );
-        let regs = plan_regions(&p, 1000, 1000, false);
-        assert_eq!(regs.len(), 1);
-        assert_eq!(regs[0].category, None);
-    }
-
-    #[test]
-    fn pictures_are_skipped_unless_requested() {
-        let raw = r#"[{"bbox":[10,10,100,100],"category":"Picture"},
-                      {"bbox":[10,300,100,400],"category":"Text"}]"#;
-        let p = page(raw);
-        assert_eq!(plan_regions(&p, 1000, 1000, false).len(), 1);
-        assert_eq!(plan_regions(&p, 1000, 1000, true).len(), 2);
-    }
-
-    #[test]
-    fn reading_order_is_rows_top_to_bottom_then_left_to_right_when_no_gap_splits() {
-        let p = page(
-            r#"[{"bbox":[290,20,600,55],"category":"Text","text":"row1-right"},
-                {"bbox":[10,10,100,45],"category":"Text","text":"row1-left"},
-                {"bbox":[90,50,300,100],"category":"Text","text":"row2"}]"#,
-        );
-        let regs = plan_regions(&p, 1000, 1000, false);
-        assert_eq!(regs.len(), 3);
-        assert!(regs[0].bbox[0] < 100.0, "row 1 left first: {regs:?}");
-        assert!(regs[1].bbox[0] > 250.0, "row 1 right second: {regs:?}");
-        assert!(regs[2].bbox[1] > 40.0, "row 2 last: {regs:?}");
-    }
-
-    #[test]
-    fn two_columns_read_column_major_left_column_first() {
+    fn reading_order_is_row_major_without_a_gap_column_major_with_one_and_headers_lead() {
         let p = page(
             r#"[{"bbox":[600,100,900,200],"category":"Text"},
                 {"bbox":[100,100,500,200],"category":"Text"},
@@ -360,10 +348,6 @@ mod tests {
             ys[0] < ys[1] && ys[2] < ys[3],
             "top to bottom within columns: {ys:?}"
         );
-    }
-
-    #[test]
-    fn a_full_width_header_precedes_the_columns_below_it() {
         let p = page(
             r#"[{"bbox":[600,300,900,800],"category":"Text"},
                 {"bbox":[100,300,500,800],"category":"Text"},
@@ -376,49 +360,32 @@ mod tests {
             regs[1].bbox[0] < 200.0 && regs[2].bbox[0] > 500.0,
             "{regs:?}"
         );
-    }
-
-    #[test]
-    fn a_body_margin_stops_at_the_title_line_above_instead_of_annexing_it() {
         let p = page(
-            r#"[{"bbox":[0,0,300,15],"category":"Title"},
-                {"bbox":[0,16,600,700],"category":"Text"}]"#,
+            r#"[{"bbox":[290,20,600,55],"category":"Text","text":"row1-right"},
+                {"bbox":[10,10,100,45],"category":"Text","text":"row1-left"},
+                {"bbox":[90,50,300,100],"category":"Text","text":"row2"}]"#,
         );
         let regs = plan_regions(&p, 1000, 1000, false);
-        assert_eq!(regs.len(), 2);
-        assert_eq!(regs[0].category.as_deref(), Some("Title"));
-        assert!(
-            (regs[1].bbox[1] - 15.0).abs() < 1e-3,
-            "body top margin must clip at the title bottom: {regs:?}"
-        );
-        assert!(
-            regs[1].bbox[3] > 700.0,
-            "the unopposed bottom margin survives: {regs:?}"
-        );
+        assert_eq!(regs.len(), 3);
+        assert!(regs[0].bbox[0] < 100.0, "row 1 left first: {regs:?}");
+        assert!(regs[1].bbox[0] > 250.0, "row 1 right second: {regs:?}");
+        assert!(regs[2].bbox[1] > 40.0, "row 2 last: {regs:?}");
     }
 
     #[test]
-    fn degenerate_and_extreme_aspect_boxes_are_dropped() {
+    fn degenerate_boxes_missing_boxes_and_unrequested_pictures_yield_no_regions() {
         let p = page(
             r#"[{"bbox":[0,0,2,2],"category":"Text"},
                 {"bbox":[0,100,4000,102],"category":"Text"}]"#,
         );
         assert!(plan_regions(&p, 5000, 5000, false).is_empty());
-    }
-
-    #[test]
-    fn elements_without_bboxes_yield_no_regions() {
         let p = page(r#"[{"category":"Text","text":"no box"}]"#);
         assert!(plan_regions(&p, 1000, 1000, false).is_empty());
-    }
-
-    #[test]
-    fn pixel_bounds_round_outward_and_stay_inside_the_image() {
-        let r = Region {
-            bbox: [10.4, -3.0, 99.2, 1005.0],
-            category: None,
-        };
-        assert_eq!(r.pixel_bounds(100, 1000), (10, 0, 100, 1000));
+        let raw = r#"[{"bbox":[10,10,100,100],"category":"Picture"},
+                      {"bbox":[10,300,100,400],"category":"Text"}]"#;
+        let p = page(raw);
+        assert_eq!(plan_regions(&p, 1000, 1000, false).len(), 1);
+        assert_eq!(plan_regions(&p, 1000, 1000, true).len(), 2);
     }
 
     #[test]
@@ -438,16 +405,17 @@ mod tests {
     }
 
     #[test]
-    fn category_prefixes_mark_headers_but_never_double_hash() {
+    fn category_prefixes_pixel_bounds_and_env_pixels_helpers_behave() {
+        assert_eq!(env_pixels("NV_DOTS_TEST_UNSET_PIXELS_XYZ", 42), 42);
+        let r = Region {
+            bbox: [10.4, -3.0, 99.2, 1005.0],
+            category: None,
+        };
+        assert_eq!(r.pixel_bounds(100, 1000), (10, 0, 100, 1000));
         assert_eq!(category_prefix(Some("Title"), "Report"), "# ");
         assert_eq!(category_prefix(Some("Section-header"), "Intro"), "## ");
         assert_eq!(category_prefix(Some("Section-header"), "## Intro"), "");
         assert_eq!(category_prefix(Some("Text"), "body"), "");
         assert_eq!(category_prefix(None, "body"), "");
-    }
-
-    #[test]
-    fn env_pixels_falls_back_to_the_default_on_unset_or_garbage() {
-        assert_eq!(env_pixels("NV_DOTS_TEST_UNSET_PIXELS_XYZ", 42), 42);
     }
 }

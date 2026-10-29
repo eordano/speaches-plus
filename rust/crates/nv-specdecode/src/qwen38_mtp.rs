@@ -1,4 +1,4 @@
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Tensor};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -15,11 +15,7 @@ pub fn accept_tracking_selected(raw: Option<&str>) -> bool {
 }
 
 pub fn accept_tracking_selected_from_env() -> bool {
-    accept_tracking_selected(
-        std::env::var(NV_Q38_MTP_ACCEPT_TRACKING_ENV)
-            .ok()
-            .as_deref(),
-    )
+    accept_tracking_selected(env::var(NV_Q38_MTP_ACCEPT_TRACKING_ENV).ok().as_deref())
 }
 
 #[derive(Debug)]
@@ -88,16 +84,8 @@ mod acceptance_tracking_tests {
     use super::*;
 
     #[test]
-    fn absent_and_every_non_one_value_leave_fixed_k_alone() {
-        assert!(!accept_tracking_selected(None));
-        assert!(accept_tracking_selected(Some("1")));
-        for value in ["", "0", "true", " 1", "1 ", "2"] {
-            assert!(!accept_tracking_selected(Some(value)));
-        }
-    }
-
-    #[test]
-    fn full_window_is_required_and_old_observations_expire() {
+    fn tracking_selects_on_the_literal_one_needs_a_full_window_expires_old_rounds_and_holds_through_middle_acceptance(
+    ) {
         let mut policy = AcceptanceTrackingK::default();
         for _ in 0..16 {
             assert_eq!(policy.next_k_for_a_non_suffix_non_forced_round(), 3);
@@ -113,40 +101,7 @@ mod acceptance_tracking_tests {
             (policy.k2_rounds, policy.k3_rounds, policy.switches),
             (1, 17, 2)
         );
-    }
 
-    #[test]
-    fn thresholds_use_weighted_counts_and_low_is_strict_high_is_inclusive() {
-        let mut policy = AcceptanceTrackingK::default();
-        policy.live_k = 2;
-        for _ in 0..8 {
-            policy.record_committed_mtp_round_not_suffix(2, 2);
-        }
-        for _ in 0..6 {
-            policy.record_committed_mtp_round_not_suffix(1, 3);
-        }
-        for _ in 0..2 {
-            policy.record_committed_mtp_round_not_suffix(3, 3);
-        }
-        assert_eq!((policy.accepted, policy.drafted), (28, 40));
-        assert_eq!(policy.next_k_for_a_non_suffix_non_forced_round(), 3);
-        for _ in 0..8 {
-            policy.record_committed_mtp_round_not_suffix(1, 2);
-        }
-        for _ in 0..6 {
-            policy.record_committed_mtp_round_not_suffix(2, 3);
-        }
-        for _ in 0..2 {
-            policy.record_committed_mtp_round_not_suffix(1, 3);
-        }
-        assert_eq!((policy.accepted, policy.drafted), (22, 40));
-        assert_eq!(policy.next_k_for_a_non_suffix_non_forced_round(), 3);
-        policy.record_committed_mtp_round_not_suffix(0, 2);
-        assert_eq!(policy.next_k_for_a_non_suffix_non_forced_round(), 2);
-    }
-
-    #[test]
-    fn middle_acceptance_holds_the_previous_choice() {
         let mut policy = AcceptanceTrackingK::default();
         for _ in 0..16 {
             policy.record_committed_mtp_round_not_suffix(2, 3);
@@ -160,222 +115,54 @@ mod acceptance_tracking_tests {
             policy.record_committed_mtp_round_not_suffix(2, 3);
         }
         assert_eq!(policy.next_k_for_a_non_suffix_non_forced_round(), 2);
+        {
+            assert!(!accept_tracking_selected(None));
+            assert!(accept_tracking_selected(Some("1")));
+            for value in ["", "0", "true", " 1", "1 ", "2"] {
+                assert!(!accept_tracking_selected(Some(value)));
+            }
+
+            let mut policy = AcceptanceTrackingK::default();
+            policy.live_k = 2;
+            for _ in 0..8 {
+                policy.record_committed_mtp_round_not_suffix(2, 2);
+            }
+            for _ in 0..6 {
+                policy.record_committed_mtp_round_not_suffix(1, 3);
+            }
+            for _ in 0..2 {
+                policy.record_committed_mtp_round_not_suffix(3, 3);
+            }
+            assert_eq!((policy.accepted, policy.drafted), (28, 40));
+            assert_eq!(policy.next_k_for_a_non_suffix_non_forced_round(), 3);
+            for _ in 0..8 {
+                policy.record_committed_mtp_round_not_suffix(1, 2);
+            }
+            for _ in 0..6 {
+                policy.record_committed_mtp_round_not_suffix(2, 3);
+            }
+            for _ in 0..2 {
+                policy.record_committed_mtp_round_not_suffix(1, 3);
+            }
+            assert_eq!((policy.accepted, policy.drafted), (22, 40));
+            assert_eq!(policy.next_k_for_a_non_suffix_non_forced_round(), 3);
+            policy.record_committed_mtp_round_not_suffix(0, 2);
+            assert_eq!(policy.next_k_for_a_non_suffix_non_forced_round(), 2);
+        }
     }
 }
 
 pub const NV_DRAFTER_ENV: &str = "NV_DRAFTER";
 pub const NV_MTP_DRAFT_DIR_ENV: &str = "NV_MTP_DRAFT_DIR";
 pub const NV_MTP_K_ENV: &str = "NV_MTP_K";
-pub const NV_Q38_DRAFT_FP8_ENV: &str = "NV_Q38_DRAFT_FP8";
-pub const NV_Q38_MTP_REANCHOR_ENV: &str = "NV_Q38_MTP_REANCHOR";
-pub const NV_Q38_DRAFT_FAST_ENV: &str = "NV_Q38_DRAFT_FAST";
 pub const NV_Q38_MTP_STREAM_PREFILL_ENV: &str = "NV_Q38_MTP_STREAM_PREFILL";
 
-pub const PROMPT_DRAFTER_BATCH_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_REPLY_05_BITWISE_FNV_2048_168000_AND_ABBA_23B649C2D_22972E453_F49FC4925_740B083ED:
-    &str = "Prompt-only 4096-row batching: pg1342 complete 257-token FNVs 3e2a24d301c7e68e and \
-             337b62db0fecc2ae match fresh default; all 24 served ABBA outputs and acceptance \
-             counters match. User sign-off 2026-09-11 promotes the bitwise default; only UNSET \
-             changes, explicit 0 restores the old 16-row prompt catch-up, decode is untouched.";
-
-pub fn prompt_drafter_batch_from_raw_unset_on_user_sign_off_2026_09_11_explicit_values_unchanged(
-    raw: Option<&std::ffi::OsStr>,
-) -> bool {
-    match raw {
-        None => {
-            let _ = PROMPT_DRAFTER_BATCH_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_REPLY_05_BITWISE_FNV_2048_168000_AND_ABBA_23B649C2D_22972E453_F49FC4925_740B083ED;
-            true
-        }
-        Some(value) => value == "1",
-    }
-}
-
-#[cfg(test)]
-mod prompt_drafter_batch_resolver_tests {
-    use super::prompt_drafter_batch_from_raw_unset_on_user_sign_off_2026_09_11_explicit_values_unchanged as selected;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn only_unset_changes_and_explicit_zero_restores_the_old_prompt_path() {
-        assert!(selected(None));
-        assert!(selected(Some(OsStr::new("1"))));
-        for raw in ["0", "", " 1", "1 ", "true", "yes", "gate"] {
-            assert!(
-                !selected(Some(OsStr::new(raw))),
-                "explicit {raw:?} must retain the old off meaning"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_unicode_is_an_explicit_off_value_not_unset() {
-        use std::os::unix::ffi::OsStrExt;
-        assert!(!selected(Some(OsStr::from_bytes(&[0xff]))));
-    }
-}
-
 pub fn mtp_stream_prefill_selected_from_env() -> bool {
-    std::env::var(NV_Q38_MTP_STREAM_PREFILL_ENV).ok().as_deref() == Some("1")
-}
-
-pub const DRAFT_QUARTET_FAST_FP8_SPLITK_LMHEAD_NVFP4_DEFAULT_ON_CHAMPION_STACK_SIGNED_OFF_2026_09_02_EXPLICIT_0_RESTORES_EACH_PRE_FLIP_DRAFT_PATH:
-    &str = "0";
-
-pub fn draft_fast_device_chained_tokens_selected(raw: Option<&str>) -> bool {
-    raw.map(str::trim)
-        != Some(DRAFT_QUARTET_FAST_FP8_SPLITK_LMHEAD_NVFP4_DEFAULT_ON_CHAMPION_STACK_SIGNED_OFF_2026_09_02_EXPLICIT_0_RESTORES_EACH_PRE_FLIP_DRAFT_PATH)
-}
-
-pub fn draft_fast_device_chained_tokens_selected_from_env() -> bool {
-    draft_fast_device_chained_tokens_selected(std::env::var(NV_Q38_DRAFT_FAST_ENV).ok().as_deref())
-}
-
-pub const NV_Q38_DRAFTER_ATTN_SPLITK_ENV_DEFAULT_ON_ROUTES_THE_Q1_DRAFTER_SCAN_THROUGH_THE_FUSED_BF16_SPLITK_DECODE_KERNEL_BECAUSE_CANDLE_FA2_FILLS_ONLY_N_HEADS_BLOCKS:
-    &str = "NV_Q38_DRAFTER_ATTN_SPLITK";
-
-pub fn drafter_attn_splitk_selected(raw: Option<&str>) -> bool {
-    raw.map(str::trim)
-        != Some(DRAFT_QUARTET_FAST_FP8_SPLITK_LMHEAD_NVFP4_DEFAULT_ON_CHAMPION_STACK_SIGNED_OFF_2026_09_02_EXPLICIT_0_RESTORES_EACH_PRE_FLIP_DRAFT_PATH)
-}
-
-pub fn drafter_attn_splitk_selected_from_env() -> bool {
-    drafter_attn_splitk_selected(
-        std::env::var(
-            NV_Q38_DRAFTER_ATTN_SPLITK_ENV_DEFAULT_ON_ROUTES_THE_Q1_DRAFTER_SCAN_THROUGH_THE_FUSED_BF16_SPLITK_DECODE_KERNEL_BECAUSE_CANDLE_FA2_FILLS_ONLY_N_HEADS_BLOCKS,
-        )
-        .ok()
-        .as_deref(),
-    )
-}
-
-pub const NV_Q38_BOOT_WARM_DRAFTER_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_COLD_FIRST_REQUEST:
-    &str = "NV_Q38_BOOT_WARM_DRAFTER";
-
-pub fn drafter_boot_warm_default_on_user_sign_off_2026_09_12(
-    raw: Option<&std::ffi::OsStr>,
-) -> bool {
-    raw.is_none() || raw.and_then(std::ffi::OsStr::to_str).map(str::trim) == Some("1")
-}
-
-pub fn drafter_boot_warm_selected_from_env() -> bool {
-    drafter_boot_warm_default_on_user_sign_off_2026_09_12(
-        std::env::var_os(
-            NV_Q38_BOOT_WARM_DRAFTER_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_COLD_FIRST_REQUEST,
-        )
-        .as_deref(),
-    )
-}
-
-#[cfg(test)]
-mod drafter_boot_warm_default_tests {
-    use super::drafter_boot_warm_default_on_user_sign_off_2026_09_12 as selected;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn only_unset_changes_and_explicit_trimmed_grammar_is_preserved() {
-        assert!(selected(None));
-        for raw in ["1", " 1", "1 ", "\t1\n"] {
-            assert!(selected(Some(OsStr::new(raw))));
-        }
-        for raw in ["0", "", "true", "gate"] {
-            assert!(
-                !selected(Some(OsStr::new(raw))),
-                "explicit {raw:?} stays off"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_unicode_remains_explicit_off() {
-        use std::os::unix::ffi::OsStrExt;
-        assert!(!selected(Some(OsStr::from_bytes(&[0xff]))));
-    }
+    env::var(NV_Q38_MTP_STREAM_PREFILL_ENV).ok().as_deref() == Some("1")
 }
 
 pub const TRUNK_OUTPUT_NORM_TENSOR_CANDIDATES: [&str; 2] =
     ["model.norm.weight", "model.language_model.norm.weight"];
-
-pub const MTP_REANCHOR_UNSET_ON_USER_SIGN_OFF_2026_09_11_REPLY_11_BITWISE_ABBA_E31BFFB54_9F37F08BE_7CC999C9E_DBB0540A6:
-    &str = "pg1342 retained-token FNV f39783307a2d1f13 at 2048 and 2e8b4f4072b2eaf7 at \
-             168000 match across all 24 served ABBA requests. Pooled decode gains 4.0658% \
-             and 0.5135%; shallow nulls 1.8004% and 0.7179%. User sign-off 2026-09-11 promotes the bitwise \
-             default; explicit 0 restores pre-norm drafter input. No target arithmetic change.";
-
-pub fn mtp_reanchor_post_norm_selected(raw: Option<&str>) -> bool {
-    match raw {
-        None => {
-            let _ = MTP_REANCHOR_UNSET_ON_USER_SIGN_OFF_2026_09_11_REPLY_11_BITWISE_ABBA_E31BFFB54_9F37F08BE_7CC999C9E_DBB0540A6;
-            true
-        }
-        Some(value) => value.trim() == "1",
-    }
-}
-
-fn mtp_reanchor_post_norm_from_raw_os(raw: Option<&std::ffi::OsStr>) -> bool {
-    match raw {
-        None => mtp_reanchor_post_norm_selected(None),
-        Some(value) => value
-            .to_str()
-            .is_some_and(|value| mtp_reanchor_post_norm_selected(Some(value))),
-    }
-}
-
-pub fn mtp_reanchor_post_norm_selected_from_env() -> bool {
-    mtp_reanchor_post_norm_from_raw_os(std::env::var_os(NV_Q38_MTP_REANCHOR_ENV).as_deref())
-}
-
-#[cfg(test)]
-mod mtp_reanchor_user_signed_resolver_tests {
-    use super::{
-        mtp_reanchor_post_norm_from_raw_os as selected_os,
-        mtp_reanchor_post_norm_selected as selected,
-    };
-
-    #[test]
-    fn only_unset_changes_and_explicit_zero_restores_pre_norm() {
-        assert!(selected(None));
-        assert!(selected_os(None));
-        for value in ["1", " 1", "1 ", "\t1\n"] {
-            assert!(selected(Some(value)));
-            assert!(selected_os(Some(std::ffi::OsStr::new(value))));
-        }
-        for value in ["0", "", "true", "yes", "gate", "2"] {
-            assert!(
-                !selected(Some(value)),
-                "explicit {value:?} must retain its off meaning"
-            );
-            assert!(!selected_os(Some(std::ffi::OsStr::new(value))));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn explicit_non_unicode_is_not_unset() {
-        use std::os::unix::ffi::OsStrExt;
-        assert!(!selected_os(Some(std::ffi::OsStr::from_bytes(&[0xff]))));
-    }
-}
-
-pub fn mtp_drafter_fp8_resident(raw: Option<&str>) -> bool {
-    raw.map(str::trim)
-        != Some(DRAFT_QUARTET_FAST_FP8_SPLITK_LMHEAD_NVFP4_DEFAULT_ON_CHAMPION_STACK_SIGNED_OFF_2026_09_02_EXPLICIT_0_RESTORES_EACH_PRE_FLIP_DRAFT_PATH)
-}
-
-pub fn mtp_drafter_fp8_resident_from_env() -> bool {
-    mtp_drafter_fp8_resident(std::env::var(NV_Q38_DRAFT_FP8_ENV).ok().as_deref())
-}
-
-pub const NV_Q38_DRAFT_LMHEAD_NVFP4_ENV: &str = "NV_Q38_DRAFT_LMHEAD_NVFP4";
-
-pub fn mtp_draft_lm_head_nvfp4_twin(raw: Option<&str>) -> bool {
-    raw.map(str::trim)
-        != Some(DRAFT_QUARTET_FAST_FP8_SPLITK_LMHEAD_NVFP4_DEFAULT_ON_CHAMPION_STACK_SIGNED_OFF_2026_09_02_EXPLICIT_0_RESTORES_EACH_PRE_FLIP_DRAFT_PATH)
-}
-
-pub fn mtp_draft_lm_head_nvfp4_twin_from_env() -> bool {
-    mtp_draft_lm_head_nvfp4_twin(std::env::var(NV_Q38_DRAFT_LMHEAD_NVFP4_ENV).ok().as_deref())
-}
 
 pub const VOCAB_PREFIX_DEFAULT_65536_THE_P32K_RUNG_FAILED_THE_TILED_SERVED_BASIS_AND_64K_CERTIFIED_ON_ALL_THREE:
     usize = 65536;
@@ -494,7 +281,7 @@ pub fn mtp_eager_deep_k_selected(raw: Option<&str>) -> bool {
 }
 
 pub fn mtp_eager_deep_k_selected_from_env() -> bool {
-    mtp_eager_deep_k_selected(std::env::var(NV_Q38_MTP_EAGER_DEEP_K_ENV).ok().as_deref())
+    mtp_eager_deep_k_selected(env::var(NV_Q38_MTP_EAGER_DEEP_K_ENV).ok().as_deref())
 }
 
 pub fn assert_eager_session_verify_rows_fit(hidden: usize, k: usize) -> Result<()> {
@@ -520,7 +307,7 @@ pub fn mtp_draft_p_min(raw: Option<&str>) -> Option<f32> {
 }
 
 pub fn mtp_draft_p_min_from_env() -> Option<f32> {
-    mtp_draft_p_min(std::env::var(NV_Q38_MTP_P_MIN_ENV).ok().as_deref())
+    mtp_draft_p_min(env::var(NV_Q38_MTP_P_MIN_ENV).ok().as_deref())
 }
 
 pub const NV_Q38_MTP_PRECAPTURE_ENV: &str = "NV_Q38_MTP_PRECAPTURE";
@@ -529,21 +316,8 @@ pub fn mtp_precapture_selected(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
-pub const NV_Q38_SUFFIX_PRECAPTURE_ENV: &str = "NV_Q38_SUFFIX_PRECAPTURE";
-
-pub const SUFFIX_PRECAPTURE_IS_MEASUREMENT_HYGIENE_NOT_SPEED_SO_SERVING_CAPTURES_LAZILY_BECAUSE_FRONT_LOADING_ALL_FOUR_SHAPES_COST_416MS_OF_TTFT_AND_0P39S_OF_WALL_WHILE_LAZY_ONLY_CAPTURES_THE_SHAPES_A_RUN_ACTUALLY_HITS: &str =
-    "set NV_Q38_SUFFIX_PRECAPTURE=1 to front-load the suffix verify graphs, which is what a      verify_ms measurement wants and what a served request does not";
-
-pub fn suffix_precapture_selected(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("1"))
-}
-
-pub fn suffix_precapture_selected_from_env() -> bool {
-    suffix_precapture_selected(std::env::var(NV_Q38_SUFFIX_PRECAPTURE_ENV).ok().as_deref())
-}
-
 pub fn mtp_precapture_selected_from_env() -> bool {
-    mtp_precapture_selected(std::env::var(NV_Q38_MTP_PRECAPTURE_ENV).ok().as_deref())
+    mtp_precapture_selected(env::var(NV_Q38_MTP_PRECAPTURE_ENV).ok().as_deref())
 }
 
 pub const ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX: usize = 2;
@@ -567,7 +341,7 @@ pub fn mtp_tree_selected(raw: Option<&str>) -> bool {
 }
 
 pub fn mtp_tree_selected_from_env() -> bool {
-    mtp_tree_selected(std::env::var(NV_Q38_MTP_TREE_ENV).ok().as_deref())
+    mtp_tree_selected(env::var(NV_Q38_MTP_TREE_ENV).ok().as_deref())
 }
 
 pub const MTP_TREE_ROWS_6_ANCHOR_PLUS_TOP1_CHAIN_D3_PLUS_TOP2_SIBLING_AND_ONE_CONTINUATION: usize =
@@ -694,7 +468,7 @@ fn top3_host_row_ids_lowest_index_tie_break_matching_device_argmax(row: &[f32]) 
 pub fn adaptive_verify_pins_the_env_unset_auto_dp4a_mlp_off_because_greedy_argmax_must_not_depend_on_which_m_the_cut_produced(
 ) {
     if !nv_config::env_arm_present_at_all_reread_every_call(NV_Q38_W4A8_MK_ENV) {
-        std::env::set_var(NV_Q38_W4A8_MK_ENV, "0");
+        unsafe { env::set_var(NV_Q38_W4A8_MK_ENV, "0") };
     }
 }
 
@@ -703,7 +477,7 @@ pub fn mtp_drafter_selected(raw: Option<&str>) -> bool {
 }
 
 pub fn mtp_drafter_selected_from_env() -> bool {
-    mtp_drafter_selected(std::env::var(NV_DRAFTER_ENV).ok().as_deref())
+    mtp_drafter_selected(env::var(NV_DRAFTER_ENV).ok().as_deref())
 }
 
 pub fn mtp_chain_depth(raw: Option<&str>) -> usize {
@@ -714,27 +488,17 @@ pub fn mtp_chain_depth(raw: Option<&str>) -> usize {
 }
 
 pub fn mtp_chain_depth_from_env() -> usize {
-    mtp_chain_depth(std::env::var(NV_MTP_K_ENV).ok().as_deref())
+    mtp_chain_depth(env::var(NV_MTP_K_ENV).ok().as_deref())
 }
 
 pub fn mtp_draft_dir_override_from_env() -> Option<PathBuf> {
-    std::env::var_os(NV_MTP_DRAFT_DIR_ENV)
+    env::var_os(NV_MTP_DRAFT_DIR_ENV)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
 }
 
 pub fn mtp_round_hidden_reanchor_index(draft_accepted: usize) -> usize {
     draft_accepted
-}
-
-pub const NV_Q38_MTP_VERIFY_REPLAY_ENV: &str = "NV_Q38_MTP_VERIFY_REPLAY";
-
-pub fn mtp_verify_replay_selected(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("1"))
-}
-
-pub fn mtp_verify_replay_selected_from_env() -> bool {
-    mtp_verify_replay_selected(std::env::var(NV_Q38_MTP_VERIFY_REPLAY_ENV).ok().as_deref())
 }
 
 pub const MTP_VERIFY_INC2_COMMITS_BATCHED_ROWS_AND_TOLERATES_MROW_VS_M1_DRIFT: &str =
@@ -748,9 +512,8 @@ pub const MTP_VERIFY_INC2_COMMITS_BATCHED_ROWS_AND_TOLERATES_MROW_VS_M1_DRIFT: &
      the 9x-decode round cost) never runs. Batched rows are NOT required to \
      be byte-identical to sequential M=1 decode; the contract is the acceptance A/B gate, the \
      teacher-forced ppl match, and the empirical logit-drift pin, all in \
-     nv-specdecode/tests/qwen38_mtp_wgpu_inc2.rs. NV_Q38_MTP_VERIFY_REPLAY=1 restores the \
-     increment-1 replay commit as the debugging escape. NV_Q3D_MTP_COMMIT_SCAN_REPLAY=1 \
-     commits the same partial accept without the commit-only trunk reforward: advance(n) \
+     nv-specdecode/tests/qwen38_mtp_wgpu_inc2.rs. Where the dedicated verify graph exists, a \
+     partial accept commits without the commit-only trunk reforward: advance(n) \
      restores the snapshot and re-dispatches only each DeltaNet layer's conv_shift and scan \
      over per-layer rows the first forward already landed, reproducing the reforward's \
      committed state bit-for-bit (qwen3_5_dense_wgpu's \
@@ -781,15 +544,13 @@ pub fn run_mtp_verify_round<T: MtpBatchedVerifyTarget + ?Sized>(
     target: &mut T,
     anchor: u32,
     drafts: &[u32],
-    replay_commit: bool,
 ) -> Result<MtpBatchedVerifyRound> {
     let batch = crate::chain::build_chain_batch(anchor, drafts, drafts.len() + 1, true)?;
     let amax = target.verify_chain(&batch)?;
     let accept = crate::chain::accept_prefix_argmax(&batch, &amax)?;
     let full = accept.commit_len == batch.len();
-    let scan_replay =
-        !replay_commit && !full && target.advance_commits_partial_prefix_without_reforward();
-    if replay_commit || full || scan_replay {
+    let scan_replay = !full && target.advance_commits_partial_prefix_without_reforward();
+    if full || scan_replay {
         target.advance(accept.commit_len)?;
     } else {
         target.advance(0)?;
@@ -802,7 +563,7 @@ pub fn run_mtp_verify_round<T: MtpBatchedVerifyTarget + ?Sized>(
         batch,
         accept,
         emitted,
-        prefix_reforwarded_batched: !replay_commit && !full && !scan_replay,
+        prefix_reforwarded_batched: !full && !scan_replay,
     })
 }
 
@@ -1020,7 +781,7 @@ pub fn resolve_mtp_weight_files(
             return Ok(vec![single]);
         }
     }
-    anyhow::bail!(
+    bail!(
         "no MTP weights found: searched {searched:?} for {MTP_WEIGHTS_FILE_NAME}, an index \
          mapping {MTP_TENSOR_PREFIX}* tensors, or a single-file checkpoint carrying them; \
          if this checkpoint truly ships no MTP head, NV_DRAFTER=mtp cannot serve it"
@@ -1069,13 +830,13 @@ pub fn mtp_speculator_dir_if_advertised(adapter_dir: &Path) -> Result<Option<Pat
             );
             Ok(Some(subdir))
         }
-        (Some(kind), false) => anyhow::bail!(
+        (Some(kind), false) => bail!(
             "adapter {}: adapter_config.json advertises speculator kind {kind} but no {}/ subdir \
              exists; serving would silently drop the co-trained drafter deltas",
             adapter_dir.display(),
             SPECULATOR_SUBDIR_MIRRORS_NV_TRAIN_SPECULATOR_SUBDIR
         ),
-        (None, true) => anyhow::bail!(
+        (None, true) => bail!(
             "adapter {}: a {}/ subdir exists but the MAIN adapter_config.json carries no {} key; \
              the kind is authoritative in the main config (eagle3 subdir configs omit it), so an \
              unkinded speculator cannot be classified and refuses to merge",
@@ -1114,7 +875,7 @@ pub fn merge_speculator_lora_into_mtp_map_before_any_quant_arm_so_the_drafter_se
                 .or_else(|| rest.strip_suffix(".lora_B.weight").map(|m| (m, 1usize)))
         });
         let Some((module, side)) = parsed else {
-            anyhow::bail!(
+            bail!(
                 "speculator tensor {name} is not a base_model.model.<module>.lora_A/lora_B.weight \
                  pair member; norms, embeddings, lm_head, d2t/t2d and DoRA vectors are never MTP \
                  speculator targets, so the whole merge refuses rather than skipping"
@@ -1205,36 +966,10 @@ mod cuda_impl {
     pub const DRAFTER_BOOT_WARM_PROMPT_TOKENS_17_COVER_BOTH_THE_16_ROW_FP8_CATCHUP_CALL_SHAPE_AND_THE_REMAINDER_ROW:
         usize = 17;
 
-    pub const NV_Q38_DRAFTER_KV_FP8_ENV_DEFAULT_ON_0_RESTORES_THE_BF16_PER_Q_HEAD_ROUTE_USER_SIGNED_OFF_2026_09_04_BITWISE_IDENTICAL_EMITTED_ALL_THREE_CLASSES:
-        &str = "NV_Q38_DRAFTER_KV_FP8";
-
     pub const KVSHARE_FP8_DRAFTER_HEAD_DIM_256_IS_THE_ONLY_GEOMETRY_THE_KVSHARE_KERNEL_ACCEPTS_IT_RETURNS_MINUS_21_OTHERWISE:
         usize = 256;
 
-    pub fn drafter_kv_fp8_selected_from_env() -> bool {
-        !matches!(
-            std::env::var(
-                NV_Q38_DRAFTER_KV_FP8_ENV_DEFAULT_ON_0_RESTORES_THE_BF16_PER_Q_HEAD_ROUTE_USER_SIGNED_OFF_2026_09_04_BITWISE_IDENTICAL_EMITTED_ALL_THREE_CLASSES
-            )
-            .as_deref(),
-            Ok("0")
-        )
-    }
-
     const DRAFTER_KVSHARE_SCRATCH_SPLITS_128_IS_THE_KERNEL_MAX: usize = 128;
-
-    pub const NV_Q38_DRAFTER_ATTN_TC_ENV_DEFAULT_ON_0_RESTORES_THE_SCALAR_DRAFTER_QK_USER_SIGNED_OFF_2026_09_04_BITWISE_IDENTICAL_EMITTED:
-        &str = "NV_Q38_DRAFTER_ATTN_TC";
-
-    pub fn drafter_attn_tc_selected_from_env() -> bool {
-        !matches!(
-            std::env::var(
-                NV_Q38_DRAFTER_ATTN_TC_ENV_DEFAULT_ON_0_RESTORES_THE_SCALAR_DRAFTER_QK_USER_SIGNED_OFF_2026_09_04_BITWISE_IDENTICAL_EMITTED
-            )
-            .as_deref(),
-            Ok("0")
-        )
-    }
 
     pub const NV_Q38_DRAFTER_KV_WINDOW_ENV_TOKEN_COUNT_CAPS_THE_FP8_DRAFTER_KV_TO_A_RING_SO_DRAFT_ATTENTION_IS_DEPTH_INDEPENDENT_THE_TRUNK_HIDDEN_STILL_CARRIES_LONG_RANGE_CONTEXT:
         &str = "NV_Q38_DRAFTER_KV_WINDOW";
@@ -1300,19 +1035,10 @@ mod cuda_impl {
             let window = drafter_kv_window_from_env();
             let fp8_geometry_ok =
                 head_dim == KVSHARE_FP8_DRAFTER_HEAD_DIM_256_IS_THE_ONLY_GEOMETRY_THE_KVSHARE_KERNEL_ACCEPTS_IT_RETURNS_MINUS_21_OTHERWISE;
-            if window.is_some() && !drafter_kv_fp8_selected_from_env() {
-                anyhow::bail!(
-                    "NV_Q38_DRAFTER_KV_WINDOW rides the fp8 kvshare route; set \
-                     NV_Q38_DRAFTER_KV_FP8=1 with it (the bf16 splitk route has no ring)"
-                );
-            }
-            let fp8 = if drafter_kv_fp8_selected_from_env() && fp8_geometry_ok {
+            let fp8 = if fp8_geometry_ok {
                 let cuda = match device {
                     Device::Cuda(d) => d.clone(),
-                    _ => anyhow::bail!(
-                        "{} needs a CUDA device; unset it for the bf16 drafter cache",
-                        NV_Q38_DRAFTER_KV_FP8_ENV_DEFAULT_ON_0_RESTORES_THE_BF16_PER_Q_HEAD_ROUTE_USER_SIGNED_OFF_2026_09_04_BITWISE_IDENTICAL_EMITTED_ALL_THREE_CLASSES
-                    ),
+                    _ => anyhow::bail!("the fp8 drafter kv cache needs a CUDA device"),
                 };
                 let stream = nv_layers::cuda_stream::current_stream(&cuda);
                 let ring = match window {
@@ -1321,21 +1047,11 @@ mod cuda_impl {
                 };
                 let rows = if ring > 0 { ring } else { max_seq } * kv_heads;
                 Some(DrafterFp8Kv {
-                    k_fp8: stream
-                        .alloc_zeros::<u8>(rows * head_dim)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                    v_fp8: stream
-                        .alloc_zeros::<u8>(rows * head_dim)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                    k_scales: stream
-                        .alloc_zeros::<f32>(rows)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                    v_scales: stream
-                        .alloc_zeros::<f32>(rows)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                    start_dev: stream
-                        .alloc_zeros::<i32>(1)
-                        .map_err(|e| anyhow::anyhow!(e))?,
+                    k_fp8: stream.alloc_zeros::<u8>(rows * head_dim)?,
+                    v_fp8: stream.alloc_zeros::<u8>(rows * head_dim)?,
+                    k_scales: stream.alloc_zeros::<f32>(rows)?,
+                    v_scales: stream.alloc_zeros::<f32>(rows)?,
+                    start_dev: stream.alloc_zeros::<i32>(1)?,
                     host_start: Box::new([0i32; 1]),
                     ring_window_rows_or_zero_for_full_length: ring,
                 })
@@ -1410,9 +1126,7 @@ mod cuda_impl {
                 };
                 let stream = nv_layers::cuda_stream::current_stream(&dev);
                 fp8.host_start[0] = self.len as i32;
-                stream
-                    .memcpy_htod(&fp8.host_start[..], &mut fp8.start_dev)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                stream.memcpy_htod(&fp8.host_start[..], &mut fp8.start_dev)?;
                 for (new_t, base, scales) in [
                     (k_new, &mut fp8.k_fp8, &mut fp8.k_scales),
                     (v_new, &mut fp8.v_fp8, &mut fp8.v_scales),
@@ -1479,8 +1193,7 @@ mod cuda_impl {
             ) else {
                 anyhow::bail!(
                     "MtpKvCache.views: the fp8 kv arm holds no bf16 rows; every consumer of \
-                     this cache must route the kvshare fp8 attention when {} is set",
-                    NV_Q38_DRAFTER_KV_FP8_ENV_DEFAULT_ON_0_RESTORES_THE_BF16_PER_Q_HEAD_ROUTE_USER_SIGNED_OFF_2026_09_04_BITWISE_IDENTICAL_EMITTED_ALL_THREE_CLASSES
+                     this cache must route the kvshare fp8 attention"
                 )
             };
             Ok((k.narrow(1, 0, self.len)?, v.narrow(1, 0, self.len)?))
@@ -1518,9 +1231,8 @@ mod cuda_impl {
             );
             ensure!(
                 k_buf.dtype() == DType::BF16,
-                "{} routes a bf16-KV kernel but this drafter cache holds {:?}; unset the env \
-                 for a non-bf16 drafter",
-                NV_Q38_DRAFTER_ATTN_SPLITK_ENV_DEFAULT_ON_ROUTES_THE_Q1_DRAFTER_SCAN_THROUGH_THE_FUSED_BF16_SPLITK_DECODE_KERNEL_BECAUSE_CANDLE_FA2_FILLS_ONLY_N_HEADS_BLOCKS,
+                "splitk drafter attention routes a bf16-KV kernel but this drafter cache holds \
+                 {:?}",
                 k_buf.dtype()
             );
             let dev = match q_roped_1_1_nh_hd.device() {
@@ -1537,14 +1249,11 @@ mod cuda_impl {
                 self.splitk_route_sized_at_first_call_because_the_head_count_arrives_with_the_query =
                     Some(SplitkRouteBuffers {
                         scratch: stream
-                            .alloc_zeros::<f32>(scratch_elems)
-                            .map_err(|e| anyhow::anyhow!(e))?,
+                            .alloc_zeros::<f32>(scratch_elems)?,
                         fan_in: stream
-                            .alloc_zeros::<u32>(heads)
-                            .map_err(|e| anyhow::anyhow!(e))?,
+                            .alloc_zeros::<u32>(heads)?,
                         len_dev: stream
-                            .alloc_zeros::<i32>(1)
-                            .map_err(|e| anyhow::anyhow!(e))?,
+                            .alloc_zeros::<i32>(1)?,
                         host_len: Box::new([0i32; 1]),
                         heads,
                     });
@@ -1553,11 +1262,8 @@ mod cuda_impl {
                 .to_dtype(DType::F32)?
                 .affine(softmax_scale as f64, 0.0)?
                 .contiguous()?;
-            let mut out: cudarc::driver::CudaSlice<bf16> = unsafe {
-                stream
-                    .alloc::<bf16>(heads * hd)
-                    .map_err(|e| anyhow::anyhow!(e))?
-            };
+            let mut out: cudarc::driver::CudaSlice<bf16> =
+                unsafe { stream.alloc::<bf16>(heads * hd)? };
             let rc = {
                 let bufs = self
                     .splitk_route_sized_at_first_call_because_the_head_count_arrives_with_the_query
@@ -1569,9 +1275,7 @@ mod cuda_impl {
                     bufs.heads
                 );
                 bufs.host_len[0] = self.len as i32;
-                stream
-                    .memcpy_htod(&bufs.host_len[..], &mut bufs.len_dev)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                stream.memcpy_htod(&bufs.host_len[..], &mut bufs.len_dev)?;
                 let (qs, ql) =
                     q_f32_prescaled_because_the_kernel_scores_raw_qk.storage_and_layout();
                 let (ks, kl) = k_buf.storage_and_layout();
@@ -1675,24 +1379,18 @@ mod cuda_impl {
                 self.splitk_route_sized_at_first_call_because_the_head_count_arrives_with_the_query =
                     Some(SplitkRouteBuffers {
                         scratch: stream
-                            .alloc_zeros::<f32>(scratch_elems)
-                            .map_err(|e| anyhow::anyhow!(e))?,
+                            .alloc_zeros::<f32>(scratch_elems)?,
                         fan_in: stream
-                            .alloc_zeros::<u32>(heads)
-                            .map_err(|e| anyhow::anyhow!(e))?,
+                            .alloc_zeros::<u32>(heads)?,
                         len_dev: stream
-                            .alloc_zeros::<i32>(1)
-                            .map_err(|e| anyhow::anyhow!(e))?,
+                            .alloc_zeros::<i32>(1)?,
                         host_len: Box::new([0i32; 1]),
                         heads,
                     });
             }
             let q_c = q_roped_1_1_nh_hd.contiguous()?;
-            let mut out: cudarc::driver::CudaSlice<bf16> = unsafe {
-                stream
-                    .alloc::<bf16>(heads * hd)
-                    .map_err(|e| anyhow::anyhow!(e))?
-            };
+            let mut out: cudarc::driver::CudaSlice<bf16> =
+                unsafe { stream.alloc::<bf16>(heads * hd)? };
             let rc = {
                 let bufs = self
                     .splitk_route_sized_at_first_call_because_the_head_count_arrives_with_the_query
@@ -1704,9 +1402,7 @@ mod cuda_impl {
                     bufs.heads
                 );
                 bufs.host_len[0] = self.len as i32;
-                stream
-                    .memcpy_htod(&bufs.host_len[..], &mut bufs.len_dev)
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                stream.memcpy_htod(&bufs.host_len[..], &mut bufs.len_dev)?;
                 let fp8 = self
                     .fp8_rows_replace_the_bf16_pair_when_the_kv_fp8_arm_is_selected_saving_704mb_at_172k
                     .as_ref()
@@ -1727,13 +1423,8 @@ mod cuda_impl {
                 let (ps, _gs) = bufs.scratch.device_ptr_mut(&stream);
                 let (pf, _gf) = bufs.fan_in.device_ptr_mut(&stream);
                 let (po, _go) = out.device_ptr_mut(&stream);
-                let launch = if drafter_attn_tc_selected_from_env() {
-                    nv_kernels::cuda::flash_decode_kvshare_fp8kv_paged_qk_tc
-                } else {
-                    nv_kernels::cuda::flash_decode_kvshare_fp8kv_paged
-                };
                 unsafe {
-                    launch(
+                    nv_kernels::cuda::flash_decode_kvshare_fp8kv_paged_qk_tc(
                         stream.cu_stream() as *mut c_void,
                         pq as *const u16,
                         pk as *const u8,
@@ -1767,7 +1458,7 @@ mod cuda_impl {
             };
             ensure!(
                 rc == 0,
-                "flash_decode_kvshare_fp8kv_paged drafter q1 rc={rc}"
+                "flash_decode_kvshare_fp8kv_paged_qk_tc drafter q1 rc={rc}"
             );
             let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
             Ok(Tensor::from_storage(
@@ -1776,16 +1467,6 @@ mod cuda_impl {
                 candle_core::op::BackpropOp::none(),
                 false,
             ))
-        }
-
-        pub fn k_rows_host_f32(&self) -> Result<Vec<f32>> {
-            let (k, _) = self.views()?;
-            Ok(k.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?)
-        }
-
-        pub fn v_rows_host_f32(&self) -> Result<Vec<f32>> {
-            let (_, v) = self.views()?;
-            Ok(v.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?)
         }
     }
 
@@ -1799,7 +1480,7 @@ mod cuda_impl {
         let loader =
             nv_weights::WeightLoader::open_dir(main_checkpoint_dir, device).with_context(|| {
                 format!(
-                    "{NV_Q38_MTP_REANCHOR_ENV}=1 needs the trunk output norm from {}",
+                    "the post-norm drafter anchor needs the trunk output norm from {}",
                     main_checkpoint_dir.display()
                 )
             })?;
@@ -1812,7 +1493,7 @@ mod cuda_impl {
         }
         let raw = raw.ok_or_else(|| {
             anyhow::anyhow!(
-                "{NV_Q38_MTP_REANCHOR_ENV}=1: none of {TRUNK_OUTPUT_NORM_TENSOR_CANDIDATES:?} \
+                "post-norm drafter anchor: none of {TRUNK_OUTPUT_NORM_TENSOR_CANDIDATES:?} \
                  found in {}",
                 main_checkpoint_dir.display()
             )
@@ -1872,9 +1553,8 @@ mod cuda_impl {
             anyhow::ensure!(
                 self.bottom_token_id_base == self.top.out_features(),
                 "the unfused dual-gemv logits index rows as vocab ids, which only holds for \
-                 the symmetric halves layout; under NV_Q38_DRAFT_VOCAB_PREFIX the fused \
-                 argmax route (greedy, no probs_top3, the only route since the unfused escape was deleted 2026-09-14) is \
-                 the only correct path"
+                 the symmetric halves layout; under the vocab-prefix twin the fused argmax route \
+                 (greedy, no probs_top3) is the only correct path"
             );
             let n2 = self.top.out_features();
             let n = n2 + self.bottom.out_features();
@@ -1886,8 +1566,7 @@ mod cuda_impl {
             let (bw, bs, b_alpha, b_ig) = self.bottom.nvfp4_parts().ok_or_else(|| {
                 anyhow::anyhow!("w4a8 draft lm_head: bottom half lost nvfp4 parts")
             })?;
-            let mut y: cudarc::driver::CudaSlice<bf16> =
-                unsafe { stream.alloc::<bf16>(n).map_err(|e| anyhow::anyhow!(e))? };
+            let mut y: cudarc::driver::CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(n)? };
             let rc = {
                 let (twp, _g1) = tw.device_ptr(&stream);
                 let (tsp, _g2) = ts.device_ptr(&stream);
@@ -1947,9 +1626,8 @@ mod cuda_impl {
                 anyhow::anyhow!("fused w4a8 draft lm_head: bottom half lost nvfp4 parts")
             })?;
             let mut packed_best: cudarc::driver::CudaSlice<u64> =
-                unsafe { stream.alloc::<u64>(1).map_err(|e| anyhow::anyhow!(e))? };
-            let mut out_id: cudarc::driver::CudaSlice<u32> =
-                unsafe { stream.alloc::<u32>(1).map_err(|e| anyhow::anyhow!(e))? };
+                unsafe { stream.alloc::<u64>(1)? };
+            let mut out_id: cudarc::driver::CudaSlice<u32> = unsafe { stream.alloc::<u32>(1)? };
             let rc = {
                 let (twp, _g1) = tw.device_ptr(&stream);
                 let (tsp, _g2) = ts.device_ptr(&stream);
@@ -2062,34 +1740,26 @@ mod cuda_impl {
                 }
             }
             let mut head = Self::from_map(&map, base)?;
-            if mtp_draft_lm_head_nvfp4_twin_from_env() {
-                let vocab = base.lm_head().out_features();
-                let explicit = std::env::var(NV_Q38_DRAFT_LMHEAD_NVFP4_ENV).is_ok();
-                if vocab.is_multiple_of(256) || explicit {
-                    head.install_draft_only_nvfp4_lm_head_twin_leaving_the_shared_fp8_untouched(
-                        base,
-                    )?;
-                } else {
-                    eprintln!(
-                        "[q38-mtp] default nvfp4 draft lm_head twin declined: vocab {vocab} is                          not a multiple of 256; drafting keeps the shared fp8 head                          (set {NV_Q38_DRAFT_LMHEAD_NVFP4_ENV}=1 to make this a hard error)"
-                    );
-                }
+            let vocab = base.lm_head().out_features();
+            if vocab.is_multiple_of(256) {
+                head.install_draft_only_nvfp4_lm_head_twin_leaving_the_shared_fp8_untouched(base)?;
+            } else {
+                eprintln!(
+                    "[q38-mtp] nvfp4 draft lm_head twin declined: vocab {vocab} is not a multiple \
+                     of 256; drafting keeps the shared fp8 head"
+                );
             }
-            if mtp_reanchor_post_norm_selected_from_env() {
-                head.trunk_output_norm_because_llama_cpp_feeds_the_mtp_post_norm_h_nextn =
-                    Some(load_trunk_output_norm_plus_one(
-                        main_checkpoint_dir,
-                        base.config().hidden_size,
-                        base.config().rms_norm_eps,
-                        base.dtype(),
-                        device,
-                    )?);
-            }
-            if crate::qwen38_mtp::drafter_boot_warm_selected_from_env() {
-                head.boot_warm_one_throwaway_catchup_and_draft_into_a_scratch_kv_dropped_before_return(
-                    base, device,
-                )?;
-            }
+            head.trunk_output_norm_because_llama_cpp_feeds_the_mtp_post_norm_h_nextn =
+                Some(load_trunk_output_norm_plus_one(
+                    main_checkpoint_dir,
+                    base.config().hidden_size,
+                    base.config().rms_norm_eps,
+                    base.dtype(),
+                    device,
+                )?);
+            head.boot_warm_one_throwaway_catchup_and_draft_into_a_scratch_kv_dropped_before_return(
+                base, device,
+            )?;
             Ok(head)
         }
 
@@ -2114,19 +1784,15 @@ mod cuda_impl {
             let anchor_hidden = ones_hiddens_stay_finite_through_every_norm_and_activation_quant
                 .narrow(1, t - 1, 1)?
                 .contiguous()?;
-            if draft_fast_device_chained_tokens_selected_from_env() {
-                let _ = self
-                    .draft_chain_reading_tokens_back_once_because_per_step_readback_stalls_the_stream(
-                        base,
-                        0,
-                        &anchor_hidden,
-                        1,
-                        None,
-                        &mut scratch_kv,
-                    )?;
-            } else {
-                let _ = self.forward_draft_tok(base, &anchor_hidden, 0, &mut scratch_kv)?;
-            }
+            let _ = self
+                .draft_chain_reading_tokens_back_once_because_per_step_readback_stalls_the_stream(
+                    base,
+                    0,
+                    &anchor_hidden,
+                    1,
+                    None,
+                    &mut scratch_kv,
+                )?;
             device.synchronize()?;
             Ok(())
         }
@@ -2173,66 +1839,50 @@ mod cuda_impl {
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("MTP tensor missing: {name}"))
             };
-            let fp8_runner = if mtp_drafter_fp8_resident_from_env() {
-                let dev = map
-                    .values()
-                    .next()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("{NV_Q38_DRAFT_FP8_ENV}=1: empty MTP tensor map")
-                    })?
-                    .device()
-                    .clone();
-                let cuda = match &dev {
-                    Device::Cuda(d) => d.clone(),
-                    _ => anyhow::bail!(
-                        "{NV_Q38_DRAFT_FP8_ENV}=1 quantizes the drafter at load through the resident \
-                         e4m3 arm and needs the MTP tensors on a CUDA device"
-                    ),
-                };
-                let stream = nv_layers::cuda_stream::current_stream(&cuda);
-                Some(std::sync::Arc::new(std::sync::Mutex::new(
-                    nv_quant::fp8::Fp8GemmRunner::new(stream)?,
-                )))
-            } else {
-                None
+            let dev = map
+                .values()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("empty MTP tensor map"))?
+                .device()
+                .clone();
+            let cuda = match &dev {
+                Device::Cuda(d) => d.clone(),
+                _ => anyhow::bail!(
+                    "the drafter quantizes to resident e4m3 at load and needs the MTP tensors on a \
+                     CUDA device"
+                ),
             };
+            let runner = std::sync::Arc::new(std::sync::Mutex::new(
+                nv_quant::fp8::Fp8GemmRunner::new(nv_layers::cuda_stream::current_stream(&cuda))?,
+            ));
             let lin = |name: &str| -> Result<Linear> {
                 let w = get(name)?.to_dtype(dtype)?.contiguous()?;
-                match &fp8_runner {
-                    Some(runner) => {
-                        let out_f = w.dim(0)?;
-                        let in_f = w.dim(1)?;
-                        let host: Vec<half::bf16> =
-                            w.to_dtype(DType::BF16)?.flatten_all()?.to_vec1()?;
-                        let (bytes, rows) = nv_layers::linear::fp8_weight_payload(
-                            &host,
-                            out_f,
-                            in_f,
-                            None,
-                            nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
-                        )?;
-                        let dev = match w.device() {
-                            Device::Cuda(d) => d.clone(),
-                            _ => anyhow::bail!(
-                                "{NV_Q38_DRAFT_FP8_ENV}=1 drafter quantization needs CUDA tensors"
-                            ),
-                        };
-                        let stream = nv_layers::cuda_stream::current_stream(&dev);
-                        let weight_u8 =
-                            stream.clone_htod(&bytes).map_err(|e| anyhow::anyhow!(e))?;
-                        Linear::new_fp8_e4m3_row_scales_without_the_cublaslt_probe(
-                            weight_u8,
-                            rows,
-                            in_f,
-                            out_f,
-                            None,
-                            w.device(),
-                            runner.clone(),
-                            nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
-                        )
-                    }
-                    None => Linear::new(w, None),
-                }
+                let out_f = w.dim(0)?;
+                let in_f = w.dim(1)?;
+                let host: Vec<half::bf16> = w.to_dtype(DType::BF16)?.flatten_all()?.to_vec1()?;
+                let (bytes, rows) = nv_layers::linear::fp8_weight_payload(
+                    &host,
+                    out_f,
+                    in_f,
+                    None,
+                    nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
+                )?;
+                let dev = match w.device() {
+                    Device::Cuda(d) => d.clone(),
+                    _ => anyhow::bail!("drafter fp8 quantization needs CUDA tensors"),
+                };
+                let stream = nv_layers::cuda_stream::current_stream(&dev);
+                let weight_u8 = stream.clone_htod(&bytes)?;
+                Linear::new_fp8_e4m3_row_scales_without_the_cublaslt_probe(
+                    weight_u8,
+                    rows,
+                    in_f,
+                    out_f,
+                    None,
+                    w.device(),
+                    runner.clone(),
+                    nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
+                )
             };
             let zero_centered_norm_stored_as_weight_minus_one = |name: &str| -> Result<RmsNorm> {
                 let raw = get(name)?.to_dtype(DType::F32)?;
@@ -2294,49 +1944,29 @@ mod cuda_impl {
             let dev = match base.device() {
                 Device::Cuda(d) => d.clone(),
                 _ => anyhow::bail!(
-                    "{NV_Q38_DRAFT_LMHEAD_NVFP4_ENV}=1 quantizes a second resident lm_head copy \
-                     and needs the base on a CUDA device"
+                    "the nvfp4 draft lm_head twin quantizes a second resident lm_head copy and \
+                     needs the base on a CUDA device"
                 ),
             };
             let lm = base.lm_head();
             let n = lm.out_features();
             ensure!(
                 n.is_multiple_of(256),
-                "{NV_Q38_DRAFT_LMHEAD_NVFP4_ENV}=1 serves the lm_head as two equal row halves \
+                "the nvfp4 draft lm_head twin serves the lm_head as two equal row halves \
                  on 128-row swizzle tiles, so vocab {n} must be a multiple of 256"
             );
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let runner = std::sync::Arc::new(std::sync::Mutex::new(
                 nv_quant::nvfp4::Nvfp4GemmRunner::new(stream)?,
             ));
-            let vocab_prefix_arm_frspec_class_draft_only_subset_full_vocab_verify_keeps_output_distribution =
-                match std::env::var("NV_Q38_DRAFT_VOCAB_PREFIX").ok().as_deref() {
-                    Some("0") => None,
-                    Some(v) => v.parse::<usize>().ok(),
-                    None => {
-                        let p = VOCAB_PREFIX_DEFAULT_65536_THE_P32K_RUNG_FAILED_THE_TILED_SERVED_BASIS_AND_64K_CERTIFIED_ON_ALL_THREE;
-                        if p + 512 < n {
-                            Some(p)
-                        } else {
-                            None
-                        }
-                    }
-                };
-            let (top_rows, bot_start, bot_rows) = match
-                vocab_prefix_arm_frspec_class_draft_only_subset_full_vocab_verify_keeps_output_distribution
-            {
-                Some(p) => {
-                    const SPECIALS_TAIL_512_COVERS_QWEN_CONTROL_TOKENS_SO_STOPS_STAY_PROPOSABLE:
-                        usize = 512;
-                    let t = SPECIALS_TAIL_512_COVERS_QWEN_CONTROL_TOKENS_SO_STOPS_STAY_PROPOSABLE;
-                    ensure!(
-                        p % 256 == 0 && p + t < n,
-                        "NV_Q38_DRAFT_VOCAB_PREFIX={p} must be 256-aligned and leave room for \
-                         the {t}-row specials tail below vocab {n}"
-                    );
-                    (p, n - t, t)
-                }
-                None => (n / 2, n / 2, n / 2),
+            const SPECIALS_TAIL_512_COVERS_QWEN_CONTROL_TOKENS_SO_STOPS_STAY_PROPOSABLE: usize =
+                512;
+            let p = VOCAB_PREFIX_DEFAULT_65536_THE_P32K_RUNG_FAILED_THE_TILED_SERVED_BASIS_AND_64K_CERTIFIED_ON_ALL_THREE;
+            let t = SPECIALS_TAIL_512_COVERS_QWEN_CONTROL_TOKENS_SO_STOPS_STAY_PROPOSABLE;
+            let (top_rows, bot_start, bot_rows) = if p + t < n {
+                (p, n - t, t)
+            } else {
+                (n / 2, n / 2, n / 2)
             };
             let top = lm
                 .nvfp4_draft_twin_rows_quantized_from_this_resident_copy_which_stays_untouched(
@@ -2384,15 +2014,10 @@ mod cuda_impl {
             let x_c = mlp_out.contiguous()?;
             let r_c = residual.contiguous()?;
             let w_c = self.norm.weight_bf16().contiguous()?;
-            let mut res_out: cudarc::driver::CudaSlice<bf16> = unsafe {
-                stream
-                    .alloc::<bf16>(hidden)
-                    .map_err(|e| anyhow::anyhow!(e))?
-            };
-            let mut x_q8: cudarc::driver::CudaSlice<i8> =
-                unsafe { stream.alloc::<i8>(hidden).map_err(|e| anyhow::anyhow!(e))? };
-            let mut x_scale: cudarc::driver::CudaSlice<f32> =
-                unsafe { stream.alloc::<f32>(1).map_err(|e| anyhow::anyhow!(e))? };
+            let mut res_out: cudarc::driver::CudaSlice<bf16> =
+                unsafe { stream.alloc::<bf16>(hidden)? };
+            let mut x_q8: cudarc::driver::CudaSlice<i8> = unsafe { stream.alloc::<i8>(hidden)? };
+            let mut x_scale: cudarc::driver::CudaSlice<f32> = unsafe { stream.alloc::<f32>(1)? };
             let rc = {
                 let (xs, xl) = x_c.storage_and_layout();
                 let (rs, rl) = r_c.storage_and_layout();
@@ -2517,17 +2142,12 @@ mod cuda_impl {
         ) -> Result<()> {
             let t = tokens.len();
             ensure!(t > 0, "MTP catch-up with zero tokens");
-            let rows_per_call = if self.fc.fp8_scale_parts().is_some() {
-                DRAFTER_FP8_CATCHUP_ROWS_PER_CALL_16_THE_GEMV_E4M3_MK_LEADING_CAP_BECAUSE_THIS_DEVICE_SERVES_NO_CUBLASLT_PER_ROW_FP8
-            } else {
-                t
-            };
             self.catch_up_kv_with_explicit_rows_per_call(
                 base,
                 tokens,
                 hiddens,
                 cache,
-                rows_per_call,
+                DRAFTER_FP8_CATCHUP_ROWS_PER_CALL_16_THE_GEMV_E4M3_MK_LEADING_CAP_BECAUSE_THIS_DEVICE_SERVES_NO_CUBLASLT_PER_ROW_FP8,
             )
         }
 
@@ -2556,18 +2176,9 @@ mod cuda_impl {
                 let normed = self.input_layernorm.forward(&fused)?;
                 let positions: Vec<i32> = (start as i32..(start + n) as i32).collect();
                 let pos_t = Tensor::from_vec(positions, n, hiddens.device())?;
-                let kv_only = std::env::var("NV_Q38_GDN_CATCHUP_KV_ONLY").as_deref() != Ok("0");
-                let (k, v) = if kv_only {
-                    self.self_attn
-                        .project_kv_only_roped_for_a_drafter_owned_kv_skips_the_discarded_q_proj_and_gate_bitwise_because_rope_k_depends_only_on_k_and_positions(&normed, base.rope(), &pos_t)?
-                } else {
-                    let (_q, k, v, _g) = self.self_attn.project_qkv_roped_for_a_drafter_owned_kv(
-                        &normed,
-                        base.rope(),
-                        &pos_t,
-                    )?;
-                    (k, v)
-                };
+                let (k, v) = self
+                    .self_attn
+                    .project_kv_only_roped_for_a_drafter_owned_kv_skips_the_discarded_q_proj_and_gate_bitwise_because_rope_k_depends_only_on_k_and_positions(&normed, base.rope(), &pos_t)?;
                 cache.append(&k, &v)?;
                 off += n;
             }
@@ -2607,20 +2218,14 @@ mod cuda_impl {
                 1,
             )?
             .contiguous()?;
-            if self.fc.fp8_scale_parts().is_some()
-                && prompt_drafter_batch_from_raw_unset_on_user_sign_off_2026_09_11_explicit_values_unchanged(
-                    std::env::var_os("NV_Q38_PROMPT_DRAFTER_BATCH").as_deref(),
-                )
-            {
-                const PROMPT_ONLY_ROWS_4096_USE_DEVICE_ROWQUANT_FP8_GEMM_WITHOUT_CHANGING_DECODE_CATCHUP_16: usize = 4096;
-                eprintln!("Q38-PROMPT-DRAFTER-BATCH tokens={seq} rows_per_call=4096 decode_catchup_unchanged=true");
-                return self.catch_up_kv_with_explicit_rows_per_call(
-                    base, prompt, &hiddens, cache,
-                    PROMPT_ONLY_ROWS_4096_USE_DEVICE_ROWQUANT_FP8_GEMM_WITHOUT_CHANGING_DECODE_CATCHUP_16,
-                );
-            }
-            self.catch_up_kv_recomputing_and_discarding_q_which_v1_prices_over_a_kv_only_projection(
-                base, prompt, &hiddens, cache,
+            const PROMPT_ONLY_ROWS_4096_USE_DEVICE_ROWQUANT_FP8_GEMM_WITHOUT_CHANGING_DECODE_CATCHUP_16:
+                usize = 4096;
+            self.catch_up_kv_with_explicit_rows_per_call(
+                base,
+                prompt,
+                &hiddens,
+                cache,
+                PROMPT_ONLY_ROWS_4096_USE_DEVICE_ROWQUANT_FP8_GEMM_WITHOUT_CHANGING_DECODE_CATCHUP_16,
             )
         }
 
@@ -2674,7 +2279,7 @@ mod cuda_impl {
                 (DraftHeadTail::FusedArgmaxTokIdU32OnDevice(tok), h) => Ok((tok, h)),
                 (DraftHeadTail::Logits(_), _) => anyhow::bail!(
                     "draft core returned logits although the fused argmax tail was requested; \
-                     the fused route needs {NV_Q38_DRAFT_LMHEAD_NVFP4_ENV}=1's resident twin"
+                     the fused route needs the resident nvfp4 twin"
                 ),
             }
         }
@@ -2724,9 +2329,7 @@ mod cuda_impl {
                 )?;
                 decode_prof::lap("draft_attn_kvshare_fp8");
                 out
-            } else if crate::qwen38_mtp::drafter_attn_splitk_selected_from_env()
-                && matches!(device, Device::Cuda(_))
-            {
+            } else if device.is_cuda() {
                 let out = cache.decode_attention_splitk_bf16kv_reading_each_kv_row_once(
                     &q.contiguous()?,
                     self.geometry.heads,
@@ -2793,7 +2396,7 @@ mod cuda_impl {
             ensure!(
                 !fuse_argmax_tail,
                 "the fused draft lm_head argmax covers only the \
-                 {NV_Q38_DRAFT_LMHEAD_NVFP4_ENV}=1 nvfp4 twin; the bf16 lm_head fallback \
+                 nvfp4 twin; the bf16 lm_head fallback \
                  stays on the materialize-then-argmax path"
             );
 
@@ -2850,26 +2453,6 @@ mod cuda_impl {
             Ok((tok, mtp_hidden))
         }
 
-        pub fn forward_draft_tok_with_top_prob(
-            &self,
-            base: &Qwen3Moe,
-            base_hidden: &Tensor,
-            next_token_id: u32,
-            cache: &mut MtpKvCache,
-        ) -> Result<(u32, f32, Tensor)> {
-            let (logits, mtp_hidden) =
-                self.forward_draft(base, base_hidden, next_token_id, cache)?;
-            let tok = logits
-                .argmax(D::Minus1)?
-                .flatten_all()?
-                .to_dtype(DType::U32)?
-                .to_vec1::<u32>()?[0];
-            let p = Self::drafter_top_prob_scalar_is_recip_sum_exp_logits_minus_max(&logits)?
-                .to_vec1::<f32>()?[0];
-            decode_prof::lap("draft_argmax_readback");
-            Ok((tok, p, mtp_hidden))
-        }
-
         fn device_row_argmax_u32_matching_candle_lowest_index_tie_break(
             logits: &Tensor,
         ) -> Result<Tensor> {
@@ -2887,15 +2470,11 @@ mod cuda_impl {
             let lf = logits.to_dtype(DType::F32)?.contiguous()?;
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let parts = nv_kernels::cuda::dflash_accept_parts();
-            let mut part_val =
-                unsafe { stream.alloc::<f32>(parts).map_err(|e| anyhow::anyhow!(e))? };
-            let mut part_idx =
-                unsafe { stream.alloc::<i32>(parts).map_err(|e| anyhow::anyhow!(e))? };
-            let mut row_argmax = unsafe { stream.alloc::<u32>(1).map_err(|e| anyhow::anyhow!(e))? };
-            let mut out_buf = unsafe { stream.alloc::<u32>(2).map_err(|e| anyhow::anyhow!(e))? };
-            let drafts_buf = stream
-                .alloc_zeros::<u32>(1)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut part_val = unsafe { stream.alloc::<f32>(parts)? };
+            let mut part_idx = unsafe { stream.alloc::<i32>(parts)? };
+            let mut row_argmax = unsafe { stream.alloc::<u32>(1)? };
+            let mut out_buf = unsafe { stream.alloc::<u32>(2)? };
+            let drafts_buf = stream.alloc_zeros::<u32>(1)?;
             let rc = {
                 let (l_storage, ll) = lf.storage_and_layout();
                 let l_cuda = match &*l_storage {
@@ -2965,7 +2544,6 @@ mod cuda_impl {
             Ok(z.recip()?.flatten_all()?)
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn draft_chain_with_top_probs_reading_back_once(
             &self,
             base: &Qwen3Moe,
@@ -2990,7 +2568,6 @@ mod cuda_impl {
             Ok((drafts, probs))
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn draft_chain_with_top_probs_and_step_top3_whose_per_step_host_readback_syncs_so_headroom_probes_only(
             &self,
             base: &Qwen3Moe,
@@ -3215,9 +2792,9 @@ mod cuda_impl {
 
             let seq = prompt.len();
             ensure!(
-                !mtp_reanchor_post_norm_selected_from_env() || mtp.reanchor_post_norm_active(),
-                "{NV_Q38_MTP_REANCHOR_ENV}=1 but this head was not loaded through from_checkpoint \
-                 so it carries no trunk output norm"
+                mtp.reanchor_post_norm_active(),
+                "the drafter anchors on the post-norm trunk hidden but this head was not loaded \
+                 through from_checkpoint so it carries no trunk output norm"
             );
             let chunk = nv_models::qwen3_5_moe::q38_prefill_chunk_tokens_from_env()
                 .filter(|&c| seq > c)
@@ -3334,58 +2911,15 @@ mod cuda_impl {
                 .p_min_drafter_confidence_cut_none_means_fixed_k
                 .filter(|_| forced_drafts.is_none());
             let (mut drafts, draft_top_probs): (Vec<u32>, Vec<f32>) =
-                if draft_fast_device_chained_tokens_selected_from_env() {
-                    self.mtp.draft_chain_with_top_probs_reading_back_once(
-                        self.base,
-                        self.anchor,
-                        &self.base_hidden,
-                        k,
-                        forced_drafts,
-                        p_min_cut.is_some(),
-                        &mut self.mtp_kv,
-                    )?
-                } else if let Some(pmin) = p_min_cut {
-                    let mut drafts: Vec<u32> = Vec::with_capacity(k);
-                    let mut probs: Vec<f32> = Vec::with_capacity(k);
-                    let mut h = self.base_hidden.clone();
-                    let mut tok = self.anchor;
-                    for _ in 0..k {
-                        let (d, p, dhidden) = self.mtp.forward_draft_tok_with_top_prob(
-                            self.base,
-                            &h,
-                            tok,
-                            &mut self.mtp_kv,
-                        )?;
-                        drafts.push(d);
-                        probs.push(p);
-                        tok = d;
-                        h = dhidden;
-                        if p < pmin
-                            && drafts.len()
-                                >= ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX
-                        {
-                            break;
-                        }
-                    }
-                    (drafts, probs)
-                } else {
-                    let mut drafts: Vec<u32> = Vec::with_capacity(k);
-                    let mut h = self.base_hidden.clone();
-                    let mut tok = self.anchor;
-                    for j in 0..k {
-                        let (d, dhidden) =
-                            self.mtp
-                                .forward_draft_tok(self.base, &h, tok, &mut self.mtp_kv)?;
-                        let d = match forced_drafts {
-                            Some(f) => f[j],
-                            None => d,
-                        };
-                        drafts.push(d);
-                        tok = d;
-                        h = dhidden;
-                    }
-                    (drafts, Vec::new())
-                };
+                self.mtp.draft_chain_with_top_probs_reading_back_once(
+                    self.base,
+                    self.anchor,
+                    &self.base_hidden,
+                    k,
+                    forced_drafts,
+                    p_min_cut.is_some(),
+                    &mut self.mtp_kv,
+                )?;
             if let Some(pmin) = p_min_cut {
                 let keep =
                     adaptive_submitted_draft_len_matching_llama_cpp_p_min_leading_confident_run(
@@ -3496,7 +3030,7 @@ mod cuda_impl {
             Vec<Vec<f32>>,
         pub tree_headroom_rounds_round_debug_fast_chain_only_drafter_top3_by_step_verify_greedy_rows_accepted:
             Vec<(Vec<[u32; 3]>, Vec<u32>, usize)>,
-        suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token:
+        suffix_arm_consulted_before_each_mtp_chain_and_fed_every_emitted_token:
             Option<crate::qwen38_sufspec::SuffixSpecArm>,
         tree_env_opt_in_two_branch_m6_rounds: bool,
         pub tree_rounds: usize,
@@ -3514,7 +3048,7 @@ mod cuda_impl {
     );
 
     fn oapi_phase_walls_selected_from_env_stderr_only_so_streamed_bytes_never_move() -> bool {
-        std::env::var("NV_OAPI_PHASE_WALLS").ok().as_deref() == Some("1")
+        nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_OAPI_PHASE_WALLS")
     }
 
     fn session_phase_wall_synced(
@@ -3534,6 +3068,10 @@ mod cuda_impl {
     }
 
     impl<'a> Qwen38MtpGraphedDecodeSession<'a> {
+        pub fn disarm_the_suffix_arm_so_every_round_drafts_the_mtp_chain(&mut self) {
+            self.suffix_arm_consulted_before_each_mtp_chain_and_fed_every_emitted_token = None;
+        }
+
         pub fn start(
             engine: &'a mut GraphedQwen3Moe,
             mtp: &'a Qwen38DenseMtpHead,
@@ -3589,9 +3127,9 @@ mod cuda_impl {
                 &mut acc,
             );
             ensure!(
-                !mtp_reanchor_post_norm_selected_from_env() || mtp.reanchor_post_norm_active(),
-                "{NV_Q38_MTP_REANCHOR_ENV}=1 but this head was not loaded through from_checkpoint \
-                 so it carries no trunk output norm"
+                mtp.reanchor_post_norm_active(),
+                "the drafter anchors on the post-norm trunk hidden but this head was not loaded \
+                 through from_checkpoint so it carries no trunk output norm"
             );
             let stream_prefill = mtp_stream_prefill_selected_from_env();
             let mut streamed_carry = None;
@@ -3649,7 +3187,6 @@ mod cuda_impl {
             }
             if p_min.is_some()
                 || acceptance_tracking.is_some()
-                || (suffix_on && suffix_precapture_selected_from_env())
                 || mtp_precapture_selected_from_env()
             {
                 let mut shapes: Vec<usize> = if p_min.is_some() || acceptance_tracking.is_some() {
@@ -3659,9 +3196,7 @@ mod cuda_impl {
                 } else {
                     vec![k + 1]
                 };
-                if suffix_on
-                    && (acceptance_tracking.is_none() || suffix_precapture_selected_from_env())
-                {
+                if suffix_on && acceptance_tracking.is_none() {
                     shapes.extend(
                         crate::qwen38_sufspec::SuffixSpecArm::verify_shapes_to_precapture(),
                     );
@@ -3677,11 +3212,6 @@ mod cuda_impl {
                     k == MTP_TREE_BRANCH_A_DEPTH_3_SO_THE_TREE_NEEDS_EXACTLY_NV_MTP_K_3,
                     "{NV_Q38_MTP_TREE_ENV}=1 serves the fixed two-branch m=6 shape whose branch \
                      A is the k=3 chain; got k={k}"
-                );
-                ensure!(
-                    draft_fast_device_chained_tokens_selected_from_env(),
-                    "{NV_Q38_MTP_TREE_ENV}=1 forks the fast device-chained draft loop; set \
-                     NV_Q38_DRAFT_FAST=1"
                 );
                 ensure!(
                     p_min.is_none(),
@@ -3768,7 +3298,7 @@ mod cuda_impl {
                     Vec::new(),
                 tree_headroom_rounds_round_debug_fast_chain_only_drafter_top3_by_step_verify_greedy_rows_accepted:
                     Vec::new(),
-                suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token:
+                suffix_arm_consulted_before_each_mtp_chain_and_fed_every_emitted_token:
                     suffix_arm,
                 tree_env_opt_in_two_branch_m6_rounds: tree_on,
                 tree_rounds: 0,
@@ -3778,7 +3308,7 @@ mod cuda_impl {
         }
 
         pub fn suffix_rounds_drafted_accepted(&self) -> Option<(usize, usize, usize)> {
-            self.suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token
+            self.suffix_arm_consulted_before_each_mtp_chain_and_fed_every_emitted_token
                 .as_ref()
                 .map(|a| (a.rounds, a.drafted, a.accepted))
         }
@@ -3906,7 +3436,7 @@ mod cuda_impl {
                 .filter(|_| forced_drafts.is_none());
             let want_probs = forced_drafts.is_none() && (p_min_cut.is_some() || round_debug_on);
             let suffix_drafts: Option<Vec<u32>> = if forced_drafts.is_none() {
-                self.suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token
+                self.suffix_arm_consulted_before_each_mtp_chain_and_fed_every_emitted_token
                     .as_ref()
                     .and_then(|arm| arm.propose_for_round(self.max_seq - l - 1))
             } else {
@@ -3937,7 +3467,7 @@ mod cuda_impl {
                             &mut self.mtp_kv,
                         )?;
                 (sd, Vec::new())
-            } else if draft_fast_device_chained_tokens_selected_from_env() {
+            } else {
                 let (d, p, t3) = self
                         .mtp
                         .draft_chain_with_top_probs_and_step_top3_whose_per_step_host_readback_syncs_so_headroom_probes_only(
@@ -3952,48 +3482,6 @@ mod cuda_impl {
                         )?;
                 round_drafter_top3_by_step = t3;
                 (d, p)
-            } else {
-                let mut drafts: Vec<u32> = Vec::with_capacity(k);
-                let mut probs: Vec<f32> = Vec::with_capacity(k);
-                let mut h = self.base_hidden.clone();
-                let mut tok = self.anchor;
-                for j in 0..k {
-                    let (d, p, dhidden) = if want_probs {
-                        self.mtp.forward_draft_tok_with_top_prob(
-                            self.engine.underlying(),
-                            &h,
-                            tok,
-                            &mut self.mtp_kv,
-                        )?
-                    } else {
-                        let (d, dhidden) = self.mtp.forward_draft_tok(
-                            self.engine.underlying(),
-                            &h,
-                            tok,
-                            &mut self.mtp_kv,
-                        )?;
-                        (d, f32::NAN, dhidden)
-                    };
-                    if want_probs {
-                        probs.push(p);
-                    }
-                    let d = match forced_drafts {
-                        Some(f) => f[j],
-                        None => d,
-                    };
-                    drafts.push(d);
-                    tok = d;
-                    h = dhidden;
-                    if let Some(pmin) = p_min_cut {
-                        if p < pmin
-                                && drafts.len()
-                                    >= ADAPTIVE_DRAFT_KEEPS_AT_LEAST_TWO_BECAUSE_THE_TWO_ROW_VERIFY_IS_THE_ONE_GRAPH_SHAPE_WHOSE_TC_GEMM_PLAN_DIFFERS_AND_FLIPS_GREEDY_ARGMAX
-                            {
-                                break;
-                            }
-                    }
-                }
-                (drafts, probs)
             };
             if !draft_top_probs.is_empty() {
                 self.draft_top_prob_rounds_present_only_when_the_p_min_cut_or_round_debug_asked_the_chain_for_probs
@@ -4056,7 +3544,7 @@ mod cuda_impl {
             let mut emitted: Vec<u32> = drafts[..accepted].to_vec();
             emitted.push(bonus);
             if let Some(arm) = self
-                .suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token
+                .suffix_arm_consulted_before_each_mtp_chain_and_fed_every_emitted_token
                 .as_mut()
             {
                 arm.extend_capped(&emitted);
@@ -4273,7 +3761,7 @@ mod cuda_impl {
                 .expect("tree accept always emits at least the bonus");
             self.anchor = bonus;
             if let Some(arm) = self
-                .suffix_arm_env_opt_in_consulted_before_each_mtp_chain_and_fed_every_emitted_token
+                .suffix_arm_consulted_before_each_mtp_chain_and_fed_every_emitted_token
                 .as_mut()
             {
                 arm.extend_capped(&acc.emitted);
@@ -4561,6 +4049,7 @@ pub use cuda_impl::{
     MtpKvCache, Qwen38DenseMtpHead, Qwen38MtpDecodeSession, Qwen38MtpGraphedDecodeSession,
     Qwen38MtpSelfSpecEngine,
 };
+use std::env;
 
 #[cfg(test)]
 mod two_branch_tree_accept_tests {
@@ -4569,62 +4058,76 @@ mod two_branch_tree_accept_tests {
     const ROWS: [u32; 6] = [10, 11, 12, 13, 21, 22];
 
     #[test]
-    fn branch_a_full_accept_takes_depth_4_bonus_from_row_3() {
-        let acc = accept_two_branch_tree_m6(&ROWS, &[11, 12, 13, 99, 7, 7]).unwrap();
-        assert_eq!(acc.emitted, vec![11, 12, 13, 99]);
-        assert_eq!(acc.drafts_accepted, 3);
-        assert_eq!(acc.depth_consumed, 4);
-        assert_eq!(acc.bonus_row, 3);
-        assert_eq!(acc.branch_b_accepted_rows, None);
-    }
-
-    #[test]
-    fn branch_a_partial_accept_stops_at_first_mismatch() {
-        let acc = accept_two_branch_tree_m6(&ROWS, &[11, 55, 13, 99, 7, 7]).unwrap();
-        assert_eq!(acc.emitted, vec![11, 55]);
-        assert_eq!(acc.drafts_accepted, 1);
-        assert_eq!(acc.depth_consumed, 2);
-        assert_eq!(acc.bonus_row, 1);
-        assert_eq!(acc.branch_b_accepted_rows, None);
-    }
-
-    #[test]
-    fn branch_b_sibling_only_accepts_c2_and_takes_row_4_bonus() {
-        let acc = accept_two_branch_tree_m6(&ROWS, &[21, 0, 0, 0, 77, 0]).unwrap();
-        assert_eq!(acc.emitted, vec![21, 77]);
-        assert_eq!(acc.drafts_accepted, 1);
-        assert_eq!(acc.depth_consumed, 2);
-        assert_eq!(acc.bonus_row, 4);
-        assert_eq!(acc.branch_b_accepted_rows, Some(1));
-    }
-
-    #[test]
-    fn branch_b_with_continuation_accepts_both_and_takes_row_5_bonus() {
-        let acc = accept_two_branch_tree_m6(&ROWS, &[21, 0, 0, 0, 22, 88]).unwrap();
-        assert_eq!(acc.emitted, vec![21, 22, 88]);
-        assert_eq!(acc.drafts_accepted, 2);
-        assert_eq!(acc.depth_consumed, 3);
-        assert_eq!(acc.bonus_row, 5);
-        assert_eq!(acc.branch_b_accepted_rows, Some(2));
-    }
-
-    #[test]
-    fn neither_branch_matches_emits_the_anchor_rows_bonus_alone() {
-        let acc = accept_two_branch_tree_m6(&ROWS, &[7, 11, 12, 13, 21, 22]).unwrap();
-        assert_eq!(acc.emitted, vec![7]);
-        assert_eq!(acc.drafts_accepted, 0);
-        assert_eq!(acc.depth_consumed, 1);
-        assert_eq!(acc.bonus_row, 0);
-        assert_eq!(acc.branch_b_accepted_rows, None);
-    }
-
-    #[test]
-    fn degenerate_equal_top1_top2_prefers_branch_a_whose_depth_reaches_further() {
-        let rows = [10u32, 11, 12, 13, 11, 22];
-        let acc = accept_two_branch_tree_m6(&rows, &[11, 12, 0, 0, 0, 0]).unwrap();
-        assert_eq!(acc.branch_b_accepted_rows, None);
-        assert_eq!(acc.emitted, vec![11, 12, 0]);
-        assert_eq!(acc.bonus_row, 2);
+    fn every_branch_outcome_emits_the_accepted_run_and_takes_its_bonus_row() {
+        for (name, rows, greedy, emitted, drafts_accepted, depth_consumed, bonus_row, branch_b) in [
+            (
+                "branch A full accept takes the depth-4 bonus from row 3",
+                ROWS,
+                [11u32, 12, 13, 99, 7, 7],
+                vec![11u32, 12, 13, 99],
+                3usize,
+                4usize,
+                3usize,
+                None,
+            ),
+            (
+                "branch A partial accept stops at the first mismatch",
+                ROWS,
+                [11, 55, 13, 99, 7, 7],
+                vec![11, 55],
+                1,
+                2,
+                1,
+                None,
+            ),
+            (
+                "branch B sibling only accepts c2 and takes the row-4 bonus",
+                ROWS,
+                [21, 0, 0, 0, 77, 0],
+                vec![21, 77],
+                1,
+                2,
+                4,
+                Some(1),
+            ),
+            (
+                "branch B with continuation accepts both and takes the row-5 bonus",
+                ROWS,
+                [21, 0, 0, 0, 22, 88],
+                vec![21, 22, 88],
+                2,
+                3,
+                5,
+                Some(2),
+            ),
+            (
+                "neither branch matches: the anchor row's bonus alone",
+                ROWS,
+                [7, 11, 12, 13, 21, 22],
+                vec![7],
+                0,
+                1,
+                0,
+                None,
+            ),
+            (
+                "degenerate equal top1/top2 prefers branch A whose depth reaches further",
+                [10u32, 11, 12, 13, 11, 22],
+                [11, 12, 0, 0, 0, 0],
+                vec![11, 12, 0],
+                2,
+                3,
+                2,
+                None,
+            ),
+        ] {
+            let acc = accept_two_branch_tree_m6(&rows, &greedy).unwrap();
+            assert_eq!(acc.emitted, emitted, "{name}");
+            assert_eq!(acc.drafts_accepted, drafts_accepted, "{name}");
+            assert_eq!(acc.depth_consumed, depth_consumed, "{name}");
+            assert_eq!(acc.bonus_row, bonus_row, "{name}");
+            assert_eq!(acc.branch_b_accepted_rows, branch_b, "{name}");
+        }
     }
 
     #[test]

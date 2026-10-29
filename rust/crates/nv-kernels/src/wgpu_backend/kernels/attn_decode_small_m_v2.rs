@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::kernels::flash_decode as fd;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
@@ -441,12 +439,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert_eq!(std::mem::size_of::<SmV2Params>() % 16, 0);
-        assert_eq!(
-            std::mem::size_of::<SmV2Params>(),
-            16 * std::mem::size_of::<u32>()
-        );
+    fn params_limits_and_entries_track_the_flash_mk_contract() {
+        {
+            assert_eq!(std::mem::size_of::<SmV2Params>() % 16, 0);
+            assert_eq!(
+                std::mem::size_of::<SmV2Params>(),
+                16 * std::mem::size_of::<u32>()
+            );
+        }
+        {
+            for entry in [
+                ENTRY_STAGE1_F32,
+                ENTRY_STAGE1_BF16,
+                ENTRY_STAGE1_FP8,
+                ENTRY_STAGE2,
+            ] {
+                assert!(WGSL.contains(&format!("fn {entry}(")), "missing {entry}");
+            }
+            assert!(compose(WGSL).contains("fn e4m3_decode("));
+        }
+        {
+            assert_eq!(MAX_M, 8);
+            assert_eq!(MAX_HEAD_DIM, 256);
+            assert_eq!(WORKGROUP_SIZE, 256);
+        }
     }
 
     #[test]
@@ -469,25 +485,5 @@ mod tests {
             scratch_elems(4, 128, MAX_M + 1, 16).unwrap_err(),
             WgpuError::Shape(_)
         ));
-    }
-
-    #[test]
-    fn wgsl_declares_every_v2_entry_point() {
-        for entry in [
-            ENTRY_STAGE1_F32,
-            ENTRY_STAGE1_BF16,
-            ENTRY_STAGE1_FP8,
-            ENTRY_STAGE2,
-        ] {
-            assert!(WGSL.contains(&format!("fn {entry}(")), "missing {entry}");
-        }
-        assert!(compose(WGSL).contains("fn e4m3_decode("));
-    }
-
-    #[test]
-    fn limits_track_the_flash_mk_contract() {
-        assert_eq!(MAX_M, 8);
-        assert_eq!(MAX_HEAD_DIM, 256);
-        assert_eq!(WORKGROUP_SIZE, 256);
     }
 }

@@ -31,10 +31,6 @@ pub(crate) fn ort_err<R>(err: ort::Error<R>) -> anyhow::Error {
     anyhow!("{err}")
 }
 
-fn commit_tail_disabled() -> bool {
-    std::env::var(defaults::env::VAD_COMMIT_TAIL).is_ok_and(|v| v.trim() == "0")
-}
-
 const MODERN_STATE_UNITS: usize = 128;
 const LEGACY_HC_STATE_UNITS: usize = 64;
 
@@ -703,12 +699,7 @@ impl<M: VadInfer> VadProcessor<M> {
         let end_sample = (stop_ms as usize) * (SAMPLE_RATE / 1000);
         let end_sample = end_sample.min(self.buffer.len());
         let start_sample = start_sample.min(end_sample);
-        let tail_end = if commit_tail_disabled() {
-            end_sample
-        } else {
-            self.buffer.len()
-        };
-        let utterance = self.buffer[start_sample..tail_end].to_vec();
+        let utterance = self.buffer[start_sample..].to_vec();
         let speech_samples = end_sample - start_sample;
         let item_id = self
             .current_item
@@ -783,15 +774,6 @@ mod tests {
 
     fn ms_from_samples_16k(n: usize) -> u64 {
         (n as u64) * 1000 / 16_000
-    }
-
-    #[test]
-    fn min_speech_ms_default_is_100() {
-        assert_eq!(MIN_SPEECH_MS, 100);
-        assert_eq!(ms_from_samples_16k(1600), 100);
-        assert_eq!(ms_from_samples_16k(800), 50);
-        assert!(ms_from_samples_16k(800) < MIN_SPEECH_MS);
-        assert!(ms_from_samples_16k(1600) >= MIN_SPEECH_MS);
     }
 
     #[test]
@@ -902,16 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn hysteresis_silent_stays_silent() {
-        let probs = vec![0.0_f32; 32];
-        let mut m = ProbReplay { probs, idx: 0 };
-        let audio = vec![0.0_f32; 32 * WINDOW_SAMPLES];
-        let ts = get_speech_timestamps(&mut m, &audio, &opts(0.5, 100, 0, 0), SAMPLE_RATE).unwrap();
-        assert!(ts.is_empty(), "expected no speech, got {ts:?}");
-    }
-
-    #[test]
-    fn hysteresis_enter_at_threshold_leave_at_neg_threshold() {
+    fn hysteresis_enters_at_threshold_leaves_at_neg_threshold_and_ignores_dips() {
         let probs = vec![0.0, 0.0, 0.7, 0.7, 0.7, 0.7, 0.4, 0.4, 0.0, 0.0];
         let mut m = ProbReplay { probs, idx: 0 };
         let audio = vec![0.0_f32; 10 * WINDOW_SAMPLES];
@@ -923,23 +896,28 @@ mod tests {
         assert_eq!(ts[0].start, 2 * WINDOW_SAMPLES);
 
         assert_eq!(ts[0].end, 8 * WINDOW_SAMPLES);
+        {
+            let probs = vec![0.0_f32; 32];
+            let mut m = ProbReplay { probs, idx: 0 };
+            let audio = vec![0.0_f32; 32 * WINDOW_SAMPLES];
+            let ts = get_speech_timestamps(&mut m, &audio, &opts(0.5, 100, 0, 0), SAMPLE_RATE).unwrap();
+            assert!(ts.is_empty(), "expected no speech, got {ts:?}");
+        }
+        {
+            let probs = vec![0.0, 0.7, 0.7, 0.4, 0.7, 0.0, 0.0];
+            let mut m = ProbReplay { probs, idx: 0 };
+            let audio = vec![0.0_f32; 7 * WINDOW_SAMPLES];
+            let mut o = opts(0.5, 0, 0, 0);
+            o.min_silence_duration_ms = 0;
+            let ts = get_speech_timestamps(&mut m, &audio, &o, SAMPLE_RATE).unwrap();
+            assert_eq!(ts.len(), 1);
+            assert_eq!(ts[0].start, WINDOW_SAMPLES);
+            assert_eq!(ts[0].end, 5 * WINDOW_SAMPLES);
+        }
     }
 
     #[test]
-    fn hysteresis_dip_above_neg_threshold_does_not_release() {
-        let probs = vec![0.0, 0.7, 0.7, 0.4, 0.7, 0.0, 0.0];
-        let mut m = ProbReplay { probs, idx: 0 };
-        let audio = vec![0.0_f32; 7 * WINDOW_SAMPLES];
-        let mut o = opts(0.5, 0, 0, 0);
-        o.min_silence_duration_ms = 0;
-        let ts = get_speech_timestamps(&mut m, &audio, &o, SAMPLE_RATE).unwrap();
-        assert_eq!(ts.len(), 1);
-        assert_eq!(ts[0].start, WINDOW_SAMPLES);
-        assert_eq!(ts[0].end, 5 * WINDOW_SAMPLES);
-    }
-
-    #[test]
-    fn min_speech_filter_drops_short_segments() {
+    fn min_speech_filter_drops_short_segments_and_padding_extends_edges() {
         let probs = vec![0.0, 0.7, 0.0, 0.0, 0.0, 0.0, 0.0];
         let mut m = ProbReplay { probs, idx: 0 };
         let audio = vec![0.0_f32; 7 * WINDOW_SAMPLES];
@@ -947,21 +925,19 @@ mod tests {
         let o = opts(0.5, 0, 200, 0);
         let ts = get_speech_timestamps(&mut m, &audio, &o, SAMPLE_RATE).unwrap();
         assert!(ts.is_empty(), "expected filter, got {ts:?}");
-    }
+        {
+            let probs = vec![0.0, 0.7, 0.7, 0.7, 0.0, 0.0];
+            let mut m = ProbReplay { probs, idx: 0 };
+            let audio = vec![0.0_f32; 6 * WINDOW_SAMPLES];
+            let mut o = opts(0.5, 0, 0, 60);
+            o.min_silence_duration_ms = 0;
+            let ts = get_speech_timestamps(&mut m, &audio, &o, SAMPLE_RATE).unwrap();
+            assert_eq!(ts.len(), 1);
 
-    #[test]
-    fn padding_pass_extends_segment_edges() {
-        let probs = vec![0.0, 0.7, 0.7, 0.7, 0.0, 0.0];
-        let mut m = ProbReplay { probs, idx: 0 };
-        let audio = vec![0.0_f32; 6 * WINDOW_SAMPLES];
-        let mut o = opts(0.5, 0, 0, 60);
-        o.min_silence_duration_ms = 0;
-        let ts = get_speech_timestamps(&mut m, &audio, &o, SAMPLE_RATE).unwrap();
-        assert_eq!(ts.len(), 1);
+            assert!(ts[0].start < WINDOW_SAMPLES);
 
-        assert!(ts[0].start < WINDOW_SAMPLES);
-
-        assert!(ts[0].end > 4 * WINDOW_SAMPLES);
+            assert!(ts[0].end > 4 * WINDOW_SAMPLES);
+        }
     }
 
     struct FakeTd {
@@ -1002,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn driver_emits_speech_started_then_committed() {
+    fn driver_emits_speech_started_then_committed_with_the_silence_tail() {
         let probs = vec![0.0, 0.0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.0, 0.0, 0.0, 0.0];
         let m = ProbReplay { probs, idx: 0 };
         let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
@@ -1014,37 +990,35 @@ mod tests {
         if let VadEvent::SpeechCommitted { audio, .. } = &evs[1] {
             assert!(!audio.is_empty(), "committed audio should be non-empty");
         }
+        {
+            let probs = vec![0.0, 0.0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.0, 0.0, 0.0, 0.0];
+            let m = ProbReplay { probs, idx: 0 };
+            let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
+            push_n_windows(&mut p, 12);
+            let evs = p.take_events();
+            let (len, speech) = evs
+                .iter()
+                .find_map(|e| match e {
+                    VadEvent::SpeechCommitted {
+                        audio,
+                        speech_samples,
+                        ..
+                    } => Some((audio.len(), *speech_samples)),
+                    _ => None,
+                })
+                .expect("commit expected");
+            assert!(speech > 0);
+            assert!(
+                len > speech,
+                "committed audio must include the trailing silence the eou classifier was trained \
+                 on; feeding audio hard-cut at speech end costs ~5 points of complete-detection \
+                 (len {len} <= speech {speech})"
+            );
+        }
     }
 
     #[test]
-    fn committed_audio_carries_the_silence_tail_for_eou() {
-        let probs = vec![0.0, 0.0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.0, 0.0, 0.0, 0.0];
-        let m = ProbReplay { probs, idx: 0 };
-        let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
-        push_n_windows(&mut p, 12);
-        let evs = p.take_events();
-        let (len, speech) = evs
-            .iter()
-            .find_map(|e| match e {
-                VadEvent::SpeechCommitted {
-                    audio,
-                    speech_samples,
-                    ..
-                } => Some((audio.len(), *speech_samples)),
-                _ => None,
-            })
-            .expect("commit expected");
-        assert!(speech > 0);
-        assert!(
-            len > speech,
-            "committed audio must include the trailing silence the eou classifier was trained \
-             on; feeding audio hard-cut at speech end costs ~5 points of complete-detection \
-             (len {len} <= speech {speech})"
-        );
-    }
-
-    #[test]
-    fn force_commit_seals_an_open_utterance() {
+    fn force_commit_seals_an_open_utterance_once_and_never_synthesizes_one() {
         let probs = vec![0.0, 0.0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7];
         let m = ProbReplay { probs, idx: 0 };
         let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
@@ -1063,10 +1037,33 @@ mod tests {
             other => panic!("expected SpeechCommitted, got {other:?}"),
         }
         assert!(p.audio_start_ms.is_none(), "take_events must reset");
+        {
+            let probs = vec![0.0_f32; 8];
+            let m = ProbReplay { probs, idx: 0 };
+            let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
+            push_n_windows(&mut p, 8);
+            assert!(
+                !p.force_commit(),
+                "silence must not synthesize an utterance"
+            );
+            assert!(p.take_events().is_empty());
+        }
+        {
+            let probs = vec![0.0, 0.0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.0, 0.0, 0.0, 0.0];
+            let m = ProbReplay { probs, idx: 0 };
+            let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
+            push_n_windows(&mut p, 12);
+            assert!(
+                !p.force_commit(),
+                "an already-sealed utterance must not be sealed twice"
+            );
+            let evs = p.take_events();
+            assert_eq!(evs.len(), 2, "{evs:?}");
+        }
     }
 
     #[test]
-    fn gap_free_speech_seals_at_the_ceiling_instead_of_growing() {
+    fn gap_free_speech_seals_at_the_ceiling_and_carries_the_boundary_tail() {
         let windows = 16_000 * 31 / WINDOW_SAMPLES;
         let probs = vec![0.7_f32; windows];
         let m = ProbReplay { probs, idx: 0 };
@@ -1093,102 +1090,59 @@ mod tests {
             "the continuation must open a fresh item: {evs:?}"
         );
         assert_eq!(p.audio_start_ms, Some(0), "continuation stays open");
-    }
+        {
+            let windows = 16_000 * 31 / WINDOW_SAMPLES;
+            let probs = vec![0.7_f32; windows];
+            let m = ProbReplay { probs, idx: 0 };
+            let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
 
-    #[test]
-    fn ceiling_seal_carries_the_boundary_audio_into_the_next_item() {
-        let windows = 16_000 * 31 / WINDOW_SAMPLES;
-        let probs = vec![0.7_f32; windows];
-        let m = ProbReplay { probs, idx: 0 };
-        let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
+            let mut ramp = vec![0.0_f32; WINDOW_SAMPLES];
+            for (i, s) in ramp.iter_mut().enumerate() {
+                *s = i as f32 / WINDOW_SAMPLES as f32;
+            }
+            for _ in 0..windows {
+                p.push(&ramp).unwrap();
+            }
+            let _ = p.take_events();
 
-        let mut ramp = vec![0.0_f32; WINDOW_SAMPLES];
-        for (i, s) in ramp.iter_mut().enumerate() {
-            *s = i as f32 / WINDOW_SAMPLES as f32;
+            let carried = p.buffer.len();
+            let carried_ms = carried * 1000 / SAMPLE_RATE;
+            assert_eq!(
+                carried_ms, MAX_SPEECH_CARRY_OVER_MS as usize,
+                "the tail must be retained so a split word repeats rather than vanishing"
+            );
+            assert_eq!(
+                p.duration_samples, carried,
+                "the timebase must follow the retained tail"
+            );
         }
-        for _ in 0..windows {
-            p.push(&ramp).unwrap();
+        {
+            let windows = 16_000 * 31 / WINDOW_SAMPLES;
+            let mut probs = vec![0.7_f32; windows];
+            probs.extend(vec![0.7_f32; 40]);
+            let m = ProbReplay { probs, idx: 0 };
+            let mut p = VadProcessor::new(m).with_turn_detection(td(200, 0, 0));
+            push_n_windows(&mut p, windows);
+            let evs = p.take_events();
+            let sealed_before = evs
+                .iter()
+                .filter(|e| matches!(e, VadEvent::SpeechCommitted { .. }))
+                .count();
+            assert_eq!(sealed_before, 1, "ceiling seals exactly once: {evs:?}");
+
+            push_n_windows(&mut p, 2);
+            let evs = p.take_events();
+            assert!(
+                !evs.iter()
+                    .any(|e| matches!(e, VadEvent::SpeechCommitted { .. })),
+                "the carried tail must not commit itself as a fragment: {evs:?}"
+            );
+            assert_eq!(p.audio_start_ms, Some(0), "continuation stays open");
         }
-        let _ = p.take_events();
-
-        let carried = p.buffer.len();
-        let carried_ms = carried * 1000 / SAMPLE_RATE;
-        assert_eq!(
-            carried_ms, MAX_SPEECH_CARRY_OVER_MS as usize,
-            "the tail must be retained so a split word repeats rather than vanishing"
-        );
-        assert_eq!(
-            p.duration_samples, carried,
-            "the timebase must follow the retained tail"
-        );
     }
 
     #[test]
-    fn carried_tail_does_not_seal_itself_before_speech_resumes() {
-        let windows = 16_000 * 31 / WINDOW_SAMPLES;
-        let mut probs = vec![0.7_f32; windows];
-        probs.extend(vec![0.7_f32; 40]);
-        let m = ProbReplay { probs, idx: 0 };
-        let mut p = VadProcessor::new(m).with_turn_detection(td(200, 0, 0));
-        push_n_windows(&mut p, windows);
-        let evs = p.take_events();
-        let sealed_before = evs
-            .iter()
-            .filter(|e| matches!(e, VadEvent::SpeechCommitted { .. }))
-            .count();
-        assert_eq!(sealed_before, 1, "ceiling seals exactly once: {evs:?}");
-
-        push_n_windows(&mut p, 2);
-        let evs = p.take_events();
-        assert!(
-            !evs.iter()
-                .any(|e| matches!(e, VadEvent::SpeechCommitted { .. })),
-            "the carried tail must not commit itself as a fragment: {evs:?}"
-        );
-        assert_eq!(p.audio_start_ms, Some(0), "continuation stays open");
-    }
-
-    #[test]
-    fn force_commit_is_a_noop_without_speech() {
-        let probs = vec![0.0_f32; 8];
-        let m = ProbReplay { probs, idx: 0 };
-        let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
-        push_n_windows(&mut p, 8);
-        assert!(
-            !p.force_commit(),
-            "silence must not synthesize an utterance"
-        );
-        assert!(p.take_events().is_empty());
-    }
-
-    #[test]
-    fn force_commit_does_not_double_commit() {
-        let probs = vec![0.0, 0.0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.0, 0.0, 0.0, 0.0];
-        let m = ProbReplay { probs, idx: 0 };
-        let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
-        push_n_windows(&mut p, 12);
-        assert!(
-            !p.force_commit(),
-            "an already-sealed utterance must not be sealed twice"
-        );
-        let evs = p.take_events();
-        assert_eq!(evs.len(), 2, "{evs:?}");
-    }
-
-    #[test]
-    fn driver_silent_input_emits_nothing() {
-        let probs = vec![0.0_f32; 50];
-        let m = ProbReplay { probs, idx: 0 };
-        let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
-        push_n_windows(&mut p, 50);
-        let evs = p.take_events();
-        assert!(evs.is_empty(), "{evs:?}");
-
-        assert!(p.audio_start_ms.is_none());
-    }
-
-    #[test]
-    fn driver_resets_state_after_commit_via_take_events() {
+    fn driver_resets_after_take_events_and_ignores_silence_and_post_commit_pushes() {
         let probs = vec![
             0.0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.0, 0.0, 0.0, 0.0, 0.0, 0.7, 0.7, 0.7, 0.7, 0.7, 0.0,
             0.0, 0.0, 0.0,
@@ -1218,24 +1172,41 @@ mod tests {
             .filter(|e| matches!(e, VadEvent::SpeechCommitted { .. }))
             .count();
         assert_eq!((started, committed), (1, 1), "second turn: {evs:?}");
+        {
+            let probs = vec![0.0_f32; 50];
+            let m = ProbReplay { probs, idx: 0 };
+            let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
+            push_n_windows(&mut p, 50);
+            let evs = p.take_events();
+            assert!(evs.is_empty(), "{evs:?}");
+
+            assert!(p.audio_start_ms.is_none());
+        }
+        {
+            let probs = vec![0.0, 0.7, 0.7, 0.7, 0.0, 0.0, 0.0, 0.0];
+            let m = ProbReplay { probs, idx: 0 };
+            let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
+            push_n_windows(&mut p, 8);
+
+            let extra_silence = vec![0.0_f32; WINDOW_SAMPLES];
+            for _ in 0..5 {
+                p.push(&extra_silence).unwrap();
+            }
+            let evs = p.take_events();
+            let committed = evs
+                .iter()
+                .filter(|e| matches!(e, VadEvent::SpeechCommitted { .. }))
+                .count();
+            assert_eq!(committed, 1, "{evs:?}");
+        }
     }
 
     #[test]
-    fn driver_ignores_pushes_after_commit_until_take_events() {
-        let probs = vec![0.0, 0.7, 0.7, 0.7, 0.0, 0.0, 0.0, 0.0];
-        let m = ProbReplay { probs, idx: 0 };
-        let mut p = VadProcessor::new(m).with_turn_detection(td(64, 0, 0));
-        push_n_windows(&mut p, 8);
-
-        let extra_silence = vec![0.0_f32; WINDOW_SAMPLES];
-        for _ in 0..5 {
-            p.push(&extra_silence).unwrap();
-        }
-        let evs = p.take_events();
-        let committed = evs
-            .iter()
-            .filter(|e| matches!(e, VadEvent::SpeechCommitted { .. }))
-            .count();
-        assert_eq!(committed, 1, "{evs:?}");
+    fn min_speech_ms_default_is_100() {
+        assert_eq!(MIN_SPEECH_MS, 100);
+        assert_eq!(ms_from_samples_16k(1600), 100);
+        assert_eq!(ms_from_samples_16k(800), 50);
+        assert!(ms_from_samples_16k(800) < MIN_SPEECH_MS);
+        assert!(ms_from_samples_16k(1600) >= MIN_SPEECH_MS);
     }
 }

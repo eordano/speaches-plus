@@ -1,4 +1,8 @@
+#[cfg(feature = "cuda")]
+use anyhow::ensure;
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(feature = "cuda")]
+use candle_core::Storage;
 use candle_core::{DType, Device, Tensor, D};
 use nv_layers::attn::{sdpa, AttnConfig};
 use nv_layers::linear::Linear;
@@ -8,7 +12,14 @@ use nv_weights::WeightLoader;
 use std::path::Path;
 
 use crate::DraftScorer;
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaStream;
 use nv_layers::weight_load::{load_linear, load_rmsnorm, load_tensor};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug)]
 pub struct Eagle3SpeculatorConfig {
@@ -207,11 +218,9 @@ pub struct DrafterKvCache {
     #[cfg(feature = "cuda")]
     dev_cap: usize,
     #[cfg(feature = "cuda")]
-    dev_align: usize,
+    dev_n: Option<CudaSlice<i32>>,
     #[cfg(feature = "cuda")]
-    dev_n: Option<cudarc::driver::CudaSlice<i32>>,
-    #[cfg(feature = "cuda")]
-    dev_masks: std::collections::HashMap<usize, cudarc::driver::CudaSlice<u8>>,
+    dev_masks: std::collections::HashMap<usize, CudaSlice<u8>>,
     #[cfg(feature = "cuda")]
     dev_off: bool,
     #[cfg(feature = "cuda")]
@@ -319,30 +328,6 @@ impl DrafterKvCache {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn disable_device_kv(&mut self) {
-        self.dev_off = true;
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn device_kv_armed(&self) -> bool {
-        self.dev_k.is_some()
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn set_device_kv_align(&mut self, align: usize) {
-        self.dev_align = align;
-    }
-
-    #[cfg(feature = "cuda")]
-    fn device_kv_align(&self) -> usize {
-        if self.dev_align == 0 {
-            DRAFTER_DEVICE_KV_ALIGN
-        } else {
-            self.dev_align
-        }
-    }
-
-    #[cfg(feature = "cuda")]
     fn clear_device_kv(&mut self) {
         self.dev_k = None;
         self.dev_v = None;
@@ -351,8 +336,6 @@ impl DrafterKvCache {
 }
 
 pub const SPECULATOR_SUBDIR: &str = "speculator";
-
-pub const EAGLE3_SPECULATOR_KIND: &str = "eagle3";
 
 pub const SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY:
     &str = "nv_speculator_kind";
@@ -368,43 +351,6 @@ pub const EAGLE3_SPECULATOR_DELTA_TARGETS_EXCLUDE_EMBED_AND_LM_HEAD_BECAUSE_THE_
     "layers.0.self_attn.q_proj",
     "layers.0.self_attn.v_proj",
 ];
-
-pub fn cotrained_eagle3_speculator_dir(adapter_dir: &Path) -> Result<Option<std::path::PathBuf>> {
-    let cfg_path = adapter_dir.join("adapter_config.json");
-    let raw = std::fs::read_to_string(&cfg_path)
-        .with_context(|| format!("read {}", cfg_path.display()))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", cfg_path.display()))?;
-    let Some(kind_v) = v
-        .get(SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY)
-    else {
-        return Ok(None);
-    };
-    let Some(kind) = kind_v.as_str() else {
-        bail!(
-            "adapter at {} carries a non-string {} ({kind_v}); reading a malformed kind as \
-             absent would silently serve the base drafter for an artifact that meant to \
-             advertise co-trained deltas",
-            adapter_dir.display(),
-            SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY
-        );
-    };
-    if kind != EAGLE3_SPECULATOR_KIND {
-        return Ok(None);
-    }
-    let sdir = adapter_dir.join(SPECULATOR_SUBDIR);
-    for f in ["adapter_config.json", "adapter_model.safetensors"] {
-        if !sdir.join(f).is_file() {
-            bail!(
-                "adapter at {} advertises an eagle3 co-trained speculator but {} is missing; \
-                 serving the base drafter would silently drop the deltas the artifact promised",
-                adapter_dir.display(),
-                sdir.join(f).display()
-            );
-        }
-    }
-    Ok(Some(sdir))
-}
 
 pub struct LoadedEagle3Scorer {
     cfg: Eagle3SpeculatorConfig,
@@ -430,7 +376,7 @@ pub struct LoadedEagle3Scorer {
     d2t: Vec<u32>,
     t2d: Vec<bool>,
 
-    d2t_map_dev: std::sync::OnceLock<Tensor>,
+    d2t_map_dev: OnceLock<Tensor>,
 }
 
 impl LoadedEagle3Scorer {
@@ -516,170 +462,6 @@ impl LoadedEagle3Scorer {
             bail!("missing model.safetensors at {}", st_path.display());
         }
         Self::load_from_safetensors(&cfg, &st_path, device)
-    }
-
-    pub fn try_load_with_speculator_deltas(
-        model_dir: &Path,
-        speculator_dir: Option<&Path>,
-        device: &Device,
-    ) -> Result<Self> {
-        let mut scorer = Self::try_load(model_dir, device)?;
-        if let Some(dir) = speculator_dir {
-            scorer.merge_speculator_deltas(dir)?;
-        }
-        Ok(scorer)
-    }
-
-    pub fn merge_speculator_deltas(&mut self, speculator_dir: &Path) -> Result<()> {
-        let cfg_path = speculator_dir.join("adapter_config.json");
-        let raw = std::fs::read_to_string(&cfg_path)
-            .with_context(|| format!("read {}", cfg_path.display()))?;
-        let cfg_v: serde_json::Value =
-            serde_json::from_str(&raw).with_context(|| format!("parse {}", cfg_path.display()))?;
-        if let Some(kind_v) = cfg_v
-            .get(SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY)
-        {
-            let Some(kind) = kind_v.as_str() else {
-                bail!(
-                    "speculator at {} carries a non-string {} ({kind_v}); a malformed kind is \
-                     refused, never read as the absent-key eagle3 default",
-                    speculator_dir.display(),
-                    SPECULATOR_KIND_IS_AUTHORITATIVE_IN_THE_MAIN_ADAPTER_CONFIG_BECAUSE_EAGLE3_SUBDIR_CONFIGS_OMIT_THE_KEY
-                );
-            };
-            if kind != EAGLE3_SPECULATOR_KIND {
-                bail!(
-                    "speculator at {} declares kind {kind:?}, not {EAGLE3_SPECULATOR_KIND:?}; \
-                     merging another speculator kind's deltas into the eagle3 drafter would \
-                     serve a drafter nobody trained",
-                    speculator_dir.display()
-                );
-            }
-        }
-        let peft = nv_weights::lora_adapter::PeftConfig::from_json_value(&cfg_v)
-            .with_context(|| format!("speculator config {}", cfg_path.display()))?;
-        let st_path = speculator_dir.join("adapter_model.safetensors");
-        let weights = WeightLoader::open_file(&st_path, &self.device)
-            .with_context(|| format!("open {}", st_path.display()))?;
-        let mut pending: std::collections::BTreeMap<String, (Option<Tensor>, Option<Tensor>)> =
-            std::collections::BTreeMap::new();
-        for name in weights.names() {
-            let (module, is_a, is_embedding) =
-                nv_weights::lora_adapter::parse_fine_tuned_lora_name(&name).with_context(|| {
-                    format!(
-                        "speculator tensor {name} at {} is not a lora_A/lora_B pair member; \
-                         the whole merge is refused, never a skip",
-                        speculator_dir.display()
-                    )
-                })?;
-            if is_embedding
-                || !EAGLE3_SPECULATOR_DELTA_TARGETS_EXCLUDE_EMBED_AND_LM_HEAD_BECAUSE_THE_TRAINER_FREEZES_BOTH_AND_EMBED_MAY_BE_TENSOR_SHARED_WITH_THE_TARGET_TRUNK
-                    .contains(&module.as_str())
-            {
-                bail!(
-                    "speculator at {} names module {module:?}, which is not an eagle3 drafter \
-                     delta target; the whole merge is refused (never a skip) because \
-                     embed_tokens and lm_head are frozen by the drafter recipe, embed_tokens \
-                     may be tensor-shared with the target trunk, and norms and d2t/t2d are not \
-                     LoRA surfaces; allowed targets: {:?}",
-                    speculator_dir.display(),
-                    EAGLE3_SPECULATOR_DELTA_TARGETS_EXCLUDE_EMBED_AND_LM_HEAD_BECAUSE_THE_TRAINER_FREEZES_BOTH_AND_EMBED_MAY_BE_TENSOR_SHARED_WITH_THE_TARGET_TRUNK
-                );
-            }
-            let t = weights.get(&name, DType::F32)?;
-            let slot = pending.entry(module.clone()).or_default();
-            let side = if is_a { &mut slot.0 } else { &mut slot.1 };
-            if side.is_some() {
-                bail!(
-                    "speculator at {} holds two tensors for module {module} lora_{}: a \
-                     prefixed and an unprefixed spelling collide after base_model.model. \
-                     stripping, and silently picking one would drop the other, so the whole \
-                     merge is refused",
-                    speculator_dir.display(),
-                    if is_a { "A" } else { "B" }
-                );
-            }
-            *side = Some(t);
-        }
-        if pending.is_empty() {
-            bail!(
-                "speculator at {} holds no lora_A/lora_B pairs; an empty artifact advertises \
-                 co-trained deltas that were never trained",
-                speculator_dir.display()
-            );
-        }
-        let mut staged: Vec<(String, Linear)> = Vec::with_capacity(pending.len());
-        for (module, (a, b)) in pending {
-            let (Some(a), Some(b)) = (a, b) else {
-                bail!(
-                    "speculator at {} module {module}: lora_A/lora_B pair is incomplete; \
-                     refusing the whole merge",
-                    speculator_dir.display()
-                );
-            };
-            let lin = self.speculator_delta_target(&module)?;
-            let out_f = lin.out_features();
-            let in_f = lin.in_features();
-            let ad = a.dims().to_vec();
-            let bd = b.dims().to_vec();
-            if ad != [peft.r, in_f] || bd != [out_f, peft.r] {
-                bail!(
-                    "speculator at {} module {module}: A {ad:?} B {bd:?} do not match the \
-                     loaded drafter's [{out_f}, {in_f}] at rank {}; the artifact was trained \
-                     against a different drafter, so the whole merge is refused",
-                    speculator_dir.display(),
-                    peft.r
-                );
-            }
-            let mut delta = b.matmul(&a)?;
-            if peft.scaling != 1.0 {
-                delta = (delta * peft.scaling)?;
-            }
-            let w = lin.weight().ok_or_else(|| {
-                anyhow!(
-                    "speculator merge targets the dense drafter weights and must run before \
-                     any load-time quant arm, but {module} has no dense weight tensor"
-                )
-            })?;
-            let merged = w
-                .to_dtype(DType::F32)?
-                .add(&delta)?
-                .to_dtype(self.dtype)?
-                .contiguous()?;
-            staged.push((module, Linear::new(merged, lin.bias().cloned())?));
-        }
-        for (module, lin) in staged {
-            self.replace_speculator_delta_target(&module, lin);
-        }
-        Ok(())
-    }
-
-    fn speculator_delta_target(&self, module: &str) -> Result<&Linear> {
-        Ok(match module {
-            "fc" => &self.fc,
-            "layers.0.self_attn.q_proj" => &self.q_proj,
-            "layers.0.self_attn.k_proj" => &self.k_proj,
-            "layers.0.self_attn.v_proj" => &self.v_proj,
-            "layers.0.self_attn.o_proj" => &self.o_proj,
-            "layers.0.mlp.gate_proj" => &self.gate_proj,
-            "layers.0.mlp.up_proj" => &self.up_proj,
-            "layers.0.mlp.down_proj" => &self.down_proj,
-            _ => bail!("no eagle3 drafter linear named {module}"),
-        })
-    }
-
-    fn replace_speculator_delta_target(&mut self, module: &str, lin: Linear) {
-        match module {
-            "fc" => self.fc = lin,
-            "layers.0.self_attn.q_proj" => self.q_proj = lin,
-            "layers.0.self_attn.k_proj" => self.k_proj = lin,
-            "layers.0.self_attn.v_proj" => self.v_proj = lin,
-            "layers.0.self_attn.o_proj" => self.o_proj = lin,
-            "layers.0.mlp.gate_proj" => self.gate_proj = lin,
-            "layers.0.mlp.up_proj" => self.up_proj = lin,
-            "layers.0.mlp.down_proj" => self.down_proj = lin,
-            _ => unreachable!("staged modules were resolved by speculator_delta_target"),
-        }
     }
 
     pub fn load_from_safetensors(
@@ -837,11 +619,10 @@ impl LoadedEagle3Scorer {
             rope,
             d2t,
             t2d,
-            d2t_map_dev: std::sync::OnceLock::new(),
+            d2t_map_dev: OnceLock::new(),
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         cfg: Eagle3SpeculatorConfig,
         device: Device,
@@ -895,11 +676,10 @@ impl LoadedEagle3Scorer {
             rope,
             d2t,
             t2d,
-            d2t_map_dev: std::sync::OnceLock::new(),
+            d2t_map_dev: OnceLock::new(),
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn block_step(
         &self,
         block_in: &Tensor,
@@ -1002,12 +782,8 @@ impl LoadedEagle3Scorer {
         v_all: &Tensor,
     ) -> Result<Option<Tensor>> {
         use cudarc::driver::DevicePtrMut;
-        if nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_NO_DEVICE_CHAIN") {
+        let Device::Cuda(dev) = self.device.clone() else {
             return Ok(None);
-        }
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
         };
         if self.dtype != DType::BF16 {
             return Ok(None);
@@ -1070,7 +846,7 @@ impl LoadedEagle3Scorer {
         }
         let storage = candle_core::CudaStorage::wrap_cuda_slice(out_dev, dev);
         let attn_out = Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, nh * hd),
             candle_core::op::BackpropOp::none(),
             false,
@@ -1135,30 +911,13 @@ impl LoadedEagle3Scorer {
                 aux_full.dims()
             );
         }
-        self.chain_draft_projected(context, &self.project_aux(aux_full)?, k)
-    }
-
-    pub fn chain_draft_projected(
-        &self,
-        context: &[u32],
-        aux_proj: &Tensor,
-        k: usize,
-    ) -> Result<Vec<u32>> {
-        let ctx_len = context.len();
         if ctx_len == 0 {
             bail!("chain_draft: empty context");
-        }
-        if aux_proj.dims() != [ctx_len, self.cfg.hidden_size] {
-            bail!(
-                "chain_draft: projected aux must be [{ctx_len}, {}], got {:?}",
-                self.cfg.hidden_size,
-                aux_proj.dims()
-            );
         }
         let ids = Tensor::from_vec(context.to_vec(), ctx_len, &self.device)?;
         let token_embed = self.embed_tokens.index_select(&ids, 0)?;
         let token_normed = self.input_layernorm.forward(&token_embed)?;
-        let aux_proj = aux_proj.to_dtype(self.dtype)?;
+        let aux_proj = self.project_aux(aux_full)?.to_dtype(self.dtype)?;
         let aux_normed = self.hidden_norm.forward(&aux_proj)?;
         let residual_ctx = if self.cfg.norm_before_residual {
             aux_normed.clone()
@@ -1208,22 +967,9 @@ impl LoadedEagle3Scorer {
         aux_proj: &Tensor,
         k: usize,
     ) -> Result<Vec<u32>> {
-        self.chain_draft_cached_cond(cache, context, aux_proj, k, None, false)
+        self.chain_draft_cached_cond_tail(cache, context, aux_proj, 0, k, None, false)
     }
 
-    pub fn chain_draft_cached_cond(
-        &self,
-        cache: &mut DrafterKvCache,
-        context: &[u32],
-        aux_proj: &Tensor,
-        k: usize,
-        bonus: Option<u32>,
-        shift: bool,
-    ) -> Result<Vec<u32>> {
-        self.chain_draft_cached_cond_tail(cache, context, aux_proj, 0, k, bonus, shift)
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn encode_context_rows(
         &self,
         cache: &mut DrafterKvCache,
@@ -1310,7 +1056,6 @@ impl LoadedEagle3Scorer {
         self.encode_context_rows(cache, context, aux_proj, aux_base, encode_to, shift, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn chain_draft_cached_cond_tail(
         &self,
         cache: &mut DrafterKvCache,
@@ -1362,67 +1107,32 @@ impl LoadedEagle3Scorer {
         let mut new_k: Vec<Tensor> = Vec::with_capacity(k);
         let mut new_v: Vec<Tensor> = Vec::with_capacity(k);
 
-        if !nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_NO_DEVICE_CHAIN") {
-            let dbg =
-                nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_GRAPH_CHAIN_DEBUG")
-                    && nv_config::env_arm_present_at_all_reread_every_call(
-                        "NV_EAGLE3_GRAPH_CHAIN_EAGER",
-                    );
-            let dump = |tag: &str, t: &Tensor| {
-                if dbg {
-                    let v: Vec<f32> = t
-                        .to_dtype(DType::F32)
-                        .and_then(|x| x.flatten_all())
-                        .and_then(|x| x.to_vec1())
-                        .unwrap_or_default();
-                    let head: Vec<f32> = v.iter().take(4).copied().collect();
-                    eprintln!("[chain-e] {tag}: {head:?}");
-                }
-            };
-            dump("h0", &h_cond);
-            let mut tok_dev = match (shift, bonus) {
-                (false, Some(b)) => Tensor::from_vec(vec![b], 1, &self.device)?,
-                _ => self.draft_next_dev(&h_cond)?,
-            };
-            let mut toks_dev: Vec<Tensor> = Vec::with_capacity(k);
-            toks_dev.push(tok_dev.clone());
-            for j in 1..k {
-                let bin = self.step_block_in_dev(&tok_dev, &h_cond)?;
-                dump(&format!("s{j} bin"), &bin);
-                let block_out = self.block_step(
-                    &bin,
-                    &h_cond,
-                    ctx_len + j - 1,
-                    k_ctx,
-                    v_ctx,
-                    &mut new_k,
-                    &mut new_v,
-                )?;
-                if dbg {
-                    if let (Some(kr), Some(_vr)) = (new_k.last(), new_v.last()) {
-                        dump(&format!("s{j} k_rot"), kr);
-                    }
-                    dump(&format!("s{j} h"), &block_out);
-                }
-                tok_dev = self.draft_next_dev(&block_out)?;
-                toks_dev.push(tok_dev.clone());
-                h_cond = block_out;
-            }
-            let all = Tensor::cat(&toks_dev[..], 0)?;
-            return Ok(all.to_vec1()?);
-        }
-
-        let mut token = match (shift, bonus) {
-            (false, Some(b)) => b,
-            _ => {
-                let draft0 = self.draft_from_block(&h_cond)?;
-                self.d2t_map(draft0)
+        let dbg =
+            nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_GRAPH_CHAIN_DEBUG")
+                && nv_config::env_arm_present_at_all_reread_every_call(
+                    "NV_EAGLE3_GRAPH_CHAIN_EAGER",
+                );
+        let dump = |tag: &str, t: &Tensor| {
+            if dbg {
+                let v: Vec<f32> = t
+                    .to_dtype(DType::F32)
+                    .and_then(|x| x.flatten_all())
+                    .and_then(|x| x.to_vec1())
+                    .unwrap_or_default();
+                let head: Vec<f32> = v.iter().take(4).copied().collect();
+                eprintln!("[chain-e] {tag}: {head:?}");
             }
         };
-        let mut out = Vec::with_capacity(k);
-        out.push(token);
+        dump("h0", &h_cond);
+        let mut tok_dev = match (shift, bonus) {
+            (false, Some(b)) => Tensor::from_vec(vec![b], 1, &self.device)?,
+            _ => self.draft_next_dev(&h_cond)?,
+        };
+        let mut toks_dev: Vec<Tensor> = Vec::with_capacity(k);
+        toks_dev.push(tok_dev.clone());
         for j in 1..k {
-            let bin = self.step_block_in(token, &h_cond)?;
+            let bin = self.step_block_in_dev(&tok_dev, &h_cond)?;
+            dump(&format!("s{j} bin"), &bin);
             let block_out = self.block_step(
                 &bin,
                 &h_cond,
@@ -1432,12 +1142,18 @@ impl LoadedEagle3Scorer {
                 &mut new_k,
                 &mut new_v,
             )?;
-            let d = self.draft_from_block(&block_out)?;
-            token = self.d2t_map(d);
-            out.push(token);
+            if dbg {
+                if let (Some(kr), Some(_vr)) = (new_k.last(), new_v.last()) {
+                    dump(&format!("s{j} k_rot"), kr);
+                }
+                dump(&format!("s{j} h"), &block_out);
+            }
+            tok_dev = self.draft_next_dev(&block_out)?;
+            toks_dev.push(tok_dev.clone());
             h_cond = block_out;
         }
-        Ok(out)
+        let all = Tensor::cat(&toks_dev[..], 0)?;
+        Ok(all.to_vec1()?)
     }
 
     fn block_seq_appended(
@@ -1552,7 +1268,7 @@ impl LoadedEagle3Scorer {
             if m <= DRAFTER_DEVICE_KV_MAX_TAIL
                 && !cache.dev_off
                 && self.dtype == DType::BF16
-                && matches!(self.device, Device::Cuda(_))
+                && self.device.is_cuda()
             {
                 match self.tail_append_device(cache, block_in, residual, m) {
                     Ok(Some(block_out)) => {
@@ -1596,13 +1312,8 @@ impl LoadedEagle3Scorer {
         m: usize,
     ) -> Result<Option<Tensor>> {
         use cudarc::driver::DevicePtrMut;
-        if nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_NO_DEVICE_KV") {
-            cache.dev_off = true;
+        let Device::Cuda(dev) = self.device.clone() else {
             return Ok(None);
-        }
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
         };
         let nh = self.cfg.num_attention_heads;
         let nkv = self.cfg.num_key_value_heads;
@@ -1612,7 +1323,7 @@ impl LoadedEagle3Scorer {
             return Ok(None);
         }
         let phys = cache.phys_len();
-        anyhow::ensure!(
+        ensure!(
             phys + cache.evicted == cache.len,
             "tail_append_device: phys {phys} + evicted {} != len {}",
             cache.evicted,
@@ -1622,7 +1333,7 @@ impl LoadedEagle3Scorer {
         let stream = nv_layers::cuda_stream::current_stream(&dev);
 
         if cache.dev_k.is_none() || cache.dev_cap < need {
-            let align = cache.device_kv_align().max(1);
+            let align = DRAFTER_DEVICE_KV_ALIGN;
             let cap = need.div_ceil(align) * align + align;
             let k_full = Tensor::zeros((1usize, cap, nkv, hd), DType::BF16, &self.device)?;
             let v_full = Tensor::zeros((1usize, cap, nkv, hd), DType::BF16, &self.device)?;
@@ -1641,7 +1352,7 @@ impl LoadedEagle3Scorer {
                         anyhow!("tail_append_device: cache.v missing at len {}", cache.len)
                     })?
                     .contiguous()?;
-                anyhow::ensure!(
+                ensure!(
                     src_k.dims() == [1, phys, nkv, hd] && src_k.dtype() == DType::BF16,
                     "tail_append_device: unexpected cache.k {:?} {:?}",
                     src_k.dims(),
@@ -1742,7 +1453,7 @@ impl LoadedEagle3Scorer {
         }
         let storage = candle_core::CudaStorage::wrap_cuda_slice(out_dev, dev);
         let attn_out = Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (m, nh * hd),
             candle_core::op::BackpropOp::none(),
             false,
@@ -1759,7 +1470,6 @@ impl LoadedEagle3Scorer {
         Ok(logits.reshape((self.cfg.draft_vocab_size,))?.to_vec1()?)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn block_step_tree(
         &self,
         block_in: &Tensor,
@@ -1874,7 +1584,6 @@ impl LoadedEagle3Scorer {
         let mut node_k: Vec<Tensor> = Vec::new();
         let mut node_v: Vec<Tensor> = Vec::new();
 
-        #[allow(clippy::type_complexity)]
         let mut queue: std::collections::VecDeque<(
             Option<usize>,
             Tensor,
@@ -1926,11 +1635,6 @@ impl LoadedEagle3Scorer {
             parents,
             depths,
         })
-    }
-
-    pub fn score_with_aux(&mut self, context: &[u32], aux_hidden: &Tensor) -> Result<Vec<f32>> {
-        let logits = self.forward(context, Some(aux_hidden))?;
-        last_row_to_f32(&logits)
     }
 
     pub fn forward(&self, token_ids: &[u32], aux_hidden: Option<&Tensor>) -> Result<Tensor> {
@@ -2079,7 +1783,7 @@ pub(crate) fn d2t_apply(d2t: &[u32], draft_token: u32) -> u32 {
 }
 
 pub(crate) fn d2t_dev_tensor(
-    cache: &std::sync::OnceLock<Tensor>,
+    cache: &OnceLock<Tensor>,
     d2t: &[u32],
     draft_vocab: usize,
     device: &Device,
@@ -2168,49 +1872,49 @@ pub(crate) fn load_t2d(weights: &WeightLoader, name: &str, len: usize) -> Result
 
 #[cfg(feature = "cuda")]
 pub struct DraftChainGraph {
-    forked: std::sync::Arc<cudarc::driver::CudaStream>,
+    forked: Arc<CudaStream>,
     runner: nv_kernels::graph::CudaGraphRunner,
     kd: usize,
     cap: usize,
 
     disabled: bool,
     captured: bool,
-    k_cache: cudarc::driver::CudaSlice<half::bf16>,
-    v_cache: cudarc::driver::CudaSlice<half::bf16>,
-    h0_buf: cudarc::driver::CudaSlice<half::bf16>,
+    k_cache: CudaSlice<half::bf16>,
+    v_cache: CudaSlice<half::bf16>,
+    h0_buf: CudaSlice<half::bf16>,
 
-    n_buf: cudarc::driver::CudaSlice<i32>,
-    out_buf: cudarc::driver::CudaSlice<u32>,
-    attn_out_buf: cudarc::driver::CudaSlice<half::bf16>,
+    n_buf: CudaSlice<i32>,
+    out_buf: CudaSlice<u32>,
+    attn_out_buf: CudaSlice<half::bf16>,
 
-    mask1: cudarc::driver::CudaSlice<u8>,
+    mask1: CudaSlice<u8>,
     host_ns: Vec<i32>,
     host_pos: Vec<i32>,
     mirrored_rows: usize,
     mirrored_compactions: u64,
 
-    pos_steps: Vec<cudarc::driver::CudaSlice<i32>>,
+    pos_steps: Vec<CudaSlice<i32>>,
 
-    normed_buf: cudarc::driver::CudaSlice<half::bf16>,
-    logits_buf: cudarc::driver::CudaSlice<half::bf16>,
-    amax_val: cudarc::driver::CudaSlice<f32>,
-    amax_idx: cudarc::driver::CudaSlice<i32>,
-    idx_buf: cudarc::driver::CudaSlice<u32>,
-    emb_buf: cudarc::driver::CudaSlice<half::bf16>,
-    bin_buf: cudarc::driver::CudaSlice<half::bf16>,
-    q_buf: cudarc::driver::CudaSlice<half::bf16>,
-    k_buf: cudarc::driver::CudaSlice<half::bf16>,
-    v_buf: cudarc::driver::CudaSlice<half::bf16>,
-    qr_buf: cudarc::driver::CudaSlice<half::bf16>,
-    kr_buf: cudarc::driver::CudaSlice<half::bf16>,
-    o_buf: cudarc::driver::CudaSlice<half::bf16>,
-    pa_buf: cudarc::driver::CudaSlice<half::bf16>,
-    nm_buf: cudarc::driver::CudaSlice<half::bf16>,
-    gate_buf: cudarc::driver::CudaSlice<half::bf16>,
-    up_buf: cudarc::driver::CudaSlice<half::bf16>,
-    act_buf: cudarc::driver::CudaSlice<half::bf16>,
-    mlp_buf: cudarc::driver::CudaSlice<half::bf16>,
-    h_bufs: Vec<cudarc::driver::CudaSlice<half::bf16>>,
+    normed_buf: CudaSlice<half::bf16>,
+    logits_buf: CudaSlice<half::bf16>,
+    amax_val: CudaSlice<f32>,
+    amax_idx: CudaSlice<i32>,
+    idx_buf: CudaSlice<u32>,
+    emb_buf: CudaSlice<half::bf16>,
+    bin_buf: CudaSlice<half::bf16>,
+    q_buf: CudaSlice<half::bf16>,
+    k_buf: CudaSlice<half::bf16>,
+    v_buf: CudaSlice<half::bf16>,
+    qr_buf: CudaSlice<half::bf16>,
+    kr_buf: CudaSlice<half::bf16>,
+    o_buf: CudaSlice<half::bf16>,
+    pa_buf: CudaSlice<half::bf16>,
+    nm_buf: CudaSlice<half::bf16>,
+    gate_buf: CudaSlice<half::bf16>,
+    up_buf: CudaSlice<half::bf16>,
+    act_buf: CudaSlice<half::bf16>,
+    mlp_buf: CudaSlice<half::bf16>,
+    h_bufs: Vec<CudaSlice<half::bf16>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2255,22 +1959,21 @@ impl DraftChainGraph {
             return Ok(());
         }
         let stride = nkv * hd;
-        anyhow::ensure!(to <= self.cap, "mirror_rows: {to} rows > cap {}", self.cap);
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => bail!("mirror_rows requires cuda"),
+        ensure!(to <= self.cap, "mirror_rows: {to} rows > cap {}", self.cap);
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("mirror_rows requires cuda")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         for (src_t, dst) in [(k_all, &mut self.k_cache), (v_all, &mut self.v_cache)] {
             let c = src_t.contiguous()?;
             let (st, l) = c.storage_and_layout();
             let cuda = match &*st {
-                candle_core::Storage::Cuda(s) => s,
+                Storage::Cuda(s) => s,
                 _ => bail!("mirror_rows: expected cuda storage"),
             };
             let sl = cuda.as_cuda_slice::<half::bf16>()?;
             let off = l.start_offset();
-            anyhow::ensure!(
+            ensure!(
                 sl.len() >= off + to * stride,
                 "mirror_rows: cache tensor has {} elems, need {} + off {}",
                 sl.len(),
@@ -2294,13 +1997,11 @@ impl LoadedEagle3Scorer {
             bail!("new_chain_graph: kd must be >= 1");
         }
         self.chain_graph_eligible()?;
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => bail!("new_chain_graph requires cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("new_chain_graph requires cuda")
         };
-        let raw_ctx: std::sync::Arc<cudarc::driver::CudaContext> =
-            dev.cuda_stream().context().clone();
-        let forked = raw_ctx.new_stream().map_err(|e| anyhow!(e))?;
+        let raw_ctx: Arc<cudarc::driver::CudaContext> = dev.cuda_stream().context().clone();
+        let forked = raw_ctx.new_stream()?;
         let nkv = self.cfg.num_key_value_heads;
         let hd = self.cfg.head_dim;
         let nh = self.cfg.num_attention_heads;
@@ -2311,18 +2012,14 @@ impl LoadedEagle3Scorer {
         let v_cache = forked
             .alloc_zeros::<half::bf16>(cap * stride)
             .map_err(|e| anyhow!("chain v_cache alloc: {e:?}"))?;
-        let h0_buf = forked
-            .alloc_zeros::<half::bf16>(self.cfg.hidden_size)
-            .map_err(|e| anyhow!(e))?;
-        let n_buf = forked.alloc_zeros::<i32>(kd).map_err(|e| anyhow!(e))?;
-        let out_buf = forked.alloc_zeros::<u32>(kd).map_err(|e| anyhow!(e))?;
-        let attn_out_buf = forked
-            .alloc_zeros::<half::bf16>(nh * hd)
-            .map_err(|e| anyhow!(e))?;
-        let mask1 = forked.alloc_zeros::<u8>(1).map_err(|e| anyhow!(e))?;
+        let h0_buf = forked.alloc_zeros::<half::bf16>(self.cfg.hidden_size)?;
+        let n_buf = forked.alloc_zeros::<i32>(kd)?;
+        let out_buf = forked.alloc_zeros::<u32>(kd)?;
+        let attn_out_buf = forked.alloc_zeros::<half::bf16>(nh * hd)?;
+        let mask1 = forked.alloc_zeros::<u8>(1)?;
         let mut pos_steps = Vec::with_capacity(kd.saturating_sub(1));
         for _ in 0..kd.saturating_sub(1) {
-            pos_steps.push(forked.alloc_zeros::<i32>(1).map_err(|e| anyhow!(e))?);
+            pos_steps.push(forked.alloc_zeros::<i32>(1)?);
         }
 
         let hidden = self.cfg.hidden_size;
@@ -2330,16 +2027,16 @@ impl LoadedEagle3Scorer {
         let dv = self.cfg.draft_vocab_size;
         let bin_dim = self.cfg.block_in_dim();
         let parts = nv_kernels::cuda::argmax_parts();
-        let abf = |n: usize| -> Result<cudarc::driver::CudaSlice<half::bf16>> {
+        let abf = |n: usize| -> Result<CudaSlice<half::bf16>> {
             forked
                 .alloc_zeros::<half::bf16>(n)
                 .map_err(|e| anyhow!("chain buf alloc ({n}): {e:?}"))
         };
         let normed_buf = abf(hidden)?;
         let logits_buf = abf(dv)?;
-        let amax_val = forked.alloc_zeros::<f32>(parts).map_err(|e| anyhow!(e))?;
-        let amax_idx = forked.alloc_zeros::<i32>(parts).map_err(|e| anyhow!(e))?;
-        let idx_buf = forked.alloc_zeros::<u32>(1).map_err(|e| anyhow!(e))?;
+        let amax_val = forked.alloc_zeros::<f32>(parts)?;
+        let amax_idx = forked.alloc_zeros::<i32>(parts)?;
+        let idx_buf = forked.alloc_zeros::<u32>(1)?;
         let emb_buf = abf(hidden)?;
         let bin_buf = abf(bin_dim)?;
         let q_buf = abf(nh * hd)?;
@@ -2355,7 +2052,7 @@ impl LoadedEagle3Scorer {
         let act_buf = abf(inter)?;
         let mlp_buf = abf(hidden)?;
         let h_bufs = vec![abf(hidden)?, abf(hidden)?];
-        forked.synchronize().map_err(|e| anyhow!(e))?;
+        forked.synchronize()?;
 
         let _ = self.d2t_map_dev_tensor()?;
         let runner = nv_kernels::graph::CudaGraphRunner::new(forked.clone());
@@ -2453,7 +2150,6 @@ impl LoadedEagle3Scorer {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn chain_draft_cached_shift_graphed_tail(
         &self,
         cache: &mut DrafterKvCache,
@@ -2471,7 +2167,6 @@ impl LoadedEagle3Scorer {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn chain_draft_cached_shift_graphed_mode(
         &self,
         cache: &mut DrafterKvCache,
@@ -2487,7 +2182,6 @@ impl LoadedEagle3Scorer {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn chain_draft_cached_shift_graphed_full(
         &self,
         cache: &mut DrafterKvCache,
@@ -2514,7 +2208,6 @@ impl LoadedEagle3Scorer {
             || kd < 1
             || projected_phys + kd > g.cap
             || ctx_len + kd > self.cfg.max_position_embeddings
-            || nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_NO_DEVICE_CHAIN")
         {
             return self.chain_draft_cached_cond_tail(
                 cache,
@@ -2563,7 +2256,7 @@ impl LoadedEagle3Scorer {
 
         {
             let phys = cache.phys_len();
-            anyhow::ensure!(
+            ensure!(
                 phys + cache.evicted() == ctx_len,
                 "graphed tail encode: cache holds {phys} rows + {} evicted, expected {ctx_len}",
                 cache.evicted()
@@ -2617,24 +2310,23 @@ impl LoadedEagle3Scorer {
         kd: usize,
         eager_body: bool,
     ) -> Result<Vec<u32>> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => bail!("run_chain_graph requires cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("run_chain_graph requires cuda")
         };
 
         let raw_ctx = dev.cuda_stream().context().clone();
         if raw_ctx.is_event_tracking() {
             unsafe { raw_ctx.disable_event_tracking() };
-            dev.cuda_stream().synchronize().map_err(|e| anyhow!(e))?;
+            dev.cuda_stream().synchronize()?;
         }
 
         let phys = cache.phys_len();
-        anyhow::ensure!(
+        ensure!(
             phys + cache.evicted() == ctx_len,
             "run_chain_graph: phys {phys} + evicted {} != ctx {ctx_len}",
             cache.evicted()
         );
-        anyhow::ensure!(
+        ensure!(
             phys + kd <= g.cap,
             "run_chain_graph: phys {phys} + kd {kd} > cap {}",
             g.cap
@@ -2644,9 +2336,7 @@ impl LoadedEagle3Scorer {
             g.host_pos[i] = (ctx_len + i) as i32;
         }
 
-        nv_layers::cuda_stream::current_stream(&dev)
-            .synchronize()
-            .map_err(|e| anyhow!(e))?;
+        nv_layers::cuda_stream::current_stream(&dev).synchronize()?;
 
         {
             let last_h = cache
@@ -2656,12 +2346,12 @@ impl LoadedEagle3Scorer {
                 .contiguous()?;
             let (st, l) = last_h.storage_and_layout();
             let cuda = match &*st {
-                candle_core::Storage::Cuda(s) => s,
+                Storage::Cuda(s) => s,
                 _ => bail!("last_h: expected cuda storage"),
             };
             let sl = cuda.as_cuda_slice::<half::bf16>()?;
             let off = l.start_offset();
-            anyhow::ensure!(
+            ensure!(
                 sl.len() >= off + self.cfg.hidden_size,
                 "last_h slice bounds"
             );
@@ -2757,7 +2447,7 @@ impl LoadedEagle3Scorer {
             .map(|b| chain_slice_ptr(b, &fk))
             .collect();
 
-        let body = |s: &std::sync::Arc<cudarc::driver::CudaStream>| -> Result<()> {
+        let body = |s: &Arc<CudaStream>| -> Result<()> {
             let cu = s.cu_stream() as *mut std::ffi::c_void;
             let gemv = |w: u64, x: u64, y: u64, n: usize, k: usize, what: &str| -> Result<()> {
                 let rc = unsafe {
@@ -2770,7 +2460,7 @@ impl LoadedEagle3Scorer {
                         k as i32,
                     )
                 };
-                anyhow::ensure!(rc == 0, "{what} rc={rc}");
+                ensure!(rc == 0, "{what} rc={rc}");
                 Ok(())
             };
             let rms = |x: u64, w: u64, y: u64, eps: f32, what: &str| -> Result<()> {
@@ -2785,7 +2475,7 @@ impl LoadedEagle3Scorer {
                         eps,
                     )
                 };
-                anyhow::ensure!(rc == 0, "{what} rc={rc}");
+                ensure!(rc == 0, "{what} rc={rc}");
                 Ok(())
             };
             const TOKEN_MAP_U32_READS_D2T_UNBOUNDED_SO_IT_RELIES_ON_ARGMAX_BF16_MATCHING_ARGMAX_CHECKED_INDEX_LT_DV_OR_0_ON_ALL_NONFINITE:
@@ -2807,7 +2497,7 @@ impl LoadedEagle3Scorer {
                         0,
                     )
                 };
-                anyhow::ensure!(rc == 0, "chain argmax rc={rc}");
+                ensure!(rc == 0, "chain argmax rc={rc}");
                 let rc = unsafe {
                     nv_kernels::cuda::token_map_u32(
                         cu,
@@ -2816,7 +2506,7 @@ impl LoadedEagle3Scorer {
                         (p_out + (slot as u64) * 4) as *mut u32,
                     )
                 };
-                anyhow::ensure!(rc == 0, "chain d2t rc={rc}");
+                ensure!(rc == 0, "chain d2t rc={rc}");
                 Ok(())
             };
 
@@ -2835,7 +2525,7 @@ impl LoadedEagle3Scorer {
                         tv as i32,
                     )
                 };
-                anyhow::ensure!(rc == 0, "chain embed gather rc={rc}");
+                ensure!(rc == 0, "chain embed gather rc={rc}");
                 rms(p_emb, p_wil, p_bin, eps_il, "chain input_ln")?;
                 rms(
                     h_in,
@@ -2868,11 +2558,11 @@ impl LoadedEagle3Scorer {
                         hd,
                     )
                 };
-                anyhow::ensure!(rc == 0, "chain rope rc={rc}");
+                ensure!(rc == 0, "chain rope rc={rc}");
                 let rc = unsafe {
                     nv_kernels::cuda::scale_inplace_bf16(cu, p_qr as *mut u16, scale, nh * hd)
                 };
-                anyhow::ensure!(rc == 0, "chain q scale rc={rc}");
+                ensure!(rc == 0, "chain q scale rc={rc}");
                 let rc = unsafe {
                     nv_kernels::cuda::kv_append_bf16(
                         cu,
@@ -2886,7 +2576,7 @@ impl LoadedEagle3Scorer {
                         hd as i32,
                     )
                 };
-                anyhow::ensure!(rc == 0, "kv_append_bf16 rc={rc}");
+                ensure!(rc == 0, "kv_append_bf16 rc={rc}");
                 let rc = unsafe {
                     nv_kernels::cuda::tree_verify_attn_bf16(
                         cu,
@@ -2904,7 +2594,7 @@ impl LoadedEagle3Scorer {
                         0,
                     )
                 };
-                anyhow::ensure!(rc == 0, "tree_verify_attn_bf16 rc={rc}");
+                ensure!(rc == 0, "tree_verify_attn_bf16 rc={rc}");
                 gemv(p_wo, p_attn, p_o, hidden, nh * hd, "chain o_proj")?;
                 let rc = unsafe {
                     nv_kernels::cuda::residual_add_scale_bf16(
@@ -2916,7 +2606,7 @@ impl LoadedEagle3Scorer {
                         hidden,
                     )
                 };
-                anyhow::ensure!(rc == 0, "chain resid add rc={rc}");
+                ensure!(rc == 0, "chain resid add rc={rc}");
                 rms(p_pa, p_wpl, p_nm, eps_pl, "chain post_ln")?;
                 gemv(p_wg, p_nm, p_gate, inter, hidden, "chain gate_proj")?;
                 gemv(p_wu, p_nm, p_up, inter, hidden, "chain up_proj")?;
@@ -2929,7 +2619,7 @@ impl LoadedEagle3Scorer {
                         inter,
                     )
                 };
-                anyhow::ensure!(rc == 0, "chain silu_mul rc={rc}");
+                ensure!(rc == 0, "chain silu_mul rc={rc}");
                 gemv(p_wd, p_act, p_mlp, hidden, inter, "chain down_proj")?;
                 let rc = unsafe {
                     nv_kernels::cuda::residual_add_scale_bf16(
@@ -2941,7 +2631,7 @@ impl LoadedEagle3Scorer {
                         hidden,
                     )
                 };
-                anyhow::ensure!(rc == 0, "chain h add rc={rc}");
+                ensure!(rc == 0, "chain h add rc={rc}");
                 draft_next(h_out, j)?;
             }
             Ok(())
@@ -2949,14 +2639,13 @@ impl LoadedEagle3Scorer {
 
         if eager_body {
             body(&fk)?;
-            fk.synchronize().map_err(|e| anyhow!(e))?;
+            fk.synchronize()?;
             if nv_config::env_arm_present_at_all_reread_every_call("NV_EAGLE3_GRAPH_CHAIN_DEBUG") {
-                let ns: Vec<i32> = fk.clone_dtoh(&g.n_buf).map_err(|e| anyhow!(e))?;
+                let ns: Vec<i32> = fk.clone_dtoh(&g.n_buf)?;
                 eprintln!("[chain-dbg] ctx={ctx_len} n_buf={ns:?}");
                 if let Some(kt) = cache.k.as_ref() {
                     let stride = nkv * hd;
-                    let kc_host: Vec<half::bf16> =
-                        fk.clone_dtoh(&g.k_cache).map_err(|e| anyhow!(e))?;
+                    let kc_host: Vec<half::bf16> = fk.clone_dtoh(&g.k_cache)?;
                     let want: Vec<half::bf16> = kt
                         .contiguous()?
                         .flatten_all()?
@@ -2984,7 +2673,7 @@ impl LoadedEagle3Scorer {
                         &kc_host[s0..(s0 + 4).min(kc_host.len())]
                     );
                 }
-                let ao: Vec<half::bf16> = fk.clone_dtoh(&g.attn_out_buf).map_err(|e| anyhow!(e))?;
+                let ao: Vec<half::bf16> = fk.clone_dtoh(&g.attn_out_buf)?;
                 eprintln!(
                     "[chain-dbg] last attn_out first4: {:?}",
                     &ao[..4.min(ao.len())]
@@ -2998,11 +2687,11 @@ impl LoadedEagle3Scorer {
 
         if !was_captured {
             body(&fk)?;
-            fk.synchronize().map_err(|e| anyhow!(e))?;
+            fk.synchronize()?;
         }
         g.runner.run(kd as u64, body)?;
         g.captured = true;
-        fk.synchronize().map_err(|e| anyhow!(e))?;
+        fk.synchronize()?;
         let out: Vec<u32> = fk
             .clone_dtoh(&g.out_buf)
             .map_err(|e| anyhow!("chain out d2h: {e:?}"))?;
@@ -3011,18 +2700,15 @@ impl LoadedEagle3Scorer {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn chain_raw<T>(
-    t: &Tensor,
-    s: &std::sync::Arc<cudarc::driver::CudaStream>,
-) -> Result<u64>
+pub(crate) fn chain_raw<T>(t: &Tensor, s: &Arc<CudaStream>) -> Result<u64>
 where
     T: cudarc::driver::DeviceRepr + candle_core::cuda_backend::CudaDType,
 {
     use cudarc::driver::DevicePtr;
-    anyhow::ensure!(t.is_contiguous(), "chain graph: tensor must be contiguous");
+    ensure!(t.is_contiguous(), "chain graph: tensor must be contiguous");
     let (st, l) = t.storage_and_layout();
     let cuda = match &*st {
-        candle_core::Storage::Cuda(c) => c,
+        Storage::Cuda(c) => c,
         _ => bail!("chain graph: expected cuda storage"),
     };
     let sl = cuda.as_cuda_slice::<T>()?;
@@ -3032,33 +2718,24 @@ where
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn chain_raw_bf16(
-    t: &Tensor,
-    s: &std::sync::Arc<cudarc::driver::CudaStream>,
-) -> Result<u64> {
+pub(crate) fn chain_raw_bf16(t: &Tensor, s: &Arc<CudaStream>) -> Result<u64> {
     chain_raw::<half::bf16>(t, s)
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn chain_raw_f32(
-    t: &Tensor,
-    s: &std::sync::Arc<cudarc::driver::CudaStream>,
-) -> Result<u64> {
+pub(crate) fn chain_raw_f32(t: &Tensor, s: &Arc<CudaStream>) -> Result<u64> {
     chain_raw::<f32>(t, s)
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn chain_raw_u32(
-    t: &Tensor,
-    s: &std::sync::Arc<cudarc::driver::CudaStream>,
-) -> Result<u64> {
+pub(crate) fn chain_raw_u32(t: &Tensor, s: &Arc<CudaStream>) -> Result<u64> {
     chain_raw::<u32>(t, s)
 }
 
 #[cfg(feature = "cuda")]
 pub(crate) fn chain_slice_ptr<T: cudarc::driver::DeviceRepr>(
-    sl: &cudarc::driver::CudaSlice<T>,
-    s: &std::sync::Arc<cudarc::driver::CudaStream>,
+    sl: &CudaSlice<T>,
+    s: &Arc<CudaStream>,
 ) -> u64 {
     use cudarc::driver::DevicePtr;
     let (p, _g) = sl.device_ptr(s);
@@ -3068,7 +2745,6 @@ pub(crate) fn chain_slice_ptr<T: cudarc::driver::DeviceRepr>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eagle3::{Eagle3Config as TreeCfg, Eagle3Proposer};
     use half::bf16;
 
     fn synthetic_scorer() -> Result<LoadedEagle3Scorer> {
@@ -3079,7 +2755,6 @@ mod tests {
         synthetic_scorer_with_d2t_on(d2t, &Device::Cpu, 16)
     }
 
-    #[allow(dead_code)]
     fn synthetic_scorer_on(dev: &Device, max_pos: usize) -> Result<LoadedEagle3Scorer> {
         synthetic_scorer_with_d2t_on((0..32u32).collect(), dev, max_pos)
     }
@@ -3153,30 +2828,14 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_zero_weight_forward_shape() {
-        let scorer = synthetic_scorer().expect("build synthetic scorer");
+    fn synthetic_forward_is_draft_vocab_wide_score_is_finite_and_project_aux_is_row_wise() {
+        let mut scorer = synthetic_scorer().expect("build synthetic scorer");
         let logits = scorer.forward(&[1u32, 2, 3], None).expect("forward");
         assert_eq!(logits.dims(), &[3, 32]);
         assert_eq!(logits.dtype(), DType::BF16);
-    }
-
-    #[test]
-    fn synthetic_score_returns_draft_vocab_floats() {
-        let mut scorer = synthetic_scorer().expect("build synthetic scorer");
         let row = scorer.score(&[1, 2, 3, 4]).expect("score");
         assert_eq!(row.len(), 32);
         assert!(row.iter().all(|x| x.is_finite()));
-    }
-
-    fn synthetic_aux(scorer: &LoadedEagle3Scorer, rows: usize) -> Tensor {
-        let n = rows * scorer.cfg.fc_in_dim();
-        let data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.007).sin() * 0.3).collect();
-        Tensor::from_vec(data, (rows, scorer.cfg.fc_in_dim()), &scorer.device).unwrap()
-    }
-
-    #[test]
-    fn project_aux_is_row_wise_so_it_can_be_appended() {
-        let scorer = synthetic_scorer().expect("build synthetic scorer");
         let rows = 7usize;
         let aux = synthetic_aux(&scorer, rows);
         let whole = scorer.project_aux(&aux).expect("project whole");
@@ -3209,21 +2868,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn chain_draft_projected_matches_chain_draft() {
-        let scorer = synthetic_scorer().expect("build synthetic scorer");
-        let context: Vec<u32> = vec![1, 5, 9, 13, 2];
-        let aux = synthetic_aux(&scorer, context.len());
-        let proj = scorer.project_aux(&aux).expect("project");
-        let a = scorer.chain_draft(&context, &aux, 4).expect("chain_draft");
-        let b = scorer
-            .chain_draft_projected(&context, &proj, 4)
-            .expect("chain_draft_projected");
-        assert_eq!(a, b);
+    fn synthetic_aux(scorer: &LoadedEagle3Scorer, rows: usize) -> Tensor {
+        let n = rows * scorer.cfg.fc_in_dim();
+        let data: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.007).sin() * 0.3).collect();
+        Tensor::from_vec(data, (rows, scorer.cfg.fc_in_dim()), &scorer.device).unwrap()
     }
 
     #[test]
-    fn chain_draft_cached_matches_projected_across_rounds() {
+    fn chain_draft_cached_matches_the_projected_draft_incremental_shift_matches_fresh_and_preencode_then_tail_matches_full_cond(
+    ) {
         let scorer = synthetic_scorer().expect("build synthetic scorer");
 
         let full: Vec<u32> = vec![1, 5, 9, 13, 2, 7, 3, 11, 4, 6, 8, 10];
@@ -3239,18 +2892,15 @@ mod tests {
             let ctx = &full[..n];
             let proj_n = proj.narrow(0, 0, n).unwrap();
             let a = scorer
-                .chain_draft_projected(ctx, &proj_n, k)
-                .expect("chain_draft_projected");
+                .chain_draft(ctx, &aux.narrow(0, 0, n).unwrap(), k)
+                .expect("chain_draft");
             let b = scorer
                 .chain_draft_cached(&mut cache, ctx, &proj_n, k)
                 .expect("chain_draft_cached");
             assert_eq!(a, b, "round {round} (n={n})");
             assert_eq!(cache.len(), n);
         }
-    }
 
-    #[test]
-    fn chain_draft_cached_cond_shift_incremental_matches_fresh() {
         let scorer = synthetic_scorer().expect("build synthetic scorer");
         let full: Vec<u32> = vec![1, 5, 9, 13, 2, 7, 3, 11, 4, 6, 8, 10];
         let aux = synthetic_aux(&scorer, full.len());
@@ -3266,68 +2916,80 @@ mod tests {
             let bonus = full[n];
             let proj_n = proj.narrow(0, 0, n).unwrap();
             let a = scorer
-                .chain_draft_cached_cond(&mut cache, ctx, &proj_n, k, Some(bonus), true)
+                .chain_draft_cached_cond_tail(&mut cache, ctx, &proj_n, 0, k, Some(bonus), true)
                 .expect("incremental shift");
             let mut fresh = DrafterKvCache::new();
             let b = scorer
-                .chain_draft_cached_cond(&mut fresh, ctx, &proj_n, k, Some(bonus), true)
+                .chain_draft_cached_cond_tail(&mut fresh, ctx, &proj_n, 0, k, Some(bonus), true)
                 .expect("fresh shift");
             assert_eq!(a, b, "round {round} (n={n})");
             assert_eq!(cache.len(), n);
             assert_eq!(a.len(), k);
+            let kc = cache.k.as_ref().expect("cache.k");
+            let vc = cache.v.as_ref().expect("cache.v");
+            assert_eq!(
+                kc.dims(),
+                &[1, n, scorer.cfg.num_key_value_heads, scorer.cfg.head_dim]
+            );
+            assert_eq!(kc.dims(), vc.dims());
         }
-    }
-
-    #[test]
-    fn preencode_then_tail_draft_matches_full_cond() {
-        let scorer = synthetic_scorer().expect("build synthetic scorer");
-        let full: Vec<u32> = vec![1, 5, 9, 13, 2, 7, 3, 11, 4, 6, 8, 10];
-        let aux = synthetic_aux(&scorer, full.len());
-        let proj = scorer.project_aux(&aux).expect("project");
-        let k = 3usize;
-        for shift in [true, false] {
-            for n in [6usize, 9, 12] {
-                let ctx = &full[..n];
-                let bonus = if n < full.len() { full[n] } else { 42 };
-                let proj_n = proj.narrow(0, 0, n).unwrap();
-                let mut fresh = DrafterKvCache::new();
-                let a = scorer
-                    .chain_draft_cached_cond(&mut fresh, ctx, &proj_n, k, Some(bonus), shift)
-                    .expect("full-aux draft");
-                for pre in [1usize, 3, n - 1] {
-                    let mut cache = DrafterKvCache::new();
-                    scorer
-                        .preencode_context(
-                            &mut cache,
-                            ctx,
-                            &proj_n.narrow(0, 0, pre).unwrap(),
-                            0,
-                            pre,
-                            shift,
-                        )
-                        .expect("preencode");
-                    assert_eq!(cache.len(), pre);
-                    let tail = proj_n.narrow(0, pre, n - pre).unwrap();
-                    let b = scorer
+        {
+            let full: Vec<u32> = vec![1, 5, 9, 13, 2, 7, 3, 11, 4, 6, 8, 10];
+            let aux = synthetic_aux(&scorer, full.len());
+            let proj = scorer.project_aux(&aux).expect("project");
+            let k = 3usize;
+            for shift in [true, false] {
+                for n in [6usize, 9, 12] {
+                    let ctx = &full[..n];
+                    let bonus = if n < full.len() { full[n] } else { 42 };
+                    let proj_n = proj.narrow(0, 0, n).unwrap();
+                    let mut fresh = DrafterKvCache::new();
+                    let a = scorer
                         .chain_draft_cached_cond_tail(
-                            &mut cache,
+                            &mut fresh,
                             ctx,
-                            &tail,
-                            pre,
+                            &proj_n,
+                            0,
                             k,
                             Some(bonus),
                             shift,
                         )
-                        .expect("tail draft");
-                    assert_eq!(a, b, "shift={shift} n={n} pre={pre}");
-                    assert_eq!(cache.len(), n);
+                        .expect("full-aux draft");
+                    for pre in [1usize, 3, n - 1] {
+                        let mut cache = DrafterKvCache::new();
+                        scorer
+                            .preencode_context(
+                                &mut cache,
+                                ctx,
+                                &proj_n.narrow(0, 0, pre).unwrap(),
+                                0,
+                                pre,
+                                shift,
+                            )
+                            .expect("preencode");
+                        assert_eq!(cache.len(), pre);
+                        let tail = proj_n.narrow(0, pre, n - pre).unwrap();
+                        let b = scorer
+                            .chain_draft_cached_cond_tail(
+                                &mut cache,
+                                ctx,
+                                &tail,
+                                pre,
+                                k,
+                                Some(bonus),
+                                shift,
+                            )
+                            .expect("tail draft");
+                        assert_eq!(a, b, "shift={shift} n={n} pre={pre}");
+                        assert_eq!(cache.len(), n);
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn encode_attn_query_block_shrinks_with_prefix_and_never_zero() {
+    fn query_block_shrinks_with_prefix_never_to_zero_and_sub_blocked_sdpa_matches_a_single_block() {
         let cap = 512 * 1024 * 1024;
         assert_eq!(encode_attn_query_block(4, 1024, 12, cap), 1024);
         let big = encode_attn_query_block(32, 1024, 24576, cap);
@@ -3340,10 +3002,7 @@ mod tests {
             1,
             "an unbounded prefix floors the query block at 1, never 0"
         );
-    }
 
-    #[test]
-    fn causal_sdpa_qblocked_matches_single_block() {
         let scorer = synthetic_scorer().expect("build synthetic scorer");
         let nh = scorer.cfg.num_attention_heads;
         let nkv = scorer.cfg.num_key_value_heads;
@@ -3397,86 +3056,7 @@ mod tests {
     }
 
     #[test]
-    fn small_tail_appends_keep_cache_dims() {
-        let scorer = synthetic_scorer().expect("build synthetic scorer");
-        let full: Vec<u32> = vec![1, 5, 9, 13, 2, 7, 3, 11, 4, 6, 8, 10, 12, 14];
-        let aux = synthetic_aux(&scorer, full.len());
-        let proj = scorer.project_aux(&aux).expect("project");
-        let k = 3usize;
-        let mut cache = DrafterKvCache::new();
-        let mut n = 4usize;
-        for g in [0usize, 1, 2, 3, 1] {
-            n += g;
-            let ctx = &full[..n];
-            let bonus = full[n];
-            let proj_n = proj.narrow(0, 0, n).unwrap();
-            let out = scorer
-                .chain_draft_cached_cond(&mut cache, ctx, &proj_n, k, Some(bonus), true)
-                .expect("tail append round");
-            assert_eq!(out.len(), k);
-            assert_eq!(cache.len(), n);
-            let kc = cache.k.as_ref().expect("cache.k");
-            let vc = cache.v.as_ref().expect("cache.v");
-            assert_eq!(
-                kc.dims(),
-                &[1, n, scorer.cfg.num_key_value_heads, scorer.cfg.head_dim]
-            );
-            assert_eq!(kc.dims(), vc.dims());
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore]
-    fn device_kv_tail_matches_sdpa_path_cuda() {
-        let dev = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("no cuda device ({e}); skipping");
-                return;
-            }
-        };
-        let scorer = synthetic_scorer_on(&dev, 512).expect("build synthetic cuda scorer");
-        let total = 96usize;
-        let full: Vec<u32> = (0..total).map(|i| ((i * 13 + 3) % 60) as u32).collect();
-        let aux = synthetic_aux(&scorer, total);
-        let proj = scorer.project_aux(&aux).expect("project");
-        let k = 4usize;
-
-        for start in [64usize, 4] {
-            let mut cache_dev = DrafterKvCache::new();
-            cache_dev.set_device_kv_align(8);
-            let mut cache_ref = DrafterKvCache::new();
-            cache_ref.disable_device_kv();
-            let mut n = start;
-            let mut rounds = 0usize;
-            while n + 2 < total.min(start + 24) {
-                let ctx = &full[..n];
-                let bonus = full[n];
-                let proj_n = proj.narrow(0, 0, n).unwrap();
-                let a = scorer
-                    .chain_draft_cached_cond(&mut cache_dev, ctx, &proj_n, k, Some(bonus), true)
-                    .expect("device-kv round");
-                let b = scorer
-                    .chain_draft_cached_cond(&mut cache_ref, ctx, &proj_n, k, Some(bonus), true)
-                    .expect("sdpa round");
-                assert_eq!(a, b, "start={start} n={n} device-KV tokens diverged");
-                assert_eq!(cache_dev.len(), cache_ref.len());
-                if rounds > 0 && start == 4 {
-                    assert!(
-                        cache_dev.device_kv_armed(),
-                        "device KV should be armed after a small tail append"
-                    );
-                }
-                n += 2;
-                rounds += 1;
-            }
-            assert!(rounds >= 8, "expected enough rounds to exercise growth");
-        }
-    }
-
-    #[test]
-    fn preencode_context_rejects_bonus_row_and_uncovered_aux() {
+    fn preencode_rejects_bonus_row_and_uncovered_aux_and_chain_draft_rejects_a_rewound_context() {
         let scorer = synthetic_scorer().expect("build synthetic scorer");
         let full: Vec<u32> = vec![1, 5, 9, 13, 2, 7];
         let aux = synthetic_aux(&scorer, full.len());
@@ -3501,31 +3081,7 @@ mod tests {
             .preencode_context(&mut cache, &full, &proj, 0, full.len(), false)
             .expect("non-shift preencode of every row is fine");
         assert_eq!(cache.len(), full.len());
-    }
 
-    #[test]
-    fn chain_draft_cached_cond_default_matches_plain_cached() {
-        let scorer = synthetic_scorer().expect("build synthetic scorer");
-        let full: Vec<u32> = vec![1, 5, 9, 13, 2, 7];
-        let aux = synthetic_aux(&scorer, full.len());
-        let proj = scorer.project_aux(&aux).expect("project");
-        let mut c1 = DrafterKvCache::new();
-        let mut c2 = DrafterKvCache::new();
-        let a = scorer
-            .chain_draft_cached(&mut c1, &full, &proj, 4)
-            .expect("plain");
-        let b = scorer
-            .chain_draft_cached_cond(&mut c2, &full, &proj, 4, None, false)
-            .expect("cond default");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn chain_draft_cached_rejects_rewound_context() {
-        let scorer = synthetic_scorer().expect("build synthetic scorer");
-        let full: Vec<u32> = vec![1, 5, 9, 13, 2, 7];
-        let aux = synthetic_aux(&scorer, full.len());
-        let proj = scorer.project_aux(&aux).expect("project");
         let mut cache = DrafterKvCache::new();
         scorer
             .chain_draft_cached(&mut cache, &full, &proj, 3)
@@ -3537,82 +3093,25 @@ mod tests {
     }
 
     #[test]
-    fn tensor_argmax_matches_first_max_scan() {
-        let dev = Device::Cpu;
-        let rows: Vec<Vec<f32>> = vec![
-            vec![0.0, 1.0, 2.0, 3.0],
-            vec![3.0, 3.0, 1.0, 3.0],
-            vec![-1.0, -2.0, -0.5, -0.5],
-            vec![f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY],
-            vec![5.0, 5.0, 5.0, 5.0],
-        ];
-        for row in rows {
-            let mut best = 0usize;
-            let mut bestv = f32::NEG_INFINITY;
-            for (i, &x) in row.iter().enumerate() {
-                if x > bestv {
-                    bestv = x;
-                    best = i;
-                }
-            }
-            let n = row.len();
-            let t = Tensor::from_vec(row.clone(), (1usize, n), &dev).unwrap();
-            let got = t
-                .argmax(D::Minus1)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<u32>()
-                .unwrap();
-            assert_eq!(got[0] as usize, best, "row={row:?}");
-        }
-    }
-
-    #[test]
-    fn validate_d2t_accepts_in_range_map() {
+    fn d2t_and_t2d_validation_accepts_in_range_maps_and_rejects_range_wrap_and_length_faults() {
         let d2t: Vec<u32> = (0..8u32).map(|i| 16 - i).collect();
         assert!(validate_d2t(&d2t, 8, 17).is_ok());
         assert!(validate_t2d(&[false; 17], 17).is_ok());
-    }
 
-    #[test]
-    fn validate_d2t_rejects_out_of_range_target() {
         let mut d2t: Vec<u32> = vec![0; 8];
         d2t[7] = 56;
         assert!(validate_d2t(&d2t, 8, 64).is_ok());
         d2t[7] = 57;
         let err = validate_d2t(&d2t, 8, 64).unwrap_err().to_string();
         assert!(err.contains("target id 64"), "unexpected error: {err}");
-    }
 
-    #[test]
-    fn validate_d2t_rejects_wrapping_offset() {
-        let d2t: Vec<u32> = vec![u32::MAX; 4];
-        assert!(validate_d2t(&d2t, 4, 262144).is_err());
-    }
-
-    #[test]
-    fn validate_d2t_rejects_length_mismatch() {
+        assert!(validate_d2t(&[u32::MAX; 4], 4, 262144).is_err());
         assert!(validate_d2t(&[0u32; 3], 4, 64).is_err());
         assert!(validate_t2d(&[false; 3], 4).is_err());
-    }
 
-    #[test]
-    fn from_parts_rejects_malformed_d2t() {
-        let mut d2t: Vec<u32> = (0..32u32).collect();
-        d2t[31] = 1000;
-        assert!(synthetic_scorer_with_d2t(d2t).is_err());
-    }
-
-    #[test]
-    fn d2t_and_t2d_helpers() {
-        let scorer = synthetic_scorer().expect("build synthetic scorer");
-
-        assert_eq!(scorer.d2t_offset(5), 5);
-        assert_eq!(scorer.d2t_map(5), 10);
-
-        assert!(scorer.t2d_supports(10));
-        assert!(!scorer.t2d_supports(40));
+        let mut malformed: Vec<u32> = (0..32u32).collect();
+        malformed[31] = 1000;
+        assert!(synthetic_scorer_with_d2t(malformed).is_err());
     }
 
     #[test]
@@ -3669,226 +3168,34 @@ mod tests {
             .fold(0f32, f32::max)
     }
 
-    #[test]
-    #[ignore]
-    fn gpu_cached_matches_projected_real_checkpoint() {
-        let Some(dir) = require(
-            "gpu_cached_matches_projected_real_checkpoint",
-            "NV_EAGLE3_DRAFT_DIR",
-            std::env::var_os("NV_EAGLE3_DRAFT_DIR").map(std::path::PathBuf::from),
-        ) else {
-            return;
-        };
-        let dev = Device::new_cuda(0).expect("cuda device");
-        let scorer = LoadedEagle3Scorer::try_load(&dir, &dev).expect("load real checkpoint");
-        let cfg = scorer.config().clone();
-        let total = 64usize;
-        let toks: Vec<u32> = (0..total)
-            .map(|i| ((i * 7919 + 13) % cfg.target_vocab_size) as u32)
-            .collect();
-        let n_aux = total * cfg.fc_in_dim();
-        let aux_host: Vec<f32> = (0..n_aux).map(|i| ((i as f32) * 0.0137).sin()).collect();
-        let aux = Tensor::from_vec(aux_host, (total, cfg.fc_in_dim()), &dev).unwrap();
-        let proj = scorer.project_aux(&aux).expect("project");
-
-        let mut cache = DrafterKvCache::new();
-        let k = 8usize;
-        let growth = [0usize, 1, 2, 3, 1, 5, 2, 1, 4, 2, 3];
-        let mut n = 40usize;
-        let mut mismatches = 0usize;
-        for (round, g) in growth.iter().enumerate() {
-            n += g;
-            let ctx = &toks[..n];
-            let proj_n = proj.narrow(0, 0, n).unwrap();
-            let a = scorer
-                .chain_draft_projected(ctx, &proj_n, k)
-                .expect("chain_draft_projected");
-            let b = scorer
-                .chain_draft_cached(&mut cache, ctx, &proj_n, k)
-                .expect("chain_draft_cached");
-
-            let mut fresh = DrafterKvCache::new();
-            let _ = scorer
-                .chain_draft_cached(&mut fresh, ctx, &proj_n, k)
-                .expect("fresh cached");
-            let kdiff = max_abs_diff(cache.k.as_ref().unwrap(), fresh.k.as_ref().unwrap());
-            let vdiff = max_abs_diff(cache.v.as_ref().unwrap(), fresh.v.as_ref().unwrap());
-            let hdiff = max_abs_diff(
-                cache.last_h.as_ref().unwrap(),
-                fresh.last_h.as_ref().unwrap(),
-            );
-            let same = a == b;
-            eprintln!(
-                "round {round} n={n} tokens_equal={same} kdiff={kdiff:.6} vdiff={vdiff:.6} hdiff={hdiff:.6}\n  projected={a:?}\n  cached   ={b:?}"
-            );
-
-            assert!(
-                kdiff < 0.5 && vdiff < 0.5 && hdiff < 2.0,
-                "round {round}: cached encode diverged beyond bf16 noise \
-                 (kdiff={kdiff} vdiff={vdiff} hdiff={hdiff})"
-            );
-            if a[0] != b[0] {
-                mismatches += 1;
-            }
-        }
-        assert_eq!(
-            mismatches, 0,
-            "cached first draft token diverged from full re-encode"
-        );
-    }
-
-    const ALLOW_SKIP: &str = "NV_SPECDECODE_ALLOW_SKIP";
-
-    fn require<T>(test: &str, what: &str, found: Option<T>) -> Option<T> {
-        if found.is_none() {
-            if !nv_config::env_arm_opt_in_eq_some_1_reread_every_call(ALLOW_SKIP) {
-                panic!(
-                    "{test}: no {what}. This test is #[ignore]d, so it runs only when asked for \
-                     by name; reporting a pass without the artifact answers a question that was \
-                     never put. Provide it or set {ALLOW_SKIP}=1."
-                );
-            }
-            eprintln!("SKIP ({ALLOW_SKIP}=1): {test}: no {what}; nothing was exercised");
-        }
-        found
-    }
-
-    fn cached_snapshot_dir() -> Option<std::path::PathBuf> {
-        let home = std::env::var("HOME").ok()?;
-        let root = std::path::PathBuf::from(home).join(
-            ".cache/huggingface/hub/\
-             models--RedHatAI--gemma-4-31B-it-speculator.eagle3/snapshots",
-        );
-        if !root.is_dir() {
-            return None;
-        }
-
-        for entry in std::fs::read_dir(&root).ok()? {
-            let p = entry.ok()?.path();
-            if p.is_dir() && p.join("model.safetensors").is_file() {
-                return Some(p);
-            }
-        }
-        None
-    }
-
-    #[test]
-    #[ignore]
-    fn loads_redhat_checkpoint_when_present() {
-        let Some(dir) = require(
-            "loads_redhat_checkpoint_when_present",
-            "RedHatAI eagle3 snapshot in the HF cache",
-            cached_snapshot_dir(),
-        ) else {
-            return;
-        };
-        let scorer =
-            LoadedEagle3Scorer::try_load(&dir, &Device::Cpu).expect("load real checkpoint");
-        let cfg = scorer.config();
-        assert_eq!(cfg.hidden_size, 5376);
-        assert_eq!(cfg.draft_vocab_size, 32000);
-        assert_eq!(cfg.target_vocab_size, 262144);
-
-        assert_eq!(scorer.d2t().len(), 32000);
-        assert_eq!(scorer.t2d().len(), 262144);
-    }
-
-    #[test]
-    #[ignore]
-    fn scores_real_checkpoint_verifier_less() {
-        let Some(dir) = require(
-            "scores_real_checkpoint_verifier_less",
-            "RedHatAI eagle3 snapshot in the HF cache",
-            cached_snapshot_dir(),
-        ) else {
-            return;
-        };
-        let mut scorer =
-            LoadedEagle3Scorer::try_load(&dir, &Device::Cpu).expect("load real checkpoint");
-        let row = scorer.score(&[1u32, 2, 3]).expect("score");
-        assert_eq!(row.len(), 32000);
-        assert!(row.iter().all(|x| x.is_finite()), "non-finite logit");
-    }
-
-    #[test]
-    #[ignore]
-    fn drives_existing_eagle3_proposer() {
-        let Some(dir) = require(
-            "drives_existing_eagle3_proposer",
-            "RedHatAI eagle3 snapshot in the HF cache",
-            cached_snapshot_dir(),
-        ) else {
-            return;
-        };
-        let scorer =
-            LoadedEagle3Scorer::try_load(&dir, &Device::Cpu).expect("load real checkpoint");
-        let draft_vocab = scorer.config().draft_vocab_size;
-
-        let target_vocab = scorer.config().target_vocab_size;
-
-        let mut proposer = Eagle3Proposer::new(
-            scorer,
-            TreeCfg {
-                max_depth: 2,
-                branch_factor: 2,
-                total_budget: 6,
-                vocab_size: draft_vocab,
-            },
-        );
-        let tree = proposer
-            .expand_tree(&[1u32])
-            .expect("expand_tree on real scorer");
-        assert!(!tree.is_empty(), "tree must contain at least one draft");
-        for (i, &tok) in tree.tokens.iter().enumerate() {
-            assert!(
-                (tok as usize) < draft_vocab,
-                "draft token {tok} out of range"
-            );
-
-            assert!(tree.depths[i] <= 2);
-
-            let target = proposer.scorer().d2t_map(tok);
-            assert!((target as usize) < target_vocab);
-
-            if let Some(p) = tree.parents[i] {
-                assert!(p < i);
-                assert_eq!(tree.depths[i], tree.depths[p] + 1);
-            } else {
-                assert_eq!(tree.depths[i], 1);
-            }
-        }
-    }
-
     fn patterned_ctx(n: usize) -> Vec<u32> {
         (0..n).map(|i| ((i * 7 + 3) % 60) as u32).collect()
     }
 
     #[test]
-    fn kv_cap_no_eviction_is_identical() {
-        let scorer = synthetic_scorer().expect("build synthetic scorer");
-        let ctx: Vec<u32> = patterned_ctx(12);
-        let aux = synthetic_aux(&scorer, ctx.len());
-        let proj = scorer.project_aux(&aux).expect("project");
-        let k = 4usize;
-        let mut plain = DrafterKvCache::new();
-        let a = scorer
-            .chain_draft_cached(&mut plain, &ctx, &proj, k)
-            .expect("uncapped draft");
-        let mut capped = DrafterKvCache::with_kv_cap(2, 8);
-        let b = scorer
-            .chain_draft_cached(&mut capped, &ctx, &proj, k)
-            .expect("capped draft");
-        assert_eq!(a, b);
-        assert_eq!(capped.evicted(), 0);
-        assert_eq!(capped.compactions(), 0);
-        assert_eq!(capped.phys_len(), capped.len());
-    }
-
-    #[test]
-    fn kv_cap_evicts_and_keeps_sink_plus_window_kv_rows() {
+    fn kv_cap_is_a_no_op_under_the_cap_evicts_to_sink_plus_window_rows_and_stays_bounded_across_shift_rounds(
+    ) {
         let dev = Device::Cpu;
         let scorer = synthetic_scorer_on(&dev, 512).expect("build synthetic scorer");
         let (sink, window) = (2usize, 8usize);
+        {
+            let ctx: Vec<u32> = patterned_ctx(12);
+            let aux = synthetic_aux(&scorer, ctx.len());
+            let proj = scorer.project_aux(&aux).expect("project");
+            let k = 4usize;
+            let mut plain = DrafterKvCache::new();
+            let a = scorer
+                .chain_draft_cached(&mut plain, &ctx, &proj, k)
+                .expect("uncapped draft");
+            let mut capped = DrafterKvCache::with_kv_cap(sink, window);
+            let b = scorer
+                .chain_draft_cached(&mut capped, &ctx, &proj, k)
+                .expect("capped draft");
+            assert_eq!(a, b);
+            assert_eq!(capped.evicted(), 0);
+            assert_eq!(capped.compactions(), 0);
+            assert_eq!(capped.phys_len(), capped.len());
+        }
         let n = sink + window + DRAFTER_KV_CAP_SLACK + 34;
         let ctx = patterned_ctx(n);
         let aux = synthetic_aux(&scorer, n);
@@ -3939,13 +3246,7 @@ mod tests {
             rows(plain_v, n - tail, tail),
             "window V rows"
         );
-    }
 
-    #[test]
-    fn kv_cap_incremental_shift_rounds_stay_bounded() {
-        let dev = Device::Cpu;
-        let scorer = synthetic_scorer_on(&dev, 512).expect("build synthetic scorer");
-        let (sink, window) = (2usize, 8usize);
         let bound = sink + window + DRAFTER_KV_CAP_SLACK;
         let total = bound + 40;
         let full = patterned_ctx(total + 1);
@@ -3959,7 +3260,7 @@ mod tests {
             let bonus = full[n];
             let proj_n = proj.narrow(0, 0, n).unwrap();
             let out = scorer
-                .chain_draft_cached_cond(&mut cache, ctx, &proj_n, k, Some(bonus), true)
+                .chain_draft_cached_cond_tail(&mut cache, ctx, &proj_n, 0, k, Some(bonus), true)
                 .expect("capped shift round");
             assert_eq!(out.len(), k);
             assert_eq!(cache.len(), n);

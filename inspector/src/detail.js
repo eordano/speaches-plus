@@ -189,7 +189,6 @@ export function setupDetail({ store, timeline }) {
   }
   function stripT(e) { const { t, ...rest } = e; return rest; }
 
-  // ── click wiring ───────────────────────────────────────────────────────
   tabs.forEach(t => {
     t.addEventListener('click', () => {
       tabs.forEach(x => x.setAttribute('aria-selected', 'false'));

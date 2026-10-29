@@ -59,6 +59,7 @@ pub(crate) async fn run_gemma4_via_engine(
     handle: Arc<nv_engine::BatchEngineHandle>,
     tokenizer: Arc<tokenizers::Tokenizer>,
     req: ChatGenerateRequest,
+    kv_max_seq_len: usize,
     default_max_new: usize,
     eos_ids: &[u32],
     bos_token_id: Option<u32>,
@@ -71,11 +72,17 @@ pub(crate) async fn run_gemma4_via_engine(
     splice_bos_at_position_0_only(&mut prompt_ids, bos_token_id, eos_ids);
     let prompt_tokens = prompt_ids.len() as u32;
     let max_new = effective_max_new(req.max_new_tokens, default_max_new);
+    let Some((_, max_new)) = kv_window(prompt_ids.len(), max_new, kv_max_seq_len) else {
+        anyhow::bail!(
+            "prompt of {} tokens does not fit the {kv_max_seq_len}-token KV window",
+            prompt_ids.len()
+        );
+    };
 
     if tx.send(ChatEvent::Started { prompt_tokens }).await.is_err() {
         return Ok(());
     }
-    if prompt_ids.is_empty() {
+    if prompt_ids.is_empty() || max_new == 0 {
         let _ = tx
             .send(ChatEvent::Done {
                 finish_reason: "length".into(),
@@ -107,6 +114,7 @@ pub(crate) async fn run_gemma4_via_engine(
     let mut finish_reason = "length".to_string();
     let mut seq_id: Option<u64> = None;
     let mut stopped_early = false;
+    let mut engine_done = false;
 
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -115,6 +123,11 @@ pub(crate) async fn run_gemma4_via_engine(
             }
             nv_engine::BatchEvent::Token { token, .. } => {
                 if stopped_early {
+                    continue;
+                }
+                if eos_ids.contains(&token) {
+                    finish_reason = "stop".into();
+                    stopped_early = true;
                     continue;
                 }
                 generated_ids.push(token);
@@ -143,12 +156,16 @@ pub(crate) async fn run_gemma4_via_engine(
                         nv_engine::FinishReason::Aborted => finish_reason.clone(),
                     };
                 }
+                engine_done = true;
                 break;
             }
             nv_engine::BatchEvent::Error { message, .. } => {
                 anyhow::bail!("batch engine: {message}");
             }
         }
+    }
+    if !engine_done && !stopped_early {
+        anyhow::bail!(crate::oapi::chat::ENGINE_INTERRUPTED);
     }
 
     if !generated_ids.is_empty() {
@@ -162,12 +179,8 @@ pub(crate) async fn run_gemma4_via_engine(
         }
     }
 
-    let _ = tx
-        .send(ChatEvent::Done {
-            finish_reason,
-            completion_tokens,
-        })
-        .await;
+    let _ =
+        send_stopped_by_then_done(tx, &mut emitter, finish_reason, completion_tokens, None).await;
     Ok(())
 }
 
@@ -350,7 +363,7 @@ pub(crate) async fn run_sampling_gemma4(
         let b = nv_models::gemma4::kv_budget(
             model.config(),
             kv_needed,
-            nv_models::gemma4::verify_kv_use_fp8(),
+            true,
             nv_models::gemma4::kv_ring_enabled(),
             0,
         );
@@ -605,13 +618,12 @@ pub(crate) async fn run_sampling_gemma4(
     }
 
     if !aborted {
-        let _ = push_event_async(
+        let _ = send_stopped_by_then_done(
             tx,
-            ChatEvent::Done {
-                finish_reason,
-                completion_tokens,
-            },
-            send_timeout,
+            &mut emitter,
+            finish_reason,
+            completion_tokens,
+            Some(send_timeout),
         )
         .await;
     }
@@ -695,10 +707,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
     let model = &*model_arc;
 
     let k_env = eagle3_k(snap.eagle3_k.as_deref(), prompt_ids.len());
-    let adaptive = adaptive_k_enabled(snap.adaptive_k.as_deref()) && {
-        let dk = !snap.eagle3_no_drafter_kv;
-        resolve_cond_mode(snap.eagle3_cond.as_deref(), dk).0 == "shift"
-    };
+    let adaptive = adaptive_k_enabled(snap.adaptive_k.as_deref());
     let k = if adaptive {
         adaptive_k_graph(snap.adaptive_k_max.as_deref(), k_env)
     } else {
@@ -713,13 +722,12 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
     };
     debug_assert!(max_seq <= kv_max_seq_len);
 
-    let graph_cache_enabled = !snap.eagle3_no_graph_cache;
     let (sticky, extra) = {
         let cache_cap = verify_cache_capacity(max_seq);
         let b = nv_models::gemma4::kv_budget_capped(
             model.config(),
             cache_cap,
-            nv_models::gemma4::verify_kv_use_fp8(),
+            true,
             nv_models::gemma4::kv_ring_enabled(),
             eagle3.proposer.scorer().config().kv_out_dim(),
             capped_drafter_kv_rows(cache_cap, drafter_kv_cap_env()),
@@ -742,7 +750,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
         (gv, had, pool.chain.take())
     };
 
-    let admit_res = if graph_cache_enabled && had_lease {
+    let admit_res = if had_lease {
         crate::oapi::admission::admit_or_bail(sticky, extra, "gemma4-spec").await
     } else {
         crate::oapi::admission::admit_or_bail(0, sticky + extra, "gemma4-spec").await
@@ -799,8 +807,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
 
     let core = (|| -> anyhow::Result<(
         nv_models::gemma4_graph::GraphedGemma4Verify<Arc<nv_models::gemma4::Gemma4>>,
-        String,
-        u32,
+        Vec<ChatEvent>,
         bool,
     )> {
 
@@ -833,28 +840,11 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
     let prefill_chunk = spec_prefill_chunk(snap.spec_prefill_chunk.as_deref())
         .min(nv_models::gemma4::VERIFY_PREFILL_CHUNK);
 
-    let use_drafter_kv = !snap.eagle3_no_drafter_kv;
     let mut drafter_kv = nv_specdecode::eagle3_loader::DrafterKvCache::new();
 
-    let (cond_mode, shift_forced, downgraded) = resolve_cond_mode(
-        snap.eagle3_cond.as_deref(),
-        use_drafter_kv,
-    );
-    if downgraded {
-        tracing::warn!(
-            "NV_EAGLE3_NO_DRAFTER_KV set: cached conditioning modes unavailable, \
-             using legacy pairing (NV_EAGLE3_COND=shift-force runs shift via a \
-             per-round throwaway drafter KV for A/B diagnostics)"
-        );
-    }
-
-    let stream_aux = use_drafter_kv;
-    let shift_prefill = cond_mode == "shift";
     use nv_specdecode::eagle3_loader::DRAFTER_ENCODE_CHUNK;
     let preencode_limit =
         (initial_len.saturating_sub(1) / DRAFTER_ENCODE_CHUNK) * DRAFTER_ENCODE_CHUNK;
-    let defer_drafter = stream_aux
-        && spec_defer_drafter_from(snap.spec_defer_drafter.as_deref());
 
     let prof_prefill = snap.prof_prefill;
     let prefill_start = std::time::Instant::now();
@@ -865,11 +855,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
     let mut aux_base = 0usize;
     let mut committed = 0usize;
     let mut seed: Vec<f32> = Vec::new();
-    let mut aux_pending: Vec<f32> = if stream_aux {
-        Vec::new()
-    } else {
-        Vec::with_capacity(initial_len.saturating_mul(fc_in_dim))
-    };
+    let mut aux_pending: Vec<f32> = Vec::new();
     while committed < initial_len {
         let t_chunk = std::time::Instant::now();
         let len = prefill_chunk.min(initial_len - committed);
@@ -904,69 +890,26 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
         } else {
             None
         };
-        if stream_aux {
-            let projected = shared
-                .proposer
-                .scorer()
-                .project_aux(&chunk_aux_cat)
-                .map_err(|e| anyhow::anyhow!("project_aux (prefill chunk at {committed}): {e}"))?;
-            aux_proj = Some(match aux_proj.take() {
-                Some(prev) => candle_core::Tensor::cat(&[&prev, &projected], 0)?,
-                None => projected,
-            });
-            committed += len;
-            let target = if defer_drafter {
-                0
-            } else {
-                ((committed / DRAFTER_ENCODE_CHUNK) * DRAFTER_ENCODE_CHUNK).min(preencode_limit)
-            };
-            if target > drafter_kv.len() {
-                let aux_t = aux_proj.take().expect("aux_proj set above");
-                shared
-                    .proposer
-                    .scorer()
-                    .preencode_context(
-                        &mut drafter_kv,
-                        &context,
-                        &aux_t,
-                        aux_base,
-                        target,
-                        shift_prefill,
-                    )
-                    .map_err(|e| anyhow::anyhow!("drafter preencode to {target}: {e}"))?;
-                let drop = target - aux_base;
-                let rows = aux_t.dims()[0];
-                aux_proj = Some(aux_t.narrow(0, drop, rows - drop)?);
-                aux_base = target;
-            }
-            if let Some(t) = t_verify_done {
-                let _ = device.synchronize();
-                let d = t.elapsed().as_secs_f64() * 1000.0;
-                prefill_drafter_ms += d;
-                eprintln!(
-                    "[NV_PROF_PREFILL] chunk at {} len {len}: verify+seed {:.1} ms drafter {:.1} ms",
-                    committed - len,
-                    (t - t_chunk).as_secs_f64() * 1000.0,
-                    d
-                );
-            }
-        } else {
-            let chunk_aux_host: Vec<f32> = chunk_aux_cat
-                .to_dtype(candle_core::DType::F32)?
-                .flatten_all()?
-                .to_vec1()?;
-            aux_pending.extend_from_slice(&chunk_aux_host);
-            committed += len;
-            if let Some(t) = t_verify_done {
-                let d = t.elapsed().as_secs_f64() * 1000.0;
-                prefill_drafter_ms += d;
-                eprintln!(
-                    "[NV_PROF_PREFILL] chunk at {} len {len}: verify+seed {:.1} ms aux-d2h {:.1} ms",
-                    committed - len,
-                    (t - t_chunk).as_secs_f64() * 1000.0,
-                    d
-                );
-            }
+        let projected = shared
+            .proposer
+            .scorer()
+            .project_aux(&chunk_aux_cat)
+            .map_err(|e| anyhow::anyhow!("project_aux (prefill chunk at {committed}): {e}"))?;
+        aux_proj = Some(match aux_proj.take() {
+            Some(prev) => candle_core::Tensor::cat(&[&prev, &projected], 0)?,
+            None => projected,
+        });
+        committed += len;
+        if let Some(t) = t_verify_done {
+            let _ = device.synchronize();
+            let d = t.elapsed().as_secs_f64() * 1000.0;
+            prefill_drafter_ms += d;
+            eprintln!(
+                "[NV_PROF_PREFILL] chunk at {} len {len}: verify+seed {:.1} ms drafter {:.1} ms",
+                committed - len,
+                (t - t_chunk).as_secs_f64() * 1000.0,
+                d
+            );
         }
     }
     if prof_prefill {
@@ -986,31 +929,17 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
         "spec prefill seed row: expected {vocab} logits, got {}",
         seed.len()
     );
-    if stream_aux {
-        let tail_rows = aux_proj.as_ref().map(|t| t.dims()[0]).unwrap_or(0);
-        anyhow::ensure!(
-            aux_base + tail_rows == initial_len && drafter_kv.len() == aux_base,
-            "spec prefill aux tail: encoded {} + tail rows [{aux_base}, {}) do not cover the {initial_len}-token prompt",
-            drafter_kv.len(),
-            aux_base + tail_rows
-        );
-    } else {
-        anyhow::ensure!(
-            aux_pending.len() == initial_len * fc_in_dim,
-            "spec prefill aux rows: expected {} floats, got {}",
-            initial_len * fc_in_dim,
-            aux_pending.len()
-        );
-    }
+    let tail_rows = aux_proj.as_ref().map(|t| t.dims()[0]).unwrap_or(0);
+    anyhow::ensure!(
+        aux_base + tail_rows == initial_len && drafter_kv.len() == aux_base,
+        "spec prefill aux tail: encoded {} + tail rows [{aux_base}, {}) do not cover the {initial_len}-token prompt",
+        drafter_kv.len(),
+        aux_base + tail_rows
+    );
 
-    let gpu_accept =
-        sampler.pure_greedy() && !snap.spec_no_gpu_accept;
+    let gpu_accept = sampler.pure_greedy();
 
-    let use_graph_chain = use_drafter_kv
-        && cond_mode == "shift"
-        && k >= 2
-        && eagle3_graph_chain_from(snap.eagle3_graph_chain.as_deref())
-        && !snap.eagle3_no_device_chain;
+    let use_graph_chain = k >= 2;
     if use_graph_chain {
         let kd = k - 1;
         let drafter_cap = drafter_kv.kv_cap();
@@ -1058,9 +987,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
     let mut adak = adaptive.then(|| AdaptiveK::new(k, k_env));
     let mut k_hist: Vec<u64> = vec![0; k + 1];
 
-    let suffix_enabled = suffix_drafter_enabled(snap.suffix_drafter.as_deref())
-        && use_drafter_kv
-        && cond_mode == "shift";
+    let suffix_enabled = suffix_drafter_enabled(snap.suffix_drafter.as_deref());
     let suffix_min = suffix_min_match(snap.suffix_min_match.as_deref());
     let mut sam = suffix_enabled.then(nv_specdecode::SuffixAutomaton::new);
     let mut sam_fed = 0usize;
@@ -1098,7 +1025,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
         }
     }
 
-    if defer_drafter && preencode_limit > drafter_kv.len() {
+    if preencode_limit > drafter_kv.len() {
         let t_arm = std::time::Instant::now();
         let aux_t = aux_proj
             .take()
@@ -1112,7 +1039,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
                 &aux_t,
                 aux_base,
                 preencode_limit,
-                shift_prefill,
+                true,
             )
             .map_err(|e| anyhow::anyhow!("deferred drafter preencode to {preencode_limit}: {e}"))?;
         let drop = preencode_limit - aux_base;
@@ -1181,42 +1108,22 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
         let t_draft = std::time::Instant::now();
         let mut draft = if let Some(sd) = suffix_draft.take() {
             pad_suffix_draft(sd, k, bonus)
-        } else if use_drafter_kv {
-            match cond_mode.as_str() {
-
-                "shift" => {
-                    match (use_graph_chain, taken_chain.as_mut()) {
-                        (true, Some(cg)) => shared
-                            .proposer
-                            .scorer()
-                            .chain_draft_cached_shift_graphed_tail(
-                                &mut drafter_kv,
-                                cg,
-                                &context,
-                                aux_t,
-                                aux_base,
-                                k_eff - 1,
-                                bonus,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("chain_draft_cached_shift_graphed: {e}")
-                            })?,
-                        _ => shared
-                            .proposer
-                            .scorer()
-                            .chain_draft_cached_cond_tail(
-                                &mut drafter_kv,
-                                &context,
-                                aux_t,
-                                aux_base,
-                                k_eff - 1,
-                                Some(bonus),
-                                true,
-                            )
-                            .map_err(|e| anyhow::anyhow!("chain_draft_cached_cond(shift): {e}"))?,
-                    }
-                }
-                "bonus" => shared
+        } else {
+            match (use_graph_chain, taken_chain.as_mut()) {
+                (true, Some(cg)) => shared
+                    .proposer
+                    .scorer()
+                    .chain_draft_cached_shift_graphed_tail(
+                        &mut drafter_kv,
+                        cg,
+                        &context,
+                        aux_t,
+                        aux_base,
+                        k_eff - 1,
+                        bonus,
+                    )
+                    .map_err(|e| anyhow::anyhow!("chain_draft_cached_shift_graphed: {e}"))?,
+                _ => shared
                     .proposer
                     .scorer()
                     .chain_draft_cached_cond_tail(
@@ -1224,31 +1131,12 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
                         &context,
                         aux_t,
                         aux_base,
-                        k,
+                        k_eff - 1,
                         Some(bonus),
-                        false,
+                        true,
                     )
-                    .map_err(|e| anyhow::anyhow!("chain_draft_cached_cond(bonus): {e}"))?,
-                _ => shared
-                    .proposer
-                    .scorer()
-                    .chain_draft_cached_cond_tail(&mut drafter_kv, &context, aux_t, aux_base, k, None, false)
-                    .map_err(|e| anyhow::anyhow!("chain_draft_cached: {e}"))?,
+                    .map_err(|e| anyhow::anyhow!("chain_draft_cached_cond(shift): {e}"))?,
             }
-        } else if shift_forced {
-
-            let mut throwaway = nv_specdecode::eagle3_loader::DrafterKvCache::new();
-            shared
-                .proposer
-                .scorer()
-                .chain_draft_cached_cond(&mut throwaway, &context, aux_t, k - 1, Some(bonus), true)
-                .map_err(|e| anyhow::anyhow!("chain_draft_cached_cond(shift-force): {e}"))?
-        } else {
-            shared
-                .proposer
-                .scorer()
-                .chain_draft_projected(&context, aux_t, k)
-                .map_err(|e| anyhow::anyhow!("chain_draft: {e}"))?
         };
 
         let draft_ms_obs = t_draft.elapsed().as_secs_f64() * 1000.0;
@@ -1257,7 +1145,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
             draft.resize(k - 1, pad);
         }
 
-        if use_drafter_kv && !from_suffix {
+        if !from_suffix {
             aux_proj = None;
             aux_base = context.len();
         }
@@ -1272,7 +1160,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
             "spec round desync: committed={committed} but context has {} tokens",
             context.len()
         );
-        let batch = build_chain_batch(bonus, &draft, k, cond_mode == "shift")?;
+        let batch = build_chain_batch(bonus, &draft, k, true)?;
         let positions = chain_positions(committed, k);
 
         let t_verify = std::time::Instant::now();
@@ -1504,8 +1392,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
             );
         }
         eprintln!(
-            "[NV_PROF_CHAT][spec] ACCEPT POS cond_mode={} k={} rounds={} acc_pos=[{}] cond=[{}] n_acc/rej=[{}]",
-            if cond_mode.is_empty() { "default" } else { &cond_mode },
+            "[NV_PROF_CHAT][spec] ACCEPT POS k={} rounds={} acc_pos=[{}] cond=[{}] n_acc/rej=[{}]",
             k,
             total_rounds,
             per_round.join(","),
@@ -1514,12 +1401,13 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
         );
     }
 
-    Ok((gv, finish_reason, completion_tokens, aborted))
+    let terminal = emitter.stopped_by_then_done(finish_reason, completion_tokens);
+    Ok((gv, terminal, aborted))
     })();
 
     drop(permit);
 
-    let (finish_reason, completion_tokens, aborted) = {
+    let (terminal, aborted) = {
         let mut pool = shared.pool.lock().await;
         if had_lease {
             pool.lease_out = false;
@@ -1528,8 +1416,8 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
             pool.chain = taken_chain.take();
         }
         match core {
-            Ok((gv, finish_reason, completion_tokens, aborted)) => {
-                if graph_cache_enabled && pool.verify.is_none() && !pool.lease_out {
+            Ok((gv, terminal, aborted)) => {
+                if pool.verify.is_none() && !pool.lease_out {
                     pool.verify = Some(gv);
                     if let Some(g) = admit_guard.as_mut() {
                         g.set_sticky(sticky);
@@ -1540,7 +1428,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
                         g.set_sticky(0);
                     }
                 }
-                (finish_reason, completion_tokens, aborted)
+                (terminal, aborted)
             }
             Err(e) => {
                 if let Some(g) = admit_guard.as_mut() {
@@ -1552,15 +1440,7 @@ pub(crate) async fn run_sampling_gemma4_spec_graphed(
     };
 
     if !aborted {
-        let _ = push_event_async(
-            tx,
-            ChatEvent::Done {
-                finish_reason,
-                completion_tokens,
-            },
-            sse_send_timeout(),
-        )
-        .await;
+        let _ = send_in_order_until_one_fails(tx, terminal, Some(sse_send_timeout())).await;
     }
     Ok(())
 }
@@ -1609,12 +1489,11 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
     };
     debug_assert!(max_seq <= kv_max_seq_len);
 
-    let graph_cache_enabled = !snap.eagle3_no_graph_cache;
     let (sticky, extra) = {
         let b = nv_models::gemma4::kv_budget(
             model.config(),
             verify_cache_capacity(max_seq),
-            nv_models::gemma4::verify_kv_use_fp8(),
+            true,
             nv_models::gemma4::kv_ring_enabled(),
             {
                 let c = dflash.drafter.config();
@@ -1639,7 +1518,7 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
         (gv, had, pool.chain.take(), pool.dflash_draft.take())
     };
 
-    let admit_res = if graph_cache_enabled && had_lease {
+    let admit_res = if had_lease {
         crate::oapi::admission::admit_or_bail(sticky, extra, "gemma4-spec-dflash").await
     } else {
         crate::oapi::admission::admit_or_bail(0, sticky + extra, "gemma4-spec-dflash").await
@@ -1699,8 +1578,7 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
 
     let core = (|| -> anyhow::Result<(
         nv_models::gemma4_graph::GraphedGemma4Verify<Arc<nv_models::gemma4::Gemma4>>,
-        String,
-        u32,
+        Vec<ChatEvent>,
         bool,
     )> {
 
@@ -1738,9 +1616,7 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
     let mut prefill_verify_ms = 0.0f64;
     let mut prefill_drafter_ms = 0.0f64;
 
-    let graph_eager_body = snap.dflash_graph_eager;
-    let use_graph = !snap.dflash_no_graph
-        && shared.drafter.dtype() == candle_core::DType::BF16;
+    let use_graph = shared.drafter.dtype() == candle_core::DType::BF16;
     let qr = shared.drafter.config().query_rows();
     let mut dflash_graph: Option<nv_specdecode::dflash::DFlashBlockGraph> = None;
     let mut dctx = nv_specdecode::dflash::DFlashContextKv::empty();
@@ -1854,8 +1730,7 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
         dctx.len()
     );
 
-    let gpu_accept =
-        sampler.pure_greedy() && !snap.spec_no_gpu_accept;
+    let gpu_accept = sampler.pure_greedy();
 
     device
         .synchronize()
@@ -1968,10 +1843,7 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
         } else {
             let graphed = match dflash_graph.as_mut() {
                 Some(bg) if !bg.disabled() => {
-                    match shared
-                        .drafter
-                        .draft_block_graphed(&dctx, bg, bonus, graph_eager_body)
-                    {
+                    match shared.drafter.draft_block_graphed(&dctx, bg, bonus) {
                         Ok(d) => Some(d),
                         Err(e) => {
                             warn!(
@@ -2011,10 +1883,7 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
             !gpu_accept,
         )
         .map_err(|e| {
-            anyhow::anyhow!(
-                "graphed chain verify (the VERIFIER CUDA graph, which runs regardless of \
-                 NV_DFLASH_NO_GRAPH -- that knob only disables the drafter block graph): {e}"
-            )
+            anyhow::anyhow!("graphed chain verify (the VERIFIER CUDA graph): {e}")
         })?;
         let gaux = verify_out.aux;
         let (verify_logits, chain_acc) = match verify_out.judgment {
@@ -2223,12 +2092,13 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
         }
     }
 
-    Ok((gv, finish_reason, completion_tokens, aborted))
+    let terminal = emitter.stopped_by_then_done(finish_reason, completion_tokens);
+    Ok((gv, terminal, aborted))
     })();
 
     drop(permit);
 
-    let (finish_reason, completion_tokens, aborted) = {
+    let (terminal, aborted) = {
         let mut pool = shared.pool.lock().await;
         if had_lease {
             pool.lease_out = false;
@@ -2240,8 +2110,8 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
             pool.dflash_draft = taken_dd.take();
         }
         match core {
-            Ok((gv, finish_reason, completion_tokens, aborted)) => {
-                if graph_cache_enabled && pool.verify.is_none() && !pool.lease_out {
+            Ok((gv, terminal, aborted)) => {
+                if pool.verify.is_none() && !pool.lease_out {
                     pool.verify = Some(gv);
                     if let Some(g) = admit_guard.as_mut() {
                         g.set_sticky(sticky);
@@ -2252,7 +2122,7 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
                         g.set_sticky(0);
                     }
                 }
-                (finish_reason, completion_tokens, aborted)
+                (terminal, aborted)
             }
             Err(e) => {
                 if let Some(g) = admit_guard.as_mut() {
@@ -2264,15 +2134,7 @@ pub(crate) async fn run_sampling_gemma4_spec_dflash(
     };
 
     if !aborted {
-        let _ = push_event_async(
-            tx,
-            ChatEvent::Done {
-                finish_reason,
-                completion_tokens,
-            },
-            sse_send_timeout(),
-        )
-        .await;
+        let _ = send_in_order_until_one_fails(tx, terminal, Some(sse_send_timeout())).await;
     }
     Ok(())
 }
@@ -2305,7 +2167,7 @@ pub(crate) async fn run_sampling_gemma4_spec_ungraphed(
         let b = nv_models::gemma4::kv_budget_capped(
             model.config(),
             ctx,
-            nv_models::gemma4::verify_kv_use_fp8(),
+            true,
             nv_models::gemma4::kv_ring_enabled(),
             crate::oapi::admission::drafter_row_elems(),
             capped_drafter_kv_rows(ctx, drafter_kv_cap_env()),
@@ -2507,13 +2369,12 @@ pub(crate) async fn run_sampling_gemma4_spec_ungraphed(
     }
 
     if !aborted {
-        let _ = push_event_async(
+        let _ = send_stopped_by_then_done(
             tx,
-            ChatEvent::Done {
-                finish_reason,
-                completion_tokens,
-            },
-            send_timeout,
+            &mut emitter,
+            finish_reason,
+            completion_tokens,
+            Some(send_timeout),
         )
         .await;
     }
@@ -2595,56 +2456,34 @@ pub(crate) async fn run_sampling_gemma4_e4b(
     let mut sampler = ChatSampler::for_request(&req, &tokenizer, eos_ids, max_new)?;
     sampler.seed_prompt(&prompt_ids);
 
-    let mut cache: Vec<Option<(candle_core::Tensor, candle_core::Tensor)>> =
-        vec![None; model.config().num_hidden_layers];
     let mut last_logits = None;
     let mut off = 0usize;
-    if nv_models::gemma4_e4b::prefill_fixed_cache_env_opted_in() {
-        let mut fixed = model.prefill_fixed_cache(prompt_ids.len())?;
-        while off < prompt_ids.len() {
-            let c = (prompt_ids.len() - off).min(PREFILL_CHUNK);
-            let final_chunk = off + c == prompt_ids.len();
-            let rows = if final_chunk {
-                if nv_models::gemma4_e4b::prefill_lm_head_last_row_env_opted_in() {
-                    nv_models::gemma4_e4b::PrefillLogitsRows::LastRow
-                } else {
-                    nv_models::gemma4_e4b::PrefillLogitsRows::AllRows
-                }
-            } else {
-                nv_models::gemma4_e4b::PrefillLogitsRows::Discarded
-            };
-            let embeds = mm_embeds
-                .as_ref()
-                .map(|e| e.narrow(0, off, c))
-                .transpose()?;
-            let logits = model.forward_step_fixed_rows(
-                &prompt_ids[off..off + c],
-                embeds.as_ref(),
-                off,
-                &mut fixed,
-                rows,
-            )?;
-            if final_chunk {
-                last_logits = logits;
-            }
-            off += c;
+    let mut fixed = model.prefill_fixed_cache(prompt_ids.len())?;
+    while off < prompt_ids.len() {
+        let c = (prompt_ids.len() - off).min(PREFILL_CHUNK);
+        let final_chunk = off + c == prompt_ids.len();
+        let rows = if final_chunk {
+            nv_models::gemma4_e4b::PrefillLogitsRows::LastRow
+        } else {
+            nv_models::gemma4_e4b::PrefillLogitsRows::Discarded
+        };
+        let embeds = mm_embeds
+            .as_ref()
+            .map(|e| e.narrow(0, off, c))
+            .transpose()?;
+        let logits = model.forward_step_fixed_rows(
+            &prompt_ids[off..off + c],
+            embeds.as_ref(),
+            off,
+            &mut fixed,
+            rows,
+        )?;
+        if final_chunk {
+            last_logits = logits;
         }
-        cache = fixed.cat_views()?;
-    } else {
-        while off < prompt_ids.len() {
-            let c = (prompt_ids.len() - off).min(PREFILL_CHUNK);
-            last_logits = Some(match &mm_embeds {
-                Some(e) => model.forward_step_embeds(
-                    &prompt_ids[off..off + c],
-                    &e.narrow(0, off, c)?,
-                    off,
-                    &mut cache,
-                )?,
-                None => model.forward_step(&prompt_ids[off..off + c], off, &mut cache)?,
-            });
-            off += c;
-        }
+        off += c;
     }
+    let mut cache = fixed.cat_views()?;
     let row: Vec<f32> = last_logits
         .expect("non-empty prompt")
         .to_dtype(candle_core::DType::F32)?
@@ -2658,8 +2497,7 @@ pub(crate) async fn run_sampling_gemma4_e4b(
     let graph_eligible = sampling_params_from(&req).is_greedy()
         && !req.logprobs
         && req.guided.is_none()
-        && req.logit_bias.is_empty()
-        && std::env::var("NV_E4B_SERVE_GRAPH").ok().as_deref() != Some("0");
+        && req.logit_bias.is_empty();
     if graph_eligible {
         const GRAPH_BATCH: usize = 16;
         let max_len = (prompt_ids.len() + max_new + GRAPH_BATCH + 8)
@@ -2721,12 +2559,14 @@ pub(crate) async fn run_sampling_gemma4_e4b(
                         }
                     }
                 }
-                let _ = tx
-                    .send(ChatEvent::Done {
-                        finish_reason,
-                        completion_tokens,
-                    })
-                    .await;
+                let _ = send_stopped_by_then_done(
+                    tx,
+                    &mut emitter,
+                    finish_reason,
+                    completion_tokens,
+                    None,
+                )
+                .await;
                 return Ok(());
             }
             Err(e) => {
@@ -2796,12 +2636,8 @@ pub(crate) async fn run_sampling_gemma4_e4b(
         }
     }
 
-    let _ = tx
-        .send(ChatEvent::Done {
-            finish_reason,
-            completion_tokens,
-        })
-        .await;
+    let _ =
+        send_stopped_by_then_done(tx, &mut emitter, finish_reason, completion_tokens, None).await;
     Ok(())
 }
 
@@ -2817,24 +2653,32 @@ mod prompt_head_position_tests {
     const QWEN_EOS: [u32; 2] = [248044, 248046];
 
     #[test]
-    fn a_gemma_shaped_bos_outside_the_eos_set_is_prepended_when_the_template_omitted_it() {
+    fn a_bos_outside_the_eos_set_is_spliced_at_position_0_exactly_once() {
         let mut ids = vec![105u32, 2364, 107];
         let head = splice_bos_at_position_0_only(&mut ids, Some(GEMMA_BOS), &GEMMA_EOS);
         assert_eq!(head, PromptHead::EnginePrependedBosAtPosition0);
         assert_eq!(ids, vec![2, 105, 2364, 107]);
+        {
+            let mut ids = vec![GEMMA_BOS, 105, 2364, 107];
+            let before = ids.clone();
+            let head = splice_bos_at_position_0_only(&mut ids, Some(GEMMA_BOS), &GEMMA_EOS);
+            assert_eq!(head, PromptHead::TemplateEmittedBosAtPosition0);
+            assert_eq!(ids, before);
+        }
+        {
+            let mut ids = vec![105u32, 2364, 107];
+            let before = ids.clone();
+            let head = splice_bos_at_position_0_only(&mut ids, None, &GEMMA_EOS);
+            assert_eq!(head, PromptHead::CheckpointDeclaresNoBos);
+            assert_eq!(
+                ids, before,
+                "an undeclared bos_token_id is absent, not 2: {BOS_IS_A_POSITION_0_ROLE_AND_THE_SAME_ID_LATER_IS_A_STOP}"
+            );
+        }
     }
 
     #[test]
-    fn a_template_that_already_opened_on_bos_is_not_given_a_second_copy() {
-        let mut ids = vec![GEMMA_BOS, 105, 2364, 107];
-        let before = ids.clone();
-        let head = splice_bos_at_position_0_only(&mut ids, Some(GEMMA_BOS), &GEMMA_EOS);
-        assert_eq!(head, PromptHead::TemplateEmittedBosAtPosition0);
-        assert_eq!(ids, before);
-    }
-
-    #[test]
-    fn a_dual_role_id_the_template_emitted_itself_stays_at_position_0_and_is_not_duplicated() {
+    fn a_dual_role_id_is_never_spliced_in_and_the_refusal_leaves_the_eos_set_intact() {
         let mut ids = vec![LAGUNA_BOS, 9204, 24];
         let before = ids.clone();
         let head = splice_bos_at_position_0_only(&mut ids, Some(LAGUNA_BOS), &LAGUNA_EOS);
@@ -2848,56 +2692,284 @@ mod prompt_head_position_tests {
             Some(LAGUNA_BOS),
             "{BOS_IS_A_POSITION_0_ROLE_AND_THE_SAME_ID_LATER_IS_A_STOP}"
         );
+        {
+            let mut ids = vec![9204u32, 610, 24];
+            let before = ids.clone();
+            let head = splice_bos_at_position_0_only(&mut ids, Some(LAGUNA_BOS), &LAGUNA_EOS);
+            assert_eq!(
+                head,
+                PromptHead::RefusedToSpliceAnIdTheCheckpointAlsoDeclaresEos
+            );
+            assert_eq!(ids, before);
+        }
+        {
+            let mut ids = vec![151644u32, 872, 198];
+            let head =
+                splice_bos_at_position_0_only(&mut ids, Some(QWEN_GENERATION_CONFIG_BOS), &QWEN_EOS);
+            assert_eq!(
+                head,
+                PromptHead::RefusedToSpliceAnIdTheCheckpointAlsoDeclaresEos
+            );
+            assert!(
+                !QWEN_EOS.contains(&ids[0]),
+                "{BOS_IS_A_POSITION_0_ROLE_AND_THE_SAME_ID_LATER_IS_A_STOP}"
+            );
+        }
+        {
+            let eos: Vec<u32> = LAGUNA_EOS.to_vec();
+            let mut ids = vec![9204u32, 610];
+            splice_bos_at_position_0_only(&mut ids, Some(LAGUNA_BOS), &eos);
+            assert!(
+                eos.contains(&LAGUNA_BOS),
+                "id {LAGUNA_BOS} must remain a stop for generated tokens: it is the checkpoint's own \
+                 declaration and removing it breaks real stopping"
+            );
+        }
     }
 
-    #[test]
-    fn a_dual_role_id_the_template_did_not_emit_is_never_spliced_in() {
-        let mut ids = vec![9204u32, 610, 24];
-        let before = ids.clone();
-        let head = splice_bos_at_position_0_only(&mut ids, Some(LAGUNA_BOS), &LAGUNA_EOS);
-        assert_eq!(
-            head,
-            PromptHead::RefusedToSpliceAnIdTheCheckpointAlsoDeclaresEos
-        );
-        assert_eq!(ids, before);
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod engine_route_tests {
+    use super::*;
+    use nv_engine::{BatchStepper, PrefillInput, SeqInput, StepResult};
+
+    const ALPHA: u32 = 0;
+    const BETA: u32 = 1;
+    const EOS: u32 = 2;
+
+    fn tiny_tokenizer() -> Arc<tokenizers::Tokenizer> {
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(
+                ["alpha", "beta", "<eos>"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| ((*s).to_string(), i as u32))
+                    .collect(),
+            )
+            .build()
+            .expect("word-level model");
+        Arc::new(tokenizers::Tokenizer::new(model))
     }
 
-    #[test]
-    fn the_qwen_generation_config_bos_that_lives_in_its_own_eos_set_never_reaches_position_0() {
-        let mut ids = vec![151644u32, 872, 198];
-        let head =
-            splice_bos_at_position_0_only(&mut ids, Some(QWEN_GENERATION_CONFIG_BOS), &QWEN_EOS);
-        assert_eq!(
-            head,
-            PromptHead::RefusedToSpliceAnIdTheCheckpointAlsoDeclaresEos
-        );
+    fn request(max_new_tokens: usize) -> ChatGenerateRequest {
+        ChatGenerateRequest {
+            prompt: "alpha".into(),
+            max_new_tokens,
+            stop: vec![],
+            seed: Some(0),
+            temperature: Some(0.0),
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            repetition_penalty: None,
+            guided: None,
+            guided_think_close: None,
+            logit_bias: vec![],
+            logprobs: false,
+            top_logprobs: 0,
+            kv_resume: None,
+            kv_store: None,
+            mm: None,
+        }
+    }
+
+    struct ScriptedStepper {
+        first: u32,
+        then_or_the_engine_thread_dies: Option<u32>,
+    }
+
+    impl BatchStepper for ScriptedStepper {
+        fn prefill(&mut self, items: &[PrefillInput]) -> anyhow::Result<Vec<StepResult>> {
+            Ok(items
+                .iter()
+                .map(|it| StepResult {
+                    seq_id: it.seq_id,
+                    token: self.first,
+                })
+                .collect())
+        }
+
+        fn decode(&mut self, items: &[SeqInput]) -> anyhow::Result<Vec<StepResult>> {
+            let token = self
+                .then_or_the_engine_thread_dies
+                .expect("the engine thread dies mid-request");
+            Ok(items
+                .iter()
+                .map(|it| StepResult {
+                    seq_id: it.seq_id,
+                    token,
+                })
+                .collect())
+        }
+    }
+
+    async fn serve(
+        stepper: ScriptedStepper,
+        req: ChatGenerateRequest,
+    ) -> (anyhow::Result<()>, Vec<ChatEvent>) {
+        serve_in_window(stepper, req, 4096).await
+    }
+
+    async fn serve_in_window(
+        stepper: ScriptedStepper,
+        req: ChatGenerateRequest,
+        kv_max_seq_len: usize,
+    ) -> (anyhow::Result<()>, Vec<ChatEvent>) {
+        let handle = Arc::new(nv_engine::BatchEngineHandle::spawn(
+            nv_engine::SchedulerConfig {
+                max_batch_size: 4,
+                max_batched_tokens: 4096,
+                block_size: 4,
+                num_blocks: 64,
+            },
+            std::time::Duration::ZERO,
+            move || stepper,
+        ));
+        let (tx, mut rx) = mpsc::channel(64);
+        let res = run_gemma4_via_engine(
+            handle,
+            tiny_tokenizer(),
+            req,
+            kv_max_seq_len,
+            16,
+            &[EOS],
+            None,
+            &tx,
+        )
+        .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        (res, events)
+    }
+
+    fn done_of(events: &[ChatEvent]) -> Option<(String, u32)> {
+        events.iter().find_map(|e| match e {
+            ChatEvent::Done {
+                finish_reason,
+                completion_tokens,
+            } => Some((finish_reason.clone(), *completion_tokens)),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn an_eos_ends_the_request_as_a_stop_and_is_neither_counted_nor_shown() {
+        let (res, events) = serve(
+            ScriptedStepper {
+                first: EOS,
+                then_or_the_engine_thread_dies: None,
+            },
+            request(4),
+        )
+        .await;
+        res.unwrap();
         assert!(
-            !QWEN_EOS.contains(&ids[0]),
-            "{BOS_IS_A_POSITION_0_ROLE_AND_THE_SAME_ID_LATER_IS_A_STOP}"
+            !events.iter().any(|e| matches!(e, ChatEvent::TextDelta(_))),
+            "{events:?}"
         );
-    }
-
-    #[test]
-    fn a_checkpoint_that_declares_no_bos_gets_none_invented_for_it() {
-        let mut ids = vec![105u32, 2364, 107];
-        let before = ids.clone();
-        let head = splice_bos_at_position_0_only(&mut ids, None, &GEMMA_EOS);
-        assert_eq!(head, PromptHead::CheckpointDeclaresNoBos);
         assert_eq!(
-            ids, before,
-            "an undeclared bos_token_id is absent, not 2: {BOS_IS_A_POSITION_0_ROLE_AND_THE_SAME_ID_LATER_IS_A_STOP}"
+            done_of(&events),
+            Some(("stop".to_string(), 0)),
+            "an EOS-first request delivers no text, so it reports 0 completion tokens as every \
+             other route does"
         );
     }
 
-    #[test]
-    fn refusing_the_splice_leaves_the_checkpoints_own_eos_set_intact() {
-        let eos: Vec<u32> = LAGUNA_EOS.to_vec();
-        let mut ids = vec![9204u32, 610];
-        splice_bos_at_position_0_only(&mut ids, Some(LAGUNA_BOS), &eos);
-        assert!(
-            eos.contains(&LAGUNA_BOS),
-            "id {LAGUNA_BOS} must remain a stop for generated tokens: it is the checkpoint's own \
-             declaration and removing it breaks real stopping"
+    #[tokio::test]
+    async fn an_eos_on_the_last_allowed_token_is_a_stop_counting_only_the_text_before_it() {
+        let (res, events) = serve(
+            ScriptedStepper {
+                first: ALPHA,
+                then_or_the_engine_thread_dies: Some(EOS),
+            },
+            request(2),
+        )
+        .await;
+        res.unwrap();
+        assert_eq!(done_of(&events), Some(("stop".to_string(), 1)), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_closes_without_done_is_an_interrupted_request_not_a_short_answer() {
+        let (res, events) = serve(
+            ScriptedStepper {
+                first: BETA,
+                then_or_the_engine_thread_dies: None,
+            },
+            request(4),
+        )
+        .await;
+        let err = res.expect_err(
+            "the engine produced one token and then its reply closed with no Done: the client \
+             must hear that generation stopped, not receive one token as a complete answer",
         );
+        assert_eq!(err.to_string(), crate::oapi::chat::ENGINE_INTERRUPTED);
+        assert!(
+            !events.iter().any(|e| matches!(e, ChatEvent::Done { .. })),
+            "{events:?}"
+        );
+    }
+    #[tokio::test]
+    async fn gemma4_engine_stop_hit_reports_stop_sequence() {
+        let mut req = request(4);
+        req.stop = vec!["beta".into()];
+        let (res, events) = serve(
+            ScriptedStepper {
+                first: ALPHA,
+                then_or_the_engine_thread_dies: Some(BETA),
+            },
+            req,
+        )
+        .await;
+        res.unwrap();
+        let terminal: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::StoppedBy { stop_sequence } => Some(stop_sequence.clone()),
+                ChatEvent::Done { finish_reason, .. } => Some(format!("done:{finish_reason}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            terminal,
+            ["beta", "done:stop"],
+            "a gemma4 request that stops on a stop string must report it before Done, or \
+             /v1/messages answers end_turn with stop_sequence null: {events:?}"
+        );
+    }
+    #[tokio::test]
+    async fn the_engine_route_clamps_max_tokens_to_the_kv_window() {
+        let stepper = || ScriptedStepper {
+            first: ALPHA,
+            then_or_the_engine_thread_dies: Some(BETA),
+        };
+        let (res, events) = serve_in_window(stepper(), request(4), 3).await;
+        res.unwrap();
+        assert_eq!(
+            done_of(&events),
+            Some(("length".to_string(), 1)),
+            "a 1-token prompt in a 3-token window leaves room for 1 new token, as kv_window \
+             allows on the per-request path: {events:?}"
+        );
+
+        let (res, events) = serve_in_window(stepper(), request(4), 2).await;
+        res.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, ChatEvent::TextDelta(_))),
+            "the window leaves no room for a new token, and the engine still emits one for \
+             max_new 0, so the route must not submit: {events:?}"
+        );
+        assert_eq!(done_of(&events), Some(("length".to_string(), 0)), "{events:?}");
+
+        let (res, events) = serve_in_window(stepper(), request(4), 1).await;
+        let err = res.expect_err("a prompt that fills the KV window is rejected, not decoded");
+        assert!(err.to_string().contains("KV window"), "{err:#}");
+        assert!(done_of(&events).is_none(), "{events:?}");
     }
 }

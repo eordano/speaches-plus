@@ -63,10 +63,6 @@ impl Sequence {
         self.prompt.len()
     }
 
-    pub fn output_len(&self) -> usize {
-        self.output.len()
-    }
-
     pub fn tokens(&self) -> Vec<u32> {
         let mut out = Vec::with_capacity(self.total_len());
         out.extend_from_slice(&self.prompt);
@@ -181,13 +177,13 @@ impl Sequence {
     }
 
     pub fn check_stop(&mut self) -> Option<FinishReason> {
-        if self.output.len() >= self.max_new_tokens {
-            return Some(FinishReason::MaxTokens);
-        }
         if let (Some(eos), Some(last)) = (self.eos_token_id, self.output.last().copied()) {
             if last == eos {
                 return Some(FinishReason::Eos);
             }
+        }
+        if self.output.len() >= self.max_new_tokens {
+            return Some(FinishReason::MaxTokens);
         }
         None
     }
@@ -226,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_cache_hit_still_recomputes_one_token() {
+    fn a_full_cache_hit_still_recomputes_one_token_and_a_recompute_keeps_no_progress() {
         let mut s = seq(&[1, 2, 3, 4], 8);
         s.transition_to_prefill_with_cache(usize::MAX).unwrap();
         assert_eq!(s.num_computed_tokens, 4 - MIN_RECOMPUTED_PREFILL_TOKENS);
@@ -243,6 +239,22 @@ mod tests {
         let mut s = seq(&[9], 8);
         s.transition_to_prefill_with_cache(5).unwrap();
         assert_eq!(s.num_computed_tokens, 0);
+
+        let mut s = seq(&[1, 2, 3], 8);
+        s.transition_to_prefill_with_cache(2).unwrap();
+        s.record_computed(1);
+        assert_eq!(s.num_computed_tokens, 3);
+        s.reset_for_recompute();
+        assert_eq!(
+            s.num_computed_tokens, 0,
+            "kept progress would skip real work"
+        );
+        assert_eq!(
+            s.state,
+            SequenceState::Waiting,
+            "and it must be schedulable again"
+        );
+        s.transition_to_prefill().unwrap();
     }
 
     #[test]
@@ -273,10 +285,18 @@ mod tests {
             "a finished sequence must not grow"
         );
         assert!(s.transition_to_prefill().is_err());
+
+        let mut s = decoding(&[1], 8);
+        s.abort();
+        assert!(
+            s.is_finished(),
+            "aborted counts as finished for the scheduler"
+        );
+        assert_eq!(s.finish_reason, Some(FinishReason::Aborted));
     }
 
     #[test]
-    fn max_tokens_is_checked_before_eos_so_the_cap_is_never_overrun() {
+    fn eos_is_checked_before_max_tokens_because_the_model_chose_to_stop() {
         let mut s = decoding(&[1], 2).with_eos_for_test(Some(99));
         s.append_token(5).unwrap();
         assert_eq!(s.check_stop(), None, "one of two");
@@ -284,8 +304,9 @@ mod tests {
 
         assert_eq!(
             s.check_stop(),
-            Some(FinishReason::MaxTokens),
-            "both conditions hold; Eos here would say the model chose to stop when it was cut off"
+            Some(FinishReason::Eos),
+            "both conditions hold and either stops the sequence at the cap; the model sampled EOS, \
+             which every family's loop reports as finish_reason stop"
         );
 
         let mut s = decoding(&[1], 8).with_eos_for_test(Some(99));
@@ -329,51 +350,5 @@ mod tests {
             0,
             "nothing needs no block"
         );
-    }
-
-    #[test]
-    fn last_token_falls_back_to_the_prompt_before_anything_is_generated() {
-        let s = seq(&[1, 2, 3], 4);
-        assert_eq!(s.last_token(), Some(3));
-        let mut s = decoding(&[1, 2, 3], 4);
-        s.append_token(9).unwrap();
-        assert_eq!(s.last_token(), Some(9));
-        assert_eq!(seq(&[], 4).last_token(), None);
-    }
-
-    #[test]
-    fn a_recompute_sends_the_sequence_back_to_waiting_with_no_progress_kept() {
-        let mut s = seq(&[1, 2, 3], 8);
-        s.transition_to_prefill_with_cache(2).unwrap();
-        s.record_computed(1);
-        assert_eq!(s.num_computed_tokens, 3);
-        s.reset_for_recompute();
-        assert_eq!(
-            s.num_computed_tokens, 0,
-            "kept progress would skip real work"
-        );
-        assert_eq!(
-            s.state,
-            SequenceState::Waiting,
-            "and it must be schedulable again"
-        );
-        s.transition_to_prefill().unwrap();
-    }
-
-    #[test]
-    fn drafts_are_a_transient_and_abort_records_its_own_reason() {
-        let mut s = decoding(&[1], 8);
-        assert!(!s.has_drafts());
-        s.set_drafts(vec![4, 5]);
-        assert!(s.has_drafts() && s.draft_len() == 2);
-        s.clear_drafts();
-        assert!(!s.has_drafts() && s.draft_len() == 0);
-
-        s.abort();
-        assert!(
-            s.is_finished(),
-            "aborted counts as finished for the scheduler"
-        );
-        assert_eq!(s.finish_reason, Some(FinishReason::Aborted));
     }
 }

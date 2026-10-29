@@ -4,8 +4,8 @@ package wire
 import "encoding/json"
 
 type AssistantTruncatedEvent struct {
-	EventId string `json:"event_id"`
-	ItemId string `json:"item_id"`
+	EventId    string `json:"event_id"`
+	ItemId     string `json:"item_id"`
 	AudioEndMs uint64 `json:"audio_end_ms"`
 	Transcript string `json:"transcript"`
 }
@@ -13,17 +13,17 @@ type BufferCommittedEvent struct {
 	ItemId string `json:"item_id"`
 }
 type DiarizationEvent struct {
-	ItemId string `json:"item_id"`
-	AudioEndMs uint64 `json:"audio_end_ms"`
-	ElapsedMs *uint64 `json:"elapsed_ms,omitempty"`
-	Segments []json.RawMessage `json:"segments"`
+	ItemId     string            `json:"item_id"`
+	AudioEndMs uint64            `json:"audio_end_ms"`
+	ElapsedMs  *uint64           `json:"elapsed_ms,omitempty"`
+	Segments   []json.RawMessage `json:"segments"`
 }
 type ErrorPayload struct {
-	Type string `json:"type"`
-	Code string `json:"code"`
-	Message string `json:"message"`
+	Type    string  `json:"type"`
+	Code    string  `json:"code"`
+	Message string  `json:"message"`
 	EventId *string `json:"event_id,omitempty"`
-	Param *string `json:"param,omitempty"`
+	Param   *string `json:"param,omitempty"`
 }
 type ErrorEvent struct {
 	Error ErrorPayload `json:"error"`
@@ -41,27 +41,27 @@ type ItemRetrievedEvent struct {
 	Item json.RawMessage `json:"item"`
 }
 type ItemTruncatedClientAckEvent struct {
-	ItemId string `json:"item_id"`
+	ItemId       string `json:"item_id"`
 	ContentIndex uint64 `json:"content_index"`
-	AudioEndMs uint64 `json:"audio_end_ms"`
+	AudioEndMs   uint64 `json:"audio_end_ms"`
 }
 type LabelHttpRequest struct {
-	Id *string `json:"id,omitempty"`
-	Tag *string `json:"tag,omitempty"`
-	Label string `json:"label"`
+	Id    *string `json:"id,omitempty"`
+	Tag   *string `json:"tag,omitempty"`
+	Label string  `json:"label"`
 }
 type LabelHttpResponse struct {
-	Id *string `json:"id,omitempty"`
-	Tag *string `json:"tag,omitempty"`
-	Label string `json:"label"`
-	Recorded bool `json:"recorded"`
-	Matched bool `json:"matched"`
+	Id       *string `json:"id,omitempty"`
+	Tag      *string `json:"tag,omitempty"`
+	Label    string  `json:"label"`
+	Recorded bool    `json:"recorded"`
+	Matched  bool    `json:"matched"`
 }
 type LabelRecord struct {
-	Ts uint64 `json:"ts"`
-	Id *string `json:"id,omitempty"`
-	Tag *string `json:"tag,omitempty"`
-	Label string `json:"label"`
+	Ts    uint64  `json:"ts"`
+	Id    *string `json:"id,omitempty"`
+	Tag   *string `json:"tag,omitempty"`
+	Label string  `json:"label"`
 }
 type OutputAudioBufferStartedEvent struct {
 	ResponseId string `json:"response_id"`
@@ -70,7 +70,7 @@ type OutputAudioBufferStoppedEvent struct {
 	ResponseId string `json:"response_id"`
 }
 type PartialTranscriptionEvent struct {
-	ItemId string `json:"item_id"`
+	ItemId     string `json:"item_id"`
 	Transcript string `json:"transcript"`
 	AudioEndMs uint64 `json:"audio_end_ms"`
 }
@@ -81,134 +81,140 @@ type ResponseCancelledEvent struct {
 	ResponseId string `json:"response_id"`
 }
 type ResponseContentPartAddedEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
-	OutputIndex uint64 `json:"output_index"`
-	ContentIndex uint64 `json:"content_index"`
-	Part json.RawMessage `json:"part"`
+	ResponseId   string          `json:"response_id"`
+	ItemId       string          `json:"item_id"`
+	OutputIndex  uint64          `json:"output_index"`
+	ContentIndex uint64          `json:"content_index"`
+	Part         json.RawMessage `json:"part"`
 }
 type ResponseContentPartDoneEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
-	OutputIndex uint64 `json:"output_index"`
-	ContentIndex uint64 `json:"content_index"`
-	Part json.RawMessage `json:"part"`
+	ResponseId   string          `json:"response_id"`
+	ItemId       string          `json:"item_id"`
+	OutputIndex  uint64          `json:"output_index"`
+	ContentIndex uint64          `json:"content_index"`
+	Part         json.RawMessage `json:"part"`
 }
 type ResponseCreatedEvent struct {
 	Response json.RawMessage `json:"response"`
 }
 type ResponseStatus string
+
 const (
-	ResponseStatusCompleted ResponseStatus = "completed"
-	ResponseStatusCancelled ResponseStatus = "cancelled"
+	ResponseStatusCompleted  ResponseStatus = "completed"
+	ResponseStatusCancelled  ResponseStatus = "cancelled"
 	ResponseStatusIncomplete ResponseStatus = "incomplete"
-	ResponseStatusFailed ResponseStatus = "failed"
+	ResponseStatusFailed     ResponseStatus = "failed"
 )
+
 type ResponseStatusReason string
+
 const (
-	ResponseStatusReasonDrainCap ResponseStatusReason = "drain_cap"
-	ResponseStatusReasonTokenLimit ResponseStatusReason = "token_limit"
-	ResponseStatusReasonLlmError ResponseStatusReason = "llm_error"
-	ResponseStatusReasonTtsError ResponseStatusReason = "tts_error"
-	ResponseStatusReasonClientTooSlow ResponseStatusReason = "client_too_slow"
-	ResponseStatusReasonBargeIn ResponseStatusReason = "barge_in"
+	ResponseStatusReasonDrainCap        ResponseStatusReason = "drain_cap"
+	ResponseStatusReasonTokenLimit      ResponseStatusReason = "token_limit"
+	ResponseStatusReasonLlmError        ResponseStatusReason = "llm_error"
+	ResponseStatusReasonTtsError        ResponseStatusReason = "tts_error"
+	ResponseStatusReasonClientTooSlow   ResponseStatusReason = "client_too_slow"
+	ResponseStatusReasonBargeIn         ResponseStatusReason = "barge_in"
 	ResponseStatusReasonClientCancelled ResponseStatusReason = "client_cancelled"
 )
+
 type ResponseStatusDetails struct {
 	Reason ResponseStatusReason `json:"reason"`
-	Error *ErrorPayload `json:"error,omitempty"`
+	Error  *ErrorPayload        `json:"error,omitempty"`
 }
 type ResponsePayload struct {
-	Id string `json:"id"`
-	Status ResponseStatus `json:"status"`
-	AudioEndMs uint64 `json:"audio_end_ms"`
-	Output []json.RawMessage `json:"output"`
+	Id            string                 `json:"id"`
+	Status        ResponseStatus         `json:"status"`
+	AudioEndMs    uint64                 `json:"audio_end_ms"`
+	Output        []json.RawMessage      `json:"output"`
 	StatusDetails *ResponseStatusDetails `json:"status_details,omitempty"`
 }
 type ResponseDoneEvent struct {
 	Response ResponsePayload `json:"response"`
 }
 type ResponseFunctionCallArgumentsDeltaEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
+	ResponseId  string `json:"response_id"`
+	ItemId      string `json:"item_id"`
 	OutputIndex uint64 `json:"output_index"`
-	CallId string `json:"call_id"`
-	Delta string `json:"delta"`
+	CallId      string `json:"call_id"`
+	Delta       string `json:"delta"`
 }
 type ResponseFunctionCallArgumentsDoneEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
+	ResponseId  string `json:"response_id"`
+	ItemId      string `json:"item_id"`
 	OutputIndex uint64 `json:"output_index"`
-	CallId string `json:"call_id"`
-	Arguments string `json:"arguments"`
+	CallId      string `json:"call_id"`
+	Arguments   string `json:"arguments"`
 }
 type ResponseOutputAudioDeltaEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
-	OutputIndex uint64 `json:"output_index"`
+	ResponseId   string `json:"response_id"`
+	ItemId       string `json:"item_id"`
+	OutputIndex  uint64 `json:"output_index"`
 	ContentIndex uint64 `json:"content_index"`
-	Delta string `json:"delta"`
+	Delta        string `json:"delta"`
 }
 type ResponseOutputAudioDoneEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
-	OutputIndex uint64 `json:"output_index"`
+	ResponseId   string `json:"response_id"`
+	ItemId       string `json:"item_id"`
+	OutputIndex  uint64 `json:"output_index"`
 	ContentIndex uint64 `json:"content_index"`
 }
 type ResponseOutputAudioTranscriptDeltaEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
-	OutputIndex uint64 `json:"output_index"`
+	ResponseId   string `json:"response_id"`
+	ItemId       string `json:"item_id"`
+	OutputIndex  uint64 `json:"output_index"`
 	ContentIndex uint64 `json:"content_index"`
-	Delta string `json:"delta"`
+	Delta        string `json:"delta"`
 }
 type ResponseOutputAudioTranscriptDoneEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
-	OutputIndex uint64 `json:"output_index"`
+	ResponseId   string `json:"response_id"`
+	ItemId       string `json:"item_id"`
+	OutputIndex  uint64 `json:"output_index"`
 	ContentIndex uint64 `json:"content_index"`
-	Transcript string `json:"transcript"`
+	Transcript   string `json:"transcript"`
 }
 type ResponseOutputItemAddedEvent struct {
-	ResponseId string `json:"response_id"`
-	OutputIndex uint64 `json:"output_index"`
-	Item json.RawMessage `json:"item"`
+	ResponseId  string          `json:"response_id"`
+	OutputIndex uint64          `json:"output_index"`
+	Item        json.RawMessage `json:"item"`
 }
 type ResponseOutputItemDoneEvent struct {
-	ResponseId string `json:"response_id"`
-	OutputIndex uint64 `json:"output_index"`
-	Item json.RawMessage `json:"item"`
+	ResponseId  string          `json:"response_id"`
+	OutputIndex uint64          `json:"output_index"`
+	Item        json.RawMessage `json:"item"`
 }
 type ResponseOutputTextDeltaEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
-	OutputIndex uint64 `json:"output_index"`
+	ResponseId   string `json:"response_id"`
+	ItemId       string `json:"item_id"`
+	OutputIndex  uint64 `json:"output_index"`
 	ContentIndex uint64 `json:"content_index"`
-	Delta string `json:"delta"`
+	Delta        string `json:"delta"`
 }
 type ResponseOutputTextDoneEvent struct {
-	ResponseId string `json:"response_id"`
-	ItemId string `json:"item_id"`
-	OutputIndex uint64 `json:"output_index"`
+	ResponseId   string `json:"response_id"`
+	ItemId       string `json:"item_id"`
+	OutputIndex  uint64 `json:"output_index"`
 	ContentIndex uint64 `json:"content_index"`
-	Text string `json:"text"`
+	Text         string `json:"text"`
 }
 type ToolStatus string
+
 const (
 	ToolStatusRunning ToolStatus = "running"
-	ToolStatusDone ToolStatus = "done"
+	ToolStatusDone    ToolStatus = "done"
 )
+
 type ToolProgressEntry struct {
-	Name string `json:"name"`
-	Status ToolStatus `json:"status"`
-	Args *json.RawMessage `json:"args,omitempty"`
-	Result *string `json:"result,omitempty"`
-	Error *bool `json:"error,omitempty"`
-	Summary *string `json:"summary,omitempty"`
+	Name    string           `json:"name"`
+	Status  ToolStatus       `json:"status"`
+	Args    *json.RawMessage `json:"args,omitempty"`
+	Result  *string          `json:"result,omitempty"`
+	Error   *bool            `json:"error,omitempty"`
+	Summary *string          `json:"summary,omitempty"`
 }
 type ResponseToolProgressEvent struct {
-	ResponseId string `json:"response_id"`
-	Tools []ToolProgressEntry `json:"tools"`
+	ResponseId string              `json:"response_id"`
+	Tools      []ToolProgressEntry `json:"tools"`
 }
 type SessionCreatedEvent struct {
 	Session json.RawMessage `json:"session"`
@@ -220,85 +226,100 @@ type SessionUpdatedEvent struct {
 	Session json.RawMessage `json:"session"`
 }
 type SpeechStartedEvent struct {
-	ItemId string `json:"item_id"`
+	ItemId       string `json:"item_id"`
 	AudioStartMs uint64 `json:"audio_start_ms"`
 }
 type SpeechStoppedEvent struct {
-	ItemId string `json:"item_id"`
+	ItemId     string `json:"item_id"`
 	AudioEndMs uint64 `json:"audio_end_ms"`
 }
 type TrajectoryRecord struct {
-	Ts uint64 `json:"ts"`
-	Endpoint string `json:"endpoint"`
-	Id string `json:"id"`
-	Model string `json:"model"`
-	Prompt string `json:"prompt"`
-	Completion string `json:"completion"`
-	Reasoning *string `json:"reasoning,omitempty"`
-	FinishReason string `json:"finish_reason"`
-	StoppedBy *string `json:"stopped_by,omitempty"`
-	Multimodal bool `json:"multimodal"`
-	Label *string `json:"label,omitempty"`
-	Tag *string `json:"tag,omitempty"`
-	PromptTokens uint32 `json:"prompt_tokens"`
-	CompletionTokens uint32 `json:"completion_tokens"`
-	Seed uint64 `json:"seed"`
-	Temperature *float32 `json:"temperature,omitempty"`
+	Ts               uint64   `json:"ts"`
+	Endpoint         string   `json:"endpoint"`
+	Id               string   `json:"id"`
+	Model            string   `json:"model"`
+	Prompt           string   `json:"prompt"`
+	Completion       string   `json:"completion"`
+	Reasoning        *string  `json:"reasoning,omitempty"`
+	FinishReason     string   `json:"finish_reason"`
+	StoppedBy        *string  `json:"stopped_by,omitempty"`
+	Multimodal       bool     `json:"multimodal"`
+	Label            *string  `json:"label,omitempty"`
+	Tag              *string  `json:"tag,omitempty"`
+	PromptTokens     uint32   `json:"prompt_tokens"`
+	CompletionTokens uint32   `json:"completion_tokens"`
+	Seed             uint64   `json:"seed"`
+	Temperature      *float32 `json:"temperature,omitempty"`
+}
+type TranscriptTokenLogprob struct {
+	Token   string  `json:"token"`
+	Logprob float32 `json:"logprob"`
+}
+type TranscriptConfidence struct {
+	AvgLogprob       *float32                  `json:"avg_logprob,omitempty"`
+	NoSpeechProb     *float32                  `json:"no_speech_prob,omitempty"`
+	CompressionRatio *float32                  `json:"compression_ratio,omitempty"`
+	Logprobs         *[]TranscriptTokenLogprob `json:"logprobs,omitempty"`
 }
 type TranscriptionCompletedEvent struct {
-	ItemId string `json:"item_id"`
-	ContentIndex uint64 `json:"content_index"`
-	Transcript string `json:"transcript"`
+	ItemId           string                    `json:"item_id"`
+	ContentIndex     uint64                    `json:"content_index"`
+	Transcript       string                    `json:"transcript"`
+	AvgLogprob       *float32                  `json:"avg_logprob,omitempty"`
+	NoSpeechProb     *float32                  `json:"no_speech_prob,omitempty"`
+	CompressionRatio *float32                  `json:"compression_ratio,omitempty"`
+	Logprobs         *[]TranscriptTokenLogprob `json:"logprobs,omitempty"`
 }
 type TranscriptionDeltaEvent struct {
-	ItemId string `json:"item_id"`
+	ItemId       string `json:"item_id"`
 	ContentIndex uint64 `json:"content_index"`
-	Delta string `json:"delta"`
+	Delta        string `json:"delta"`
 }
 type TranscriptionFailedEvent struct {
-	ItemId string `json:"item_id"`
-	ContentIndex uint64 `json:"content_index"`
-	Error json.RawMessage `json:"error"`
+	ItemId       string          `json:"item_id"`
+	ContentIndex uint64          `json:"content_index"`
+	Error        json.RawMessage `json:"error"`
 }
 type RealtimeServerEventType string
+
 const (
-	RealtimeServerEventTypeSessionCreated RealtimeServerEventType = "session.created"
-	RealtimeServerEventTypeSessionUpdated RealtimeServerEventType = "session.updated"
-	RealtimeServerEventTypeSessionDone RealtimeServerEventType = "session.done"
-	RealtimeServerEventTypeSpeechStarted RealtimeServerEventType = "input_audio_buffer.speech_started"
-	RealtimeServerEventTypeSpeechStopped RealtimeServerEventType = "input_audio_buffer.speech_stopped"
-	RealtimeServerEventTypeBufferCommitted RealtimeServerEventType = "input_audio_buffer.committed"
-	RealtimeServerEventTypeBufferCleared RealtimeServerEventType = "input_audio_buffer.cleared"
-	RealtimeServerEventTypePartialTranscription RealtimeServerEventType = "input_audio_buffer.partial_transcription"
-	RealtimeServerEventTypeItemAdded RealtimeServerEventType = "conversation.item.added"
-	RealtimeServerEventTypeItemDeleted RealtimeServerEventType = "conversation.item.deleted"
-	RealtimeServerEventTypeItemTruncatedClientAck RealtimeServerEventType = "conversation.item.truncated"
-	RealtimeServerEventTypeAssistantTruncated RealtimeServerEventType = "conversation.item.assistant_truncated"
-	RealtimeServerEventTypeTranscriptionCompleted RealtimeServerEventType = "conversation.item.input_audio_transcription.completed"
-	RealtimeServerEventTypeTranscriptionDelta RealtimeServerEventType = "conversation.item.input_audio_transcription.delta"
-	RealtimeServerEventTypeTranscriptionFailed RealtimeServerEventType = "conversation.item.input_audio_transcription.failed"
-	RealtimeServerEventTypeItemDone RealtimeServerEventType = "conversation.item.done"
-	RealtimeServerEventTypeItemRetrieved RealtimeServerEventType = "conversation.item.retrieved"
-	RealtimeServerEventTypeResponseCreated RealtimeServerEventType = "response.created"
-	RealtimeServerEventTypeResponseOutputItemAdded RealtimeServerEventType = "response.output_item.added"
-	RealtimeServerEventTypeResponseOutputItemDone RealtimeServerEventType = "response.output_item.done"
-	RealtimeServerEventTypeResponseContentPartAdded RealtimeServerEventType = "response.content_part.added"
-	RealtimeServerEventTypeResponseContentPartDone RealtimeServerEventType = "response.content_part.done"
+	RealtimeServerEventTypeSessionCreated                     RealtimeServerEventType = "session.created"
+	RealtimeServerEventTypeSessionUpdated                     RealtimeServerEventType = "session.updated"
+	RealtimeServerEventTypeSessionDone                        RealtimeServerEventType = "session.done"
+	RealtimeServerEventTypeSpeechStarted                      RealtimeServerEventType = "input_audio_buffer.speech_started"
+	RealtimeServerEventTypeSpeechStopped                      RealtimeServerEventType = "input_audio_buffer.speech_stopped"
+	RealtimeServerEventTypeBufferCommitted                    RealtimeServerEventType = "input_audio_buffer.committed"
+	RealtimeServerEventTypeBufferCleared                      RealtimeServerEventType = "input_audio_buffer.cleared"
+	RealtimeServerEventTypePartialTranscription               RealtimeServerEventType = "input_audio_buffer.partial_transcription"
+	RealtimeServerEventTypeItemAdded                          RealtimeServerEventType = "conversation.item.added"
+	RealtimeServerEventTypeItemDeleted                        RealtimeServerEventType = "conversation.item.deleted"
+	RealtimeServerEventTypeItemTruncatedClientAck             RealtimeServerEventType = "conversation.item.truncated"
+	RealtimeServerEventTypeAssistantTruncated                 RealtimeServerEventType = "conversation.item.assistant_truncated"
+	RealtimeServerEventTypeTranscriptionCompleted             RealtimeServerEventType = "conversation.item.input_audio_transcription.completed"
+	RealtimeServerEventTypeTranscriptionDelta                 RealtimeServerEventType = "conversation.item.input_audio_transcription.delta"
+	RealtimeServerEventTypeTranscriptionFailed                RealtimeServerEventType = "conversation.item.input_audio_transcription.failed"
+	RealtimeServerEventTypeItemDone                           RealtimeServerEventType = "conversation.item.done"
+	RealtimeServerEventTypeItemRetrieved                      RealtimeServerEventType = "conversation.item.retrieved"
+	RealtimeServerEventTypeResponseCreated                    RealtimeServerEventType = "response.created"
+	RealtimeServerEventTypeResponseOutputItemAdded            RealtimeServerEventType = "response.output_item.added"
+	RealtimeServerEventTypeResponseOutputItemDone             RealtimeServerEventType = "response.output_item.done"
+	RealtimeServerEventTypeResponseContentPartAdded           RealtimeServerEventType = "response.content_part.added"
+	RealtimeServerEventTypeResponseContentPartDone            RealtimeServerEventType = "response.content_part.done"
 	RealtimeServerEventTypeResponseOutputAudioTranscriptDelta RealtimeServerEventType = "response.output_audio_transcript.delta"
-	RealtimeServerEventTypeResponseOutputAudioTranscriptDone RealtimeServerEventType = "response.output_audio_transcript.done"
-	RealtimeServerEventTypeResponseOutputAudioDelta RealtimeServerEventType = "response.output_audio.delta"
-	RealtimeServerEventTypeResponseOutputAudioDone RealtimeServerEventType = "response.output_audio.done"
-	RealtimeServerEventTypeResponseOutputTextDelta RealtimeServerEventType = "response.output_text.delta"
-	RealtimeServerEventTypeResponseOutputTextDone RealtimeServerEventType = "response.output_text.done"
+	RealtimeServerEventTypeResponseOutputAudioTranscriptDone  RealtimeServerEventType = "response.output_audio_transcript.done"
+	RealtimeServerEventTypeResponseOutputAudioDelta           RealtimeServerEventType = "response.output_audio.delta"
+	RealtimeServerEventTypeResponseOutputAudioDone            RealtimeServerEventType = "response.output_audio.done"
+	RealtimeServerEventTypeResponseOutputTextDelta            RealtimeServerEventType = "response.output_text.delta"
+	RealtimeServerEventTypeResponseOutputTextDone             RealtimeServerEventType = "response.output_text.done"
 	RealtimeServerEventTypeResponseFunctionCallArgumentsDelta RealtimeServerEventType = "response.function_call_arguments.delta"
-	RealtimeServerEventTypeResponseFunctionCallArgumentsDone RealtimeServerEventType = "response.function_call_arguments.done"
-	RealtimeServerEventTypeResponseToolProgress RealtimeServerEventType = "response.tool_progress"
-	RealtimeServerEventTypeResponseCancelled RealtimeServerEventType = "response.cancelled"
-	RealtimeServerEventTypeResponseDone RealtimeServerEventType = "response.done"
-	RealtimeServerEventTypeOutputAudioBufferCleared RealtimeServerEventType = "output_audio_buffer.cleared"
-	RealtimeServerEventTypeOutputAudioBufferStarted RealtimeServerEventType = "output_audio_buffer.started"
-	RealtimeServerEventTypeOutputAudioBufferStopped RealtimeServerEventType = "output_audio_buffer.stopped"
-	RealtimeServerEventTypeRateLimitsUpdated RealtimeServerEventType = "rate_limits.updated"
-	RealtimeServerEventTypeError RealtimeServerEventType = "error"
-	RealtimeServerEventTypeDiarization RealtimeServerEventType = "conversation.item.diarization"
+	RealtimeServerEventTypeResponseFunctionCallArgumentsDone  RealtimeServerEventType = "response.function_call_arguments.done"
+	RealtimeServerEventTypeResponseToolProgress               RealtimeServerEventType = "response.tool_progress"
+	RealtimeServerEventTypeResponseCancelled                  RealtimeServerEventType = "response.cancelled"
+	RealtimeServerEventTypeResponseDone                       RealtimeServerEventType = "response.done"
+	RealtimeServerEventTypeOutputAudioBufferCleared           RealtimeServerEventType = "output_audio_buffer.cleared"
+	RealtimeServerEventTypeOutputAudioBufferStarted           RealtimeServerEventType = "output_audio_buffer.started"
+	RealtimeServerEventTypeOutputAudioBufferStopped           RealtimeServerEventType = "output_audio_buffer.stopped"
+	RealtimeServerEventTypeRateLimitsUpdated                  RealtimeServerEventType = "rate_limits.updated"
+	RealtimeServerEventTypeError                              RealtimeServerEventType = "error"
+	RealtimeServerEventTypeDiarization                        RealtimeServerEventType = "conversation.item.diarization"
 )

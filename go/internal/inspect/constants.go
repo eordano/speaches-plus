@@ -5,13 +5,6 @@ const (
 	defaultMicSampleRate = 16000
 	defaultTTSSampleRate = 24000
 
-	wsWriteTimeoutSec = 5
-
-	defaultMaxSessions = 200
-	defaultMaxBytes    = int64(2) << 30
-	defaultMaxAgeDays  = 14
-	historyChunkSize   = 65536
-
 	defaultSessionDirEnv = "SPEACHES_INSPECT_SESSION_DIR"
 	defaultSessionDirRel = ".cache/speaches/sessions"
 )

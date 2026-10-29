@@ -22,7 +22,7 @@ Rates and accuracies live in the private run ledger per the basis-tuple quoting 
 
 ## One canonical audio format
 
-Every input path converges on **16 kHz mono f32** (RFC §3.0).
+Every input path converges on 16 kHz mono f32 (RFC §3.0).
 `TARGET_SAMPLE_RATE` is defined once per language (`rust/src/audio/types.rs`,
 `go/internal/audio/types.go`, `python/audio/types.py`) because Silero,
 Whisper, WeSpeaker, DiariZen and the audio EOU head all require f32 at that
@@ -38,14 +38,25 @@ magic-sniffed in `audio/ogg_opus.rs` (`OggS` + `OpusHead`, decoded at native
 resampled); WebM/Matroska + Opus via the hand-written EBML parser in
 `audio/webm_opus.rs` (VINT id/size decoding, `SimpleBlock` and
 `BlockGroup>Block` payloads, `A_OPUS` only, `CodecPrivate` for `pre_skip`);
-and everything else through symphonia in `audio/avdecode.rs`.
+if the Opus parser rejects the container, symphonia tries its audio track
+with Matroska support enabled (including Vorbis). Everything else goes
+through symphonia in `audio/avdecode.rs`. A video-only container is rejected
+with the general decoder error and the Opus parser error.
+
+The WebM regression fixtures in `rust/tests/data` contain a half-second
+440 Hz tone at 48 kHz (stereo Vorbis and mono Opus) and a silent 16x16 video
+without an audio track. FFmpeg generates the tones from
+`sine=frequency=440:sample_rate=48000:duration=0.5` with `libvorbis` / `libopus`
+and the video from `color=black:size=16x16:rate=2:duration=0.5` with `libvpx`
+and `-an`. The decoding suite (`audio::decode_any::tests`) checks output
+length, finite samples, signal RMS, and rejection of video-only input.
 
 Resampling on the decode path is linear interpolation
 (`rust/src/audio/resample.rs`), guarded by minimum and maximum input rates. A
 size cap from `SPEACHES_MAX_AUDIO_SECONDS` is enforced before conversion, not
 after.
 
-G.711 (`rust/src/audio/g711.rs`) is deliberately *not* in `decode_any`: µ-law
+G.711 (`rust/src/audio/g711.rs`) is deliberately not in `decode_any`: µ-law
 and A-law appear only as realtime wire formats, encoded and decoded in
 `rust/src/realtime/audio_in_ws.rs` and `audio_out_ws.rs`. The accepted
 realtime formats are `pcm16`, `pcm16_16k`, `g711_ulaw`, `g711_alaw`
@@ -58,12 +69,13 @@ Python's `python/audio/decode_any.py` tries `soundfile` then shells out to
 `ffmpeg`. Go also carries a windowed-sinc `PolyphaseUpsampler`
 (`go/internal/audio/polyphase.go`), used on TTS output rather than ingest.
 
-## Speech to text: three backends, and why each exists
+## Speech to text: four backends, and why each exists
 
-`rust/src/stt/mod.rs` defines `enum Backend { Ct2, WhisperCpp, Parakeet }`
+`rust/src/stt/mod.rs` defines `enum Backend { Ct2, WhisperCpp, Parakeet, Voxtral }`
 and one `WhisperEngine` wrapping any of them. `Backend::from_env` reads
 `STT_BACKEND`: `ct2` / `ctranslate2` / `faster-whisper` select CTranslate2;
 `parakeet` / `parakeet-tdt` / `tdt` select the Parakeet-TDT ONNX path;
+`voxtral` / `voxtral-realtime` select the native Voxtral Realtime graph;
 `whisper-cpp` / `whisper_cpp` / `cpp` / `ggml` select whisper.cpp. When the
 variable is unset, the Rust server selects parakeet-tdt if — and only if —
 the dylib behind `ORT_DYLIB_PATH` carries `libonnxruntime_providers_cuda.so`
@@ -79,7 +91,7 @@ that is why the unset default prefers the GPU lane. **The Go default is
 ct2** (`go/cmd/server/main.go`) — a real divergence, not a documented
 choice.
 
-**Parakeet-TDT** (`rust/src/stt/parakeet.rs`) is the CPU-fast English lane:
+Parakeet-TDT (`rust/src/stt/parakeet.rs`) is the CPU-fast English lane:
 NVIDIA parakeet-tdt-0.6b-v2 via the istupakov ONNX export (nemo128 mel
 preprocessor + conformer encoder + TDT decoder_joint greedy loop over 1024
 sentencepiece tokens, blank 1024, five duration bins), on the same `ort`
@@ -88,11 +100,10 @@ via `TranslateUnsupported`), one proportional-word segment per request, and
 conformer full-attention cost bounded by 60-second decode windows
 (`WINDOW_SAMPLES_BOUNDS_FULL_ATTENTION_COST`). Checkpoint resolution:
 `STT_PARAKEET_DIR`, else the newest hub snapshot of
-`istupakov/parakeet-tdt-0.6b-v2-onnx`. The suite covering it is
-`stt_parakeet_real` (gated `NV_PARAKEET_TEST=1`): it transcribes the
-committed espeak clip `rust/tests/data/parakeet_fox_16k.wav` exactly and
-asserts faster-than-realtime CPU decode including the 128-mel frontend, with
-the model's own inverse text normalization ("seventeen" -> "17"). Its three
+`istupakov/parakeet-tdt-0.6b-v2-onnx`. No real-checkpoint suite covers it; the
+unit tests in `stt/parakeet.rs` cover the decoder's log-softmax and head-width
+checks. The model applies its own inverse text normalization
+("seventeen" -> "17"). Its three
 sessions load through the shared EP ladder
 (`crate::diarization::ep::load_session`), so they engage the CUDA EP whenever
 the `ORT_DYLIB_PATH` dylib carries it and honor the same `DIAR_EP` /
@@ -100,11 +111,243 @@ the `ORT_DYLIB_PATH` dylib carries it and honor the same `DIAR_EP` /
 provider is on the `parakeet-tdt backend loaded` and `Whisper loaded` boot
 lines (`ep=`).
 
+Voxtral Realtime (`rust/src/stt/voxtral.rs` over
+`nv_models::voxtral::VoxtralRealtime`) is the native multilingual lane:
+Mistral's Voxtral-Mini-4B-Realtime-2602 (a 970M causal audio encoder, a 4x
+frame-stacking projector and a 3.4B Ministral decoder) built on the nv-*
+crates and candle, not on an external runtime, so it shares the device, the
+quant kernels and the allocators with the chat engine. The checkpoint is the
+HF `model.safetensors` (bf16) plus `tekken.json` (vocabulary and the
+streaming audio config) and `config.json`; `HfLayouts` resolves both the
+transformers-5.2 and 5.17 tensor layouts. The frontend is the 128-bin
+log-mel of `VoxtralMel` (slaney filters, 10 ms hop, the clip is clamped
+against the constant `GLOBAL_LOG_MEL_MAX` rather than its own maximum); it
+runs on the CPU, each filter summing only its nonzero band, which is bitwise
+the full-bin dot product
+(`EACH_MEL_FILTER_SUMS_ITS_NONZERO_BAND_ONLY_BECAUSE_ADDING_POSITIVE_ZERO_IS_THE_IDENTITY`)
+and leaves the frontend a small share of a clip, whereas a GPU DFT would
+reassociate it; the
+clip is padded as mistral-common pads it (32 silent tokens on the left,
+alignment plus delay + 1 + `OFFLINE_STREAMING_BUFFER_TOKENS` on the right).
+Decoding is the 80 ms stream: the prefix is BOS plus one `[STREAMING_PAD]`
+per left-pad and per delay token (480 ms is six), every step's input is the
+previous token's embedding plus that step's audio embedding, the decoder's
+FFN branch is scaled by `1 + ada(t_cond)` where `t_cond` is the sinusoidal
+embedding of the delay, `[STREAMING_WORD]` opens each word and EOS ends the
+stream; greedy argmax is the only sampler. The language field is accepted
+and not applied (the model detects it), `prompt` is refused with the typed
+`SttParamUnsupported`, translation is refused, and no token logprob exists,
+so the noise gate sees no signal. One model instance serves calls serially
+behind a mutex; clips longer than
+`CHUNK_SECONDS_KEEP_THE_DECODER_UNDER_ITS_SLIDING_WINDOW` are tiled and the
+texts joined. The oracle is transformers'
+`VoxtralRealtimeForConditionalGeneration` (`rust/scripts/voxtral-reference.py`);
+the suite covering stream parity (`tests/voxtral_realtime.rs`, opt in with
+`NV_VOXTRAL_TEST=1`) holds the oracle's token stream, log-mel and projector
+output for one LibriSpeech clip under `rust/tests/data`.
+
+How the step is served fast. One 80 ms token costs one pass over every
+decoder weight, so the step is weight-bandwidth-bound and the work went into
+bytes and launches, in this order: the q/k/v and gate/up projections are one
+fused GEMV each (`FUSED_QKV_AND_GATE_UP_HALVE_THE_DECODE_GEMV_LAUNCHES_PER_LAYER`);
+`1/sqrt(head_dim)` is folded into the q rows and `1 + ada(t_cond)` into the
+post-attention norm weight at load, so neither costs a kernel; K/V rows are
+written in place (`KvCache::write_at` uses `slice_set`); `NV_VOXTRAL_QUANT=nvfp4`
+stores the 26 decoder layers' linears and the tied lm_head as NVFP4 with the
+bf16-activation GEMV for rows up to `NVFP4_GEMV_ROWS_COVER_THE_39_TOKEN_STREAMING_PREFIX`
+(fp8 is not offered: cuBLASLt serves no per-row fp8 GEMM on sm_120, see
+`FP8_IS_NOT_OFFERED_BECAUSE_CUBLASLT_SERVES_NO_PER_ROW_FP8_GEMM_ON_SM_120`);
+and on CUDA the decode step is one captured graph of M rows
+(`nv_models::voxtral_graph`) that drafts pads
+(`PAD_DRAFT_SPECULATION_COMMITS_EVERY_LEADING_PAD_OF_AN_M_ROW_STEP`): row 0
+carries the last committed token and rows 1..M carry `[STREAMING_PAD]`, the
+step writes K/V at M consecutive positions and attends causally within the
+block (`flash_decode_fused_bf16kv_mk`), and the accept kernel commits rows
+while the previous row's argmax is the pad, so the first non-pad token ends
+the chain and the positions past it are recomputed next step over the same
+K/V slots. Greedy acceptance is exact: the suite covering pad-draft parity
+(`pad_draft_speculation_reproduces_the_single_row_graph_on_the_fixture_and_the_corpus`)
+holds rows 2, 4 and 8 token-identical to the one-row graph on the fixture and
+on the 73-clip corpus, which is why `NV_VOXTRAL_SPEC_ROWS=4` is the NVFP4
+default; the gain is the mean committed length over the M-row step's cost,
+and the step is not bandwidth-flat in M, because the bf16-activation NVFP4
+GEMV and the mk attention grow with the row count, so the lever that remains
+is an M-row GEMV whose cost stays near the one-row weight read. The per-row
+arithmetic is the one-row arithmetic by construction
+(`M_ROWS_STAY_BITWISE_WITH_ONE_ROW_BECAUSE_EVERY_KERNEL_KEEPS_ONE_LANE_PER_ROW`),
+the dense bf16 grade keeps one row because its M-row linear is a cuBLAS tile
+(`BF16_KEEPS_ONE_ROW_BECAUSE_ITS_M_ROW_LINEAR_IS_A_CUBLAS_TILE`), and
+`NV_VOXTRAL_SPEC_ROWS=1` is the one-row graph that the bitwise gate against
+the eager loop pins. The position, the draft tokens and the token ring are
+device buffers advanced by the `voxtral_pad_spec` kernels
+(`nv-kernels/cuda/voxtral_pad_spec.cu`): `spec_begin` lays out the block's
+positions, `spec_qkv_prep` rotates q and k from the GEMV's bf16 rows and
+stores K/V, `spec_silu_mul_halves` applies candle's bf16 silu-product to the
+fused gate/up halves, and `spec_accept` reduces each row's argmax into
+partials. The commit itself is `voxtral_draft_accept`, an nvrtc-compiled
+kernel in `nv_models::voxtral_graph` over those partials
+(`THE_DRAFT_IS_A_PER_POSITION_TABLE_AND_THE_ACCEPT_COMPARES_EACH_ROW_WITH_ITS_OWN_DRAFT`):
+the draft rows come from a per-position table the host loads with the clip,
+every entry the pad unless a drafter fills it, and a row commits while the
+previous row's argmax equals its own draft token; the pad accept's own commit
+lands in dummy buffers. The argmax is order-independent (max value, lowest
+index), so the table path with an all-pad table is the pad-draft path exactly.
+A drafter fills the table before the decode: `DraftHead`
+(`THE_DRAFT_HEAD_IS_A_LINEAR_PROBE_OVER_THE_AUDIO_EMBEDDING_THE_DECODER_SAW`)
+is one linear over the audio embedding at the previous position, classifying
+each position as pad, word mark, one of the most frequent word pieces or
+other; `voxtral-tune draft-head` trains it on the model's own greedy streams
+(`THE_DRAFT_HEAD_TRAINS_ON_THE_MODELS_OWN_GREEDY_STREAM_NOT_THE_REFERENCE`),
+saves `voxtral-draft-head.safetensors`, and the model loads it from
+`NV_VOXTRAL_DRAFT_HEAD` or from beside a served adapter. It is off by
+default and stays off: trained on the even corpus clips and measured on the
+odd ones (`NV_VOXTRAL_CORPUS_PARITY=odd` on the pad-draft parity suite), every
+variant commits fewer tokens per step than the all-pad table, because its
+held-out accuracy sits below the stream's pad fraction; the corpus is too
+small to teach an audio-only probe when the decoder emits a word mark. The
+committed stream is the single-row graph's with any table, so a drafter
+needs no parity work beyond that suite. Replaying the corpus streams
+through the accept rule bounds the levers: knowing only where word marks fall
+adds little at one drafted row, knowing the next token outright adds most of
+a committed row per step, so the drafter worth building predicts the word
+piece from the decoder's hidden state, trained on far more self-distilled
+audio than the corpus holds.
+The streaming prefix prefills eagerly in eight-row blocks
+(`THE_PREFIX_PREFILLS_IN_EIGHT_ROW_BLOCKS_SO_THE_NVFP4_LINEAR_READS_ITS_WEIGHTS_FIVE_TIMES_NOT_THIRTY_NINE`):
+the NVFP4 linear serves a block of up to eight rows in one launch and loops
+single rows above that, and the same `decoder_hidden` keeps every row on the
+kernel decode uses. Of the 39 prefix positions the first 31 are
+clip-independent (`clip_independent_prefix_positions`,
+`THE_LEFT_PAD_POSITIONS_ARE_CLIP_INDEPENDENT_BECAUSE_THE_ENCODER_IS_CAUSAL`):
+their mel frames end inside the 32 silent left-pad tokens and every encoder
+stage looks backwards, so on CUDA their decoder K/V is computed once per model
+from one token of silence and seeds each clip's cache, and a clip prefills the
+remaining eight rows as one block. An encoder row is a function of the clip's
+length as well as of its audio, because cuBLAS picks the GEMM kernel by the
+row count: the suite covering the prefix
+(`left_pad_positions_have_one_audio_embedding_and_one_prefix_kv_for_every_clip`)
+holds those rows and their K/V bitwise against a same-length silent clip, and
+the fixed-length seed differs from a clip's own run in low bits, which moved
+the token stream on two of the 74 clips without changing a word; the 73-clip
+word-error instrument blessed the default. Attaching or detaching an adapter
+drops the cached prefix together with the graph. One `GraphState` per model owns capacity-plus-M-row K/V
+buffers and an audio-embedding table, so the capture made on the first clip
+replays for every later clip
+(`ONE_CAPTURE_SERVES_EVERY_CLIP_BECAUSE_THE_GRAPH_BAKES_ITS_BUFFER_ADDRESSES`);
+`NV_VOXTRAL_GRAPH=0` keeps the eager loop, which the parity suite also checks.
+The serving device is `Device::new_cuda_with_stream`, because capture refuses
+the legacy stream. The CUPTI tracer (`rust/scripts/profiling`) is the
+instrument for this path: it sees inside the graph, and the rule it enforced is
+that a replay whose GPU-busy time equals its span with microsecond gaps is
+bandwidth-bound and no launch-side change can help it; the suite's wall
+ms/step amortizes the prefix prefill over the clip's steps, so a gap between
+GPU-busy and wall is read against the prefill before the launch path.
+
+What may enter the capture is pinned by the suite covering capture rules
+(`nv-models/tests/voxtral_capture_rules.rs`, opt in with `NV_VOXTRAL_TEST=1`):
+candle adds, casts, bf16 matmuls and nv-layers `Linear` forwards replay
+correctly; `Tensor::slice_set` issues its copy on another stream and breaks a
+capture; a candle f32 matmul goes through cuBLAS sgemm, which fails under
+capture and leaves the graph with an illegal address. The f32 LoRA hooks
+therefore never enter a capture: a hooked model decodes eagerly, and served
+adapters are merged into the weights at load (`06.6-lora-training.md`).
+
+On CPU the decoder serves GGML quants through candle's k-quant kernels
+(`NV_VOXTRAL_QUANT=q4_k`, the CPU default, or `q8_0`;
+`CPU_SERVES_GGML_QUANTS_BECAUSE_F32_WEIGHTS_READ_TWELVE_GIGABYTES_A_STEP`),
+the encoder stays f32, and the suite covering CPU parity
+(`cpu_quantized_decoder_keeps_the_oracle_text`, `NV_VOXTRAL_CPU_TEST=1`) holds
+the oracle text for both grades. The quantized decoder linears are served by
+nv-layers' `cpu_qmatvec`, a runtime-dispatched kernel (AVX-512, AVX2 and
+scalar arms picked by `is_x86_feature_detected!`) that computes the same
+integer block sums in the same f32 accumulation order as candle's scalar
+`vec_dot`, so every arm is bitwise identical to candle's `QMatMul` and the
+suite covering it (`cpu_qmatvec`) checks each arm against candle at the Voxtral
+shapes for one row and for the 39-row streaming prefix. The kernel streams the
+weights at the machine's DRAM rate at any thread count, so a decode step costs
+the decoder's quantized bytes (about 1.9 GB at Q4_K) over the box's read
+bandwidth plus the eager step's remaining ops; the CPU harness's ms/step also
+includes the streaming prefill, which runs through the same kernel. The stdarch
+VNNI intrinsics do not build on the pinned toolchain, so the AVX-512 arm uses
+`vpmaddwd`. candle's own k-quant SIMD is compiled only under a compile-time
+`target_feature`, which this workspace does not set.
+
+On CPU the decoder drafts: each step runs the last committed token plus three
+`[STREAMING_PAD]` rows at the next positions through
+`voxtral_cpu::decode_stream_rows`, writes their K/V, attends causally within
+the block and commits rows while the previous row's argmax is the pad, the
+acceptance rule of the CUDA accept kernel. `cpu_qmatvec` reads each weight row
+once for any row count and its blocked Q4_K/Q8_0 dots keep one accumulator per
+input row with the block unpack shared, so four rows cost one weight read plus
+per-row compute and every row is bitwise the single-row step; the suite
+covering it (`pad_draft_rows_reproduce_the_single_row_decode_on_the_fixture_and_the_corpus`)
+holds the token stream identical to the single-row decode over the fixture and
+the corpus at about 2.2 committed tokens per step, and eight rows are
+compute-bound and lose. The first decode of a model keeps the K/V of the 31
+clip-independent prefix positions and every later clip seeds its cache from
+them, prefilling the 8 remaining prefix rows instead of 39. `NVK_TARGET_CPU=x86-64-v3` (an opt-in of
+`rust/scripts/nvk.sh`, exported as `-C target-cpu`) turns the AVX2 kernels on
+and keeps the Voxtral fixture bitwise, but it reassociates host arithmetic
+elsewhere: the suite covering guided-speculation losslessness
+(`guided_speculation_emits_the_non_speculative_guided_tokens_and_reasoning_stays_free`)
+diverges at one seed under it, so it stays opt-in until a corpus instrument
+blesses it. Per-row int8 decoder weights with a per-call activation
+scale were tried and rejected: the 3072-wide activations carry outliers that
+per-tensor int8 cannot hold, and the stream diverged on the fixture.
+
+The CPU step around those linears is `nv_models::voxtral_cpu`
+(`THE_CPU_STEP_IS_PLAIN_F32_LOOPS_AROUND_THE_QUANTIZED_LINEARS`): rmsnorm, rope,
+the KV write, attention over the cache, silu*up, the residual adds and the
+argmax are loops over host f32 slices in candle's own evaluation order
+(sequential sums, `x / denom * w`, gemm's plain product at depth zero followed
+by fused multiply-adds for the two attention products), so the hidden state is
+bitwise the candle eager path's and the suite covering it
+(`cpu_step_is_bitwise_with_the_candle_eager_path`, opt in with
+`VOXTRAL_MODEL_DIR`) walks a clip step by step against `decoder_hidden`. K is
+stored `[kv_head][head_dim][position]` padded to eight positions
+(`KEYS_ARE_STORED_TRANSPOSED_SO_THE_SCORE_LOOP_STREAMS_EIGHT_POSITIONS_PER_FMA`),
+V stays position-major, and the 39-token streaming prefix is one block so the
+prefill reads each weight once. `NV_VOXTRAL_CPU_PROFILE=1` prints per-op
+ms/step for the prefill and the decode loop; under it a Q4_K decode step is the
+five quantized linears at the box's DRAM rate plus attention, norms, rope and
+activations that together cost a few percent of the matvecs, where the candle
+sdpa path this replaces (GQA expand, permute and mask tensors per layer) cost
+about a third of the step. What remains is the matvec floor: `cpu_qmatvec`
+runs on rayon's default thread count, and the decoder_step_floor_probe shows
+the box's DRAM rate reached with fewer threads than cores, so the thread count
+of the quantized GEMV, not the step around it, is the next lever.
+
+On Vulkan the model is a twin, `nv_models::voxtral_wgpu::VoxtralWgpu`
+(`NV_SERVE_BACKEND=wgpu` selects it; without a CUDA device the serving layer
+tries it before the candle CPU path), built on the same folds and the same
+stream layout: the decoder step is a prebuilt pass list (embed-add, per layer
+rmsnorm, qkv GEMV, rope plus KV write at a device position, split-K decode
+attention, o GEMV, residual rmsnorm, gate-up GEMV, silu-mul, down GEMV, add),
+submitted sixteen steps per batch with one ring readback, and the encoder is
+tiled bf16 GEMM with fused bias/GELU epilogues. Its parity claim is text and
+token-stream identity with the transformers oracle on the fixture
+(`tests/voxtral_wgpu.rs`, `NV_VOXTRAL_TEST=1 NV_SERVE_BACKEND=wgpu`) and
+encoder output within half a percent of the oracle's `audio_embeds`; bitwise
+agreement with the CUDA port is not claimed, since bf16 GEMV reassociation and
+an f32-logit argmax differ from CUDA's. Its status page is
+`05.1-wgpu-status.md`.
+
+NVFP4 is the CUDA default by a named instrument
+(`NVFP4_IS_THE_CUDA_DEFAULT_BY_THE_LIBRISPEECH_73_CLIP_WER_INSTRUMENT`): the
+instrument is `voxtral-tune eval` over the 73 clips of
+`hf-internal-testing/librispeech_asr_dummy` (1150 reference words, lowercase
+unpunctuated transcripts), on which bf16 graphed, bf16 eager and NVFP4 score
+the same word-error count; the bitwise gates in `tests/voxtral_realtime.rs`
+pin `NV_VOXTRAL_QUANT=bf16` explicitly, and that value restores dense weights
+in serving.
+
 Model resolution is by path convention, not model id: `ct2_model_dir`
 requires `<models>/whisper-ct2/model.bin`; `whisper_cpp_model_path` probes
-`ggml-large-v3-turbo.bin`, `ggml-large-v3.bin`, `ggml-tiny.en.bin` in order.
-One engine is pinned per process; the multipart `model` field is parsed and
-ignored.
+`ggml-large-v3-turbo.bin`, `ggml-large-v3.bin`, `ggml-tiny.en.bin` in order;
+`voxtral::model_dir` takes `VOXTRAL_MODEL_DIR`, then
+`<models>/voxtral-realtime`, then the newest hub snapshot of
+`mistralai/Voxtral-Mini-4B-Realtime-2602`. One engine is pinned per process;
+the multipart `model` field is parsed and ignored.
 
 The bindings differ per language and are all vendored:
 
@@ -121,16 +364,16 @@ identical prompt assembly, identical `avg_logprob` computation, and the same
 `-2 → resize buffer` contract (`python/ct2_bindings/README.md`,
 `python/whisper_bindings/README.md`).
 
-Why two Whisper backends at all: **kernel coverage** — CTranslate2 has no
+Why two Whisper backends at all: kernel coverage — CTranslate2 has no
 Metal kernels so Apple silicon uses whisper.cpp, while CTranslate2 is the
 path with a real CUDA build (`ct2_config()` is `#[cfg(feature = "cuda")]`
 gated to `Ct2Device::CUDA` + `Ct2ComputeType::FLOAT16`); **quantization
 control** — Go threads `CT2_COMPUTE_TYPE` into
 `ctranslate2::str_to_compute_type` so `int8` / `float16` / `int8_float16` are
-reachable, with no whisper.cpp analogue; **word timestamps** — whisper.cpp
-exposes per-token timings, ct2rs does not; **artifact format** — ggml `.bin`
+reachable, with no whisper.cpp analogue; word timestamps — whisper.cpp
+exposes per-token timings, ct2rs does not; artifact format — ggml `.bin`
 and CT2 `model.bin` + `tokenizer.json` are disjoint, so the checkpoint forces
-the backend; **concurrency** — whisper.cpp needs `ctx.create_state()` per
+the backend; concurrency — whisper.cpp needs `ctx.create_state()` per
 request while CTranslate2 is internally thread-safe and shares one
 `Arc<Ct2State>`.
 
@@ -143,7 +386,7 @@ Translation capability is decided by parsing the checkpoint name:
 token not followed by an alphanumeric, as translation-incapable, and for ct2
 the tokenizer must additionally expose `<|translate|>`.
 `/v1/audio/translations` then refuses with the typed `TranslateUnsupported`
-error unless `STT_ALLOW_UNSUPPORTED_TRANSLATE=1`.
+error.
 
 ## The mel frontend
 
@@ -156,7 +399,7 @@ only for the ct2 backend; whisper.cpp computes its own mel in C++.
 `TARGET_SAMPLES = 480000`. `n_mels` is read from the model
 (`model.n_mels()`), 80 for most checkpoints and 128 for large-v3. The chain:
 pad or truncate to exactly 30 s, reflect-pad by `N_FFT/2`, Hann-window each
-frame, real FFT to a power spectrum, apply a **Slaney**-scale mel filterbank,
+frame, real FFT to a power spectrum, apply a Slaney-scale mel filterbank,
 `log10(max(v, 1e-10))`, clamp to `global_max - 8`, normalize `(v + 4) / 4`.
 These constants are frozen rather than tuned because they reproduce
 faster-whisper's preprocessing exactly, which is the input distribution the
@@ -164,9 +407,9 @@ weights were trained on (`python/stt/IMPLEMENTATION.md`).
 
 ## Decoding, long audio, and the silence pre-gate
 
-Decoding is greedy everywhere in Rust: ct2 with `beam_size: 1`, whisper.cpp
-with `SamplingStrategy::Greedy { best_of: 1 }`. Go's ct2 path defaults to
-beam 5. There is no temperature-fallback ladder anywhere; the HTTP layer
+ct2 decodes with beam width `defaults::stt::BEAM_SIZE` (5, as Go's ct2 path
+does); whisper.cpp decodes greedily (`SamplingStrategy::Greedy { best_of: 1 }`).
+There is no temperature-fallback ladder anywhere; the HTTP layer
 rejects `temperature != 0` outright with `unsupported_parameter`
 (`check_stt_params` in `rust/src/main.rs`) and rejects `prompt` for the same
 reason — conditioning on previous text is disabled (`set_no_context(true)`,
@@ -183,13 +426,13 @@ output and uses the winning language token in the prompt; whisper.cpp sets
 `"auto"` and reads back `full_lang_id_from_state`; Go bakes `<|en|>` into the
 prompt.
 
-Long audio is handled by **fixed 30 s non-overlapping tiling**, not a sliding
+Long audio is handled by fixed 30 s non-overlapping tiling, not a sliding
 window or a seek-token loop. `go/internal/stt/long.go` (`chunkAudio`,
 `shiftSegments`) and the Rust `transcribe_ct2_long` both chunk, skip chunks
 whose peak amplitude is below `0.005`, run the model, shift each chunk's
 segment and word times by the chunk offset, join surviving texts with one
 space, and recombine `avg_logprob` / `no_speech_prob` as a
-**duration-weighted mean** over surviving chunks. In Rust only the ct2 arm is
+duration-weighted mean over surviving chunks. In Rust only the ct2 arm is
 chunked; `transcribe_whisper_cpp` hands the whole buffer to `whisper_full`,
 which windows internally. The peak-amplitude gate at `0.005` is the cheapest
 hallucination filter and runs before the model is invoked at all.
@@ -200,7 +443,7 @@ Whisper produces short, plausible transcripts for coughs, breaths and ambient
 noise. `rust/src/stt/noise_gate.rs` bounds that with the two statistics the
 model emits: `no_speech_prob` and `avg_logprob`. `evaluate()` checks
 `no_speech_prob` first (reason-priority ordering matching upstream), then
-`avg_logprob` against a **duration-aware** threshold:
+`avg_logprob` against a duration-aware threshold:
 `effective_avg_logprob_threshold` keeps the base threshold up to `FULL_MS`,
 lerps toward `LOOSE_FLOOR` between `FULL_MS` and `OFF_MS`, and disables
 entirely past `OFF_MS` — a cough and a real word are indistinguishable at
@@ -232,12 +475,12 @@ nothing valid survives, `whole_clip_segment` emits one segment spanning the
 clip.
 
 Word timestamps have two mechanisms, neither DTW nor cross-attention
-alignment. Under **whisper.cpp** the backend provides token times
+alignment. Under whisper.cpp the backend provides token times
 (`set_token_timestamps(true)`) and
 `group_whisper_tokens_into_words` opens a new word on any token whose text
 starts with a space, taking the first token's `t0` and the last token's `t1`;
 pseudo-tokens (`[_BEG_]`, `[BLANK_AUDIO]`, `<|…|>`) are filtered first by
-`is_whisper_pseudo_token` so they cannot become words. Under **ct2**,
+`is_whisper_pseudo_token` so they cannot become words. Under ct2,
 `proportional_word_timings` splits on whitespace and apportions the segment
 span by cumulative character count — also the fallback when whisper.cpp
 yields no usable token times. Go has no word timestamps at all; its `Segment`
@@ -259,7 +502,7 @@ those — routing and multipart parsing live in
 | `vtt` | `nv_aligner::to_vtt` — `WEBVTT` header, `HH:MM:SS.mmm` |
 | `diarized_json` | speaker-attributed segments, below |
 
-There is **no streaming on the HTTP transcription surface** — no `stream`
+There is no streaming on the HTTP transcription surface — no `stream`
 field, no SSE, one buffered body. Incremental transcription exists only over
 the realtime socket as `input_audio_buffer.partial_transcription` and the
 `conversation.item.input_audio_transcription.*` events. Go supports only
@@ -274,13 +517,13 @@ mirror in `python/diarization/`. Stages, all inside one call:
    `DiarConfig::from_env` defaults `chunk_seconds = 16.0`, `hop_ratio = 0.1`, so
    windows overlap heavily. Only full chunks are emitted — a trailing partial
    tail is dropped.
-2. `segmentation::SegmentationModel::run_batch` runs the **DiariZen** WavLM +
+2. `segmentation::SegmentationModel::run_batch` runs the DiariZen WavLM +
    Conformer EEND model as ONNX (input `waveform`, `[B, 1, N]`), exported by
    `rust/scripts/export-diarizen-onnx.py`. The raw-waveform layer norm makes the
    sample axis static, so short chunks are zero-padded rather than shape-varied.
    `FRAME_RATE_HZ = 50`, `SAMPLES_PER_FRAME = 320`.
 3. `powerset::PowersetDecoder::to_multilabel_hard` decodes a softmax over
-   *subsets* of the local speakers capped at `max_speakers_per_frame`, not
+   subsets of the local speakers capped at `max_speakers_per_frame`, not
    independent per-speaker sigmoids — so overlap is a first-class class (a
    two-element set) rather than a thresholding artifact. `build_mapping`
    enumerates subsets by size then lexicographically; decoding is a hard argmax.
@@ -289,10 +532,10 @@ mirror in `python/diarization/`. Stages, all inside one call:
    and marking spans whose frames are mostly overlap.
 5. Unique spans are featurized once each with Kaldi-style log-mel filterbanks
    (`rust/src/diarization/fbank.rs`): 80 mels, 25 ms frames at 10 ms shift,
-   pre-emphasis 0.97, **Povey** window, triangular mel filters over
+   pre-emphasis 0.97, Povey window, triangular mel filters over
    20 Hz–7600 Hz, natural log, mean-only cepstral normalization over the
    utterance.
-6. `embedding::EmbeddingModel` runs **WeSpeaker ResNet293-LM** as ONNX (`feats`
+6. `embedding::EmbeddingModel` runs WeSpeaker ResNet293-LM as ONNX (`feats`
    → `embs`, 256-d, L2-normalized). Spans shorter than one second are dropped.
    A windowed GPU path tiles each span and mean-pools; a CPU path
    length-buckets spans to bound the number of distinct ONNX shapes.
@@ -313,9 +556,9 @@ NIST RTTM; `build_speaker_label_map` maps clusters onto supplied
 `known_speaker_references` by concatenating each cluster's audio, embedding it,
 and taking the argmax cosine.
 
-**Merging with transcription** happens in
+Merging with transcription happens in
 `rust/src/main.rs::build_diarized_segments_json`: diarization segments are the
-output rows and Whisper segments are bucketed *into* them by midpoint
+output rows and Whisper segments are bucketed into them by midpoint
 (containing segment, else nearest), texts joined and statistics
 duration-weighted. Missing diarization models degrade to a passthrough with
 every `speaker` set to `null` — a silent failure rather than an error. Python
@@ -331,11 +574,11 @@ diarization event never precedes its item's transcript.
 
 ## Voice activity detection
 
-`rust/src/vad/mod.rs::VadModel` runs **Silero VAD** as ONNX through `ort`,
+`rust/src/vad/mod.rs::VadModel` runs Silero VAD as ONNX through `ort`,
 pinned to the v6.2 release but tolerant of every export generation: the
 loader reads the session's input signature and adapts. The classic layout
 (v5/v6, 16k-op15, op18-ifless) takes 16 kHz mono f32, a 512-sample inference
-window with a **64-sample context window** prepended from the tail of the
+window with a 64-sample context window prepended from the tail of the
 previous chunk, an `sr` scalar, and a `[2, 1, N]` recurrent `state` (N read
 from the model, 128 today) carried across calls and zeroed on speech end.
 Omitting the context window on classic exports makes the model emit its idle
@@ -388,28 +631,28 @@ pub trait EouModel: Send + Sync {
 }
 ```
 
-- **`vad`** calls no classifier; the wait is `silence_duration_ms`.
-- **`heuristic`** (`eou/heuristic.rs`) is a fixed table over the tail of the
+- `vad` calls no classifier; the wait is `silence_duration_ms`.
+- `heuristic` (`eou/heuristic.rs`) is a fixed table over the tail of the
   partial transcript: terminal punctuation high, soft punctuation low,
   hesitation markers and continuation words lower still.
-- **`text`** (`eou/onnx.rs`) is a distilled LM.
+- `text` (`eou/onnx.rs`) is a distilled LM.
   `eou/chat_template.rs::format_qwen_chat` renders the conversation into
   `<|im_start|>role\ncontent<|im_end|>` turns with no trailing `<|im_end|>`
   on the partial, left-truncated to `MAX_CONTEXT_TOKENS`; the score is
   `softmax(logits[-1])[<|im_end|>]` via `extract_im_end_prob`. The tokenizer
   is reimplemented in-tree — `eou/bpe.rs`, `byte_map.rs` (GPT-2
   byte↔unicode), `special_trie.rs` for atomic special-token splitting.
-- **`audio`** (`eou/audio.rs`) is a smart-turn ONNX model over the trailing
-  `audio_window_ms`. `prepare_audio` zero-pads with **leading** alignment
-  because the model expects speech at the *end* of its window; the frontend
+- `audio` (`eou/audio.rs`) is a smart-turn ONNX model over the trailing
+  `audio_window_ms`. `prepare_audio` zero-pads with leading alignment
+  because the model expects speech at the end of its window; the frontend
   is an 80-mel Whisper-style log-mel in the same file. Its text-only
   `score()` deliberately returns `NaN`, so it can never be used without
   audio.
-- **`fusion`** runs both heads and combines them.
-- **`integrated`** is the RFC's predicted-response path, advertised in the
+- `fusion` runs both heads and combines them.
+- `integrated` is the RFC's predicted-response path, advertised in the
   capabilities document but inert in Rust (see "What is scaffolding").
 
-**Fusion** (`rust/src/eou/fusion.rs`) first handles degradation, identically
+Fusion (`rust/src/eou/fusion.rs`) first handles degradation, identically
 in all three languages: both heads garbage → `1.0` (commit fast), one head
 garbage → the other's probability, with `is_garbage_prob` catching
 non-finite and out-of-range values. Then
@@ -434,12 +677,12 @@ wait pinned to the maximum below `p_threshold`.
 
 `rust/src/realtime/pipeline.rs::run_eou_dispatch` implements the RFC's
 mandatory hard-cap pattern (RFC §6.3.1): a `hard_cap_deadline` derived
-**once**, raced by the classifier call, then raced again by the derived wait.
+once, raced by the classifier call, then raced again by the derived wait.
 A timeout, an error or a garbage probability all collapse to `p = 1.0` and
 the minimum delay (RFC §6.5). `race_hard_cap` uses a biased `select!` so the
 deadline wins ties.
 
-Two speculative extensions sit on top. **Eager** dispatch
+Two speculative extensions sit on top. Eager dispatch
 (`realtime/eou_eager.rs`) fires when the score clears `eager_p_threshold`,
 spawning speculative STT and, in conversation mode, a speculative LLM call,
 and moving the response phase to `Predicted`. The LLM stream opens only once
@@ -454,7 +697,7 @@ compare (`transcriptsMateriallyDiffer`) because its eager prompt is a
 streaming partial that can differ from its commit-time STT, and any change
 that gives Rust or Python a second transcript source — commit-time
 re-transcription, streaming-partial prompts — must reintroduce that compare
-at the promotion seam. **Predicted**
+at the promotion seam. Predicted
 (`realtime/eou_predicted.rs`) buffers the speculative LLM deltas in a capped
 ring; the entire `response.*` family is refused while the phase is
 `Predicted`, both at the emit site and structurally via `ResponseGate::open`,
@@ -481,14 +724,14 @@ Every rule below is backed by a harness under `client/perf/` --
 the private run ledger. The probes hash features, so reproducing one needs
 `PYTHONHASHSEED=0`.
 
-**The committed utterance carries its silence tail.** smart-turn is trained on
+The committed utterance carries its silence tail. smart-turn is trained on
 clips ending in a natural pause, so audio hard-cut at the last speech-positive
 window is out of distribution and costs several points of complete-detection.
 The VAD seal therefore includes the buffered trailing silence in
 `SpeechCommitted.audio` and reports the speech-only length as `speech_samples`;
 the EOU classifier scores the full audio while STT, diarization and eager
 partials consume only the `speech_samples` prefix (whisper hallucinates on
-trailing silence). `VAD_COMMIT_TAIL=0` restores the hard-cut for A/B.
+trailing silence).
 
 **A convex blend of text and audio cannot beat audio alone, and the ceiling is
 the blend rather than the text head's quality.** Retrained on the full
@@ -506,10 +749,10 @@ dilutes the stronger one. `DEFAULT_GATED_FUSION_WEIGHTS` stays the
 default. Text-channel value lives in policy (capping the Incomplete fallback
 timer, eager-prefill decisions), not the blend, and the fallback-cap policy is
 refuted on both the corpus and on real conversational pauses (`context_probe.py`
-over LiveKit eot-bench), where the text head is *anti-correlated* because the
+over LiveKit eot-bench), where the text head is anti-correlated because the
 pauses that fool smart-turn fool the transcript the same way.
 
-**Text fusion must be band-gated or capped, never a global reweight.** A global
+Text fusion must be band-gated or capped, never a global reweight. A global
 text weight large enough to matter re-opens the invariant-violating
 cross-routing the fusion tests refuse. Two combiners satisfy this and both are
 opt-in:
@@ -543,7 +786,7 @@ opt-in:
 The default stays `gated`: turning either on is a false-cutoff-vs-latency
 product trade, not a pure win.
 
-**Quote a false-cutoff rate only next to its hold latency**, since any fusion
+Quote a false-cutoff rate only next to its hold latency, since any fusion
 can buy false-cutoff by holding longer. Both are quoted under the production
 delay policy (`sigmoid_lerp`, `MIN_DELAY_MS` / `MAX_DELAY_MS` /
 `SILENCE_HARD_CAP_MS`). Mean hold on true completes is dominated by the miss
@@ -552,28 +795,26 @@ hard cap — so the top latency lever here is shrinking that tail with a better
 audio model, not reshaping the delay curve for the majority already committed
 near `MIN_DELAY_MS`.
 
-**Recalibrate under the real-pause protocol, not the corpus.** The logit stack
+Recalibrate under the real-pause protocol, not the corpus. The logit stack
 is operating-point-positive but ranking-negative against the retrained audio
 model on eot-bench: it lowers false-cutoff at the 0.5 threshold with identical
 eot-detection, yet AUC drops, because the capped text term reorders scores away
 from the corpus distribution it was fit on. Any `EOU_P_THRESHOLD` recalibration
 must be measured under `context_probe.py`.
 
-**The trained FNV text head is a committed artifact.**
+The trained FNV text head is a committed artifact.
 `rust/tests/data/eou_text_head_fnv_v1.bin` (FNV-1a hashed n-gram logistic
 weights, DIM 2^18) is what `EOU_TEXT_HEAD_PATH` and `FusionRule::Banded`
-consume; `rust/tests/eou_text_head_golden.rs` pins the Rust loader and hash
-against training-time probabilities so drift on either side fails loudly.
-Regenerate with `client/perf/text_head_fnv.py` (`TH_FEATURES` = a
-`fusion_extract.py` shard dir; deterministic seed). The head is calibrated to
+consume. No suite pins the Rust loader and hash against training-time
+probabilities, and the script that trained it is not in the tree. The head is calibrated to
 the smart-turn corpus — a bare "yes." scores near 1 while a politeness-final
 like "That's all I needed, thanks." scores near 0 — so treat it as a
 corpus-shaped signal, not a general finality oracle.
 
-**Silence-end and smart-turn are independent knobs.** smart-turn's verdict is
+Silence-end and smart-turn are independent knobs. smart-turn's verdict is
 driven by speech content, not by how much trailing silence the window carries,
 so shortening `turn_detection::SILENCE_DURATION_MS` is a pure latency choice
-*at the smart-turn layer*; what it changes is how often mid-utterance pauses
+at the smart-turn layer; what it changes is how often mid-utterance pauses
 reach the classifier at all, and shortening it raises mid-utterance false-cut
 exposure substantially. The eager two-threshold rescue — commit at the shorter
 silence only above confidence `t`, else wait for the longer one — has no
@@ -596,7 +837,7 @@ timer, rolls back a `Predicted` response (aborting both speculative tasks and
 emitting nothing to the client), then either commits the barge-in immediately
 or — when `barge_in_delay_ms > 0` — buffers the outbound `speech_started` and
 sleeps. If `speech_stopped` arrives during that sleep the barge-in is
-**suppressed**: the task is cancelled, no event is published, the active
+suppressed: the task is cancelled, no event is published, the active
 response continues. The pending record is a single slot, so a second
 `speech_started` retires the first.
 
@@ -605,7 +846,7 @@ response continues. The pending record is a single slot, so a second
 1. `Session::cancel_current_response` snapshots `response_id`,
    `assistant_item_id` and `played_ms` under the session mutex, takes the
    runtime, and sets the response phase to `None`. Outside the lock it aborts
-   the response task **and** `TtsAbort::cancel`, which stops synthesis, not
+   the response task and `TtsAbort::cancel`, which stops synthesis, not
    just delivery.
 2. If the response's brackets were ever opened, the close cascade is emitted
    in order — transcript done, audio done, content part done, output item
@@ -625,7 +866,7 @@ The ordering is forced by invariant I1 in `rust/src/realtime/state.rs`: a
 `Speaking` VAD phase concurrent with an active response is a violation that
 terminates the session with `internal_state_error`. Cancel-then-speak is what
 keeps the transition legal. `played_ms` is what makes the truncation honest —
-it is incremented in the outbound pacer *after* the frame is written to the
+it is incremented in the outbound pacer after the frame is written to the
 transport, so the snapshot taken under the mutex reflects exactly what the
 user heard.
 
@@ -636,24 +877,23 @@ over the blank-interleaved label trellis**. `dp.rs::viterbi_align` takes a flat
 `[T, V]` log-probability matrix, builds the extended target
 `blank, tok0, blank, tok1, …, blank`, and runs a max-product DP with stay /
 advance-one / advance-two transitions, the skip legal only when the skipped
-state is a blank between two *different* labels. `pipeline.rs::align_with_logprobs`
+state is a blank between two different labels. `pipeline.rs::align_with_logprobs`
 validates the vocabulary size, converts frame spans with `frame_to_time_ms`, and
 groups words into `AlignedSegment`s; `output.rs` holds `to_srt`, `to_vtt` and
 `to_diarized_json`; `lib.rs` declares the `Aligner` trait.
 
-There is **no acoustic model in the crate** — it consumes emissions computed
+There is no acoustic model in the crate — it consumes emissions computed
 elsewhere. On the serving path only the output formatters are used
 (`rust/src/oapi/transcriptions.rs` imports `to_srt`, `to_vtt`, `AlignedSegment`,
 `WordTiming` to render Whisper's already-timestamped segments); the DP has no
 callers outside its own tests, and `to_diarized_json` is unreachable because
 `main.rs` builds a different diarized shape by hand.
 
-`tests/paper_ctc.rs` compares the DP against an exhaustive enumeration of every
-legal CTC path over randomized inputs, asserts repeated labels are separated by
-at least one blank frame, and pins a known deviation from the paper — the
-implementation requires `T >= 2L+1` and so rejects otherwise-valid alignments,
-with a test that fails if the deviation is ever fixed without updating the
-ledger.
+The unit tests in `dp.rs` assert that repeated labels are separated by at least
+one blank frame (`repeated_token_requires_blank_between`) and pin a known
+deviation from the paper: the implementation requires `T >= 2L+1` and so
+rejects otherwise-valid alignments (`too_few_frames_errors`). Nothing compares
+the DP against an exhaustive enumeration of legal CTC paths.
 
 The working forced aligner is the Python one. `python/aligner/` is a fork of
 Qwen3-ASR whose `Qwen3ForcedAligner.align` is not CTC at all: it interleaves a
@@ -707,18 +947,22 @@ for the same purpose. Neither the EOU path nor `nv-aligner` uses it;
 
 `rust/crates/nv-tts` implements Qwen3-TTS-12Hz. A second, unused `Talker` lives
 in `rust/crates/nv-omni/src/talker.rs` (the Qwen3-Omni thinker/talker split,
-where the thinker is an LLM backbone whose *hidden states* condition a small
+where the thinker is an LLM backbone whose hidden states condition a small
 autoregressive speech head). Only the `nv-tts` talker is wired to HTTP.
+`qwen3_tts_device` (`rust/src/oapi/audio_speech_nvtts.rs`) places the talker,
+the code predictor, the vocoder and the speaker conditioning tensors on CUDA
+device 0 when the build has CUDA and a device is present, and on the CPU
+otherwise; the VRAM plan books the CUDA case as `aux-qwen3-tts-talker`.
 
-**Codec tokens.** One frame is 1920 samples at 24 kHz carrying **16 codebook
+Codec tokens. One frame is 1920 samples at 24 kHz carrying **16 codebook
 indices** of 2048 entries each (`nv_omni::vocoder::NUM_CODEBOOKS`,
 `nv_tts::CODEC_CODEBOOK_SIZE`) — residual-VQ levels, not parallel streams. The
 talker's vocabulary is wider than the codebook because codebook-0 space also
 carries control ids: pad, BOS, EOS and the think markers
 (`nv-tts/src/talker.rs`).
 
-**Dual-stream prefill.** `Qwen3TtsTalker::build_nonstreaming_prefill` builds one
-residual sequence by *element-wise adding* a text-stream and a codec-stream
+Dual-stream prefill. `Qwen3TtsTalker::build_nonstreaming_prefill` builds one
+residual sequence by element-wise adding a text-stream and a codec-stream
 embedding at every position: role prefix, a text side of pads then the TTS BOS
 against a codec side of think tokens, an optional speaker-embedding row,
 pad/BOS, then the projected body tokens plus a codec pad everywhere. During
@@ -731,7 +975,7 @@ predictor over time** (the RQ-Transformer pattern): fifteen embedding tables and
 fifteen output heads, recurrence along the codebook axis *within a single
 frame*, each step keeping its own small KV cache.
 
-**Sampling** (`nv-tts/src/sampling.rs`) applies, in order: a sign-aware
+Sampling (`nv-tts/src/sampling.rs`) applies, in order: a sign-aware
 repetition penalty, an allowed-set mask, a greedy shortcut if sampling is
 disabled, temperature, top-k, softmax, top-p, then inverse-CDF sampling from a
 seeded xorshift PRNG. The allowed-set mask does double duty — narrowing the
@@ -741,14 +985,14 @@ exist. The base sampler's repetition penalty sees every base token emitted so
 far in the utterance; the sub-sampler for codebooks 1–15 uses no penalty and no
 mask. There is no classifier-free guidance anywhere in the Rust tree.
 
-**The vocoder** is `nv-omni/src/vocoder.rs`, consumed through
+The vocoder is `nv-omni/src/vocoder.rs`, consumed through
 `nv-tts/src/codec_decoder.rs`: an RVQ dequantizer (codebook 0 plus summed
 residual codebooks, reconstructed at load time from EMA statistics), a causal
 Conv1d, a windowed-causal transformer with LayerScale and RoPE, two
 ConvNeXt-block upsample stages, and four BigVGAN-style decoder stages of
 transposed convolutions with dilated residual blocks, activated by snakebeta.
 Every convolution is causal — `CausalConv1d` left-pads only, `CausalConvT1d`
-trims from the right — so there is **zero lookahead**, and that is what makes
+trims from the right — so there is zero lookahead, and that is what makes
 streaming exact. `VocoderStreamer` re-decodes `left_context` already-emitted
 frames purely to warm the receptive field, then discards exactly that many
 frames' worth of samples from the front; with no lookahead and the transformer's
@@ -762,14 +1006,29 @@ weight subtree into a `VocoderInventory`, `is_real_qwen3_decoder` requires the
 expected subtrees to be non-empty, and `VocoderLoadReport` records whether
 loading silently degraded to zero-initialized weights. A zero-init vocoder
 decodes every frame to silence, answering 200 with a correctly-sized WAV of
-nothing, so the route refuses to serve unless `NV_TTS_ALLOW_SILENT_VOCODER` is
-set; the synthesis entry point likewise bails rather than emit audio if the
+nothing, so boot refuses a zero-initialized vocoder; the synthesis entry point likewise bails rather than emit audio if the
 talker, code predictor or text embedding is missing.
 
 `rust/src/oapi/audio_speech_nvtts.rs` runs three stages concurrently — frame
 generation on a blocking task, vocoder decode on another, and an async forwarder
-that awaits the *first* PCM chunk before returning the receiver, so a
+that awaits the first PCM chunk before returning the receiver, so a
 first-chunk failure surfaces as an error status rather than a truncated 200.
+The receiver carries `Result` chunks: a failure after the first chunk (a CUDA
+out-of-memory halfway through a paragraph, a panicked task) is the stream's
+last item, never a silent close. The forwarder awaits the first chunk, so a
+failure before it answers 503 `insufficient_vram` for a device out-of-memory
+(the gateway moves on, `synthesis_error` in `audio_speech.rs`) and 500
+`synthesize_failed` for anything else. Every format then streams
+(`audio_response`, shared with the Voxtral TTS route: `pcm`, `wav` under
+placeholder lengths, and the `ffmpeg`-encoded formats), so a failure after the
+first chunk aborts the chunked body -- the encoder's stdin feeder included --
+and the client sees an incomplete transfer rather than a clean end. A short 200
+is never an answer: the suite covering it
+(`a_synthesis_that_fails_after_it_started_never_answers_a_short_200` in
+`audio_speech.rs`) feeds each encoder a producer that fails after three chunks.
+A tokenizer that cannot encode the input is an error, not a silent clip.
+Kokoro's `ffmpeg`-encoded formats follow the same rule: a failed chunk, a
+failed write to the encoder or an encoder that exits non-zero aborts the body.
 Every codebook index is range-checked before it reaches the vocoder.
 
 ## Voices: built-in speakers, profiles, custom voice, voice design
@@ -778,7 +1037,7 @@ Three conditioning mechanisms exist and the checkpoint decides which are
 available: `tts_model_type` is read from the checkpoint's `config.json`, and
 `profiles_supported` is true only for `base`.
 
-**Built-in speakers.** `SpeakerResolver::resolve` looks the requested voice
+Built-in speakers. `SpeakerResolver::resolve` looks the requested voice
 up in `talker.config().spk_id`; the "embedding" is the talker's codec
 embedding row for that speaker's token id. OpenAI voice aliases (`alloy`,
 `echo`, …), `default` and an empty voice land on `serena` when the checkpoint
@@ -795,7 +1054,7 @@ unreachable-store degradation included, and the `#[ignore]`
 `real_base_checkpoint_serves_aliases_from_the_builtin_then_the_default_profile`
 repeats it on the real weights.
 
-**Voice profiles (custom voice).** `nv-tts/src/speaker_encoder.rs` is an
+Voice profiles (custom voice). `nv-tts/src/speaker_encoder.rs` is an
 ECAPA-TDNN: SE-Res2Net blocks with dilated TDNN convolutions, multi-layer
 feature aggregation, attentive statistics pooling over `[x, mean, std]`, and
 a final projection to a 1024-d x-vector. Its frontend, `spk_mel.rs`, is a
@@ -820,14 +1079,72 @@ and the checkpoint must be `base`; each failure is a distinct 400 with a
 message naming the fix. The resulting `[1, 1, hidden]` tensor occupies the
 single speaker slot in the codec-stream prefill.
 
-**Voice design** — a voice described in words rather than demonstrated — is
-implemented only in Python.
-`python/tts/qwen3/inference/qwen3_tts_model.py`'s `generate_voice_design`
-builds an instruction as a chat-formatted *prompt*, not a vector, and
-`python/server.py` sources it from the OpenAI `instructions` field, falling
-back to the voice name string itself. In Rust `design_params` is stored,
-round-tripped and never read; `conformance/fixtures/030-voice-clone-design-warm`
-says so and asserts only the structural round-trip.
+Voice design — a voice described in words rather than demonstrated — is the
+1.7B VoiceDesign checkpoint (`tts_model_type` `voice_design`), served beside the
+talker from `NV_TTS_VOICE_DESIGN_DIR` (`audio_speech_nvtts::voice_design`). A
+request names it by its id or `qwen3-tts-voicedesign` and carries the
+description in `instructions`; without one it is a 400 naming the field, and a
+Base talker answers 400 to `instructions` rather than ignore them. The
+description is not a vector: as in `generate_voice_design`
+(`python/tts/qwen3/inference/qwen3_tts_model.py`), `voice_design_prompt` wraps
+it as `<|im_start|>user\n…<|im_end|>\n`, and `build_nonstreaming_prefill`
+puts its projected text embeddings ahead of the role prefix; the codec side
+carries no speaker row. The draw is the request's `seed`, else a decimal
+`voice` (`request_seed`; LiteLLM forwards `voice` and drops `seed`), else
+random, and one description, text and draw give the same audio on one device.
+`language` (auto, an ISO 639-1 code or a codec language name) applies to this
+model only. The 1.7B code predictor is narrower than its talker: its fifteen
+codec embeddings live at talker width and `small_to_mtp_projection` maps the
+talker's hidden state and every embedding it feeds into the predictor
+(`CodecDecoderConfig::talker_hidden_size`).
+
+On CUDA the Base talker and its code predictor run their projections as FP8
+(e4m3, one scale per output row, bf16 activations) through the same
+`gemv_e4m3` kernels the Qwen chat models use; embeddings, the codec head and
+the vocoder stay dense. The suite covering Base talker precision
+(`real_base_talker_precisions_keep_the_anchors_words_pitch_and_clone_likeness`,
+`NV_TTS_PRECISIONS` names the anchor first) holds every precision to the
+anchor's word error rate, median pitch, audio length and ECAPA clone likeness
+against the reference clip, and FP8 passes against F32 at three fifths of its
+peak; the VRAM plan books it as `aux-qwen3-tts-talker`. On the CPU the
+Base talker is F32.
+
+The designer is a cold-tier resident (`qwen3-tts-voicedesign`): BF16 on CUDA,
+F32 on the CPU. BF16 halves its residency and loads without a conversion pass,
+and across seeds it matched F32 on the instruments the real-weight suite
+measures — STT word error, median F0 per description, and how close an
+enrolled clone sits to the designed sample. It loads only when the device has
+its booked size free beyond chat's floor (`NV_COLD_TIER_CHAT_MIN_FREE_GIB`)
+after evicting idle siblings; otherwise the request answers 503
+`voice_design_unavailable` and a gateway moves on. A designed voice is not
+stored: keeping one means enrolling the sample through `POST
+/v1/voice-profiles` on a Base talker, which then reads anything in it.
+`design_params` on a profile is stored, round-tripped and never read.
+
+On Apple Silicon the designer runs on the CPU: `qwen3_tts_device` picks CUDA or
+the CPU, never Metal. With the device switched to Metal the talker is no faster
+on an M2 Ultra, in F32 or BF16 (each frame is a chain of small ops, and Metal's
+per-op cost eats what its bandwidth saves), and candle's Metal
+backend segfaults in `MetalDevice::drop_unused_buffers` (an `objc_release` of a
+pooled buffer, reached from `nv_layers::rope::host_positions`) after a few
+requests. On the CPU it is F32, about 4.3 s of compute per second of audio on
+that machine, and a seed repeats bit for bit.
+
+The suite covering it is
+`real_voice_design_follows_the_description_repeats_by_seed_and_clones_onto_base`
+(`#[ignore]`, `NV_TTS_VOICE_DESIGN_TEST=1`, an STT endpoint in
+`NV_TTS_STT_URL`), driven by
+`conformance/fixtures/030-voice-clone-design-warm`: the token ids of the text
+and of the instruction prompt equal the Python reference processor's, the same
+draw repeats bit for bit, a deep male and a high female description land on
+either side of the fixture's F0 gates and further apart in speaker-encoder
+space than two male descriptions, every sample round-trips through STT, and the
+designed sample enrolled on the 0.6B Base clones a paragraph that sits closer
+to it than the Base default voice and keeps its pitch. The in-tree Python
+reference does not run under the transformers that nixpkgs ships (its masking
+and rope APIs moved), so codec-level parity is not established: the
+VoiceDesign path is verified architecturally against it plus the measured
+behaviour above.
 
 ## The Kokoro ONNX path
 
@@ -836,7 +1153,7 @@ The second TTS engine is Kokoro-82M as a single ONNX graph, served from
 zero-padded on both ends, a 256-wide `style` vector and a `speed` scalar, and
 emits mono f32 at 24 kHz.
 
-**Execution-provider policy is per model, not global.** The GPU-worthy
+Execution-provider policy is per model, not global. The GPU-worthy
 sessions ride a ladder or an explicit pin: Kokoro (`KOKORO_ONNX_PROVIDER`,
 auto ladder) and both diarization models, segmentation and speaker embedding
 sharing `diarization/ep.rs` (`DIAR_EP`). The latency-critical or
@@ -850,7 +1167,7 @@ build alike. On AMD hosts (`ortAccel = "rocm"`) the unit pins
 registers but cannot run fails loudly per request (warmup logs the first
 failure at boot), never silently on CPU.
 
-**Provider selection** (Rust and Python; Go is CPU-only): the session walks a
+Provider selection (Rust and Python; Go is CPU-only): the session walks a
 GPU provider ladder — cuda, rocm, coreml, webgpu, dml — and runs on the first
 one the loaded onnxruntime exposes and registers, falling back to CPU when
 none does. `KOKORO_ONNX_PROVIDER=<name>|cpu` forces one (Python spellings
@@ -874,7 +1191,7 @@ frame — so **tests comparing provider outputs must compare spectra, not
 samples**: a few-millisecond timing drift destroys sample-level correlation
 while the audio stays identical to the ear.
 
-**Phonemization** is espeak-ng through a hand-written C shim that is
+Phonemization is espeak-ng through a hand-written C shim that is
 logically identical in both languages (`rust/src/tts/phonemize_glue.c`,
 `go/internal/tts/phonemize_cgo.c`): it initializes espeak in retrieval mode,
 sets the voice by name, and loops `espeak_TextToPhonemes` with the IPA flag,
@@ -890,15 +1207,15 @@ is Castilian (`θ`, `ʎ`), `es-AR`/`es-419` is Latin American with seseo and
 yeísmo (`s`, `ʝ`), and the fit request's `language` is passed to the
 phonemizer unmapped, so a Rioplatense voice is fitted with `es-419`.
 
-**Voice packs** are `.npz` files parsed by hand (`rust/src/tts/npz.rs`): a
+Voice packs are `.npz` files parsed by hand (`rust/src/tts/npz.rs`): a
 zip of `.npy` arrays, one per voice, with a header scanner rejecting Fortran
 order and any dtype other than little-endian f32. The crucial detail is that
-**the style row is selected by phoneme count** — `voice.row(n)` where `n` is
+the style row is selected by phoneme count — `voice.row(n)` where `n` is
 the number of tokens — which is why the pack's leading dimension and
 `MAX_PHONEME_LENGTH` must agree, and why exceeding it is an error in Rust
 (Go truncates instead, a real divergence).
 
-**Vocabulary** (`rust/src/tts/vocab.rs`) concatenates a pad character, a
+Vocabulary (`rust/src/tts/vocab.rs`) concatenates a pad character, a
 punctuation set, the ASCII letters and an IPA inventory, assigning sequential
 ids. `clean_phonemes` applies two literal fixes for the word "kokoro", maps a
 handful of IPA characters onto in-vocabulary ones, then drops every rune not
@@ -907,7 +1224,7 @@ in the vocabulary. The `r` to `ɹ` and `x` to `k` remaps are English-only
 velar fricative `x` of "jamón", which are all in the vocabulary and are what
 the Spanish stock voices were trained on.
 
-**Text handling** is where Kokoro differs most from nv-tts.
+Text handling is where Kokoro differs most from nv-tts.
 `rust/src/tts/text.rs` strips emoji by Unicode range, strips markdown
 emphasis and collapses whitespace; `chunk::plan` then splits with Punkt and
 packs sentences into chunks bounded by `KOKORO_CHUNK_CHARS`, capped at
@@ -918,7 +1235,7 @@ response headers are chosen, so a first-chunk failure maps to a status code
 while later failures can only truncate the stream; each subsequent chunk
 races client disconnect so a dropped client cancels the work.
 
-**Output encoding**: `pcm` streams raw s16le directly; everything else is
+Output encoding: `pcm` streams raw s16le directly; everything else is
 piped through a spawned `ffmpeg` (`rust/src/tts/http.rs`,
 `go/internal/tts/ffmpeg.go`), with `ffmpeg` availability probed once and
 surfaced as a 400 when missing, and an abort channel so a mid-stream
@@ -926,7 +1243,7 @@ synthesis failure kills the encoder rather than producing a silently short
 file. `stream_format=sse` emits `speech.audio.delta` events carrying base64
 s16le, terminated by `speech.audio.done`.
 
-By contrast the nv-tts path applies **no text normalization and no chunking**
+By contrast the nv-tts path applies no text normalization and no chunking
 at all: raw input goes through a byte-level BPE with no normalizer and no
 post-processor, into one prefill bounded only by a maximum frame count.
 
@@ -946,12 +1263,12 @@ Kokoro are two implementations of one trait:
 
 `resolve_speech_route` is a pure function with an exhaustive test block. A
 blank `model` picks nv-tts when a talker is loaded, 503s when the talker's
-bootstrap *failed* (recorded in a `OnceLock` so "not configured" and
+bootstrap failed (recorded in a `OnceLock` so "not configured" and
 "configured but broken" stay distinguishable), and otherwise falls back to
 Kokoro. A model containing "kokoro" always routes to Kokoro. Anything else is
 matched against the loaded talker id by `model_id_matches`, which strips both
 sides to lowercase alphanumerics and requires a prefix match against the full
-id or its basename. A non-match is a **404** whose message says the request
+id or its basename. A non-match is a 404 whose message says the request
 was refused rather than rendered by whichever engine happened to be loaded.
 
 `unsupported_nvtts_params` follows the same philosophy for parameters nv-tts
@@ -967,42 +1284,57 @@ route's rejection of `temperature` and `prompt`.
 normative contract is the RFC; the conformance corpus under `conformance/`
 replays the same fixtures against both the Rust and Go implementations.
 
-**Ingress.** WebRTC decodes Opus and resamples to 16 kHz in
+Ingress. WebRTC decodes Opus and resamples to 16 kHz in
 `realtime/audio_in.rs`, carrying leftover samples across calls so chunking
 stays exact; WebSocket decodes the session's `input_audio_format` in
 `audio_in_ws.rs`. Both push `Vec<f32>` onto one bounded channel and tee into
 the inspector's audio store.
 
-**VAD lane.** `spawn_vad_task` owns the only `VadProcessor` and consumes that
+VAD lane. `spawn_vad_task` owns the only `VadProcessor` and consumes that
 channel, rebuilding the processor when `input_audio_buffer.clear` bumps the
-clear epoch. Optionally it also runs **partial transcription**: at a fixed
+clear epoch. Optionally it also runs partial transcription: at a fixed
 interval, with at most one in flight, it takes the current speech audio and
 runs a full STT pass, emitting `input_audio_buffer.partial_transcription`.
 Partials are client hints only — they feed neither the LLM nor the EOU
 classifier.
 
-**Turn.** On `SpeechCommitted` with enough speech, the session builds the EOU
+Turn. On `SpeechCommitted` with enough speech, the session builds the EOU
 context and installs `run_eou_dispatch` as an abortable commit timer. When it
 fires, `commit_after_eou` pushes the user conversation item, harvests any
 speculative work, and emits `input_audio_buffer.committed` before
 `conversation.item.added` (RFC §10.3 W3).
 
-**Transcribe.** `process_utterance` stores a sealed buffer, uses the
+Transcribe. `process_utterance` stores a sealed buffer, uses the
 speculative transcript if one was promoted or runs STT on a blocking task,
 applies the noise gate, and emits
 `conversation.item.input_audio_transcription.completed` (or `.failed`). Short
 utterances are treated as backchannels and suppress the response entirely.
 The completed event also carries `speaker: {id, name, score} | null`, the
 utterance's match against the voices workspace registry (see 7.2, "Who is
-speaking"); clients that ignore unknown fields are unaffected.
+speaking"), and the decoder's confidence (`TranscriptConfidence` in
+`rust/src/realtime/wire.rs`): `avg_logprob`, `no_speech_prob` and
+`compression_ratio` whenever the backend reports them, and `logprobs:
+[{token, logprob}]` when it decodes greedily (parakeet-tdt scores every
+emitted token with the log-softmax of its joint step; CT2 whisper only has a
+sequence score, so it sends `avg_logprob` alone). A field the backend cannot
+supply is omitted, not null, so traces without a model stay byte-identical;
+clients that ignore unknown fields are unaffected. The HUD's hands-free gate
+reads these to drop hallucinated fragments before they become agent turns.
 
-**Respond.** `run_response` opens the response brackets and sets a
+Respond. `run_response` opens the response brackets and sets a
 `wire_opened` flag — the exact flag barge-in later consults to decide whether
-the close cascade is legal. The LLM is reached over **HTTP**, not internally:
+the close cascade is legal. The LLM is reached over HTTP, not internally:
 `rust/src/conversation/llm.rs` POSTs an OpenAI-shaped
-`{model, messages, stream: true}` to `CHAT_COMPLETION_BASE_URL` and
-hand-parses the SSE stream, reading `choices[].delta.content`. It can point
-at this same binary's `/v1/chat/completions` or anything else. There is no
+`{model, messages, stream: true}` to `CHAT_COMPLETION_BASE_URL`, with
+`CHAT_COMPLETION_API_KEY` as the bearer when set, and hand-parses the SSE
+stream, reading `choices[].delta.content`. It can point at this same binary's
+`/v1/chat/completions` or anything else, a LiteLLM in front of Claude
+included. `model` is `DEFAULT_REALTIME_CONVERSATION_MODEL` until a
+`session.update` names a different `model`: `Session::llm_config_for_turn`
+then carries that name on every later request, so one session can speak
+through `claude-opus-5-5` while the next keeps the local default. Echoing
+the session's own `model` label back, as a client that round-trips
+`session.created` does, changes nothing. There is no
 tool calling in this path: the SSE structs deserialize only `content`, and
 the `response.function_call_arguments.*` events declared in `wire.rs` are
 unused outside the ordering harness.
@@ -1011,7 +1343,7 @@ Deltas fan out three ways: appended to the response text, appended to a
 shared `transcript_so_far` (the string barge-in snapshots when it truncates),
 and fed to `SentenceChunker`, which cuts at the first terminal punctuation or
 newline. Each sentence is one Kokoro synthesis call on a blocking task,
-played through an outbound pacer. The realtime path uses **Kokoro only** —
+played through an outbound pacer. The realtime path uses Kokoro only —
 nv-tts is not wired into it.
 
 The main loop is a biased `select!` over the TTS worker joining and the LLM
@@ -1024,7 +1356,7 @@ remaining planned audio against a cap derived from the planned duration,
 downgrading to `incomplete` with reason `drain_cap` if the client never
 drains it.
 
-**Egress.** The input pipeline is symmetric — everything at 16 kHz — but the
+Egress. The input pipeline is symmetric — everything at 16 kHz — but the
 output pipeline deliberately is not (RFC §12.4): TTS produces audio at the
 model's native rate and there is a single resample-and-encode step at egress.
 WebRTC always emits Opus at 48 kHz on the track regardless of
@@ -1032,18 +1364,18 @@ WebRTC always emits Opus at 48 kHz on the track regardless of
 in parallel; WebSocket resamples and encodes to PCM16 or G.711 into
 `response.output_audio.delta`.
 
-**Ordering.** `Session::deliver_to_sink` holds one lock across
+Ordering. `Session::deliver_to_sink` holds one lock across
 stamp-then-record-then-write, because unsynchronized steps let two tasks
 emitting concurrently take sequence numbers `N` and `N+1` and land on the
 wire in the opposite order. Events are bucketed by topic, and only the
 response topic is gated by the `Predicted` phase.
 
-**Cancellation** has three layers: a session-wide `CancellationToken` with an
+Cancellation has three layers: a session-wide `CancellationToken` with an
 inflight-lane counter and a quiesce wait (`realtime/cancel.rs`); a
-single-slot `TtsAbort` registry keyed by response id, which stops *synthesis*
+single-slot `TtsAbort` registry keyed by response id, which stops synthesis
 rather than just delivery; and the response task's own abort handle.
 
-**Transports** differ only at the edges. The data channel fragments every
+Transports differ only at the edges. The data channel fragments every
 event — base64 the JSON, wrap as a full message under a size limit or as
 contiguous indexed partials above it (`realtime/framing.rs`); the WebSocket
 sends raw JSON. Both converge on the same `Session`, state machine and event
@@ -1054,31 +1386,31 @@ alphabet, which is what lets one fixture corpus cover both.
 The audio tree contains substantial built-but-unwired code, named here so the
 chapter is not read as a description of live behaviour.
 
-- **`nv-omni` beyond the vocoder.** `Thinker`, `Talker`, `AudioEncoder` and
+- `nv-omni` beyond the vocoder. `Thinker`, `Talker`, `AudioEncoder` and
   `Qwen3VisionTower` are architecturally complete but nothing in `rust/src/`
   imports them; the only `nv_omni::` imports outside the crate are for the
   vocoder. The omni ASR/TTS path exists in `python/` only.
-- **`nv-omni/src/codec_vel.rs`.** A FiLM-conditioned flow-matching velocity
+- `nv-omni/src/codec_vel.rs`. A FiLM-conditioned flow-matching velocity
   field with no caller anywhere, including inside its own crate — a scaffold
   for a latent decoder the shipped Qwen3-TTS path does not use.
-- **`nv-aligner`'s DP.** Fully implemented and validated against brute-force
+- `nv-aligner`'s DP. Fully implemented and validated against brute-force
   path enumeration, with no callers outside its tests.
-- **`EouKind::Integrated`.** Advertised in the capabilities document, but it
+- `EouKind::Integrated`. Advertised in the capabilities document, but it
   resolves to a stub returning `1.0`, the verdict handler has no non-test
   caller, and the VAD handler explicitly excludes it — so selecting it
   commits immediately with no classifier.
-- **`conversation.item.retrieve`.** Parsed on the wire and answered with a
+- `conversation.item.retrieve`. Parsed on the wire and answered with a
   not-implemented error in `rust/src/realtime/session.rs`; RFC §7.5 and W9
   are unmet in the Rust tree.
-- **The DiariZen segmentation ONNX is not shipped.** Until
+- The DiariZen segmentation ONNX is not shipped. Until
   `rust/scripts/export-diarizen-onnx.py` is run, `/v1/audio/diarization`
   correctly answers 503, but `response_format=diarized_json` returns every
   `speaker` as `null` with no failure signal. The speaker-embedding half
   works independently at `/v1/audio/embeddings`.
-- **The Rust and Python diarization configs disagree** on
+- The Rust and Python diarization configs disagree on
   `max_speakers_per_frame` and `chunk_seconds`, which changes the powerset
   class count — the two would not decode the same ONNX export.
-- **The EOU classifier never sees the current utterance's text.** The context
+- The EOU classifier never sees the current utterance's text. The context
   is built at `SpeechCommitted`, before the user item is pushed to the
   conversation, so the text head scores only prior turns and the gated-fusion
   text features derive from history rather than the partial. The audio head

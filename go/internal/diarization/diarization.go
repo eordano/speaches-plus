@@ -6,7 +6,6 @@ import (
 )
 
 const (
-
 	defaultChunkSeconds        float32 = 16.0
 	defaultHopRatio            float32 = 0.1
 	defaultMedianFilterWindow          = 11

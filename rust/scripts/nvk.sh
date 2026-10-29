@@ -21,10 +21,11 @@ usage() {
   cat <<'EOF'
 nvk.sh - build/test wrapper with a cached nix dev env
 
-  rust/scripts/nvk.sh test --test parity_rope -- --nocapture
-  NVK_LANE=rope rust/scripts/nvk.sh test --test parity_rope
+  rust/scripts/nvk.sh test --test rope -- --nocapture
+  NVK_LANE=rope rust/scripts/nvk.sh test --test rope
   NVK_FEATURES=wgpu rust/scripts/nvk.sh test --test wgpu_rope
-  NVK_PKG=nv-models rust/scripts/nvk.sh test --release --test laguna_smoke
+  NVK_TARGET_CPU=x86-64-v3 rust/scripts/nvk.sh test --release --test voxtral_realtime   # opt-in SIMD codegen
+  NVK_PKG=nv-models rust/scripts/nvk.sh test --release --test laguna_fa2_contract
   NVK_LANE=agent2 rust/scripts/nvk.sh check
   rust/scripts/nvk.sh test --no-run
 
@@ -58,6 +59,15 @@ env:
                 empty string for none)
                 use "wgpu" to skip every nvcc invocation - far faster edit loop
   NVK_JOBS      cargo -j (default: 8)
+  NVK_PREBUILT_KERNELS  1 to link nv-kernels against the flake's crane-built
+                speaches-plus-cuda.cudaKernels (NV_KERNELS_PREBUILT) instead of
+                running nvcc: substituted from a binary cache or built once per
+                kernel-source revision, so a cold lane on a fresh box skips ~9 min
+                of nvcc. Costs a flake eval per call; leave it off while editing .cu
+  cuda builds share one candle-flash-attn build per machine under
+                $CACHE/flash-attn/<version>-sm<arch>-<devenv hash>: the first cold
+                lane that needs it builds nv-layers under a lock to fill it, later
+                lanes skip its ~6 min of nvcc (cudaforge rebuilds by content hash)
   NVK_SHELL     nix devshell attr (default: .#cuda, or .#default when no cuda)
   NVK_REFRESH   set to 1 to force-regenerate the cached dev env
   NVK_VULKAN_LOADER  dir holding libvulkan.so.1 (default: newest in /nix/store);
@@ -174,7 +184,9 @@ lanes_cmd() {
   fi
   echo "nvk: reaping lanes idle > $reap_days days:"
   printf '%s' "$doomed"
-  printf '%s' "$doomed" | xargs -r -d '\n' rm -rf --
+  while IFS= read -r dir; do
+    [ -n "$dir" ] && rm -rf -- "$dir"
+  done <<<"$doomed"
 }
 
 case "${1:-}" in
@@ -272,6 +284,7 @@ mkdir -p "$TMPDIR"
 export CARGO_TARGET_DIR="$TGT"
 export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
 export CUDA_ARCH_LIST="${NVK_CUDA_ARCH:-12.0}"
+if [ -n "${NVK_TARGET_CPU:-}" ]; then export RUSTFLAGS="${RUSTFLAGS:-} -C target-cpu=$NVK_TARGET_CPU"; fi
 CMAKE_CUDA_ARCHITECTURES=$(printf '%s' "$CUDA_ARCH_LIST" | tr -d '.')
 export CMAKE_CUDA_ARCHITECTURES
 export NV_KERNELS_PARITY_REQUIRE="${NV_KERNELS_PARITY_REQUIRE:-1}"
@@ -341,7 +354,31 @@ else
   unset NVK_NVCC_WRAPPER
 fi
 
+bash "$REPO/rust/scripts/fetch-third-party.sh" | { grep -vE ': up to date$|headers verified$' || true; } >&2
+
 cd rust
+
+case "$FEATURES" in
+  *cuda*)
+    if [ "${NVK_PREBUILT_KERNELS:-0}" = 1 ]; then
+      NV_KERNELS_PREBUILT=$(nix build "$REPO#speaches-plus-cuda.cudaKernels" --no-link --print-out-paths) || exit $?
+      export NV_KERNELS_PREBUILT
+    fi
+    FA_VERSION=$(awk '$0 == "name = \"candle-flash-attn\"" { getline; gsub(/"/, "", $3); print $3; exit }' Cargo.lock)
+    if [ -n "$FA_VERSION" ]; then
+      FA_DIR="$CACHE/flash-attn/$FA_VERSION-sm$CMAKE_CUDA_ARCHITECTURES-$(sha256sum "$ENVFILE" | cut -c1-12)"
+      mkdir -p "$FA_DIR"
+      if [ ! -e "$FA_DIR/.nvk-ready" ] && cargo tree -p "$PKG" --features "$FEATURES" -i candle-flash-attn >/dev/null 2>&1; then
+        if command -v flock >/dev/null 2>&1; then FA_LOCK=(flock "$FA_DIR.lock"); else FA_LOCK=(python3 "$REPO/rust/scripts/gpu-flock.py" "$FA_DIR.lock"); fi
+        "${FA_LOCK[@]}" bash -c '[ -e "$1/.nvk-ready" ] || { CANDLE_FLASH_ATTN_BUILD_DIR="$1" cargo build -j "$2" -p nv-layers --features cuda >&2 && [ -e "$1/libflashattention.a" ] && touch "$1/.nvk-ready"; }' _ "$FA_DIR" "$JOBS" || true
+      fi
+      if [ -e "$FA_DIR/.nvk-ready" ]; then
+        export CANDLE_FLASH_ATTN_BUILD_DIR="$FA_DIR"
+      fi
+    fi
+    ;;
+esac
+
 LOCKWRAP=""
 case "$SUB" in
   gate)

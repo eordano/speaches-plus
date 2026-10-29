@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -106,16 +105,6 @@ impl InspectorRelay {
     }
     pub fn set_item_id(&self, v: Option<String>) {
         self.inner.lock().expect("relay poisoned").item_id = v;
-    }
-    pub fn set_response_id(&self, v: Option<String>) {
-        self.inner.lock().expect("relay poisoned").response_id = v;
-    }
-    pub fn set_phrase_id(&self, v: Option<String>) {
-        self.inner.lock().expect("relay poisoned").phrase_id = v;
-    }
-
-    pub fn subscriber_count(&self) -> usize {
-        self.tx.receiver_count()
     }
 
     pub fn subscribe(&self) -> InspectorSubscription {
@@ -292,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_writes_ndjson_and_replays_to_subscriber() {
+    fn publish_writes_ndjson_and_replays_a_capped_snapshot_to_subscribers() {
         let dir = temp_dir();
         let relay = InspectorRelay::new("sess_test".into(), Some(dir.clone()));
         let mut payload = BTreeMap::new();
@@ -308,10 +297,32 @@ mod tests {
         let sub = relay.subscribe();
         assert_eq!(sub.snapshot.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+        {
+            let dir = temp_dir();
+            let relay = InspectorRelay::new("sess_replay".into(), Some(dir.clone()));
+            for i in 0..3 {
+                let mut p = BTreeMap::new();
+                p.insert("i".into(), json!(i));
+                relay.publish("turn", "turn_start", None, p);
+            }
+            let sub = relay.subscribe();
+            assert_eq!(sub.snapshot.len(), 3);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        {
+            let dir = temp_dir();
+            let relay = InspectorRelay::new("sess_cap".into(), Some(dir.clone()));
+            for _ in 0..(REPLAY_CAP + 100) {
+                relay.publish("turn", "turn_start", None, BTreeMap::new());
+            }
+            let sub = relay.subscribe();
+            assert_eq!(sub.snapshot.len(), REPLAY_CAP);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
-    fn error_mirror_emits_when_kind_is_in_err_set() {
+    fn error_mirror_corr_overrides_and_turn_count_follow_the_published_kinds() {
         let dir = temp_dir();
         let relay = InspectorRelay::new("sess_err".into(), Some(dir.clone()));
         let mut payload = BTreeMap::new();
@@ -327,69 +338,40 @@ mod tests {
         assert!(lines[1].contains("\"origin_kind\":\"failed\""));
         assert!(lines[1].contains("\"kaboom\""));
         let _ = std::fs::remove_dir_all(&dir);
-    }
+        {
+            let dir = temp_dir();
+            let relay = InspectorRelay::new("sess_corr".into(), Some(dir.clone()));
+            relay.set_turn_id(Some("t1".into()));
+            relay.set_item_id(Some("i1".into()));
+            let corr_override = Corr {
+                item_id: Some("i_override".into()),
+                ..Default::default()
+            };
+            relay.publish(
+                "turn",
+                "user_committed",
+                Some(corr_override),
+                BTreeMap::new(),
+            );
 
-    #[test]
-    fn corr_merges_with_override() {
-        let dir = temp_dir();
-        let relay = InspectorRelay::new("sess_corr".into(), Some(dir.clone()));
-        relay.set_turn_id(Some("t1".into()));
-        relay.set_item_id(Some("i1".into()));
-        let corr_override = Corr {
-            item_id: Some("i_override".into()),
-            ..Default::default()
-        };
-        relay.publish(
-            "turn",
-            "user_committed",
-            Some(corr_override),
-            BTreeMap::new(),
-        );
-
-        let path = dir.join("sess_corr.ndjson");
-        let body = std::fs::read_to_string(&path).unwrap();
-        assert!(body.contains("\"turn_id\":\"t1\""));
-        assert!(body.contains("\"item_id\":\"i_override\""));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn turn_count_tracks_turn_end_kind() {
-        let dir = temp_dir();
-        let relay = InspectorRelay::new("sess_turn".into(), Some(dir.clone()));
-        assert_eq!(relay.turn_count(), 0);
-        relay.publish("turn", "turn_start", None, BTreeMap::new());
-        assert_eq!(relay.turn_count(), 0);
-        relay.publish("turn", "turn_end", None, BTreeMap::new());
-        assert_eq!(relay.turn_count(), 1);
-        relay.publish("turn", "turn_end", None, BTreeMap::new());
-        assert_eq!(relay.turn_count(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn subscriber_gets_replay_snapshot_first() {
-        let dir = temp_dir();
-        let relay = InspectorRelay::new("sess_replay".into(), Some(dir.clone()));
-        for i in 0..3 {
-            let mut p = BTreeMap::new();
-            p.insert("i".into(), json!(i));
-            relay.publish("turn", "turn_start", None, p);
+            let path = dir.join("sess_corr.ndjson");
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert!(body.contains("\"turn_id\":\"t1\""));
+            assert!(body.contains("\"item_id\":\"i_override\""));
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let sub = relay.subscribe();
-        assert_eq!(sub.snapshot.len(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn replay_buffer_caps_at_replay_cap() {
-        let dir = temp_dir();
-        let relay = InspectorRelay::new("sess_cap".into(), Some(dir.clone()));
-        for _ in 0..(REPLAY_CAP + 100) {
+        {
+            let dir = temp_dir();
+            let relay = InspectorRelay::new("sess_turn".into(), Some(dir.clone()));
+            assert_eq!(relay.turn_count(), 0);
             relay.publish("turn", "turn_start", None, BTreeMap::new());
+            assert_eq!(relay.turn_count(), 0);
+            relay.publish("turn", "turn_end", None, BTreeMap::new());
+            assert_eq!(relay.turn_count(), 1);
+            relay.publish("turn", "turn_end", None, BTreeMap::new());
+            assert_eq!(relay.turn_count(), 2);
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let sub = relay.subscribe();
-        assert_eq!(sub.snapshot.len(), REPLAY_CAP);
-        let _ = std::fs::remove_dir_all(&dir);
     }
+
 }

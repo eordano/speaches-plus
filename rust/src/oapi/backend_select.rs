@@ -213,7 +213,7 @@ impl ModelClass {
                 module: "nv_models::gemma4_e4b_wgpu",
                 entry: "Gemma4E4bWgpu::new",
                 evidence: WgpuEvidence::RealWeights {
-                    checkpoint: "google/gemma-4-E4B-it-qat-w4a16-ct (int4 group-32 weights serve by default: chat_engine_wgpu redirects a bf16 gemma-4-E4B-it dir to this pack-quantized sibling's weights unless NV_E4B_SERVE_BF16=1; ppl reference row for this checkpoint lives in perf/runs.jsonl)",
+                    checkpoint: "google/gemma-4-E4B-it-qat-w4a16-ct (int4 group-32 weights serve by default: chat_engine_wgpu redirects a bf16 gemma-4-E4B-it dir to this pack-quantized sibling's weights; ppl reference row for this checkpoint lives in perf/runs.jsonl)",
                     test: "real_e4b_checkpoint_wgpu_decode (NV_E4B_WGPU_TEST=1)",
                 },
             }),
@@ -236,8 +236,8 @@ impl ModelClass {
                 module: "nv_models::qwen3_5_dense_wgpu",
                 entry: "Qwen3_5DenseWgpu::from_loader",
                 evidence: WgpuEvidence::RealWeights {
-                    checkpoint: "ig1/Qwen3.5-9B-NVFP4 (nvfp4 weight_packed weights serve by default: chat_engine_wgpu redirects a bf16 Qwen3.5-9B dir to this pack-quantized sibling's weights unless NV_QWEN35_SERVE_BF16=1; ppl A/B rows for both arms live in perf/runs.jsonl)",
-                    test: "qwen35_dense_wgpu_real_weights_decode (NV_QWEN35_DENSE_WGPU_TEST=1)",
+                    checkpoint: "ig1/Qwen3.5-9B-NVFP4 (nvfp4 weight_packed weights serve by default: chat_engine_wgpu redirects a bf16 Qwen3.5-9B dir to this pack-quantized sibling's weights; ppl A/B rows for both arms live in perf/runs.jsonl)",
+                    test: "none live: qwen3.5-dense is a parked family and its real-weights decode suite is gone",
                 },
             }),
             Self::Qwen38Dense => Some(WgpuDecoder {
@@ -252,7 +252,7 @@ impl ModelClass {
                 entry: "GptOssWgpu::from_loader",
                 evidence: WgpuEvidence::RealWeights {
                     checkpoint: "openai/gpt-oss-20b",
-                    test: "gptoss_wgpu_real_weights_decode (NV_GPTOSS_WGPU_TEST=1)",
+                    test: "none live: gpt-oss is a parked family and its real-weights decode suite is gone",
                 },
             }),
             Self::Laguna => Some(WgpuDecoder {
@@ -440,7 +440,7 @@ pub fn cuda_model_unservable_reason(class: ModelClass) -> Option<String> {
         ModelClass::Gemma4Moe => None,
         ModelClass::Gemma4E4b => {
 
-            if std::env::var("NV_E4B_CUDA_SERVE").ok().as_deref() == Some("1") {
+            if nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_E4B_CUDA_SERVE") {
                 None
             } else {
                 Some(
@@ -634,10 +634,6 @@ pub fn resolve_with(
 
 pub fn resolve(sel: ServeBackend, model_id: &str) -> Result<BackendKind, BackendSelectError> {
     resolve_with(sel, model_id, &probe_cuda, &probe_wgpu)
-}
-
-pub fn resolve_from_env(model_id: &str) -> Result<BackendKind, BackendSelectError> {
-    resolve(ServeBackend::from_env()?, model_id)
 }
 
 fn decoder_entry(d: WgpuDecoder) -> Value {
@@ -849,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen38_ids_classify_dense_and_flagship_ids_classify_max() {
+    fn qwen38_ids_classify_and_the_flagship_is_refused_on_both_backends() {
         for id in [
             "Qwen/Qwen3.8-27B",
             "qwen/qwen3-8-27b",
@@ -876,42 +872,40 @@ mod tests {
             ModelClass::classify("ig1/Qwen3.5-9B-NVFP4"),
             ModelClass::Qwen35Dense
         );
-    }
-
-    #[test]
-    fn the_qwen38_flagship_is_refused_on_both_backends_for_capacity() {
-        let reason = cuda_model_unservable_reason(ModelClass::Qwen38Max)
-            .expect("the 2.4T flagship must carry a capacity refusal");
-        assert_eq!(reason, QWEN38_MAX_EXCEEDS_ANY_SINGLE_CARD);
-        for needle in ["2.4T", "96 GiB", "~1.3 TB", "either backend"] {
+        {
+            let reason = cuda_model_unservable_reason(ModelClass::Qwen38Max)
+                .expect("the 2.4T flagship must carry a capacity refusal");
+            assert_eq!(reason, QWEN38_MAX_EXCEEDS_ANY_SINGLE_CARD);
+            for needle in ["2.4T", "96 GiB", "~1.3 TB", "either backend"] {
+                assert!(
+                    reason.contains(needle),
+                    "the capacity refusal must state {needle:?}: {reason}"
+                );
+            }
+            assert_eq!(ModelClass::Qwen38Max.wgpu_decoder(), None);
+            let wgpu_err = wgpu_model_support(ModelClass::Qwen38Max)
+                .expect_err("no wgpu decoder row may exist for a checkpoint no single card can hold");
             assert!(
-                reason.contains(needle),
-                "the capacity refusal must state {needle:?}: {reason}"
+                wgpu_err.contains(QWEN38_MAX_EXCEEDS_ANY_SINGLE_CARD),
+                "{wgpu_err}"
             );
+            let err = resolve_with_build(
+                ServeBackend::Auto,
+                "Qwen/Qwen3.8-2.4T-A95B",
+                &|| Ok(()),
+                &|| Ok(()),
+                true,
+            )
+            .expect_err("auto must refuse the flagship on both backends, never pick one silently");
+            assert!(matches!(err, BackendSelectError::NoBackend { .. }), "{err}");
+            let msg = err.to_string();
+            assert!(msg.contains("96 GiB"), "{msg}");
+            assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let entry = model_entry(ModelClass::Qwen38Max);
+            assert_eq!(entry["cuda"]["servable"], false);
+            assert_eq!(entry["wgpu"]["servable"], false);
+            assert_eq!(entry["wgpu"]["decoder"], Value::Null);
         }
-        assert_eq!(ModelClass::Qwen38Max.wgpu_decoder(), None);
-        let wgpu_err = wgpu_model_support(ModelClass::Qwen38Max)
-            .expect_err("no wgpu decoder row may exist for a checkpoint no single card can hold");
-        assert!(
-            wgpu_err.contains(QWEN38_MAX_EXCEEDS_ANY_SINGLE_CARD),
-            "{wgpu_err}"
-        );
-        let err = resolve_with_build(
-            ServeBackend::Auto,
-            "Qwen/Qwen3.8-2.4T-A95B",
-            &|| Ok(()),
-            &|| Ok(()),
-            true,
-        )
-        .expect_err("auto must refuse the flagship on both backends, never pick one silently");
-        assert!(matches!(err, BackendSelectError::NoBackend { .. }), "{err}");
-        let msg = err.to_string();
-        assert!(msg.contains("96 GiB"), "{msg}");
-        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let entry = model_entry(ModelClass::Qwen38Max);
-        assert_eq!(entry["cuda"]["servable"], false);
-        assert_eq!(entry["wgpu"]["servable"], false);
-        assert_eq!(entry["wgpu"]["decoder"], Value::Null);
     }
 
     #[test]
@@ -1006,37 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pinned_qwen38_27b_config_parses_for_the_wgpu_dense_decoder_architectural_verification_only(
-    ) {
-        let cfg = qwen38_27b_config_json_pinned_from_release_facts_not_a_fetched_file();
-        let dense = nv_models::qwen3_5_moe::Qwen3_5DenseConfig::from_hf_json_str(&cfg).expect(
-            "release facts say qwen3.8 adds no config keys over qwen3.5, so the qwen3.5 dense \
-             parser must accept the pinned qwen3.8-27b shape",
-        );
-        assert_eq!(dense.num_hidden_layers, 64);
-        assert_eq!(dense.head_dim, 256);
-        assert_eq!(dense.vocab_size, 248320);
-        assert!(dense.attn_output_gate);
-        assert!((dense.rope_theta - 1.0e7).abs() < 1.0);
-        assert!((dense.partial_rotary_factor - 0.25).abs() < 1e-6);
-        assert_eq!(
-            dense
-                .layer_types
-                .iter()
-                .filter(|t| **t == nv_models::qwen3_5_moe::LayerType::FullAttention)
-                .count(),
-            16,
-            "full_attention_interval=4 over 64 layers is 16 gated-attention layers"
-        );
-        let err = nv_models::qwen3::Qwen3Config::from_hf_json_str(&cfg).expect_err(
-            "the cuda qwen3 parser must still choke on the text_config nesting; if it now \
-             parses, re-derive QWEN38_DENSE_NO_CUDA against whatever the load does instead",
-        );
-        assert!(format!("{err:#}").contains("missing field"), "{err:#}");
-    }
-
-    #[test]
-    fn a_qwen35_dense_checkpoint_is_refused_on_cuda_and_pointed_at_wgpu() {
+    fn a_qwen35_dense_checkpoint_is_refused_on_cuda_with_its_own_reason_and_pointed_at_wgpu() {
         for id in [
             "ig1/Qwen3.5-9B-NVFP4",
             "Qwen/Qwen3.5-9B",
@@ -1106,34 +1070,32 @@ mod tests {
             "nv_models::qwen3_5_dense_wgpu"
         );
         assert_eq!(entry["wgpu"]["decoder"]["evidence"], "real-weights-decode");
-    }
-
-    #[test]
-    fn a_models_own_refusal_outranks_the_builds() {
-        let dense = cuda_unservable_reason(ModelClass::Qwen35Dense)
-            .expect("qwen3.5-dense is unservable on cuda in every build");
-        assert_eq!(
-            dense, QWEN35_DENSE_NO_CUDA,
-            "the models map documents CHECKPOINTS, so a checkpoint cuda cannot serve must say \
-             why it cannot -- collapsing every entry to the build's own capability throws away \
-             the per-model detail on exactly the builds that need it most, and whether this \
-             binary has cuda is already reported by the top-level available field. \
-             wgpu_unservable_reason_for_build already resolves it this way round"
-        );
-        let servable = cuda_unservable_reason(ModelClass::Gemma4Moe);
-        if cfg!(feature = "cuda") {
-            assert_eq!(servable, None, "gemma4-moe is servable on a cuda build");
-        } else {
+        {
+            let dense = cuda_unservable_reason(ModelClass::Qwen35Dense)
+                .expect("qwen3.5-dense is unservable on cuda in every build");
             assert_eq!(
-                servable.as_deref(),
-                Some(CUDA_FEATURE_OFF_REASON),
-                "a model with no refusal of its own still falls back to the build's"
+                dense, QWEN35_DENSE_NO_CUDA,
+                "the models map documents CHECKPOINTS, so a checkpoint cuda cannot serve must say \
+                 why it cannot -- collapsing every entry to the build's own capability throws away \
+                 the per-model detail on exactly the builds that need it most, and whether this \
+                 binary has cuda is already reported by the top-level available field. \
+                 wgpu_unservable_reason_for_build already resolves it this way round"
             );
+            let servable = cuda_unservable_reason(ModelClass::Gemma4Moe);
+            if cfg!(feature = "cuda") {
+                assert_eq!(servable, None, "gemma4-moe is servable on a cuda build");
+            } else {
+                assert_eq!(
+                    servable.as_deref(),
+                    Some(CUDA_FEATURE_OFF_REASON),
+                    "a model with no refusal of its own still falls back to the build's"
+                );
+            }
         }
     }
 
     #[test]
-    fn the_cuda_loader_rejects_the_very_config_the_wgpu_decoder_accepts() {
+    fn the_cuda_loader_rejects_the_qwen35_and_pinned_qwen38_configs_the_wgpu_decoder_accepts() {
         let cfg = qwen35_dense_config_json();
 
         let err = nv_models::qwen3::Qwen3Config::from_hf_json_str(&cfg).expect_err(
@@ -1171,6 +1133,33 @@ mod tests {
             .expect("the same bytes must parse for the wgpu dense decoder");
         assert_eq!(dense.num_hidden_layers, 32);
         assert_eq!(dense.layer_types.len(), 32);
+        {
+            let cfg = qwen38_27b_config_json_pinned_from_release_facts_not_a_fetched_file();
+            let dense = nv_models::qwen3_5_moe::Qwen3_5DenseConfig::from_hf_json_str(&cfg).expect(
+                "release facts say qwen3.8 adds no config keys over qwen3.5, so the qwen3.5 dense \
+                 parser must accept the pinned qwen3.8-27b shape",
+            );
+            assert_eq!(dense.num_hidden_layers, 64);
+            assert_eq!(dense.head_dim, 256);
+            assert_eq!(dense.vocab_size, 248320);
+            assert!(dense.attn_output_gate);
+            assert!((dense.rope_theta - 1.0e7).abs() < 1.0);
+            assert!((dense.partial_rotary_factor - 0.25).abs() < 1e-6);
+            assert_eq!(
+                dense
+                    .layer_types
+                    .iter()
+                    .filter(|t| **t == nv_models::qwen3_5_moe::LayerType::FullAttention)
+                    .count(),
+                16,
+                "full_attention_interval=4 over 64 layers is 16 gated-attention layers"
+            );
+            let err = nv_models::qwen3::Qwen3Config::from_hf_json_str(&cfg).expect_err(
+                "the cuda qwen3 parser must still choke on the text_config nesting; if it now \
+                 parses, re-derive QWEN38_DENSE_NO_CUDA against whatever the load does instead",
+            );
+            assert!(format!("{err:#}").contains("missing field"), "{err:#}");
+        }
     }
 
     #[cfg(feature = "cuda")]

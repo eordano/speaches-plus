@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 RFC_VERSION = "v3"
 
 class session_defaults:

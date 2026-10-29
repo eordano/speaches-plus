@@ -25,10 +25,14 @@ pub mod q38;
 pub mod train;
 
 pub mod kokoro_web;
+#[cfg(feature = "browser")]
+pub mod voxtral_tts_web;
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub mod wasm;
 #[cfg(all(feature = "browser", target_arch = "wasm32"))]
 pub mod wasm_kokoro;
+#[cfg(all(feature = "browser", target_arch = "wasm32"))]
+pub mod wasm_tts;
 
 #[cfg(feature = "browser")]
 mod browser {
@@ -107,7 +111,7 @@ mod browser {
             < ATTN_REG_STAGES_16480_BYTES_SO_A_DEFAULT_LIMIT_BROWSER_MUST_KEEP_IT_OFF
             && std::env::var_os(nv_models::dots_ocr::decoder_wgpu_graph::ATTN_REG_ENV).is_none()
         {
-            std::env::set_var(nv_models::dots_ocr::decoder_wgpu_graph::ATTN_REG_ENV, "0");
+            unsafe { std::env::set_var(nv_models::dots_ocr::decoder_wgpu_graph::ATTN_REG_ENV, "0") };
         }
         WgpuContext::install_shared(ctx)
             .map_err(|e| anyhow::anyhow!("install browser wgpu context: {e}"))?;

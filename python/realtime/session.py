@@ -142,13 +142,6 @@ class FailReason(enum.Enum):
     TTS_ERROR = "tts_error"
     CLIENT_TOO_SLOW = "client_too_slow"
 
-    def to_status_reason(self) -> ResponseStatusReason:
-        return {
-            FailReason.LLM_ERROR: ResponseStatusReason.LLM_ERROR,
-            FailReason.TTS_ERROR: ResponseStatusReason.TTS_ERROR,
-            FailReason.CLIENT_TOO_SLOW: ResponseStatusReason.CLIENT_TOO_SLOW,
-        }[self]
-
 def _gen_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
@@ -383,10 +376,6 @@ class Session:
     async def instructions(self) -> str | None:
         async with self._state_lock:
             return self.state.instructions
-
-    async def set_instructions(self, instructions: str | None) -> None:
-        async with self._state_lock:
-            self.state.instructions = instructions
 
     async def build_chat_messages(self, instructions: str | None) -> list[dict[str, str]]:
         msgs: list[dict[str, str]] = []
@@ -674,27 +663,11 @@ class Session:
         except Exception as err:
             log.warning("observer on_session_end failed: %s", err)
 
-    def capture_inbound_pcm16(self, pcm: bytes) -> None:
-        if not pcm:
-            return
-        try:
-            self._observer.on_inbound_audio_pcm16(pcm)
-        except Exception as err:
-            log.warning("observer on_inbound_audio_pcm16 failed: %s", err)
-
     def capture_inbound_f32(self, samples: Any) -> None:
         try:
             self._observer.on_inbound_audio_f32(samples)
         except Exception as err:
             log.warning("observer on_inbound_audio_f32 failed: %s", err)
-
-    def capture_outbound_pcm16(self, pcm: bytes) -> None:
-        if not pcm:
-            return
-        try:
-            self._observer.on_outbound_audio_pcm16(pcm)
-        except Exception as err:
-            log.warning("observer on_outbound_audio_pcm16 failed: %s", err)
 
     def capture_outbound_f32(self, samples: Any) -> None:
         try:

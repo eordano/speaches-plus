@@ -14,6 +14,8 @@ pub struct Models {
     whisper_unavailable: Option<String>,
     pub kokoro: Option<KokoroHandle>,
 
+    pub voxtral_tts: Option<Arc<super::tts::voxtral_tts::VoxtralTtsSpeech>>,
+
     pub diar_segmentation: Option<Arc<SegmentationModel>>,
 
     pub diar_embedding: Option<Arc<EmbeddingModel>>,
@@ -71,6 +73,7 @@ impl Models {
                     WhisperHandle::Ct2 { .. } => "ct2",
                     WhisperHandle::WhisperCpp { .. } => "whisper.cpp",
                     WhisperHandle::Parakeet { .. } => "parakeet-tdt",
+                    WhisperHandle::Voxtral { .. } => "voxtral-realtime",
                 };
                 tracing::info!(
                     elapsed_ms = t.elapsed().as_millis() as u64,
@@ -102,6 +105,32 @@ impl Models {
                 model_dir.display()
             );
         }
+
+        let t = std::time::Instant::now();
+        let voxtral_tts = match super::tts::voxtral_tts::VoxtralTtsSpeech::prepared(&model_dir) {
+            Ok(Some(v)) => {
+                tracing::info!(
+                    elapsed_ms = t.elapsed().as_millis() as u64,
+                    device = v.device_name(),
+                    codec = v.codec_device(),
+                    "Voxtral TTS loaded; voxtral-tts on /v1/audio/speech ready"
+                );
+                Some(Arc::new(v))
+            }
+            Ok(None) => {
+                tracing::info!(
+                    "no {}/{} link and {} unset -- voxtral-tts on /v1/audio/speech disabled",
+                    model_dir.display(),
+                    super::tts::voxtral_tts::VOXTRAL_TTS_MODELS_DIR_LINK_NAME,
+                    super::tts::voxtral_tts::VOXTRAL_TTS_MODEL_DIR_ENV
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "failed to load Voxtral TTS; voxtral-tts disabled");
+                None
+            }
+        };
 
         let t = std::time::Instant::now();
         let diar_segmentation = {
@@ -165,6 +194,7 @@ impl Models {
             vad_unavailable,
             whisper_unavailable,
             kokoro,
+            voxtral_tts,
             diar_segmentation,
             diar_embedding,
             model_dir,
@@ -195,12 +225,6 @@ impl Models {
 
     pub fn whisper_opt(&self) -> Option<&WhisperHandle> {
         self.whisper.as_ref()
-    }
-
-    pub fn audio_disabled_reason(&self) -> Option<&str> {
-        self.vad_unavailable
-            .as_deref()
-            .or(self.whisper_unavailable.as_deref())
     }
 }
 
@@ -288,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_voices_bin_disables_kokoro_instead_of_aborting_boot() {
+    fn a_corrupt_missing_or_voiceless_kokoro_disables_kokoro_instead_of_aborting_boot() {
         let s = Scratch::new("corrupt-voices");
         std::fs::write(s.0.join("kokoro-v1.0.onnx"), b"placeholder onnx").unwrap();
         std::fs::write(s.0.join("voices.bin"), b"not a zip archive").unwrap();
@@ -303,20 +327,17 @@ mod tests {
         );
 
         assert!(load_kokoro(&s.0).is_none());
+        {
+            let s = Scratch::new("no-kokoro");
+            assert!(crate::tts::prepared_handle(&s.0).unwrap().is_none());
+            assert!(load_kokoro(&s.0).is_none());
+        }
+        {
+            let s = Scratch::new("no-voices");
+            std::fs::write(s.0.join("kokoro-v1.0.onnx"), b"placeholder onnx").unwrap();
+            assert!(crate::tts::prepared_handle(&s.0).unwrap().is_none());
+            assert!(load_kokoro(&s.0).is_none());
+        }
     }
 
-    #[test]
-    fn missing_kokoro_model_disables_kokoro() {
-        let s = Scratch::new("no-kokoro");
-        assert!(crate::tts::prepared_handle(&s.0).unwrap().is_none());
-        assert!(load_kokoro(&s.0).is_none());
-    }
-
-    #[test]
-    fn kokoro_model_without_voices_disables_kokoro() {
-        let s = Scratch::new("no-voices");
-        std::fs::write(s.0.join("kokoro-v1.0.onnx"), b"placeholder onnx").unwrap();
-        assert!(crate::tts::prepared_handle(&s.0).unwrap().is_none());
-        assert!(load_kokoro(&s.0).is_none());
-    }
 }

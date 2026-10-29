@@ -58,45 +58,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn heuristic_terminator_high() {
+    fn heuristic_scores_terminators_high_but_not_a_trailing_ellipsis() {
         assert!(HeuristicEouModel::score_text("are you sure?") >= 0.9);
         assert!(HeuristicEouModel::score_text("done.") >= 0.9);
         assert!(HeuristicEouModel::score_text("wow!") >= 0.9);
+        {
+            assert!(
+                HeuristicEouModel::score_text("about 440 for the...") <= 0.2,
+                "whisper writes '...' exactly when the speaker trails off; reading the final '.' \
+                 as a strong terminator inverts the signal"
+            );
+            assert!(HeuristicEouModel::score_text("I was thinking…") <= 0.2);
+            assert!(HeuristicEouModel::score_text("done.") >= 0.9);
+        }
     }
 
     #[test]
-    fn heuristic_continuation_low() {
+    fn heuristic_scores_continuations_hesitations_and_empties_low_and_neutral_text_midrange() {
         assert!(HeuristicEouModel::score_text("the cat is on the") <= 0.25);
         assert!(HeuristicEouModel::score_text("apples and") <= 0.25);
         assert!(HeuristicEouModel::score_text("she said,") <= 0.3);
+        {
+            assert!(HeuristicEouModel::score_text("I think um") <= 0.2);
+            assert!(HeuristicEouModel::score_text("hmm") <= 0.2);
+        }
+        {
+            let s = HeuristicEouModel::score_text("the train arrives at noon");
+            assert!((0.4..=0.8).contains(&s), "got {s}");
+        }
+        {
+            assert!(HeuristicEouModel::score_text("") <= 0.2);
+            assert!(HeuristicEouModel::score_text("   ") <= 0.2);
+        }
     }
 
-    #[test]
-    fn heuristic_hesitation_lowest() {
-        assert!(HeuristicEouModel::score_text("I think um") <= 0.2);
-        assert!(HeuristicEouModel::score_text("hmm") <= 0.2);
-    }
-
-    #[test]
-    fn heuristic_ellipsis_is_trailing_off_not_a_terminator() {
-        assert!(
-            HeuristicEouModel::score_text("about 440 for the...") <= 0.2,
-            "whisper writes '...' exactly when the speaker trails off; reading the final '.' \
-             as a strong terminator inverts the signal"
-        );
-        assert!(HeuristicEouModel::score_text("I was thinking…") <= 0.2);
-        assert!(HeuristicEouModel::score_text("done.") >= 0.9);
-    }
-
-    #[test]
-    fn heuristic_neutral_midrange() {
-        let s = HeuristicEouModel::score_text("the train arrives at noon");
-        assert!((0.4..=0.8).contains(&s), "got {s}");
-    }
-
-    #[test]
-    fn heuristic_empty_low() {
-        assert!(HeuristicEouModel::score_text("") <= 0.2);
-        assert!(HeuristicEouModel::score_text("   ") <= 0.2);
-    }
 }

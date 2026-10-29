@@ -20,9 +20,9 @@ bands hold a single fixture each and document themselves in that fixture's
 ## Bands
 
 | band | family | kind | fixtures | consumed by |
-| --- | --- | --- | --- | --- |
+|---|---|---|---|---|
 | 001-015 | realtime barge-turn | wire-trace | 15 | Go + Rust conformance gates, `run_fixture.py` |
-| 020 | `020-chat-completions` | endpoint manifest | 4 | `run_endpoint_fixture.py` |
+| 020 | `020-chat-completions` | endpoint manifest | 7 | `run_endpoint_fixture.py` |
 | 030 | `030-voice-clone` | endpoint manifest | 3 | `run_endpoint_fixture.py` |
 | 040 | `040-align` | endpoint manifest | 3 | `run_endpoint_fixture.py` |
 | 050 | `050-diarization` | declarative manifest | 1 | `rust/src/diarization/hop_sweep.rs` |
@@ -36,40 +36,57 @@ Declarative `fixture.json` payload keys are family-specific: `cases` for 060,
 
 ## Scenarios (001-015)
 
-| ID  | Name                                  | Focus                                                              |
-| --- | ------------------------------------- | ------------------------------------------------------------------ |
-| 001 | clean-utterance                       | Clean turn, full assistant response                                |
-| 002 | barge-in-streaming                    | User barges in mid-streaming assistant response                    |
-| 003 | eou-reentry                           | Speaking -> Stopped -> Speaking re-entry                             |
-| 004 | backchannel                           | Short utterance below `min_speech_for_response_ms`                 |
-| 005 | manual-response-create                | Client-driven `response.create` with instructions override         |
-| 006 | session-update-atomic                 | Invalid `session.update` rejected, reflective `session.updated` echo |
-| 007 | per-status-audio-end-ms-completed     | W4 / §8.5 -- `audio_end_ms` on `response.done(status=completed)`    |
-| 008 | per-status-audio-end-ms-cancelled     | W4 / §8.5 -- `audio_end_ms` on `response.done(status=cancelled)`    |
-| 009 | per-status-audio-end-ms-incomplete    | W4 / §8.5 -- `audio_end_ms` on `response.done(status=incomplete)`   |
-| 010 | session-update-atomic-both-fields     | §11.2.1 -- atomic accept/reject when one field is valid + one invalid |
-| 011 | silence-only-input                    | §15.3 -- silent session: only `session.created`, nothing else       |
-| 012 | per-status-audio-end-ms-failed        | W4 / §8.5 -- `audio_end_ms` on `response.done(status=failed)`       |
-| 013 | session-update-invalid-no-speech-prob | §11.2 / §17.4 -- out-of-range `no_speech_prob_threshold` rejected   |
-| 014 | session-update-invalid-neg-threshold  | §11.2 / §17.4 -- out-of-range `turn_detection.neg_threshold` rejected |
+| ID | Name | Focus |
+|---|---|---|
+| 001 | clean-utterance | Clean turn, full assistant response |
+| 002 | barge-in-streaming | User barges in mid-streaming assistant response |
+| 003 | eou-reentry | Speaking -> Stopped -> Speaking re-entry |
+| 004 | backchannel | Short utterance below `min_speech_for_response_ms` |
+| 005 | manual-response-create | Client-driven `response.create` with instructions override |
+| 006 | session-update-atomic | Invalid `session.update` rejected, reflective `session.updated` echo |
+| 007 | per-status-audio-end-ms-completed | W4 / §8.5 -- `audio_end_ms` on `response.done(status=completed)` |
+| 008 | per-status-audio-end-ms-cancelled | W4 / §8.5 -- `audio_end_ms` on `response.done(status=cancelled)` |
+| 009 | per-status-audio-end-ms-incomplete | W4 / §8.5 -- `audio_end_ms` on `response.done(status=incomplete)` |
+| 010 | session-update-atomic-both-fields | §11.2.1 -- atomic accept/reject when one field is valid + one invalid |
+| 011 | silence-only-input | §15.3 -- silent session: only `session.created`, nothing else |
+| 012 | per-status-audio-end-ms-failed | W4 / §8.5 -- `audio_end_ms` on `response.done(status=failed)` |
+| 013 | session-update-invalid-no-speech-prob | §11.2 / §17.4 -- out-of-range `no_speech_prob_threshold` rejected |
+| 014 | session-update-invalid-neg-threshold | §11.2 / §17.4 -- out-of-range `turn_detection.neg_threshold` rejected |
 | 015 | session-update-invalid-min-speech-duration | §11.2 / §17.4 -- `min_speech_duration_ms` above the 60 s cap rejected |
 
 ## Fixtures (020 / 030 / 040)
 
-| ID                                | Endpoint                                    |
-| --------------------------------- | ------------------------------------------- |
-| `020-chat-greedy-basic`           | POST /v1/chat/completions                   |
-| `020-chat-sampled-temp07`         | POST /v1/chat/completions                   |
-| `020-chat-structured-json`        | POST /v1/chat/completions                   |
-| `020-chat-tool-call-stub`         | POST /v1/chat/completions (streaming)       |
-| `030-voice-clone-base`            | POST /v1/audio/speech                       |
-| `030-voice-clone-design-warm`     | POST /v1/voice-profiles -> /v1/audio/speech  |
-| `030-voice-clone-custom-from-3sec`| POST /v1/voice-profiles -> GET -> DELETE      |
-| `040-align-en-words`              | POST /v1/audio/transcriptions               |
-| `040-align-zh-segments`           | POST /v1/audio/diarization                  |
-| `040-align-multi-lang-de-es-fr`   | POST /v1/audio/transcriptions x 3           |
+| ID | Endpoint |
+|---|---|
+| `020-chat-greedy-basic` | POST /v1/chat/completions |
+| `020-chat-sampled-temp07` | POST /v1/chat/completions |
+| `020-chat-structured-json` | POST /v1/chat/completions |
+| `020-chat-tool-call-stub` | POST /v1/chat/completions (streaming) |
+| `020-chat-guided-schema-keywords` | POST /v1/chat/completions |
+| `020-chat-guided-unsupported-keyword` | POST /v1/chat/completions (400) |
+| `020-chat-forced-tool-required` | POST /v1/chat/completions |
+| `030-voice-clone-base` | POST /v1/audio/speech |
+| `030-voice-clone-design-warm` | POST /v1/voice-profiles -> /v1/audio/speech |
+| `030-voice-clone-custom-from-3sec` | POST /v1/voice-profiles -> GET -> DELETE |
+| `040-align-en-words` | POST /v1/audio/transcriptions |
+| `040-align-zh-segments` | POST /v1/audio/diarization |
+| `040-align-multi-lang-de-es-fr` | POST /v1/audio/transcriptions x 3 |
 
 ## Running
+
+Tools shared by every implementation (`client/` drives the e2e suite over the wire):
+
+| Tool | Purpose |
+|---|---|
+| `client/test_e2e.py` | Single-leg STT round-trip |
+| `client/test_e2e_full.py` | Full conversation (orchestrator spawns subprocess) |
+| `client/fuzz_e2e.py` | Black-box fuzzer + RFC v3 invariant checker (§9.6, §8.2, §8.4, §10.x) |
+| `client/fake_llm.py` | Deterministic LLM stub (validates received text + emits fixed response) |
+| `client/fixtures/` | Synthetic audio WAVs |
+| `conformance/fixtures/` | Fixture corpus (input.jsonl + expected.jsonl pairs) |
+| `conformance/lib/trace_invariants.py` | W1-W8 wire invariants and I1-I11 state-machine invariants checker |
+| `conformance/lib/trace_diff.py` | Canonical trace diff against expected |
+| `conformance/runner/run_fixture.py` | Standalone fixture runner (no per-language harness needed) |
 
 ```sh
 ./conformance/runner/run_fixture.py fixtures/001-clean-utterance

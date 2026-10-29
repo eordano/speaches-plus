@@ -1,4 +1,8 @@
-use anyhow::{Context, Result};
+#[cfg(feature = "cuda")]
+use anyhow::bail;
+use anyhow::{ensure, Context, Result};
+#[cfg(feature = "cuda")]
+use candle_core::Storage;
 use candle_core::{DType, Device, Tensor, D};
 use nv_layers::linear::Linear;
 use nv_layers::norm::RmsNorm;
@@ -7,6 +11,16 @@ use nv_weights::WeightLoader;
 
 use crate::gemma4::{Gemma4Config, LayerType};
 use crate::CausalLm;
+#[cfg(feature = "cuda")]
+use candle_core::op::BackpropOp;
+#[cfg(feature = "cuda")]
+use candle_core::CudaDevice;
+#[cfg(feature = "cuda")]
+use candle_core::CudaStorage;
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
+use std::collections::BTreeMap;
 
 const PREFIX: &str = "model.language_model";
 
@@ -22,64 +36,10 @@ fn boot_warm_prefill_env_opted_in() -> bool {
     )
 }
 
-pub const NV_E4B_PREFILL_FIXED_CACHE_ENV_DEFAULT_ON_BITWISE_WITH_THE_CAT_PATH_0_RESTORES_CAT_WRITES_PREFILL_KV_IN_PLACE_INTO_A_PREALLOCATED_CAPACITY_BUFFER_SO_THE_SERVED_PREFILL_STOPS_COPYING_THE_WHOLE_CACHE_EVERY_CHUNK:
-    &str = "NV_E4B_PREFILL_FIXED_CACHE";
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PrefillLogitsRows {
-    AllRows,
     LastRow,
     Discarded,
-}
-
-pub const NV_E4B_PREFILL_LM_HEAD_LAST_ROW_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_INBAND_INSTRUMENT_RULE_0_RESTORES_THE_ALL_ROWS_LM_HEAD_THE_FINAL_PREFILL_CHUNK_RUNS_NORM_AND_LM_HEAD_ON_ITS_LAST_ROW_ONLY:
-    &str = "NV_E4B_PREFILL_LM_HEAD_LAST_ROW";
-
-pub const NV_E4B_PREFILL_QKV_PREP_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_INBAND_INSTRUMENT_RULE_0_RESTORES_THE_CANDLE_OP_CHAIN_ONE_KERNEL_PER_LAYER_CHUNK_DOES_Q_K_NORMS_ROPE_V_RMS_AND_THE_F32_CACHE_AND_BF16_TWIN_WRITES:
-    &str = "NV_E4B_PREFILL_QKV_PREP";
-
-pub fn prefill_qkv_prep_env_opted_in() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_E4B_PREFILL_QKV_PREP_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_INBAND_INSTRUMENT_RULE_0_RESTORES_THE_CANDLE_OP_CHAIN_ONE_KERNEL_PER_LAYER_CHUNK_DOES_Q_K_NORMS_ROPE_V_RMS_AND_THE_F32_CACHE_AND_BF16_TWIN_WRITES,
-    )
-}
-
-pub const NV_E4B_STEP_ARENA_ENV_DEFAULT_ON_BITWISE_0_RESTORES_PER_STEP_ALLOCATIONS_THE_GRAPHED_DECODE_STEPS_TEMPORARIES_COME_FROM_PERSISTENT_SLOTS_IN_CAPTURE_ORDER_SO_THE_GRAPH_CARRIES_NO_ALLOC_OR_FREE_NODES:
-    &str = "NV_E4B_STEP_ARENA";
-
-pub fn step_arena_env_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_E4B_STEP_ARENA_ENV_DEFAULT_ON_BITWISE_0_RESTORES_PER_STEP_ALLOCATIONS_THE_GRAPHED_DECODE_STEPS_TEMPORARIES_COME_FROM_PERSISTENT_SLOTS_IN_CAPTURE_ORDER_SO_THE_GRAPH_CARRIES_NO_ALLOC_OR_FREE_NODES,
-    )
-}
-
-pub fn prefill_lm_head_last_row_env_opted_in() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_E4B_PREFILL_LM_HEAD_LAST_ROW_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_INBAND_INSTRUMENT_RULE_0_RESTORES_THE_ALL_ROWS_LM_HEAD_THE_FINAL_PREFILL_CHUNK_RUNS_NORM_AND_LM_HEAD_ON_ITS_LAST_ROW_ONLY,
-    )
-}
-
-fn last_row_logits_rows() -> PrefillLogitsRows {
-    if prefill_lm_head_last_row_env_opted_in() {
-        PrefillLogitsRows::LastRow
-    } else {
-        PrefillLogitsRows::AllRows
-    }
-}
-
-pub fn prefill_fixed_cache_env_opted_in() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_E4B_PREFILL_FIXED_CACHE_ENV_DEFAULT_ON_BITWISE_WITH_THE_CAT_PATH_0_RESTORES_CAT_WRITES_PREFILL_KV_IN_PLACE_INTO_A_PREALLOCATED_CAPACITY_BUFFER_SO_THE_SERVED_PREFILL_STOPS_COPYING_THE_WHOLE_CACHE_EVERY_CHUNK,
-    )
-}
-
-pub const NV_E4B_PREFILL_SLIDING_NARROW_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_0_RESTORES_FULL_WIDTH_SCORING_OF_THE_35_SLIDING_LAYERS:
-    &str = "NV_E4B_PREFILL_SLIDING_NARROW";
-
-pub fn prefill_sliding_narrow_env_opted_in() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_E4B_PREFILL_SLIDING_NARROW_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_0_RESTORES_FULL_WIDTH_SCORING_OF_THE_35_SLIDING_LAYERS,
-    )
 }
 
 pub const NV_E4B_MLP_W4A8FP8_ENV_OPT_IN_1_RUNS_MLP_MARLIN_GEMMS_WITH_PER_ROW_FP8_ACTIVATIONS_AND_X512_COMPENSATED_SCALES_BECAUSE_CHUNK_512_PREFILL_IS_THE_LARGE_M_REGIME_WHERE_FP8_TENSOR_CORES_PAY_WHILE_DECODE_M1_KEEPS_THE_GEMV_PATH_UNTOUCHED_AND_ATTN_PROJECTIONS_STAY_A16_PER_THE_QWEN_W4A8_MLP_ONLY_PRECEDENT:
@@ -91,53 +51,8 @@ pub fn mlp_w4a8fp8_env_opted_in() -> bool {
     )
 }
 
-pub const NV_E4B_PREFILL_FLASH_ATTN_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_0_RESTORES_EAGER_SDPA_ON_EVERY_PREFILL_LAYER:
-    &str = "NV_E4B_PREFILL_FLASH_ATTN";
-
-pub fn prefill_flash_attn_env_opted_in() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_E4B_PREFILL_FLASH_ATTN_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_0_RESTORES_EAGER_SDPA_ON_EVERY_PREFILL_LAYER,
-    )
-}
-
-pub const NV_E4B_PREFILL_FULL_GEMM_ATTN_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_0_RESTORES_THE_FLASH_OR_EAGER_FULL_LAYER_PATH_GQA_FOLDED_BF16_GEMMS_WITH_F32_SCORES_AND_A_4096_KEY_TILED_ONLINE_SOFTMAX_PAST_THE_FIRST_TILE_BECAUSE_EVERY_FA2_HDIM512_INSTANTIATION_SPILLS_AND_SM120_SMEM_LEAVES_ONLY_THE_32X32_TWO_WARP_TILE:
-    &str = "NV_E4B_PREFILL_FULL_GEMM_ATTN";
-
 pub const E4B_FULL_GEMM_ATTN_FROM_THE_SECOND_KEY_TILE_4096_BECAUSE_INSIDE_ONE_TILE_FA2_WINS_THE_2K_CELL_BY_15_MS: usize =
     nv_layers::attn::E4B_FULL_ATTN_KEY_TILE_4096_KEEPS_THE_F32_SCORE_TILE_INSIDE_L2_AND_MATCHES_THE_SOFTMAX_KERNELS_REGISTER_BUDGET;
-
-pub const NV_E4B_DECODE_GQA_FULL_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_0_RESTORES_THE_PER_QUERY_HEAD_KERNEL_THE_7_FULL_LAYERS_DECODE_ON_A_KV_HEAD_GROUPED_HD512_SPLIT_K_KERNEL_THAT_STREAMS_EACH_KV_ROW_ONCE_FOR_ITS_4_QUERY_HEADS:
-    &str = "NV_E4B_DECODE_GQA_FULL";
-
-pub fn decode_gqa_full_env_opted_in() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_E4B_DECODE_GQA_FULL_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_0_RESTORES_THE_PER_QUERY_HEAD_KERNEL_THE_7_FULL_LAYERS_DECODE_ON_A_KV_HEAD_GROUPED_HD512_SPLIT_K_KERNEL_THAT_STREAMS_EACH_KV_ROW_ONCE_FOR_ITS_4_QUERY_HEADS,
-    )
-}
-
-pub fn prefill_full_gemm_attn_env_opted_in() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_E4B_PREFILL_FULL_GEMM_ATTN_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_0_RESTORES_THE_FLASH_OR_EAGER_FULL_LAYER_PATH_GQA_FOLDED_BF16_GEMMS_WITH_F32_SCORES_AND_A_4096_KEY_TILED_ONLINE_SOFTMAX_PAST_THE_FIRST_TILE_BECAUSE_EVERY_FA2_HDIM512_INSTANTIATION_SPILLS_AND_SM120_SMEM_LEAVES_ONLY_THE_32X32_TWO_WARP_TILE,
-    )
-}
-
-pub const NV_E4B_PREFILL_FULL_FLASH_HD512_ENV_OPT_OUT_0_UNDER_NV_E4B_PREFILL_FLASH_ATTN_FULL_ATTENTION_HD512_LAYERS_DEFAULT_TO_CANDLE_FLASH_ATTN_F16_NATIVE_GQA_CAUSAL_BECAUSE_CANDLE_011_FIXED_THE_SM120_HDIM512_FORWARD_AND_FLASH_WINS_1_09X_AT_8K_TO_1_39X_AT_120K_ON_THE_HD512_FLASHVSBF16_ROWS_WHILE_0_SELECTS_THE_BF16_TENSOR_CORE_GEMM_ROUTE:
-    &str = "NV_E4B_PREFILL_FULL_FLASH_HD512";
-
-pub fn prefill_full_flash_hd512_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_E4B_PREFILL_FULL_FLASH_HD512_ENV_OPT_OUT_0_UNDER_NV_E4B_PREFILL_FLASH_ATTN_FULL_ATTENTION_HD512_LAYERS_DEFAULT_TO_CANDLE_FLASH_ATTN_F16_NATIVE_GQA_CAUSAL_BECAUSE_CANDLE_011_FIXED_THE_SM120_HDIM512_FORWARD_AND_FLASH_WINS_1_09X_AT_8K_TO_1_39X_AT_120K_ON_THE_HD512_FLASHVSBF16_ROWS_WHILE_0_SELECTS_THE_BF16_TENSOR_CORE_GEMM_ROUTE,
-    )
-}
-
-pub const NV_E4B_STEP_LOGITS_UNCAPPED_ENV_OPT_IN_1_RESTORES_THE_RAW_LM_HEAD_STEP_ROWS_THAT_SKIPPED_THE_CONFIGS_FINAL_LOGIT_SOFTCAPPING_WHICH_TRACE_WGPU_AND_GEMMA4_31B_ALL_APPLY_TANH_IS_MONOTONE_SO_GREEDY_OUTPUT_NEVER_MOVED_BUT_SAMPLING_LOGPROBS_AND_PPL_READ_THE_UNCAPPED_DISTRIBUTION_705_VS_16_ON_THE_CHAT_SLICE:
-    &str = "NV_E4B_STEP_LOGITS_UNCAPPED";
-
-pub fn step_logits_uncapped_env_opted_in() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
-        NV_E4B_STEP_LOGITS_UNCAPPED_ENV_OPT_IN_1_RESTORES_THE_RAW_LM_HEAD_STEP_ROWS_THAT_SKIPPED_THE_CONFIGS_FINAL_LOGIT_SOFTCAPPING_WHICH_TRACE_WGPU_AND_GEMMA4_31B_ALL_APPLY_TANH_IS_MONOTONE_SO_GREEDY_OUTPUT_NEVER_MOVED_BUT_SAMPLING_LOGPROBS_AND_PPL_READ_THE_UNCAPPED_DISTRIBUTION_705_VS_16_ON_THE_CHAT_SLICE,
-    )
-}
 
 fn name(suffix: &str) -> String {
     format!("{PREFIX}.{suffix}")
@@ -162,12 +77,12 @@ fn load_linear(
         )?));
     }
     let packed = format!("{suffix}.weight_packed");
-    anyhow::ensure!(
+    ensure!(
         weights.has(&name(&packed)),
         "no .weight or .weight_packed for {suffix}"
     );
     #[cfg(feature = "cuda")]
-    if matches!(device, Device::Cuda(_)) {
+    if device.is_cuda() {
         let (pbytes, scale, out, inp) = read_packed_parts(weights, suffix)?;
         return pick_quant_backend(&pbytes, scale, out, inp, device, suffix);
     }
@@ -183,7 +98,7 @@ fn load_linear_merged(
     dtype: DType,
     device: &Device,
 ) -> Result<QLinear> {
-    anyhow::ensure!(suffixes.len() >= 2, "merge needs >= 2 linears");
+    ensure!(suffixes.len() >= 2, "merge needs >= 2 linears");
     let wa = format!("{}.weight", suffixes[0]);
     if weights.has(&name(&wa)) {
         let parts = suffixes
@@ -194,7 +109,7 @@ fn load_linear_merged(
         return Ok(QLinear::Dense(Linear::new(Tensor::cat(&refs, 0)?, None)?));
     }
     #[cfg(feature = "cuda")]
-    if matches!(device, Device::Cuda(_)) {
+    if device.is_cuda() {
         let mut p: Vec<u8> = Vec::new();
         let mut scales: Vec<Tensor> = Vec::new();
         let mut out = 0usize;
@@ -204,7 +119,7 @@ fn load_linear_merged(
             if inp == 0 {
                 inp = ib;
             }
-            anyhow::ensure!(ib == inp, "merged linears must share in_features");
+            ensure!(ib == inp, "merged linears must share in_features");
             p.extend_from_slice(&pb);
             scales.push(sb);
             out += ob;
@@ -232,7 +147,7 @@ fn read_packed_parts(
     let inp = shape[1] as usize;
     let scale = load_tensor(weights, &format!("{suffix}.weight_scale"), DType::BF16)?;
     let pbytes = weights.raw_bytes(&name(&format!("{suffix}.weight_packed")))?;
-    anyhow::ensure!(
+    ensure!(
         pbytes.len() == out * (inp / 8) * 4,
         "{suffix} packed size mismatch"
     );
@@ -262,16 +177,7 @@ fn pick_quant_backend(
             pbytes, scale, out, inp, device,
         )?));
     }
-    if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_FORCE_MARLIN") {
-        return Ok(QLinear::Marlin(MarlinLinear::from_raw_backend(
-            pbytes, scale, out, inp, device, a8_mlp,
-        )?));
-    }
-
-    let large_gemv = nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_E4B_GEMV_LARGE",
-    );
-    if large_gemv && gs == 32 {
+    if gs == 32 {
         let variant = if inp == 2560 && out == 20480 {
             Some(0)
         } else if inp == 10240 && out == 2560 {
@@ -308,7 +214,7 @@ fn pick_quant_backend(
         )?));
     }
 
-    if std::env::var("NV_E4B_AUTOTUNE").is_err() {
+    if !nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_AUTOTUNE") {
         return Ok(QLinear::Marlin(MarlinLinear::from_raw_backend(
             pbytes, scale, out, inp, device, a8_mlp,
         )?));
@@ -342,20 +248,19 @@ fn pick_quant_backend(
 
 #[cfg(feature = "cuda")]
 fn bench_forward<F: FnMut() -> Result<Tensor>>(mut f: F, device: &Device) -> Result<f64> {
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("bench_forward requires cuda"),
+    let Device::Cuda(dev) = device.clone() else {
+        bail!("bench_forward requires cuda")
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     for _ in 0..3 {
         let _ = f()?;
     }
-    stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+    stream.synchronize()?;
     let t0 = std::time::Instant::now();
     for _ in 0..20 {
         let _ = f()?;
     }
-    stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+    stream.synchronize()?;
     Ok(t0.elapsed().as_secs_f64() / 20.0)
 }
 
@@ -375,7 +280,7 @@ fn dequant_pack_quantized(
     let gs = inp / scale[0].len();
 
     let pbytes = weights.raw_bytes(&name(&format!("{suffix}.weight_packed")))?;
-    anyhow::ensure!(
+    ensure!(
         pbytes.len() == out * cols * 4,
         "{suffix}.weight_packed: {} bytes != {}",
         pbytes.len(),
@@ -417,7 +322,7 @@ struct GemvM1Hybrid {
     variant: i32,
     y_persist: std::sync::OnceLock<(Tensor, u64)>,
     geglu_persist: std::sync::OnceLock<(Tensor, u64)>,
-    post_norm_last_block_counter: std::sync::OnceLock<cudarc::driver::CudaSlice<u32>>,
+    post_norm_last_block_counter: std::sync::OnceLock<CudaSlice<u32>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -430,30 +335,21 @@ fn persist_bf16_row(
     lock: &std::sync::OnceLock<(Tensor, u64)>,
     elems: usize,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-    dev: &candle_core::CudaDevice,
+    dev: &CudaDevice,
 ) -> Result<(Tensor, u64)> {
     use cudarc::driver::DevicePtrMut;
     use half::bf16;
     if let Some((t, p)) = lock.get() {
         return Ok((t.clone(), *p));
     }
-    let mut buf: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(elems)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut buf: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(elems)? };
     let ptr = {
         let (p, _g) = buf.device_ptr_mut(stream);
         p
     };
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(buf, dev.clone());
-    let storage = candle_core::Storage::Cuda(storage);
-    let t = Tensor::from_storage(
-        storage,
-        (1usize, elems),
-        candle_core::op::BackpropOp::none(),
-        false,
-    );
+    let storage = CudaStorage::wrap_cuda_slice(buf, dev.clone());
+    let storage = Storage::Cuda(storage);
+    let t = Tensor::from_storage(storage, (1usize, elems), BackpropOp::none(), false);
     let _ = lock.set((t, ptr));
     let (t, p) = lock.get().unwrap();
     Ok((t.clone(), *p))
@@ -464,7 +360,7 @@ impl GemvM1Hybrid {
     fn persist_y(
         &self,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-        dev: &candle_core::CudaDevice,
+        dev: &CudaDevice,
     ) -> Result<(Tensor, u64)> {
         persist_bf16_row(&self.y_persist, self.gemv.out_features, stream, dev)
     }
@@ -472,24 +368,33 @@ impl GemvM1Hybrid {
     fn m1_operands(
         &self,
         x: &Tensor,
-    ) -> Result<(candle_core::CudaDevice, std::sync::Arc<cudarc::driver::CudaStream>, Tensor)> {
+    ) -> Result<(
+        CudaDevice,
+        std::sync::Arc<cudarc::driver::CudaStream>,
+        Tensor,
+    )> {
         let kin = *x.dims().last().unwrap();
-        anyhow::ensure!(kin == self.gemv.in_features, "gemv_m1 in mismatch");
-        let dev = match &self.gemv.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("gemv_m1 requires cuda"),
+        ensure!(kin == self.gemv.in_features, "gemv_m1 in mismatch");
+        let Device::Cuda(dev) = self.gemv.device.clone() else {
+            bail!("gemv_m1 requires cuda")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let x2 = x.reshape((1, kin))?.to_dtype(DType::BF16)?.contiguous()?;
         Ok((dev, stream, x2))
     }
 
-    fn forward_geglu_pairing_gate_row_n_with_up_row_n_plus_inter(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward_geglu_pairing_gate_row_n_with_up_row_n_plus_inter(
+        &self,
+        x: &Tensor,
+    ) -> Result<Tensor> {
         use cudarc::driver::DevicePtr;
         use half::bf16;
         let m: usize = x.dims()[..x.dims().len() - 1].iter().product();
-        anyhow::ensure!(m == 1, "the geglu fold is M=1 only");
-        anyhow::ensure!(self.gemv.out_features % 2 == 0, "geglu needs gate rows then up rows");
+        ensure!(m == 1, "the geglu fold is M=1 only");
+        ensure!(
+            self.gemv.out_features % 2 == 0,
+            "geglu needs gate rows then up rows"
+        );
         let inter = self.gemv.out_features / 2;
         let (dev, stream, x2) = self.m1_operands(x)?;
         let (yt, yp) = persist_bf16_row(&self.geglu_persist, inter, &stream, &dev)?;
@@ -497,10 +402,9 @@ impl GemvM1Hybrid {
             let (xs, _) = x2.storage_and_layout();
             let (ps, _) = self.gemv.packed.storage_and_layout();
             let (ss, _) = self.gemv.scale.storage_and_layout();
-            let (candle_core::Storage::Cuda(xc), candle_core::Storage::Cuda(pc), candle_core::Storage::Cuda(sc)) =
-                (&*xs, &*ps, &*ss)
+            let (Storage::Cuda(xc), Storage::Cuda(pc), Storage::Cuda(sc)) = (&*xs, &*ps, &*ss)
             else {
-                anyhow::bail!("gemv_m1: operands not cuda")
+                bail!("gemv_m1: operands not cuda")
             };
             let (xp, _gx) = xc.as_cuda_slice::<bf16>()?.device_ptr(&stream);
             let (pp, _gp) = pc.as_cuda_slice::<u32>()?.device_ptr(&stream);
@@ -519,7 +423,7 @@ impl GemvM1Hybrid {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "gemv_w4a16_m1_proto_geglu returned {rc}");
+        ensure!(rc == 0, "gemv_w4a16_m1_proto_geglu returned {rc}");
         yt.reshape((1usize, inter)).map_err(Into::into)
     }
 
@@ -535,24 +439,27 @@ impl GemvM1Hybrid {
         use cudarc::driver::DevicePtr;
         use half::bf16;
         let m: usize = x.dims()[..x.dims().len() - 1].iter().product();
-        anyhow::ensure!(m == 1, "the post-norm fold is M=1 only");
+        ensure!(m == 1, "the post-norm fold is M=1 only");
         let n = self.gemv.out_features;
         let (dev, stream, x2) = self.m1_operands(x)?;
         let (_yt, yp) = self.persist_y(&stream, &dev)?;
         let res_c = res.contiguous()?;
-        anyhow::ensure!(
+        ensure!(
             res_c.dtype() == DType::BF16 && res_c.elem_count() == n,
             "post-norm fold residual mismatch"
         );
         let w = norm.weight_bf16();
-        anyhow::ensure!(w.dtype() == DType::BF16 && w.elem_count() == n, "norm weight mismatch");
+        ensure!(
+            w.dtype() == DType::BF16 && w.elem_count() == n,
+            "norm weight mismatch"
+        );
         if next_w.is_some() {
-            anyhow::ensure!(chain_eps.is_some(), "next_w requires chain_eps");
+            ensure!(chain_eps.is_some(), "next_w requires chain_eps");
         }
         let counter = match self.post_norm_last_block_counter.get() {
             Some(c) => c,
             None => {
-                let z = stream.alloc_zeros::<u32>(1).map_err(|e| anyhow::anyhow!(e))?;
+                let z = stream.alloc_zeros::<u32>(1)?;
                 let _ = self.post_norm_last_block_counter.set(z);
                 self.post_norm_last_block_counter.get().unwrap()
             }
@@ -564,21 +471,28 @@ impl GemvM1Hybrid {
             &[n],
         )?;
         let rstd_dev = match chain_eps {
-            Some(_) => Some(nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
-                &cdev,
-                DType::F32,
-                &[1],
-            )?),
+            Some(_) => Some(
+                nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
+                    &cdev,
+                    DType::F32,
+                    &[1],
+                )?,
+            ),
             None => None,
         };
         let normed_dev = match next_w {
             Some(nw) => {
-                anyhow::ensure!(nw.dtype() == DType::BF16 && nw.elem_count() == n, "next_w mismatch");
-                Some(nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
-                    &cdev,
-                    DType::BF16,
-                    &[n],
-                )?)
+                ensure!(
+                    nw.dtype() == DType::BF16 && nw.elem_count() == n,
+                    "next_w mismatch"
+                );
+                Some(
+                    nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
+                        &cdev,
+                        DType::BF16,
+                        &[n],
+                    )?,
+                )
             }
             None => None,
         };
@@ -589,14 +503,14 @@ impl GemvM1Hybrid {
             let (rs, _) = res_c.storage_and_layout();
             let (ws, _) = w.storage_and_layout();
             let (
-                candle_core::Storage::Cuda(xc),
-                candle_core::Storage::Cuda(pc),
-                candle_core::Storage::Cuda(sc),
-                candle_core::Storage::Cuda(rcu),
-                candle_core::Storage::Cuda(wc),
+                Storage::Cuda(xc),
+                Storage::Cuda(pc),
+                Storage::Cuda(sc),
+                Storage::Cuda(rcu),
+                Storage::Cuda(wc),
             ) = (&*xs, &*ps, &*ss, &*rs, &*ws)
             else {
-                anyhow::bail!("gemv_m1: operands not cuda")
+                bail!("gemv_m1: operands not cuda")
             };
             let (xp, _gx) = xc.as_cuda_slice::<bf16>()?.device_ptr(&stream);
             let (pp, _gp) = pc.as_cuda_slice::<u32>()?.device_ptr(&stream);
@@ -612,8 +526,8 @@ impl GemvM1Hybrid {
             let next_w_ptr = match next_w {
                 Some(nw) => {
                     let (ns, _nl) = nw.storage_and_layout();
-                    let candle_core::Storage::Cuda(nc) = &*ns else {
-                        anyhow::bail!("next_w not cuda")
+                    let Storage::Cuda(nc) = &*ns else {
+                        bail!("next_w not cuda")
                     };
                     let (np, _gn) = nc.as_cuda_slice::<bf16>()?.device_ptr(&stream);
                     np as *const u16
@@ -648,7 +562,7 @@ impl GemvM1Hybrid {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "gemv_w4a16_m1_proto_post_norm returned {rc}");
+        ensure!(rc == 0, "gemv_w4a16_m1_proto_post_norm returned {rc}");
         let h = h_dev.reshape((1usize, n))?;
         let normed = normed_dev.map(|b| b.reshape((1usize, n))).transpose()?;
         Ok((h, rstd_dev, normed))
@@ -663,10 +577,9 @@ impl GemvM1Hybrid {
         if m != 1 {
             return self.marlin.forward(x);
         }
-        anyhow::ensure!(kin == self.gemv.in_features, "gemv_m1 in mismatch");
-        let dev = match &self.gemv.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("gemv_m1 requires cuda"),
+        ensure!(kin == self.gemv.in_features, "gemv_m1 in mismatch");
+        let Device::Cuda(dev) = self.gemv.device.clone() else {
+            bail!("gemv_m1 requires cuda")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let (yt, yp) = self.persist_y(&stream, &dev)?;
@@ -676,16 +589,16 @@ impl GemvM1Hybrid {
             let (ps, _) = self.gemv.packed.storage_and_layout();
             let (ss, _) = self.gemv.scale.storage_and_layout();
             let xc = match &*xs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("gemv_m1: x not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("gemv_m1: x not cuda"),
             };
             let pc = match &*ps {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("gemv_m1: packed not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("gemv_m1: packed not cuda"),
             };
             let sc = match &*ss {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("gemv_m1: scale not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("gemv_m1: scale not cuda"),
             };
             let xsl = xc.as_cuda_slice::<bf16>()?;
             let psl = pc.as_cuda_slice::<u32>()?;
@@ -707,7 +620,7 @@ impl GemvM1Hybrid {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "gemv_w4a16_m1 returned {rc}");
+        ensure!(rc == 0, "gemv_w4a16_m1 returned {rc}");
         let mut out_dims = dims[..dims.len() - 1].to_vec();
         out_dims.push(self.gemv.out_features);
         yt.reshape(out_dims).map_err(Into::into)
@@ -787,12 +700,11 @@ impl W4a16Linear {
 
         let dims = x.dims().to_vec();
         let kin = *dims.last().unwrap();
-        anyhow::ensure!(kin == self.in_features, "w4a16 in mismatch");
+        ensure!(kin == self.in_features, "w4a16 in mismatch");
         let m: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((m, kin))?.to_dtype(DType::BF16)?.contiguous()?;
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("w4a16 requires cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("w4a16 requires cuda")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let y_dev = nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
@@ -805,16 +717,16 @@ impl W4a16Linear {
             let (ps, _) = self.packed.storage_and_layout();
             let (ss, _) = self.scale.storage_and_layout();
             let xc = match &*xs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("w4a16: x not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("w4a16: x not cuda"),
             };
             let pc = match &*ps {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("w4a16: packed not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("w4a16: packed not cuda"),
             };
             let sc = match &*ss {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("w4a16: scale not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("w4a16: scale not cuda"),
             };
             let xsl = xc.as_cuda_slice::<bf16>()?;
             let psl = pc.as_cuda_slice::<u32>()?;
@@ -841,7 +753,7 @@ impl W4a16Linear {
                     )
                 };
                 if rc != 0 {
-                    anyhow::bail!("gemv_w4a16 returned {rc}");
+                    bail!("gemv_w4a16 returned {rc}");
                 }
             }
         }
@@ -857,21 +769,20 @@ impl W4a16Linear {
     fn forward_gelu_pli(&self, x: &Tensor, pli: &Tensor) -> Result<Tensor> {
         use cudarc::driver::DevicePtr;
         use half::bf16;
-        anyhow::ensure!(
+        ensure!(
             self.in_features <= 3072 && self.group_size >= 32,
             "fused pli shape"
         );
         let dims = x.dims().to_vec();
-        anyhow::ensure!(
+        ensure!(
             *dims.last().unwrap() == self.in_features,
             "fused pli in mismatch"
         );
         let m: usize = dims[..dims.len() - 1].iter().product();
-        anyhow::ensure!(m == 1, "fused pli is M=1 only");
-        anyhow::ensure!(pli.elem_count() == self.out_features, "pli numel mismatch");
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("fused pli requires cuda"),
+        ensure!(m == 1, "fused pli is M=1 only");
+        ensure!(pli.elem_count() == self.out_features, "pli numel mismatch");
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("fused pli requires cuda")
         };
         let x2 = x
             .reshape((1, self.in_features))?
@@ -892,20 +803,20 @@ impl W4a16Linear {
                 .contiguous_offsets()
                 .ok_or_else(|| anyhow::anyhow!("pli not dense"))?;
             let xc = match &*xs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("x not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("x not cuda"),
             };
             let pc = match &*ps {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("packed not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("packed not cuda"),
             };
             let sc = match &*ss {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("scale not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("scale not cuda"),
             };
             let plc = match &*pls {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("pli not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("pli not cuda"),
             };
             let xsl = xc.as_cuda_slice::<bf16>()?;
             let psl = pc.as_cuda_slice::<u32>()?;
@@ -931,7 +842,7 @@ impl W4a16Linear {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "gemv_w4a16_gelu_pli returned {rc}");
+        ensure!(rc == 0, "gemv_w4a16_gelu_pli returned {rc}");
         y_dev
             .reshape((1usize, self.out_features))
             .map_err(Into::into)
@@ -954,24 +865,24 @@ pub(crate) enum MarlinM1Tail<'a> {
 
 #[cfg(feature = "cuda")]
 pub(crate) struct MarlinLinear {
-    b_q_marlin: cudarc::driver::CudaSlice<i32>,
+    b_q_marlin: CudaSlice<i32>,
     b_scales: Tensor,
-    workspace: cudarc::driver::CudaSlice<i32>,
+    workspace: CudaSlice<i32>,
 
-    c_tmp: Option<std::sync::Arc<cudarc::driver::CudaSlice<f32>>>,
+    c_tmp: Option<std::sync::Arc<CudaSlice<f32>>>,
     c_persist: std::sync::OnceLock<(Tensor, u64)>,
-    m1_tail_last_block_counter: std::sync::OnceLock<cudarc::driver::CudaSlice<u32>>,
+    m1_tail_last_block_counter: std::sync::OnceLock<CudaSlice<u32>>,
     a8_fp8: bool,
     out_features: usize,
     in_features: usize,
     group_size: usize,
-    device: candle_core::CudaDevice,
+    device: CudaDevice,
 }
 
 #[cfg(feature = "cuda")]
 struct MarlinZeroRegistry {
     entries: Vec<u64>,
-    dev: Option<cudarc::driver::CudaSlice<u64>>,
+    dev: Option<CudaSlice<u64>>,
     dev_ptr: u64,
     version: u64,
     uploaded_version: u64,
@@ -1019,9 +930,7 @@ pub(crate) fn marlin_zero_upload(
         return Ok(());
     }
     if reg.dev.is_none() {
-        let mut dev: cudarc::driver::CudaSlice<u64> = stream
-            .alloc_zeros::<u64>(2 * MARLIN_ZERO_CAP)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut dev: CudaSlice<u64> = stream.alloc_zeros::<u64>(2 * MARLIN_ZERO_CAP)?;
         let ptr = {
             let (p, _g) = dev.device_ptr_mut(stream);
             p
@@ -1033,10 +942,8 @@ pub(crate) fn marlin_zero_upload(
     host.resize(2 * MARLIN_ZERO_CAP, 0);
     let count = (reg.entries.len() / 2) as i32;
     let version = reg.version;
-    stream
-        .memcpy_htod(&host, reg.dev.as_mut().unwrap())
-        .map_err(|e| anyhow::anyhow!(e))?;
-    stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+    stream.memcpy_htod(&host, reg.dev.as_mut().unwrap())?;
+    stream.synchronize()?;
     reg.uploaded_version = version;
     reg.uploaded_count = count;
     Ok(())
@@ -1060,14 +967,14 @@ pub(crate) fn marlin_zero_launch(
             count,
         )
     };
-    anyhow::ensure!(rc == 0, "multi_zero_bf16 returned {rc}");
+    ensure!(rc == 0, "multi_zero_bf16 returned {rc}");
     Ok(())
 }
 
 #[cfg(feature = "cuda")]
 fn marlin_zero_deregister_then_reupload_before_the_buffer_frees_so_no_zero_launch_scribbles_the_reused_address(
     ptr: u64,
-    device: &candle_core::CudaDevice,
+    device: &CudaDevice,
 ) {
     let reupload = {
         let mut reg = marlin_zero_registry().lock().unwrap();
@@ -1108,7 +1015,7 @@ pub(crate) fn marlin_zero_snapshot_host_entries_uploaded_device_list_and_count(
 ) -> Result<(Vec<u64>, Vec<u64>, i32)> {
     let reg = marlin_zero_registry().lock().unwrap();
     let dev_list = match &reg.dev {
-        Some(d) => stream.clone_dtoh(d).map_err(|e| anyhow::anyhow!(e))?,
+        Some(d) => stream.clone_dtoh(d)?,
         None => Vec::new(),
     };
     Ok((reg.entries.clone(), dev_list, reg.uploaded_count))
@@ -1118,10 +1025,9 @@ pub(crate) fn marlin_zero_snapshot_host_entries_uploaded_device_list_and_count(
 fn marlin_c_tmp_scratch(
     n: usize,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-) -> Result<std::sync::Arc<cudarc::driver::CudaSlice<f32>>> {
+) -> Result<std::sync::Arc<CudaSlice<f32>>> {
     use std::sync::{Arc, Mutex, OnceLock};
-    static SCRATCH: OnceLock<Mutex<Option<(usize, Arc<cudarc::driver::CudaSlice<f32>>)>>> =
-        OnceLock::new();
+    static SCRATCH: OnceLock<Mutex<Option<(usize, Arc<CudaSlice<f32>>)>>> = OnceLock::new();
     let elems = 64 * n;
     let cell = SCRATCH.get_or_init(|| Mutex::new(None));
     let mut guard = cell.lock().unwrap();
@@ -1130,11 +1036,7 @@ fn marlin_c_tmp_scratch(
             return Ok(buf.clone());
         }
     }
-    let buf: Arc<cudarc::driver::CudaSlice<f32>> = Arc::new(
-        stream
-            .alloc_zeros::<f32>(elems)
-            .map_err(|e| anyhow::anyhow!(e))?,
-    );
+    let buf: Arc<CudaSlice<f32>> = Arc::new(stream.alloc_zeros::<f32>(elems)?);
     *guard = Some((elems, buf.clone()));
     Ok(buf)
 }
@@ -1145,16 +1047,11 @@ fn marlin_a8_input_scratch(
     s_elems: usize,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
 ) -> Result<(
-    std::sync::Arc<cudarc::driver::CudaSlice<u8>>,
-    std::sync::Arc<cudarc::driver::CudaSlice<f32>>,
+    std::sync::Arc<CudaSlice<u8>>,
+    std::sync::Arc<CudaSlice<f32>>,
 )> {
     use std::sync::{Arc, Mutex, OnceLock};
-    type Bufs = (
-        usize,
-        Arc<cudarc::driver::CudaSlice<u8>>,
-        usize,
-        Arc<cudarc::driver::CudaSlice<f32>>,
-    );
+    type Bufs = (usize, Arc<CudaSlice<u8>>, usize, Arc<CudaSlice<f32>>);
     static SCRATCH: OnceLock<Mutex<Option<Bufs>>> = OnceLock::new();
     let cell = SCRATCH.get_or_init(|| Mutex::new(None));
     let mut guard = cell.lock().unwrap();
@@ -1165,10 +1062,8 @@ fn marlin_a8_input_scratch(
     }
     let qcap = q_elems.max(guard.as_ref().map(|g| g.0).unwrap_or(0));
     let scap = s_elems.max(guard.as_ref().map(|g| g.2).unwrap_or(0));
-    let q: Arc<cudarc::driver::CudaSlice<u8>> =
-        Arc::new(unsafe { stream.alloc::<u8>(qcap).map_err(|e| anyhow::anyhow!(e))? });
-    let s: Arc<cudarc::driver::CudaSlice<f32>> =
-        Arc::new(unsafe { stream.alloc::<f32>(scap).map_err(|e| anyhow::anyhow!(e))? });
+    let q: Arc<CudaSlice<u8>> = Arc::new(unsafe { stream.alloc::<u8>(qcap)? });
+    let s: Arc<CudaSlice<f32>> = Arc::new(unsafe { stream.alloc::<f32>(scap)? });
     *guard = Some((qcap, q.clone(), scap, s.clone()));
     Ok((q, s))
 }
@@ -1194,12 +1089,11 @@ impl MarlinLinear {
         a8_fp8: bool,
     ) -> Result<Self> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("marlin requires cuda"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("marlin requires cuda")
         };
         let group_size = inp / scale.dim(1)?;
-        anyhow::ensure!(
+        ensure!(
             !a8_fp8 || group_size >= 32,
             "marlin w4a8-fp8 needs group_size >= 32, got {group_size}"
         );
@@ -1207,7 +1101,7 @@ impl MarlinLinear {
         let s = scale.t()?.contiguous()?;
         let ng = s.dim(0)?;
         let n = s.dim(1)?;
-        anyhow::ensure!((ng * n) % 64 == 0, "marlin scale reshape: {ng}x{n} not %64");
+        ensure!((ng * n) % 64 == 0, "marlin scale reshape: {ng}x{n} not %64");
         let b_scales = if a8_fp8 {
             let mut perm = Vec::with_capacity(32);
             for i in 0..4u32 {
@@ -1236,7 +1130,7 @@ impl MarlinLinear {
         };
 
         let cols = inp / 8;
-        anyhow::ensure!(pbytes.len() == out * cols * 4, "packed size mismatch");
+        ensure!(pbytes.len() == out * cols * 4, "packed size mismatch");
         let mut tvec = vec![0i32; cols * out];
         for o in 0..out {
             for k8 in 0..cols {
@@ -1247,13 +1141,8 @@ impl MarlinLinear {
             }
         }
         let stream = nv_layers::cuda_stream::current_stream(&dev);
-        let b_q_packed: cudarc::driver::CudaSlice<i32> =
-            stream.clone_htod(&tvec).map_err(|e| anyhow::anyhow!(e))?;
-        let mut b_q_marlin: cudarc::driver::CudaSlice<i32> = unsafe {
-            stream
-                .alloc::<i32>(inp * out / 8)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let b_q_packed: CudaSlice<i32> = stream.clone_htod(&tvec)?;
+        let mut b_q_marlin: CudaSlice<i32> = unsafe { stream.alloc::<i32>(inp * out / 8)? };
         let rc = {
             let (pp, _gp) = b_q_packed.device_ptr(&stream);
             let (mp, _gm) = b_q_marlin.device_ptr_mut(&stream);
@@ -1266,7 +1155,7 @@ impl MarlinLinear {
                         (inp * out / 8) as i64,
                     )
                 };
-                anyhow::ensure!(pre == 0, "marlin_int4_fp8_preprocess returned {pre}");
+                ensure!(pre == 0, "marlin_int4_fp8_preprocess returned {pre}");
                 unsafe {
                     nv_kernels::cuda::marlin_repack_w4a8(
                         stream.cu_stream() as *mut _,
@@ -1290,17 +1179,15 @@ impl MarlinLinear {
                 }
             }
         };
-        anyhow::ensure!(rc == 0, "marlin_repack returned {rc}");
+        ensure!(rc == 0, "marlin_repack returned {rc}");
         drop(b_q_packed);
 
         let mut elems: i32 = 0;
         unsafe {
             nv_kernels::cuda::marlin_workspace_elems(&mut elems as *mut i32);
         }
-        anyhow::ensure!(elems > 0, "marlin workspace elems = {elems}");
-        let workspace: cudarc::driver::CudaSlice<i32> = stream
-            .clone_htod(&vec![0i32; elems as usize])
-            .map_err(|e| anyhow::anyhow!(e))?;
+        ensure!(elems > 0, "marlin workspace elems = {elems}");
+        let workspace: CudaSlice<i32> = stream.clone_htod(&vec![0i32; elems as usize])?;
 
         let c_tmp = if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_MARLIN_FP32RED")
         {
@@ -1333,9 +1220,7 @@ impl MarlinLinear {
         if let Some((t, p)) = self.c_persist.get() {
             return Ok(Some((t.clone(), *p)));
         }
-        let mut buf: cudarc::driver::CudaSlice<bf16> = stream
-            .alloc_zeros::<bf16>(self.out_features)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let mut buf: CudaSlice<bf16> = stream.alloc_zeros::<bf16>(self.out_features)?;
         let ptr = {
             let (p, _g) = buf.device_ptr_mut(stream);
             p
@@ -1343,12 +1228,12 @@ impl MarlinLinear {
         if !marlin_zero_register(ptr, self.out_features as u64) {
             return Ok(None);
         }
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(buf, self.device.clone());
-        let storage = candle_core::Storage::Cuda(storage);
+        let storage = CudaStorage::wrap_cuda_slice(buf, self.device.clone());
+        let storage = Storage::Cuda(storage);
         let t = Tensor::from_storage(
             storage,
             (1usize, self.out_features),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         let _ = self.c_persist.set((t, ptr));
@@ -1365,7 +1250,7 @@ impl MarlinLinear {
         use half::bf16;
         let dims = x.dims().to_vec();
         let kin = *dims.last().unwrap();
-        anyhow::ensure!(kin == self.in_features, "marlin in mismatch");
+        ensure!(kin == self.in_features, "marlin in mismatch");
         let m: usize = dims[..dims.len() - 1].iter().product();
         if m != 1 || self.a8_fp8 {
             return Ok(None);
@@ -1379,7 +1264,7 @@ impl MarlinLinear {
         let counter = match self.m1_tail_last_block_counter.get() {
             Some(c) => c,
             None => {
-                let z = stream.alloc_zeros::<u32>(1).map_err(|e| anyhow::anyhow!(e))?;
+                let z = stream.alloc_zeros::<u32>(1)?;
                 let _ = self.m1_tail_last_block_counter.set(z);
                 self.m1_tail_last_block_counter.get().unwrap()
             }
@@ -1387,13 +1272,15 @@ impl MarlinLinear {
         let cdev = Device::Cuda(self.device.clone());
         let arena = |dtype: DType, len: usize| {
             nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
-                &cdev, dtype, &[len],
+                &cdev,
+                dtype,
+                &[len],
             )
         };
         let cuda_ptr = |t: &Tensor| -> Result<u64> {
             let (st, layout) = t.storage_and_layout();
-            let candle_core::Storage::Cuda(c) = &*st else {
-                anyhow::bail!("marlin tail operand not cuda")
+            let Storage::Cuda(c) = &*st else {
+                bail!("marlin tail operand not cuda")
             };
             let (p0, _p1) = layout
                 .contiguous_offsets()
@@ -1407,69 +1294,81 @@ impl MarlinLinear {
                     let (p, _g) = c.as_cuda_slice::<f32>()?.device_ptr(&stream);
                     p + (p0 * 4) as u64
                 }
-                other => anyhow::bail!("marlin tail operand dtype {other:?}"),
+                other => bail!("marlin tail operand dtype {other:?}"),
             })
         };
-        let (kind, res_p, w_p, h_out, rstd_out, next_w_p, normed_out, pli_p, gelu_out, eps, scale, eps_next) =
-            match tail {
-                MarlinM1Tail::RmsnormAddScale {
-                    norm,
-                    res,
+        let (
+            kind,
+            res_p,
+            w_p,
+            h_out,
+            rstd_out,
+            next_w_p,
+            normed_out,
+            pli_p,
+            gelu_out,
+            eps,
+            scale,
+            eps_next,
+        ) = match tail {
+            MarlinM1Tail::RmsnormAddScale {
+                norm,
+                res,
+                scale,
+                chain_eps,
+                next_w,
+            } => {
+                ensure!(
+                    res.dtype() == DType::BF16 && res.elem_count() == n,
+                    "marlin tail residual mismatch"
+                );
+                let w = norm.weight_bf16();
+                ensure!(w.elem_count() == n, "marlin tail norm weight mismatch");
+                if let Some(nw) = next_w {
+                    ensure!(
+                        chain_eps.is_some() && nw.elem_count() == n,
+                        "marlin tail next_w mismatch"
+                    );
+                }
+                let h = arena(DType::BF16, n)?;
+                let rstd = chain_eps.map(|_| arena(DType::F32, 1)).transpose()?;
+                let normed = next_w.map(|_| arena(DType::BF16, n)).transpose()?;
+                (
+                    1i32,
+                    cuda_ptr(res)?,
+                    cuda_ptr(w)?,
+                    Some(h),
+                    rstd,
+                    next_w.map(cuda_ptr).transpose()?.unwrap_or(0),
+                    normed,
+                    0u64,
+                    None,
+                    norm.eps() as f32,
                     scale,
-                    chain_eps,
-                    next_w,
-                } => {
-                    anyhow::ensure!(
-                        res.dtype() == DType::BF16 && res.elem_count() == n,
-                        "marlin tail residual mismatch"
-                    );
-                    let w = norm.weight_bf16();
-                    anyhow::ensure!(w.elem_count() == n, "marlin tail norm weight mismatch");
-                    if let Some(nw) = next_w {
-                        anyhow::ensure!(
-                            chain_eps.is_some() && nw.elem_count() == n,
-                            "marlin tail next_w mismatch"
-                        );
-                    }
-                    let h = arena(DType::BF16, n)?;
-                    let rstd = chain_eps.map(|_| arena(DType::F32, 1)).transpose()?;
-                    let normed = next_w.map(|_| arena(DType::BF16, n)).transpose()?;
-                    (
-                        1i32,
-                        cuda_ptr(res)?,
-                        cuda_ptr(w)?,
-                        Some(h),
-                        rstd,
-                        next_w.map(cuda_ptr).transpose()?.unwrap_or(0),
-                        normed,
-                        0u64,
-                        None,
-                        norm.eps() as f32,
-                        scale,
-                        chain_eps.unwrap_or(0.0),
-                    )
-                }
-                MarlinM1Tail::GeluPli { pli } => {
-                    anyhow::ensure!(
-                        pli.dtype() == DType::F32 && pli.elem_count() == n,
-                        "marlin tail pli mismatch"
-                    );
-                    (
-                        2i32,
-                        0u64,
-                        0u64,
-                        None,
-                        None,
-                        0u64,
-                        None,
-                        cuda_ptr(pli)?,
-                        Some(arena(DType::BF16, n)?),
-                        0.0,
-                        0.0,
-                        0.0,
-                    )
-                }
-            };
+                    chain_eps.unwrap_or(0.0),
+                )
+            }
+            MarlinM1Tail::GeluPli { pli } => {
+                ensure!(
+                    pli.dtype() == DType::F32 && pli.elem_count() == n,
+                    "marlin tail pli mismatch"
+                );
+                (
+                    2i32,
+                    0u64,
+                    0u64,
+                    None,
+                    None,
+                    0u64,
+                    None,
+                    cuda_ptr(pli)?,
+                    Some(arena(DType::BF16, n)?),
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+            }
+        };
         let out_ptr = |t: &Option<Tensor>| -> Result<u64> {
             match t {
                 Some(t) => nv_layers::step_arena::device_ptr_for_a_kernel_to_write(t),
@@ -1485,9 +1384,8 @@ impl MarlinLinear {
         let rc = {
             let (xs, _xl) = x2.storage_and_layout();
             let (ss, _sl) = self.b_scales.storage_and_layout();
-            let (candle_core::Storage::Cuda(xc), candle_core::Storage::Cuda(sc)) = (&*xs, &*ss)
-            else {
-                anyhow::bail!("marlin: operands not cuda")
+            let (Storage::Cuda(xc), Storage::Cuda(sc)) = (&*xs, &*ss) else {
+                bail!("marlin: operands not cuda")
             };
             let (xp, _gx) = xc.as_cuda_slice::<bf16>()?.device_ptr(&stream);
             let (sp, _gs) = sc.as_cuda_slice::<bf16>()?.device_ptr(&stream);
@@ -1521,7 +1419,7 @@ impl MarlinLinear {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "marlin_gemm_w4a16_m1_tail returned {rc}");
+        ensure!(rc == 0, "marlin_gemm_w4a16_m1_tail returned {rc}");
         let first = match kind {
             1 => h_out.unwrap(),
             _ => gelu_out.unwrap(),
@@ -1539,7 +1437,7 @@ impl MarlinLinear {
         use half::bf16;
         let dims = x.dims().to_vec();
         let kin = *dims.last().unwrap();
-        anyhow::ensure!(kin == self.in_features, "marlin in mismatch");
+        ensure!(kin == self.in_features, "marlin in mismatch");
         let m: usize = dims[..dims.len() - 1].iter().product();
         let x2 = x.reshape((m, kin))?.to_dtype(DType::BF16)?.contiguous()?;
         let stream = nv_layers::cuda_stream::current_stream(&self.device);
@@ -1552,12 +1450,12 @@ impl MarlinLinear {
                     let (xs, _xl) = x2.storage_and_layout();
                     let (ss, _sl) = self.b_scales.storage_and_layout();
                     let xc = match &*xs {
-                        candle_core::Storage::Cuda(s) => s,
-                        _ => anyhow::bail!("marlin: x not cuda"),
+                        Storage::Cuda(s) => s,
+                        _ => bail!("marlin: x not cuda"),
                     };
                     let sc = match &*ss {
-                        candle_core::Storage::Cuda(s) => s,
-                        _ => anyhow::bail!("marlin: scales not cuda"),
+                        Storage::Cuda(s) => s,
+                        _ => bail!("marlin: scales not cuda"),
                     };
                     let xsl = xc.as_cuda_slice::<bf16>()?;
                     let ssl = sc.as_cuda_slice::<bf16>()?;
@@ -1581,7 +1479,7 @@ impl MarlinLinear {
                         )
                     }
                 };
-                anyhow::ensure!(rc == 0, "marlin_gemm returned {rc}");
+                ensure!(rc == 0, "marlin_gemm returned {rc}");
                 let mut out_dims = dims[..dims.len() - 1].to_vec();
                 out_dims.push(self.out_features);
                 return t.reshape(out_dims).map_err(Into::into);
@@ -1596,12 +1494,12 @@ impl MarlinLinear {
             let (xs, _xl) = x2.storage_and_layout();
             let (ss, _sl) = self.b_scales.storage_and_layout();
             let xc = match &*xs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("marlin: x not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("marlin: x not cuda"),
             };
             let sc = match &*ss {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("marlin: scales not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("marlin: scales not cuda"),
             };
             let xsl = xc.as_cuda_slice::<bf16>()?;
             let ssl = sc.as_cuda_slice::<bf16>()?;
@@ -1649,7 +1547,7 @@ impl MarlinLinear {
                 },
             }
         };
-        anyhow::ensure!(rc == 0, "marlin_gemm returned {rc}");
+        ensure!(rc == 0, "marlin_gemm returned {rc}");
         let out = c_dev.reshape((m, self.out_features))?;
         let mut out_dims = dims[..dims.len() - 1].to_vec();
         out_dims.push(self.out_features);
@@ -1675,12 +1573,12 @@ impl MarlinLinear {
             let (xs, _xl) = x2.storage_and_layout();
             let (ss, _sl) = self.b_scales.storage_and_layout();
             let xc = match &*xs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("marlin a8: x not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("marlin a8: x not cuda"),
             };
             let sc = match &*ss {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("marlin a8: scales not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("marlin a8: scales not cuda"),
             };
             let xsl = xc.as_cuda_slice::<bf16>()?;
             let ssl = sc.as_cuda_slice::<bf16>()?;
@@ -1701,7 +1599,7 @@ impl MarlinLinear {
                     self.in_features as i32,
                 )
             };
-            anyhow::ensure!(rq == 0, "rowquant_e4m3 returned {rq}");
+            ensure!(rq == 0, "rowquant_e4m3 returned {rq}");
             unsafe {
                 nv_kernels::cuda::marlin_gemm_w4a8_fp8(
                     stream.cu_stream() as *mut _,
@@ -1719,7 +1617,7 @@ impl MarlinLinear {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "marlin_gemm_w4a8_fp8 returned {rc}");
+        ensure!(rc == 0, "marlin_gemm_w4a8_fp8 returned {rc}");
         let out = c_dev.reshape((m, self.out_features))?;
         let mut out_dims = dims[..dims.len() - 1].to_vec();
         out_dims.push(self.out_features);
@@ -1791,10 +1689,7 @@ pub struct Gemma4E4b {
 
     embed_tokens: Tensor,
     #[cfg(feature = "cuda")]
-    lm_head_i8: Option<(
-        cudarc::driver::CudaSlice<i8>,
-        cudarc::driver::CudaSlice<f32>,
-    )>,
+    lm_head_i8: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
     embed_tokens_per_layer: Tensor,
     per_layer_model_projection: QLinear,
     per_layer_projection_norm: RmsNorm,
@@ -1829,8 +1724,8 @@ const E4B_PREFILL_PROF_FAMILY_NAMES: [&str; E4B_PREFILL_PROF_FAMILIES_7] = [
 
 #[cfg(feature = "cuda")]
 pub struct E4bPrefillProf {
-    buf: cudarc::driver::CudaSlice<u64>,
-    dev: candle_core::CudaDevice,
+    buf: CudaSlice<u64>,
+    dev: CudaDevice,
     n_layers: usize,
     kinds: Vec<LayerType>,
     acc: std::sync::Mutex<E4bPrefillProfAcc>,
@@ -1975,7 +1870,7 @@ impl Gemma4E4b {
         weights: &WeightLoader,
         device: &Device,
     ) -> Result<Self> {
-        anyhow::ensure!(
+        ensure!(
             config.has_per_layer_embeddings(),
             "gemma4_e4b requires hidden_size_per_layer_input > 0 (got {})",
             config.hidden_size_per_layer_input
@@ -1992,7 +1887,7 @@ impl Gemma4E4b {
 
         #[cfg(feature = "cuda")]
         let lm_head_i8 =
-            if std::env::var("NV_E4B_LMHEAD_INT8").is_ok() && matches!(device, Device::Cuda(_)) {
+            if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_LMHEAD_INT8") && device.is_cuda() {
                 Some(nv_layers::lm_head_resident_quant::rowquant_i8_dev(
                     &embed_tokens,
                 )?)
@@ -2126,7 +2021,7 @@ impl Gemma4E4b {
             model.prefill_prof = E4bPrefillProf::from_env(device, kinds)?;
             model
         };
-        if matches!(device, Device::Cuda(_)) && boot_warm_prefill_env_opted_in() {
+        if device.is_cuda() && boot_warm_prefill_env_opted_in() {
             let warm =
                 vec![0u32; E4B_BOOT_WARM_CHUNK_512_MATCHES_THE_SERVING_PREFILL_CHUNK_SO_THE_THROWAWAY_PASS_COMPILES_EXACTLY_THE_MODULES_THE_FIRST_REAL_CHUNK_NEEDS];
             let mut scratch: Vec<Option<(Tensor, Tensor)>> =
@@ -2310,9 +2205,9 @@ impl Gemma4E4b {
     }
 
     pub fn generate(&self, prompt: &[u32], max_new: usize, eos: &[u32]) -> Result<Vec<u32>> {
-        anyhow::ensure!(!prompt.is_empty(), "empty prompt");
+        ensure!(!prompt.is_empty(), "empty prompt");
         #[cfg(feature = "cuda")]
-        if matches!(self.device, Device::Cuda(_)) && e4b_kv_fp8_enabled() {
+        if self.device.is_cuda() && e4b_kv_fp8_enabled() {
             return self.generate_fp8(prompt, max_new, eos);
         }
         let mut cache: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
@@ -2341,8 +2236,8 @@ impl Gemma4E4b {
             p.stamp(0)?;
         }
         let mut kv = E4bKvMut::Cat(cache);
-        let rows = last_row_logits_rows();
-        let (logits, _hidden) = self.forward_step_inner(new_ids, None, past_len, &mut kv, rows)?;
+        let (logits, _hidden) =
+            self.forward_step_inner(new_ids, None, past_len, &mut kv, PrefillLogitsRows::LastRow)?;
         let logits = logits.context("forward_step asked for logits")?;
         logits
             .narrow(0, logits.dim(0)? - 1, 1)?
@@ -2363,7 +2258,7 @@ impl Gemma4E4b {
             Some(embeds),
             past_len,
             &mut kv,
-            last_row_logits_rows(),
+            PrefillLogitsRows::LastRow,
         )?;
         let logits = logits.context("forward_step_embeds asked for logits")?;
         logits
@@ -2372,23 +2267,8 @@ impl Gemma4E4b {
             .map_err(Into::into)
     }
 
-    pub fn forward_step_spec(
-        &self,
-        new_ids: &[u32],
-        past_len: usize,
-        cache: &mut [Option<(Tensor, Tensor)>],
-    ) -> Result<(Tensor, Tensor)> {
-        let mut kv = E4bKvMut::Cat(cache);
-        let (logits, hidden) =
-            self.forward_step_inner(new_ids, None, past_len, &mut kv, PrefillLogitsRows::AllRows)?;
-        Ok((
-            logits.context("forward_step_spec asked for all rows")?,
-            hidden,
-        ))
-    }
-
     pub fn prefill_fixed_cache(&self, capacity: usize) -> Result<E4bPrefillFixedCache> {
-        anyhow::ensure!(capacity > 0, "prefill_fixed_cache: zero capacity");
+        ensure!(capacity > 0, "prefill_fixed_cache: zero capacity");
         let mut k = Vec::with_capacity(self.layers.len());
         let mut v = Vec::with_capacity(self.layers.len());
         let mut k16 = Vec::with_capacity(self.layers.len());
@@ -2435,7 +2315,7 @@ impl Gemma4E4b {
             embeds_override,
             past_len,
             cache,
-            last_row_logits_rows(),
+            PrefillLogitsRows::LastRow,
         )
         .and_then(|l| l.context("forward_step_fixed asked for logits"))
     }
@@ -2482,7 +2362,7 @@ impl Gemma4E4b {
         cache.begin_step(past_len, n)?;
         let mut kv = E4bKvMut::Fp8(cache);
         let (logits, _hidden) =
-            self.forward_step_inner(new_ids, None, past_len, &mut kv, last_row_logits_rows())?;
+            self.forward_step_inner(new_ids, None, past_len, &mut kv, PrefillLogitsRows::LastRow)?;
         let logits = logits.context("forward_step_fp8 asked for logits")?;
         logits
             .narrow(0, logits.dim(0)? - 1, 1)?
@@ -2492,7 +2372,7 @@ impl Gemma4E4b {
 
     #[cfg(feature = "cuda")]
     pub fn generate_fp8(&self, prompt: &[u32], max_new: usize, eos: &[u32]) -> Result<Vec<u32>> {
-        anyhow::ensure!(!prompt.is_empty(), "empty prompt");
+        ensure!(!prompt.is_empty(), "empty prompt");
         let cap = (prompt.len() + max_new + 8).next_power_of_two().max(64);
         let mut cache = E4bFp8Cache::new(&self.config, cap, &self.device)?;
         let mut logits = self.forward_step_fp8(prompt, 0, &mut cache)?;
@@ -2528,7 +2408,7 @@ impl Gemma4E4b {
         let ids = Tensor::from_vec(new_ids.to_vec(), n, &self.device)?;
         let embeds = match embeds_override {
             Some(e) => {
-                anyhow::ensure!(
+                ensure!(
                     e.dims() == [n, hidden],
                     "embeds override must be [{n}, {hidden}], got {:?}",
                     e.dims()
@@ -2551,11 +2431,7 @@ impl Gemma4E4b {
 
         let total = past_len + n;
         let full_mask = cache_mask(n, total, past_len, None, total, &self.device)?;
-        let sliding_kept = if prefill_sliding_narrow_env_opted_in() {
-            total.min(self.config.sliding_window + n)
-        } else {
-            total
-        };
+        let sliding_kept = total.min(self.config.sliding_window + n);
         let sliding_mask = cache_mask(
             n,
             total,
@@ -2578,14 +2454,6 @@ impl Gemma4E4b {
         let hidden_pre = x.reshape((n, hidden))?;
         let logits = match rows {
             PrefillLogitsRows::Discarded => None,
-            PrefillLogitsRows::AllRows => {
-                let xn = self.norm.forward(&x)?;
-                let logits = self
-                    .lm_head
-                    .forward(&xn)?
-                    .reshape((n, self.config.vocab_size))?;
-                Some(self.step_logits_softcap_f32_capped_serving_default(logits)?)
-            }
             PrefillLogitsRows::LastRow => {
                 let xn = self.norm.forward(&x.narrow(1, n - 1, 1)?)?;
                 let logits = self
@@ -2604,11 +2472,11 @@ impl Gemma4E4b {
 
     fn step_logits_softcap_f32_capped_serving_default(&self, logits: Tensor) -> Result<Tensor> {
         let cap = self.config.final_logit_softcapping;
-        if !(cap > 0.0 && cap.is_finite()) || step_logits_uncapped_env_opted_in() {
+        if !(cap > 0.0 && cap.is_finite()) {
             return Ok(logits);
         }
         #[cfg(feature = "cuda")]
-        if matches!(self.device, Device::Cuda(_)) && logits.dtype() == DType::BF16 {
+        if self.device.is_cuda() && logits.dtype() == DType::BF16 {
             return crate::gemma4::tanh_softcap_bf16_to_f32_op(&logits, cap, &self.device);
         }
         softcap(&logits.to_dtype(DType::F32)?, cap)
@@ -2664,42 +2532,6 @@ impl Gemma4E4b {
         self.normalizer
     }
 
-    pub fn embed_scaled_row(&self, token: u32) -> Result<Tensor> {
-        let ids = Tensor::from_vec(vec![token], 1, &self.device)?;
-        let e = self.embed_tokens.index_select(&ids, 0)?;
-        (e.to_dtype(DType::F32)? * self.normalizer)?
-            .reshape(self.config.hidden_size)
-            .map_err(Into::into)
-    }
-
-    pub fn spec_shared_kv(
-        &self,
-        cache: &[Option<(Tensor, Tensor)>],
-    ) -> Result<((Tensor, Tensor), (Tensor, Tensor))> {
-        let mut sl = None;
-        let mut fl = None;
-        for (i, l) in self.layers.iter().enumerate() {
-            if l.k_norm.is_some() {
-                match l.kind {
-                    LayerType::SlidingAttention => sl = Some(i),
-                    LayerType::FullAttention => fl = Some(i),
-                }
-            }
-        }
-        let view = |i: usize| -> Result<(Tensor, Tensor)> {
-            let (k, v) = cache[i].as_ref().context("shared kv missing from cache")?;
-            Ok((
-                k.squeeze(0)?.transpose(0, 1)?.contiguous()?,
-                v.squeeze(0)?.transpose(0, 1)?.contiguous()?,
-            ))
-        };
-        Ok((
-            view(sl.context("no sliding kv-writing layer")?)?,
-            view(fl.context("no full kv-writing layer")?)?,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn layer_step(
         &self,
         layer: &E4bLayer,
@@ -2764,13 +2596,12 @@ impl Gemma4E4b {
         let pos_t = Tensor::from_vec(pos.to_vec(), (1, n), &self.device)?;
         let nkv = layer.n_kv_heads;
         let qkv = layer.qkv_proj.forward(normed)?;
+        #[cfg(feature = "cuda")]
         let mut twin: Option<(Tensor, Tensor)> = None;
         #[cfg(feature = "cuda")]
         let fused_prep = match kv {
             E4bKvMut::FixedPrefill(cache)
-                if n > 1
-                    && matches!(self.device, Device::Cuda(_))
-                    && prefill_qkv_prep_env_opted_in() =>
+                if n > 1 && self.device.is_cuda() =>
             {
                 let pos_i32 = Tensor::from_vec(pos.to_vec(), n, &self.device)?;
                 let q_rot = cache.prep_and_append_one_kernel(
@@ -2835,7 +2666,10 @@ impl Gemma4E4b {
                         }
                         E4bKvMut::FixedPrefill(cache) => {
                             let (kk, vv) = cache.append(idx, &k_rot, &v)?;
-                            twin = cache.bf16_twin_views_for_the_gemm_arm(idx, kk.dim(1)?);
+                            #[cfg(feature = "cuda")]
+                            {
+                                twin = cache.bf16_twin_views_for_the_gemm_arm(idx, kk.dim(1)?);
+                            }
                             (kk, vv, q_rot)
                         }
                         #[cfg(feature = "cuda")]
@@ -2858,7 +2692,10 @@ impl Gemma4E4b {
                         E4bKvMut::FixedPrefill(cache) => {
                             let total =
                                 *pos.last().context("attn_cached: empty positions")? as usize + 1;
-                            twin = cache.bf16_twin_views_for_the_gemm_arm(src, total);
+                            #[cfg(feature = "cuda")]
+                            {
+                                twin = cache.bf16_twin_views_for_the_gemm_arm(src, total);
+                            }
                             cache.view(src, total)?
                         }
                         #[cfg(feature = "cuda")]
@@ -2878,7 +2715,7 @@ impl Gemma4E4b {
             p.stamp(p.slot_qkv(idx))?;
         }
         #[cfg(feature = "cuda")]
-        if n == 1 && matches!(self.device, Device::Cuda(_)) {
+        if n == 1 && self.device.is_cuda() {
             let total = k_all.dim(1)?;
             let start = match layer.kind {
                 LayerType::SlidingAttention => total.saturating_sub(self.config.sliding_window),
@@ -2907,10 +2744,9 @@ impl Gemma4E4b {
             };
         #[cfg(feature = "cuda")]
         if n > 1
-            && matches!(self.device, Device::Cuda(_))
+            && self.device.is_cuda()
             && matches!(layer.kind, LayerType::FullAttention)
             && k_all.dim(1)? > E4B_FULL_GEMM_ATTN_FROM_THE_SECOND_KEY_TILE_4096_BECAUSE_INSIDE_ONE_TILE_FA2_WINS_THE_2K_CELL_BY_15_MS
-            && prefill_full_gemm_attn_env_opted_in()
         {
             let qg = q_rot
                 .squeeze(0)?
@@ -2941,65 +2777,23 @@ impl Gemma4E4b {
             return layer.o_proj.forward(&out);
         }
         #[cfg(feature = "cuda")]
-        if n > 1 && matches!(self.device, Device::Cuda(_)) && prefill_flash_attn_env_opted_in() {
-            let out = match layer.kind {
-                LayerType::SlidingAttention => {
-                    let cfg = nv_layers::attn::AttnConfig {
-                        num_heads: nh,
-                        num_kv_heads: layer.n_kv_heads,
-                        head_dim: hd,
-                        softmax_scale: 1.0,
-                        causal: true,
-                    };
-                    let qh = q_rot.to_dtype(DType::F16)?.contiguous()?;
-                    let kh = k_all.to_dtype(DType::F16)?.contiguous()?;
-                    let vh = v_all.to_dtype(DType::F16)?.contiguous()?;
-                    nv_layers::attn::flash_attn_windowed(
-                        &qh,
-                        &kh,
-                        &vh,
-                        &cfg,
-                        Some(self.config.sliding_window.saturating_sub(1)),
-                        Some(0),
-                    )?
-                    .reshape((1, n, nh * hd))?
-                }
-                LayerType::FullAttention if prefill_full_flash_hd512_enabled() => {
-                    let cfg = nv_layers::attn::AttnConfig {
-                        num_heads: nh,
-                        num_kv_heads: layer.n_kv_heads,
-                        head_dim: hd,
-                        softmax_scale: 1.0,
-                        causal: true,
-                    };
-                    let qh = q_rot.to_dtype(DType::F16)?.contiguous()?;
-                    let kh = k_all.to_dtype(DType::F16)?.contiguous()?;
-                    let vh = v_all.to_dtype(DType::F16)?.contiguous()?;
-                    nv_layers::attn::flash_attn_windowed(&qh, &kh, &vh, &cfg, None, Some(0))?
-                        .reshape((1, n, nh * hd))?
-                }
-                LayerType::FullAttention => {
-                    let group = nh / layer.n_kv_heads;
-                    let qb = q_rot
-                        .squeeze(0)?
-                        .transpose(0, 1)?
-                        .to_dtype(DType::BF16)?
-                        .contiguous()?;
-                    let kb = repeat_kv(
-                        &k_all.squeeze(0)?.transpose(0, 1)?.to_dtype(DType::BF16)?,
-                        group,
-                    )?;
-                    let vb = repeat_kv(
-                        &v_all.squeeze(0)?.transpose(0, 1)?.to_dtype(DType::BF16)?,
-                        group,
-                    )?;
-                    let scores = qb.matmul(&kb.transpose(1, 2)?.contiguous()?)?;
-                    let scores = scores.broadcast_add(&mask.to_dtype(DType::BF16)?)?;
-                    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-                    let out = probs.matmul(&vb.contiguous()?)?;
-                    out.transpose(0, 1)?.reshape((1, n, nh * hd))?
-                }
+        if n > 1 && self.device.is_cuda() {
+            let cfg = nv_layers::attn::AttnConfig {
+                num_heads: nh,
+                num_kv_heads: layer.n_kv_heads,
+                head_dim: hd,
+                softmax_scale: 1.0,
+                causal: true,
             };
+            let window = match layer.kind {
+                LayerType::SlidingAttention => Some(self.config.sliding_window.saturating_sub(1)),
+                LayerType::FullAttention => None,
+            };
+            let qh = q_rot.to_dtype(DType::F16)?.contiguous()?;
+            let kh = k_all.to_dtype(DType::F16)?.contiguous()?;
+            let vh = v_all.to_dtype(DType::F16)?.contiguous()?;
+            let out = nv_layers::attn::flash_attn_windowed(&qh, &kh, &vh, &cfg, window, Some(0))?
+                .reshape((1, n, nh * hd))?;
             let out = out.to_dtype(self.dtype)?;
             return layer.o_proj.forward(&out);
         }
@@ -3029,10 +2823,9 @@ impl Gemma4E4b {
             .and_then(|v| v.parse().ok())
             .filter(|&v| (1..=32).contains(&v))
             .unwrap_or(16);
-        anyhow::ensure!(!prompt.is_empty(), "empty prompt");
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("generate_graphed requires cuda"),
+        ensure!(!prompt.is_empty(), "empty prompt");
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("generate_graphed requires cuda")
         };
         let mut cat: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
         let logits = self.forward_step(prompt, 0, &mut cat)?;
@@ -3049,13 +2842,13 @@ impl Gemma4E4b {
         }
         next = dec.warm_step(next)?;
         out.push(next);
-        'gen: while out.len() < max_new && !eos.contains(out.last().unwrap()) {
+        'decode: while out.len() < max_new && !eos.contains(out.last().unwrap()) {
             let k = graph_batch.min(max_new - out.len());
             let toks = dec.replay_batch(*out.last().unwrap(), k)?;
             for t in toks {
                 out.push(t);
                 if out.len() >= max_new || eos.contains(&t) {
-                    break 'gen;
+                    break 'decode;
                 }
             }
         }
@@ -3069,9 +2862,8 @@ impl Gemma4E4b {
         past_len: usize,
         max_len: usize,
     ) -> Result<GraphedE4bDecoder<'_>> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("graphed_decoder requires cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("graphed_decoder requires cuda")
         };
         let fixed = E4bFixedCache::from_cat(cat, past_len, max_len, &dev)?;
         GraphedE4bDecoder::new(self, fixed, past_len)
@@ -3079,10 +2871,9 @@ impl Gemma4E4b {
 
     #[cfg(feature = "cuda")]
     pub fn generate_fast(&self, prompt: &[u32], max_new: usize, eos: &[u32]) -> Result<Vec<u32>> {
-        anyhow::ensure!(!prompt.is_empty(), "empty prompt");
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("generate_fast requires cuda"),
+        ensure!(!prompt.is_empty(), "empty prompt");
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("generate_fast requires cuda")
         };
         let mut cat: Vec<Option<(Tensor, Tensor)>> = vec![None; self.layers.len()];
         let mut logits = self.forward_step(prompt, 0, &mut cat)?;
@@ -3140,13 +2931,12 @@ impl Gemma4E4b {
         if let Some(p) = &self.prefill_prof {
             p.stamp(1)?;
         }
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("cuda only"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("cuda only")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
 
-        anyhow::ensure!(pos_t.dtype() == DType::I32, "pos_t must be i32");
+        ensure!(pos_t.dtype() == DType::I32, "pos_t must be i32");
         let rc = {
             let pos_ptr = {
                 let (p, _g) = fixed.pos.device_ptr_mut(&stream);
@@ -3154,8 +2944,8 @@ impl Gemma4E4b {
             };
             let (ps, _pl) = pos_t.storage_and_layout();
             let pc = match &*ps {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("pos_t not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("pos_t not cuda"),
             };
             let psl = pc.as_cuda_slice::<i32>()?;
             let (rp, _gr) = psl.device_ptr(&stream);
@@ -3167,7 +2957,7 @@ impl Gemma4E4b {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "incr_pos_rope returned {rc}");
+        ensure!(rc == 0, "incr_pos_rope returned {rc}");
         let mut x = embeds.clone();
         let mut rstd = rstd_op(&embeds, self.config.rms_norm_eps as f32)?;
         let mut normed: Option<Tensor> = None;
@@ -3208,263 +2998,6 @@ impl Gemma4E4b {
     }
 
     #[cfg(feature = "cuda")]
-    fn per_layer_inputs_fast_mk(
-        &self,
-        ids: &Tensor,
-        inputs_embeds: &Tensor,
-        m: usize,
-    ) -> Result<Tensor> {
-        let n_layers = self.config.num_hidden_layers;
-        let hpl = self.config.hidden_size_per_layer_input;
-
-        let ple_bf = gather_rows_bf16_op(&self.embed_tokens_per_layer, ids)?;
-        let ple = cast_scale_f32_op(&ple_bf, self.embed_scale_per_layer as f32)?;
-
-        let proj_bf = self
-            .per_layer_model_projection
-            .forward(&inputs_embeds.reshape((m, self.config.hidden_size))?)?;
-        let proj = cast_scale_f32_op(
-            &proj_bf.reshape((m, n_layers * hpl))?,
-            self.per_layer_proj_scale as f32,
-        )?;
-        let proj = self
-            .per_layer_projection_norm
-            .forward(&proj.reshape((m * n_layers, hpl))?)?;
-
-        add_scale_f32_op(
-            &proj.reshape((m, n_layers, hpl))?,
-            &ple.reshape((m, n_layers, hpl))?,
-            self.per_layer_input_scale as f32,
-        )
-    }
-
-    #[cfg(feature = "cuda")]
-    pub(crate) fn forward_step_fast_mk(
-        &self,
-        ids: &Tensor,
-        pos_t: &Tensor,
-        fixed: &mut E4bFixedCache,
-        m: usize,
-    ) -> Result<(Tensor, Tensor)> {
-        use cudarc::driver::{DevicePtr, DevicePtrMut};
-        let hidden = self.config.hidden_size;
-        if let Device::Cuda(d) = &self.device {
-            marlin_zero_launch(&nv_layers::cuda_stream::current_stream(d))?;
-        }
-        let emb = gather_rows_bf16_op(&self.embed_tokens, ids)?;
-        let embeds = scale_bf16_op(&emb, self.normalizer as f32)?.reshape((1, m, hidden))?;
-        let pli_all = self.per_layer_inputs_fast_mk(ids, &embeds, m)?;
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("cuda only"),
-        };
-        let stream = nv_layers::cuda_stream::current_stream(&dev);
-
-        anyhow::ensure!(pos_t.dtype() == DType::I32, "pos_t must be i32");
-        for _ in 0..m {
-            let rc = {
-                let pos_ptr = {
-                    let (p, _g) = fixed.pos.device_ptr_mut(&stream);
-                    p as *mut i32
-                };
-                let (ps, _pl) = pos_t.storage_and_layout();
-                let pc = match &*ps {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("pos_t not cuda"),
-                };
-                let psl = pc.as_cuda_slice::<i32>()?;
-                let (rp, _gr) = psl.device_ptr(&stream);
-                unsafe {
-                    nv_kernels::cuda::incr_pos_rope(
-                        stream.cu_stream() as *mut _,
-                        pos_ptr,
-                        rp as *mut i32,
-                    )
-                }
-            };
-            anyhow::ensure!(rc == 0, "incr_pos_rope returned {rc}");
-        }
-
-        let mut x = embeds.clone();
-        let mut rstd = rstd_op(
-            &embeds.reshape((m, hidden))?,
-            self.config.rms_norm_eps as f32,
-        )?;
-        let mut normed: Option<Tensor> = None;
-        for (i, layer) in self.layers.iter().enumerate() {
-            let pli = pli_all
-                .narrow(1, i, 1)?
-                .reshape((m, self.config.hidden_size_per_layer_input))?
-                .contiguous()?;
-            let next_w = self.layers.get(i + 1).map(|l| l.input_ln.weight_bf16());
-            let (nx, nrstd, nnormed) = self.layer_step_fast_mk(
-                layer,
-                &x,
-                i,
-                pos_t,
-                &pli,
-                &rstd,
-                normed.as_ref(),
-                next_w,
-                fixed,
-                m,
-            )?;
-            x = nx;
-            rstd = nrstd;
-            normed = nnormed;
-        }
-
-        let hidden_pre = x.reshape((m, hidden))?;
-        let logits = match &self.lm_head_i8 {
-            Some((wq, rs)) => nv_layers::lm_head_resident_quant::lm_head_i8_normed_mk_op(
-                wq,
-                rs,
-                &hidden_pre,
-                self.norm.weight_bf16(),
-                &rstd,
-                m,
-                &dev,
-            )?,
-            None => {
-                anyhow::bail!("forward_step_fast_mk requires NV_E4B_LMHEAD_INT8=1")
-            }
-        };
-        Ok((logits, hidden_pre))
-    }
-
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    fn layer_step_fast_mk(
-        &self,
-        layer: &E4bLayer,
-        x: &Tensor,
-        idx: usize,
-        pos_t: &Tensor,
-        per_layer_input: &Tensor,
-        rstd_in: &Tensor,
-        normed_in: Option<&Tensor>,
-        next_input_w: Option<&Tensor>,
-        fixed: &mut E4bFixedCache,
-        m: usize,
-    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
-        let hidden = self.config.hidden_size;
-        let nh = self.config.num_attention_heads;
-        let hd = layer.head_dim;
-        let nkv = layer.n_kv_heads;
-        let window = match layer.kind {
-            LayerType::SlidingAttention => self.config.sliding_window,
-            LayerType::FullAttention => 0,
-        };
-        let eps = self.config.rms_norm_eps as f32;
-        let rope = match layer.kind {
-            LayerType::SlidingAttention => &self.sliding_rope,
-            LayerType::FullAttention => &self.full_rope,
-        };
-        let h0 = x.reshape((m, hidden))?;
-        let normed = match normed_in {
-            Some(n) => n.clone(),
-            None => rms_apply_op(&h0, layer.input_ln.weight_bf16(), rstd_in)?,
-        };
-        let qkv = layer
-            .qkv_proj
-            .forward(&normed)?
-            .reshape((m, ()))?
-            .contiguous()?;
-
-        let attn_rows = Tensor::zeros((m, nh * hd), DType::BF16, &self.device)?;
-        for j in 0..m {
-            let delta = (m - 1 - j) as i32;
-            let qf = match &layer.k_norm {
-                Some(kn) => fixed.qkv_prep(
-                    Some(idx),
-                    &qkv,
-                    j,
-                    layer.q_norm.weight_bf16(),
-                    Some(kn.weight_bf16()),
-                    rope,
-                    pos_t,
-                    delta,
-                    nh,
-                    nkv,
-                    hd,
-                    eps,
-                )?,
-                None => fixed.qkv_prep(
-                    None,
-                    &qkv,
-                    j,
-                    layer.q_norm.weight_bf16(),
-                    None,
-                    rope,
-                    pos_t,
-                    delta,
-                    nh,
-                    nkv,
-                    hd,
-                    eps,
-                )?,
-            };
-            let buf = match &layer.k_norm {
-                Some(_) => idx,
-                None => layer.kv_source.context("kv-shared layer without source")?,
-            };
-            fixed.attend_into(buf, &qf, delta, &attn_rows, j, nh, nkv, hd, window)?;
-        }
-        self.attn_tail_mk(
-            layer,
-            &h0,
-            &attn_rows,
-            hidden,
-            per_layer_input,
-            next_input_w,
-            m,
-        )
-    }
-
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
-    fn attn_tail_mk(
-        &self,
-        layer: &E4bLayer,
-        h0: &Tensor,
-        attn: &Tensor,
-        hidden: usize,
-        per_layer_input: &Tensor,
-        next_input_w: Option<&Tensor>,
-        m: usize,
-    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
-        let eps = self.config.rms_norm_eps as f32;
-
-        let attn = layer.o_proj.forward(attn)?;
-        let (h, _rstd_h1, normed2) = rmsnorm_add_scale_chain_op(
-            &attn.reshape((m, hidden))?,
-            &layer.post_attn_ln,
-            h0,
-            1.0,
-            Some(eps),
-            Some(layer.pre_ff_ln.weight_bf16()),
-        )?;
-        let normed2 = normed2.context("missing fused pre_ff apply")?;
-
-        let act = geglu_fused_op(&layer.gate_up_proj.forward(&normed2)?)?;
-        let down = layer.down_proj.forward(&act)?;
-        let h = rmsnorm_add_scale_op(&down.reshape((m, hidden))?, &layer.post_ff_ln, &h, 1.0)?;
-
-        let gated = gelu_mul(&layer.per_layer_input_gate.forward(&h)?, per_layer_input)?;
-        let contrib = layer.per_layer_projection.forward(&gated)?;
-        let (h, rstd_next, normed_next) = rmsnorm_add_scale_chain_op(
-            &contrib.reshape((m, hidden))?,
-            &layer.post_per_layer_input_norm,
-            &h,
-            layer.layer_scalar,
-            Some(eps),
-            next_input_w,
-        )?;
-        let rstd_next = rstd_next.context("missing chained rstd")?;
-        Ok((h.reshape((1, m, hidden))?, rstd_next, normed_next))
-    }
-
-    #[cfg(feature = "cuda")]
     fn per_layer_inputs_fast(&self, ids: &Tensor, inputs_embeds: &Tensor) -> Result<Tensor> {
         let n_layers = self.config.num_hidden_layers;
         let hpl = self.config.hidden_size_per_layer_input;
@@ -3489,7 +3022,6 @@ impl Gemma4E4b {
     }
 
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn layer_step_fast(
         &self,
         layer: &E4bLayer,
@@ -3589,7 +3121,6 @@ impl Gemma4E4b {
     }
 
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn attn_tail(
         &self,
         layer: &E4bLayer,
@@ -3750,12 +3281,12 @@ impl E4bPrefillFixedCache {
     }
 
     fn begin_step(&self, past_len: usize, n: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             past_len == self.len,
             "E4bPrefillFixedCache: step at past_len {past_len} but cache holds {} tokens",
             self.len
         );
-        anyhow::ensure!(
+        ensure!(
             past_len + n <= self.capacity,
             "E4bPrefillFixedCache: step to {} exceeds capacity {}",
             past_len + n,
@@ -3798,7 +3329,6 @@ impl E4bPrefillFixedCache {
     }
 
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn prep_and_append_one_kernel(
         &mut self,
         idx: usize,
@@ -3814,42 +3344,40 @@ impl E4bPrefillFixedCache {
     ) -> Result<Tensor> {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         let n = qkv.dim(0)?;
-        let dev = match qkv.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("prep_and_append_one_kernel requires cuda"),
+        let Device::Cuda(dev) = qkv.device().clone() else {
+            bail!("prep_and_append_one_kernel requires cuda")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let qkv = qkv.contiguous()?;
         let row_stride = qkv.dim(1)?;
-        let mut q_dev: cudarc::driver::CudaSlice<f32> =
-            unsafe { stream.alloc::<f32>(n * nh * hd) }.map_err(|e| anyhow::anyhow!(e))?;
+        let mut q_dev: CudaSlice<f32> = unsafe { stream.alloc::<f32>(n * nh * hd) }?;
         let cuda_ptr = |t: &Tensor| -> Result<u64> {
             let (st, layout) = t.storage_and_layout();
             match &*st {
-                candle_core::Storage::Cuda(c) => {
+                Storage::Cuda(c) => {
                     let off = layout.start_offset();
                     Ok(match t.dtype() {
                         DType::BF16 => {
                             let sl = c.as_cuda_slice::<half::bf16>()?;
                             let (p, _g) = sl.device_ptr(&stream);
-                            p as u64 + (off * 2) as u64
+                            p + (off * 2) as u64
                         }
                         DType::F32 => {
                             let sl = c.as_cuda_slice::<f32>()?;
                             let (p, _g) = sl.device_ptr(&stream);
-                            p as u64 + (off * 4) as u64
+                            p + (off * 4) as u64
                         }
                         DType::U32 => {
                             let sl = c.as_cuda_slice::<u32>()?;
                             let (p, _g) = sl.device_ptr(&stream);
-                            p as u64 + (off * 4) as u64
+                            p + (off * 4) as u64
                         }
                         other => {
-                            anyhow::bail!("prep_and_append_one_kernel: unexpected dtype {other:?}")
+                            bail!("prep_and_append_one_kernel: unexpected dtype {other:?}")
                         }
                     })
                 }
-                _ => anyhow::bail!("prep_and_append_one_kernel: tensor not on cuda"),
+                _ => bail!("prep_and_append_one_kernel: tensor not on cuda"),
             }
         };
         let qkv_p = cuda_ptr(&qkv)?;
@@ -3902,17 +3430,18 @@ impl E4bPrefillFixedCache {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "e4b_prefill_qkv_prep returned {rc}");
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(q_dev, dev);
-        let storage = candle_core::Storage::Cuda(storage);
+        ensure!(rc == 0, "e4b_prefill_qkv_prep returned {rc}");
+        let storage = CudaStorage::wrap_cuda_slice(q_dev, dev);
+        let storage = Storage::Cuda(storage);
         Ok(Tensor::from_storage(
             storage,
             (1, n, nh, hd),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         ))
     }
 
+    #[cfg(feature = "cuda")]
     fn bf16_twin_views_for_the_gemm_arm(
         &self,
         idx: usize,
@@ -3973,7 +3502,7 @@ impl E4bFp8Cache {
 
     fn begin_step(&mut self, past_len: usize, n: usize) -> Result<()> {
         use crate::gemma4::Gemma4Cache;
-        anyhow::ensure!(
+        ensure!(
             past_len + n <= self.capacity,
             "E4bFp8Cache: step to {} exceeds capacity {}",
             past_len + n,
@@ -3993,31 +3522,6 @@ impl E4bFp8Cache {
         let (k, v) = self.inner.view(layer, len)?;
         Ok((cast_to_f32(&k)?, cast_to_f32(&v)?))
     }
-}
-
-pub fn cat_kv_cache_bytes(config: &Gemma4Config, kv_max_seq_len: usize) -> usize {
-    (0..config.num_hidden_layers)
-        .filter(|i| !config.is_kv_shared_layer(*i))
-        .map(|i| {
-            let kind = config.layer_kind(i);
-            let stride = config.num_kv_heads_for(kind) * config.head_dim_for(kind);
-            kv_max_seq_len * stride * std::mem::size_of::<f32>() * 2
-        })
-        .sum()
-}
-
-pub fn truncate_kv_cache(cache: &mut [Option<(Tensor, Tensor)>], len: usize) -> Result<()> {
-    for e in cache.iter_mut() {
-        if let Some((k, v)) = e.take() {
-            let cur = k.dim(1)?;
-            if cur > len {
-                *e = Some((k.narrow(1, 0, len)?, v.narrow(1, 0, len)?));
-            } else {
-                *e = Some((k, v));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn cache_mask(
@@ -4057,7 +3561,7 @@ fn rms_no_weight(x: &Tensor, eps: f64) -> Result<Tensor> {
 
 fn add_scale_op(a: &Tensor, b: &Tensor, scale: f64) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
-    if matches!(a.device(), Device::Cuda(_)) && a.dtype() == DType::BF16 {
+    if a.device().is_cuda() && a.dtype() == DType::BF16 {
         return cuda_binary_bf16(a, b, |stream, pa, pb, py, n| unsafe {
             nv_kernels::cuda::residual_add_scale_bf16(stream, pa, pb, py, scale as f32, n)
         });
@@ -4071,7 +3575,7 @@ fn add_scale_op(a: &Tensor, b: &Tensor, scale: f64) -> Result<Tensor> {
 #[allow(dead_code)]
 fn gelu_mul_op(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
-    if matches!(gate.device(), Device::Cuda(_)) && gate.dtype() == DType::BF16 {
+    if gate.device().is_cuda() && gate.dtype() == DType::BF16 {
         return cuda_binary_bf16(gate, up, |stream, pg, pu, py, n| unsafe {
             nv_kernels::cuda::gelu_tanh_mul_bf16(stream, pg, pu, py, n)
         });
@@ -4086,14 +3590,13 @@ where
 {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match a.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("cuda_binary_bf16 requires cuda"),
+    let Device::Cuda(dev) = a.device().clone() else {
+        bail!("cuda_binary_bf16 requires cuda")
     };
     let a_c = a.contiguous()?;
     let b_c = b.contiguous()?;
     let dims = a_c.dims().to_vec();
-    anyhow::ensure!(
+    ensure!(
         dims == b_c.dims(),
         "shape mismatch {:?} vs {:?}",
         dims,
@@ -4110,12 +3613,12 @@ where
         let (a_st, _al) = a_c.storage_and_layout();
         let (b_st, _bl) = b_c.storage_and_layout();
         let ac = match &*a_st {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("a not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("a not cuda"),
         };
         let bc = match &*b_st {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("b not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("b not cuda"),
         };
         let asl = ac.as_cuda_slice::<bf16>()?;
         let bsl = bc.as_cuda_slice::<bf16>()?;
@@ -4130,7 +3633,7 @@ where
             n,
         )
     };
-    anyhow::ensure!(rc == 0, "elementwise bf16 kernel returned {rc}");
+    ensure!(rc == 0, "elementwise bf16 kernel returned {rc}");
     y_dev
         .reshape(dims)?
         .reshape(a_c.shape())
@@ -4138,7 +3641,6 @@ where
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 fn attn_decode_f32_op(
     q: &Tensor,
     k: &Tensor,
@@ -4150,9 +3652,8 @@ fn attn_decode_f32_op(
     start: usize,
 ) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
-    let dev = match q.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("attn_decode_f32_op requires cuda"),
+    let Device::Cuda(dev) = q.device().clone() else {
+        bail!("attn_decode_f32_op requires cuda")
     };
     let q = q.contiguous()?;
     let k = k.contiguous()?;
@@ -4168,16 +3669,16 @@ fn attn_decode_f32_op(
         let (ks, _kl) = k.storage_and_layout();
         let (vs, _vl) = v.storage_and_layout();
         let qc = match &*qs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("q not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("q not cuda"),
         };
         let kc = match &*ks {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("k not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("k not cuda"),
         };
         let vc = match &*vs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("v not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("v not cuda"),
         };
         let qsl = qc.as_cuda_slice::<f32>()?;
         let ksl = kc.as_cuda_slice::<f32>()?;
@@ -4201,18 +3702,17 @@ fn attn_decode_f32_op(
             )
         }
     };
-    anyhow::ensure!(rc == 0, "attn_decode_f32 returned {rc}");
+    ensure!(rc == 0, "attn_decode_f32 returned {rc}");
     out_dev.reshape((nh, hd)).map_err(Into::into)
 }
 
 #[cfg(feature = "cuda")]
 fn cast_to_f32(x: &Tensor) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("cast_to_f32 requires cuda"),
+    let Device::Cuda(dev) = x.device().clone() else {
+        bail!("cast_to_f32 requires cuda")
     };
-    anyhow::ensure!(x.dtype() == DType::BF16, "cast_to_f32 expects bf16");
+    ensure!(x.dtype() == DType::BF16, "cast_to_f32 expects bf16");
     let x_c = x.contiguous()?;
     let dims = x_c.dims().to_vec();
     let n: usize = dims.iter().product();
@@ -4225,8 +3725,8 @@ fn cast_to_f32(x: &Tensor) -> Result<Tensor> {
     let rc = {
         let (xs, _xl) = x_c.storage_and_layout();
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("cast_to_f32: x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("cast_to_f32: x not cuda"),
         };
         let xsl = xc.as_cuda_slice::<half::bf16>()?;
         let (xp, _gx) = xsl.device_ptr(&stream);
@@ -4240,7 +3740,7 @@ fn cast_to_f32(x: &Tensor) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "cast_bf16_f32 returned {rc}");
+    ensure!(rc == 0, "cast_bf16_f32 returned {rc}");
     y_dev
         .reshape(dims)?
         .reshape(x_c.shape())
@@ -4250,11 +3750,10 @@ fn cast_to_f32(x: &Tensor) -> Result<Tensor> {
 #[cfg(feature = "cuda")]
 fn cast_to_bf16(x: &Tensor) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("cast_to_bf16 requires cuda"),
+    let Device::Cuda(dev) = x.device().clone() else {
+        bail!("cast_to_bf16 requires cuda")
     };
-    anyhow::ensure!(x.dtype() == DType::F32, "cast_to_bf16 expects f32");
+    ensure!(x.dtype() == DType::F32, "cast_to_bf16 expects f32");
     let x_c = x.contiguous()?;
     let dims = x_c.dims().to_vec();
     let n: usize = dims.iter().product();
@@ -4267,8 +3766,8 @@ fn cast_to_bf16(x: &Tensor) -> Result<Tensor> {
     let rc = {
         let (xs, _xl) = x_c.storage_and_layout();
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("cast_to_bf16: x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("cast_to_bf16: x not cuda"),
         };
         let xsl = xc.as_cuda_slice::<f32>()?;
         let (xp, _gx) = xsl.device_ptr(&stream);
@@ -4282,7 +3781,7 @@ fn cast_to_bf16(x: &Tensor) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "cast_f32_bf16 returned {rc}");
+    ensure!(rc == 0, "cast_f32_bf16 returned {rc}");
     y_dev
         .reshape(dims)?
         .reshape(x_c.shape())
@@ -4293,11 +3792,10 @@ fn cast_to_bf16(x: &Tensor) -> Result<Tensor> {
 #[allow(dead_code)]
 fn rms_no_weight_f32(x: &Tensor, eps: f64) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("rms_no_weight_f32 requires cuda"),
+    let Device::Cuda(dev) = x.device().clone() else {
+        bail!("rms_no_weight_f32 requires cuda")
     };
-    anyhow::ensure!(x.dtype() == DType::BF16, "rms_no_weight_f32 expects bf16");
+    ensure!(x.dtype() == DType::BF16, "rms_no_weight_f32 expects bf16");
     let (rows, dim) = x.dims2()?;
     let x_c = x.contiguous()?;
     let n = rows * dim;
@@ -4313,8 +3811,8 @@ fn rms_no_weight_f32(x: &Tensor, eps: f64) -> Result<Tensor> {
             .contiguous_offsets()
             .ok_or_else(|| anyhow::anyhow!("rms_no_weight_f32: x not dense"))?;
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("rms_no_weight_f32: x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("rms_no_weight_f32: x not cuda"),
         };
         let xsl = xc.as_cuda_slice::<half::bf16>()?;
         let xview = xsl.slice(x0..x1);
@@ -4331,7 +3829,7 @@ fn rms_no_weight_f32(x: &Tensor, eps: f64) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "rms_no_weight_bf16_f32 returned {rc}");
+    ensure!(rc == 0, "rms_no_weight_bf16_f32 returned {rc}");
     y_dev.reshape((rows, dim)).map_err(Into::into)
 }
 
@@ -4339,15 +3837,14 @@ fn rms_no_weight_f32(x: &Tensor, eps: f64) -> Result<Tensor> {
 fn gelu_mul(gate: &Tensor, pli: &Tensor) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match gate.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("gelu_mul requires cuda"),
+    let Device::Cuda(dev) = gate.device().clone() else {
+        bail!("gelu_mul requires cuda")
     };
-    anyhow::ensure!(gate.dtype() == DType::BF16, "gelu_mul gate expects bf16");
-    anyhow::ensure!(pli.dtype() == DType::F32, "gelu_mul pli expects f32");
+    ensure!(gate.dtype() == DType::BF16, "gelu_mul gate expects bf16");
+    ensure!(pli.dtype() == DType::F32, "gelu_mul pli expects f32");
     let dims = gate.dims().to_vec();
     let n: usize = dims.iter().product();
-    anyhow::ensure!(
+    ensure!(
         pli.elem_count() == n,
         "gelu_mul numel mismatch {} vs {}",
         n,
@@ -4368,14 +3865,14 @@ fn gelu_mul(gate: &Tensor, pli: &Tensor) -> Result<Tensor> {
         let (p0, p1) = pl
             .contiguous_offsets()
             .ok_or_else(|| anyhow::anyhow!("gelu_mul: pli not dense"))?;
-        anyhow::ensure!(g1 - g0 == n && p1 - p0 == n, "gelu_mul: range mismatch");
+        ensure!(g1 - g0 == n && p1 - p0 == n, "gelu_mul: range mismatch");
         let gc = match &*gs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("gelu_mul: gate not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("gelu_mul: gate not cuda"),
         };
         let pc = match &*ps {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("gelu_mul: pli not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("gelu_mul: pli not cuda"),
         };
         let gsl = gc.as_cuda_slice::<bf16>()?;
         let psl = pc.as_cuda_slice::<f32>()?;
@@ -4394,7 +3891,7 @@ fn gelu_mul(gate: &Tensor, pli: &Tensor) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "gelu_mul_bf16f32 returned {rc}");
+    ensure!(rc == 0, "gelu_mul_bf16f32 returned {rc}");
     y_dev
         .reshape(dims)?
         .reshape(gate.shape())
@@ -4405,14 +3902,13 @@ fn gelu_mul(gate: &Tensor, pli: &Tensor) -> Result<Tensor> {
 fn gather_rows_bf16_op(weight: &Tensor, ids: &Tensor) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match weight.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("gather_rows_bf16_op requires cuda"),
+    let Device::Cuda(dev) = weight.device().clone() else {
+        bail!("gather_rows_bf16_op requires cuda")
     };
     let (vocab, hidden) = weight.dims2()?;
-    anyhow::ensure!(weight.dtype() == DType::BF16, "gather weight must be bf16");
+    ensure!(weight.dtype() == DType::BF16, "gather weight must be bf16");
     let ids_c = ids.flatten_all()?.contiguous()?;
-    anyhow::ensure!(ids_c.dtype() == DType::U32, "gather ids must be u32");
+    ensure!(ids_c.dtype() == DType::U32, "gather ids must be u32");
     let n = ids_c.dims()[0];
     let w_c = weight.contiguous()?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
@@ -4425,12 +3921,12 @@ fn gather_rows_bf16_op(weight: &Tensor, ids: &Tensor) -> Result<Tensor> {
         let (ts, _tl) = ids_c.storage_and_layout();
         let (ws, _wl) = w_c.storage_and_layout();
         let tc = match &*ts {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("ids not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("ids not cuda"),
         };
         let wc = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("weight not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("weight not cuda"),
         };
         let tsl = tc.as_cuda_slice::<u32>()?;
         let wsl = wc.as_cuda_slice::<bf16>()?;
@@ -4449,7 +3945,7 @@ fn gather_rows_bf16_op(weight: &Tensor, ids: &Tensor) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "gather_rows_bf16 returned {rc}");
+    ensure!(rc == 0, "gather_rows_bf16 returned {rc}");
     y_dev.reshape((n, hidden)).map_err(Into::into)
 }
 
@@ -4457,11 +3953,10 @@ fn gather_rows_bf16_op(weight: &Tensor, ids: &Tensor) -> Result<Tensor> {
 fn scale_bf16_op(x: &Tensor, scale: f32) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("scale_bf16_op requires cuda"),
+    let Device::Cuda(dev) = x.device().clone() else {
+        bail!("scale_bf16_op requires cuda")
     };
-    anyhow::ensure!(x.dtype() == DType::BF16, "scale_bf16_op expects bf16");
+    ensure!(x.dtype() == DType::BF16, "scale_bf16_op expects bf16");
     let x_c = x.contiguous()?;
     let dims = x_c.dims().to_vec();
     let n: usize = dims.iter().product();
@@ -4474,8 +3969,8 @@ fn scale_bf16_op(x: &Tensor, scale: f32) -> Result<Tensor> {
     let rc = {
         let (xs, _xl) = x_c.storage_and_layout();
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("scale_bf16_op: x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("scale_bf16_op: x not cuda"),
         };
         let xsl = xc.as_cuda_slice::<bf16>()?;
         let (xp, _gx) = xsl.device_ptr(&stream);
@@ -4490,7 +3985,7 @@ fn scale_bf16_op(x: &Tensor, scale: f32) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "scale_out_bf16 returned {rc}");
+    ensure!(rc == 0, "scale_out_bf16 returned {rc}");
     y_dev
         .reshape(dims)?
         .reshape(x_c.shape())
@@ -4501,11 +3996,10 @@ fn scale_bf16_op(x: &Tensor, scale: f32) -> Result<Tensor> {
 fn cast_scale_f32_op(x: &Tensor, scale: f32) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("cast_scale_f32_op requires cuda"),
+    let Device::Cuda(dev) = x.device().clone() else {
+        bail!("cast_scale_f32_op requires cuda")
     };
-    anyhow::ensure!(x.dtype() == DType::BF16, "cast_scale_f32_op expects bf16");
+    ensure!(x.dtype() == DType::BF16, "cast_scale_f32_op expects bf16");
     let x_c = x.contiguous()?;
     let dims = x_c.dims().to_vec();
     let n: usize = dims.iter().product();
@@ -4518,8 +4012,8 @@ fn cast_scale_f32_op(x: &Tensor, scale: f32) -> Result<Tensor> {
     let rc = {
         let (xs, _xl) = x_c.storage_and_layout();
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("cast_scale_f32_op: x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("cast_scale_f32_op: x not cuda"),
         };
         let xsl = xc.as_cuda_slice::<bf16>()?;
         let (xp, _gx) = xsl.device_ptr(&stream);
@@ -4534,7 +4028,7 @@ fn cast_scale_f32_op(x: &Tensor, scale: f32) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "cast_scale_bf16_f32 returned {rc}");
+    ensure!(rc == 0, "cast_scale_bf16_f32 returned {rc}");
     y_dev
         .reshape(dims)?
         .reshape(x_c.shape())
@@ -4544,18 +4038,17 @@ fn cast_scale_f32_op(x: &Tensor, scale: f32) -> Result<Tensor> {
 #[cfg(feature = "cuda")]
 fn add_scale_f32_op(a: &Tensor, b: &Tensor, scale: f32) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
-    let dev = match a.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("add_scale_f32_op requires cuda"),
+    let Device::Cuda(dev) = a.device().clone() else {
+        bail!("add_scale_f32_op requires cuda")
     };
-    anyhow::ensure!(
+    ensure!(
         a.dtype() == DType::F32 && b.dtype() == DType::F32,
         "add_scale_f32_op expects f32"
     );
     let a_c = a.contiguous()?;
     let b_c = b.contiguous()?;
     let dims = a_c.dims().to_vec();
-    anyhow::ensure!(dims == b_c.dims(), "add_scale_f32_op shape mismatch");
+    ensure!(dims == b_c.dims(), "add_scale_f32_op shape mismatch");
     let n: usize = dims.iter().product();
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let y_dev = nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
@@ -4567,12 +4060,12 @@ fn add_scale_f32_op(a: &Tensor, b: &Tensor, scale: f32) -> Result<Tensor> {
         let (as_, _al) = a_c.storage_and_layout();
         let (bs, _bl) = b_c.storage_and_layout();
         let ac = match &*as_ {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("add_scale_f32_op: a not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("add_scale_f32_op: a not cuda"),
         };
         let bc = match &*bs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("add_scale_f32_op: b not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("add_scale_f32_op: b not cuda"),
         };
         let asl = ac.as_cuda_slice::<f32>()?;
         let bsl = bc.as_cuda_slice::<f32>()?;
@@ -4590,7 +4083,7 @@ fn add_scale_f32_op(a: &Tensor, b: &Tensor, scale: f32) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "add_scale_f32 returned {rc}");
+    ensure!(rc == 0, "add_scale_f32 returned {rc}");
     y_dev
         .reshape(dims)?
         .reshape(a_c.shape())
@@ -4618,22 +4111,21 @@ fn rmsnorm_add_scale_chain_op(
 ) -> Result<(Tensor, Option<Tensor>, Option<Tensor>)> {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("rmsnorm_add_scale_op requires cuda"),
+    let Device::Cuda(dev) = x.device().clone() else {
+        bail!("rmsnorm_add_scale_op requires cuda")
     };
-    anyhow::ensure!(
+    ensure!(
         x.dtype() == DType::BF16 && res.dtype() == DType::BF16,
         "rmsnorm_add_scale_op expects bf16"
     );
     let x_c = x.contiguous()?;
     let res_c = res.contiguous()?;
     let dims = x_c.dims().to_vec();
-    anyhow::ensure!(res_c.elem_count() == x_c.elem_count(), "res numel mismatch");
+    ensure!(res_c.elem_count() == x_c.elem_count(), "res numel mismatch");
     let dim = *dims.last().unwrap();
     let rows: usize = dims.iter().product::<usize>() / dim;
     let w = norm.weight_bf16();
-    anyhow::ensure!(
+    ensure!(
         w.dtype() == DType::BF16 && w.elem_count() == dim,
         "norm weight mismatch"
     );
@@ -4654,11 +4146,11 @@ fn rmsnorm_add_scale_chain_op(
         None => None,
     };
     if next_w.is_some() {
-        anyhow::ensure!(chain_eps.is_some(), "next_w requires chain_eps");
+        ensure!(chain_eps.is_some(), "next_w requires chain_eps");
     }
     let normed_dev: Option<Tensor> = match next_w {
         Some(nw) => {
-            anyhow::ensure!(
+            ensure!(
                 nw.dtype() == DType::BF16 && nw.elem_count() == dim,
                 "next_w mismatch"
             );
@@ -4677,16 +4169,16 @@ fn rmsnorm_add_scale_chain_op(
         let (ws, _wl) = w.storage_and_layout();
         let (rs, _rl) = res_c.storage_and_layout();
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("x not cuda"),
         };
         let wc = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("w not cuda"),
         };
         let rcu = match &*rs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("res not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("res not cuda"),
         };
         let xsl = xc.as_cuda_slice::<bf16>()?;
         let wsl = wc.as_cuda_slice::<bf16>()?;
@@ -4703,8 +4195,8 @@ fn rmsnorm_add_scale_chain_op(
             Some(nw) => {
                 let (ns, _nl) = nw.storage_and_layout();
                 let nc = match &*ns {
-                    candle_core::Storage::Cuda(s) => s,
-                    _ => anyhow::bail!("next_w not cuda"),
+                    Storage::Cuda(s) => s,
+                    _ => bail!("next_w not cuda"),
                 };
                 let nsl = nc.as_cuda_slice::<bf16>()?;
                 let (np, _gn) = nsl.device_ptr(&stream);
@@ -4734,7 +4226,7 @@ fn rmsnorm_add_scale_chain_op(
             )
         }
     };
-    anyhow::ensure!(rc == 0, "rmsnorm_add_scale_bf16 returned {rc}");
+    ensure!(rc == 0, "rmsnorm_add_scale_bf16 returned {rc}");
     let y = y_dev.reshape(dims)?.reshape(x_c.shape())?;
     let rstd = rstd_dev;
     let normed = normed_dev.map(|b| b.reshape(x_c.shape())).transpose()?;
@@ -4745,11 +4237,10 @@ fn rmsnorm_add_scale_chain_op(
 pub(crate) fn rstd_op(x: &Tensor, eps: f32) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("rstd_op requires cuda"),
+    let Device::Cuda(dev) = x.device().clone() else {
+        bail!("rstd_op requires cuda")
     };
-    anyhow::ensure!(x.dtype() == DType::BF16, "rstd_op expects bf16");
+    ensure!(x.dtype() == DType::BF16, "rstd_op expects bf16");
     let dims = x.dims().to_vec();
     let dim = *dims.last().context("rstd_op: scalar input")?;
     let rows = x.elem_count() / dim;
@@ -4766,8 +4257,8 @@ pub(crate) fn rstd_op(x: &Tensor, eps: f32) -> Result<Tensor> {
             .contiguous_offsets()
             .ok_or_else(|| anyhow::anyhow!("rstd_op: x not dense"))?;
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("x not cuda"),
         };
         let xsl = xc.as_cuda_slice::<bf16>()?;
         let xview = xsl.slice(x0..x1);
@@ -4784,7 +4275,7 @@ pub(crate) fn rstd_op(x: &Tensor, eps: f32) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "rstd_bf16 returned {rc}");
+    ensure!(rc == 0, "rstd_bf16 returned {rc}");
     r_dev.reshape((rows,)).map_err(Into::into)
 }
 
@@ -4792,20 +4283,19 @@ pub(crate) fn rstd_op(x: &Tensor, eps: f32) -> Result<Tensor> {
 fn rms_apply_op(x: &Tensor, w_bf16: &Tensor, rstd: &Tensor) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("rms_apply_op requires cuda"),
+    let Device::Cuda(dev) = x.device().clone() else {
+        bail!("rms_apply_op requires cuda")
     };
-    anyhow::ensure!(x.dtype() == DType::BF16, "rms_apply_op expects bf16");
+    ensure!(x.dtype() == DType::BF16, "rms_apply_op expects bf16");
     let x_c = x.contiguous()?;
     let dims = x_c.dims().to_vec();
     let n: usize = dims.iter().product();
     let dim = w_bf16.elem_count();
-    anyhow::ensure!(
+    ensure!(
         dim > 0 && n.is_multiple_of(dim),
         "rms_apply_op weight mismatch"
     );
-    anyhow::ensure!(
+    ensure!(
         rstd.elem_count() == n / dim,
         "rms_apply_op rstd rows mismatch"
     );
@@ -4823,16 +4313,16 @@ fn rms_apply_op(x: &Tensor, w_bf16: &Tensor, rstd: &Tensor) -> Result<Tensor> {
         let (ws, _wl) = w_bf16.storage_and_layout();
         let (rs, _rl) = rstd.storage_and_layout();
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("x not cuda"),
         };
         let wc = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("w not cuda"),
         };
         let rcu = match &*rs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("rstd not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("rstd not cuda"),
         };
         let xsl = xc.as_cuda_slice::<bf16>()?;
         let xview = xsl.slice(x0..x1);
@@ -4854,7 +4344,7 @@ fn rms_apply_op(x: &Tensor, w_bf16: &Tensor, rstd: &Tensor) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "rms_apply_bf16 returned {rc}");
+    ensure!(rc == 0, "rms_apply_bf16 returned {rc}");
     y_dev
         .reshape(dims)?
         .reshape(x_c.shape())
@@ -4862,134 +4352,14 @@ fn rms_apply_op(x: &Tensor, w_bf16: &Tensor, rstd: &Tensor) -> Result<Tensor> {
 }
 
 #[cfg(feature = "cuda")]
-pub struct E4bSpecVerifier<'a> {
-    model: &'a Gemma4E4b,
-    fixed: E4bFixedCache,
-    pos_scratch: Tensor,
-    device: candle_core::CudaDevice,
-    pub committed: usize,
-    pub last_token: u32,
-    pub last_hidden: Tensor,
-}
-
-#[cfg(feature = "cuda")]
-impl<'a> E4bSpecVerifier<'a> {
-    pub fn new(model: &'a Gemma4E4b, prompt: &[u32], max_total: usize) -> Result<Self> {
-        anyhow::ensure!(!prompt.is_empty(), "empty prompt");
-        let dev = match &model.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("spec verifier requires cuda"),
-        };
-        let mut cat: Vec<Option<(Tensor, Tensor)>> = vec![None; model.layers.len()];
-        let (logits, hiddens) = model.forward_step_spec(prompt, 0, &mut cat)?;
-        let n0 = prompt.len();
-        let last_token = logits
-            .narrow(0, n0 - 1, 1)?
-            .argmax(D::Minus1)?
-            .reshape(1)?
-            .to_vec1::<u32>()?[0];
-        let last_hidden = hiddens
-            .narrow(0, n0 - 1, 1)?
-            .reshape(model.config.hidden_size)?;
-        let max_len = max_total.next_power_of_two().max(64);
-        let fixed = E4bFixedCache::from_cat(&cat, n0, max_len, &dev)?;
-        let pos_scratch = Tensor::zeros(1, DType::I32, &model.device)?;
-        Ok(Self {
-            model,
-            fixed,
-            pos_scratch,
-            device: dev,
-            committed: n0,
-            last_token,
-            last_hidden,
-        })
-    }
-
-    pub fn verify(&mut self, feed: &[u32]) -> Result<(Vec<u32>, Tensor)> {
-        let m = feed.len();
-        let ids = Tensor::from_vec(feed.to_vec(), m, &self.model.device)?;
-        let (logits, hiddens) =
-            self.model
-                .forward_step_fast_mk(&ids, &self.pos_scratch, &mut self.fixed, m)?;
-        let targets = logits.argmax(D::Minus1)?.to_vec1::<u32>()?;
-        Ok((targets, hiddens))
-    }
-
-    pub fn accept(&mut self, accepted: usize, bonus: u32, hiddens: &Tensor) -> Result<()> {
-        self.committed += accepted + 1;
-        self.last_token = bonus;
-        self.last_hidden = hiddens
-            .narrow(0, accepted, 1)?
-            .reshape(self.model.config.hidden_size)?;
-        let stream = nv_layers::cuda_stream::current_stream(&self.device);
-        stream
-            .memcpy_htod(&[self.committed as i32], &mut self.fixed.pos)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(())
-    }
-
-    pub fn drafter_shared_kv(&self) -> Result<((Tensor, Tensor), (Tensor, Tensor))> {
-        let mut sl = None;
-        let mut fl = None;
-        for (i, l) in self.model.layers.iter().enumerate() {
-            if l.k_norm.is_some() {
-                match l.kind {
-                    LayerType::SlidingAttention => sl = Some(i),
-                    LayerType::FullAttention => fl = Some(i),
-                }
-            }
-        }
-        let view = |i: usize, hd: usize, nkv: usize| -> Result<(Tensor, Tensor)> {
-            let len = self.committed;
-            let stream = nv_layers::cuda_stream::current_stream(&self.device);
-            let mk = |src: &cudarc::driver::CudaSlice<half::bf16>| -> Result<Tensor> {
-                let elems = len * nkv * hd;
-                let mut buf: cudarc::driver::CudaSlice<half::bf16> = unsafe {
-                    stream
-                        .alloc::<half::bf16>(elems)
-                        .map_err(|e| anyhow::anyhow!(e))?
-                };
-                let src_view = src.slice(0..elems);
-                stream
-                    .memcpy_dtod(&src_view, &mut buf)
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                let storage = candle_core::CudaStorage::wrap_cuda_slice(buf, self.device.clone());
-                let storage = candle_core::Storage::Cuda(storage);
-                Tensor::from_storage(
-                    storage,
-                    (len, nkv, hd),
-                    candle_core::op::BackpropOp::none(),
-                    false,
-                )
-                .transpose(0, 1)?
-                .contiguous()
-                .map_err(Into::into)
-            };
-            let k = self.fixed.k[i].as_ref().context("drafter kv: no k")?;
-            let v = self.fixed.v[i].as_ref().context("drafter kv: no v")?;
-            Ok((mk(k)?, mk(v)?))
-        };
-        let sl = sl.context("no sliding kv layer")?;
-        let fl = fl.context("no full kv layer")?;
-        let lsl = &self.model.layers[sl];
-        let lfl = &self.model.layers[fl];
-        Ok((
-            view(sl, lsl.head_dim, lsl.n_kv_heads)?,
-            view(fl, lfl.head_dim, lfl.n_kv_heads)?,
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
 fn lm_head_normed_op(embed: &Tensor, x: &Tensor, w_norm: &Tensor, rstd: &Tensor) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match x.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("lm_head_normed_op requires cuda"),
+    let Device::Cuda(dev) = x.device().clone() else {
+        bail!("lm_head_normed_op requires cuda")
     };
     let (vocab, hidden) = embed.dims2()?;
-    anyhow::ensure!(x.elem_count() == hidden, "lm_head x mismatch");
+    ensure!(x.elem_count() == hidden, "lm_head x mismatch");
     let x_c = x.contiguous()?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let y_dev = nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
@@ -5006,20 +4376,20 @@ fn lm_head_normed_op(embed: &Tensor, x: &Tensor, w_norm: &Tensor, rstd: &Tensor)
         let (ws, _wl) = w_norm.storage_and_layout();
         let (rs, _rl) = rstd.storage_and_layout();
         let ec = match &*es {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("embed not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("embed not cuda"),
         };
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("x not cuda"),
         };
         let wc = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w_norm not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("w_norm not cuda"),
         };
         let rcu = match &*rs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("rstd not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("rstd not cuda"),
         };
         let esl = ec.as_cuda_slice::<bf16>()?;
         let xsl = xc.as_cuda_slice::<bf16>()?;
@@ -5044,7 +4414,7 @@ fn lm_head_normed_op(embed: &Tensor, x: &Tensor, w_norm: &Tensor, rstd: &Tensor)
             )
         }
     };
-    anyhow::ensure!(rc == 0, "gemv_bf16_normed returned {rc}");
+    ensure!(rc == 0, "gemv_bf16_normed returned {rc}");
     y_dev.reshape((1usize, 1usize, vocab)).map_err(Into::into)
 }
 
@@ -5052,7 +4422,7 @@ fn lm_head_normed_op(embed: &Tensor, x: &Tensor, w_norm: &Tensor, rstd: &Tensor)
 fn geglu_fused_op(gu: &Tensor) -> Result<Tensor> {
     let last = gu.dims().len() - 1;
     let two_inter = gu.dim(last)?;
-    anyhow::ensure!(two_inter % 2 == 0, "geglu last dim must be even");
+    ensure!(two_inter % 2 == 0, "geglu last dim must be even");
     let inter = two_inter / 2;
     let gate = gu.narrow(last, 0, inter)?.contiguous()?;
     let up = gu.narrow(last, inter, inter)?.contiguous()?;
@@ -5064,15 +4434,14 @@ fn geglu_fused_op(gu: &Tensor) -> Result<Tensor> {
 fn geglu_fused_op(gu: &Tensor) -> Result<Tensor> {
     use cudarc::driver::DevicePtr;
     use half::bf16;
-    let dev = match gu.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("geglu_fused_op requires cuda"),
+    let Device::Cuda(dev) = gu.device().clone() else {
+        bail!("geglu_fused_op requires cuda")
     };
-    anyhow::ensure!(gu.dtype() == DType::BF16, "geglu_fused_op expects bf16");
+    ensure!(gu.dtype() == DType::BF16, "geglu_fused_op expects bf16");
     let gu_c = gu.contiguous()?;
     let mut dims = gu_c.dims().to_vec();
     let two_inter = *dims.last().unwrap();
-    anyhow::ensure!(two_inter % 2 == 0, "geglu last dim must be even");
+    ensure!(two_inter % 2 == 0, "geglu last dim must be even");
     let inter = two_inter / 2;
     let rows: usize = dims.iter().product::<usize>() / two_inter;
     *dims.last_mut().unwrap() = inter;
@@ -5085,8 +4454,8 @@ fn geglu_fused_op(gu: &Tensor) -> Result<Tensor> {
     let rc = {
         let (gs, _gl) = gu_c.storage_and_layout();
         let gc = match &*gs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("gu not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("gu not cuda"),
         };
         let gsl = gc.as_cuda_slice::<bf16>()?;
         let (gp, _gg) = gsl.device_ptr(&stream);
@@ -5101,18 +4470,18 @@ fn geglu_fused_op(gu: &Tensor) -> Result<Tensor> {
             )
         }
     };
-    anyhow::ensure!(rc == 0, "gelu_tanh_mul_fused_bf16 returned {rc}");
+    ensure!(rc == 0, "gelu_tanh_mul_fused_bf16 returned {rc}");
     y_dev.reshape(dims).map_err(Into::into)
 }
 
 #[cfg(feature = "cuda")]
 pub(crate) struct E4bFixedCache {
-    k: Vec<Option<cudarc::driver::CudaSlice<half::bf16>>>,
-    v: Vec<Option<cudarc::driver::CudaSlice<half::bf16>>>,
-    pos: cudarc::driver::CudaSlice<i32>,
+    k: Vec<Option<CudaSlice<half::bf16>>>,
+    v: Vec<Option<CudaSlice<half::bf16>>>,
+    pos: CudaSlice<i32>,
 
-    fan_in: cudarc::driver::CudaSlice<u32>,
-    device: candle_core::CudaDevice,
+    fan_in: CudaSlice<u32>,
+    device: CudaDevice,
 }
 
 #[cfg(feature = "cuda")]
@@ -5121,7 +4490,7 @@ impl E4bFixedCache {
         cat: &[Option<(Tensor, Tensor)>],
         plen: usize,
         max_len: usize,
-        dev: &candle_core::CudaDevice,
+        dev: &CudaDevice,
     ) -> Result<Self> {
         let stream = nv_layers::cuda_stream::current_stream(dev);
         let mut k = Vec::with_capacity(cat.len());
@@ -5132,16 +4501,8 @@ impl E4bFixedCache {
                     let dims = kt.dims().to_vec();
                     let nkv = dims[2];
                     let hd = dims[3];
-                    let mut kbuf = unsafe {
-                        stream
-                            .alloc::<half::bf16>(max_len * nkv * hd)
-                            .map_err(|e| anyhow::anyhow!(e))?
-                    };
-                    let mut vbuf = unsafe {
-                        stream
-                            .alloc::<half::bf16>(max_len * nkv * hd)
-                            .map_err(|e| anyhow::anyhow!(e))?
-                    };
+                    let mut kbuf = unsafe { stream.alloc::<half::bf16>(max_len * nkv * hd)? };
+                    let mut vbuf = unsafe { stream.alloc::<half::bf16>(max_len * nkv * hd)? };
                     cast_tensor_front_bf16(kt, &mut kbuf, plen * nkv * hd, &stream)?;
                     cast_tensor_front_bf16(vt, &mut vbuf, plen * nkv * hd, &stream)?;
                     k.push(Some(kbuf));
@@ -5153,12 +4514,8 @@ impl E4bFixedCache {
                 }
             }
         }
-        let pos = stream
-            .clone_htod(&[plen as i32])
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let fan_in = stream
-            .alloc_zeros::<u32>(64)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let pos = stream.clone_htod(&[plen as i32])?;
+        let fan_in = stream.alloc_zeros::<u32>(64)?;
         Ok(Self {
             k,
             v,
@@ -5168,7 +4525,6 @@ impl E4bFixedCache {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn qkv_prep(
         &mut self,
         idx: Option<usize>,
@@ -5192,13 +4548,13 @@ impl E4bFixedCache {
         } else {
             nh * hd
         };
-        anyhow::ensure!(
+        ensure!(
             qkv_c.dtype() == DType::BF16
                 && qkv_c.elem_count() % expected == 0
                 && qkv_row < qkv_c.elem_count() / expected,
             "qkv_prep: bad qkv shape"
         );
-        anyhow::ensure!(rope_pos.dtype() == DType::I32, "rope_pos must be i32");
+        ensure!(rope_pos.dtype() == DType::I32, "rope_pos must be i32");
         let q_out = nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
             &Device::Cuda(self.device.clone()),
             DType::F32,
@@ -5207,28 +4563,28 @@ impl E4bFixedCache {
         let rc = {
             let (qs, _ql) = qkv_c.storage_and_layout();
             let qc = match &*qs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("qkv not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("qkv not cuda"),
             };
             let qsl = qc.as_cuda_slice::<half::bf16>()?;
             let (qp, _gq) = qsl.device_ptr(&stream);
             let qp = qp + (qkv_row * expected * 2) as u64;
             let (qws, _l) = q_norm_w.storage_and_layout();
             let qwc = match &*qws {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("q_norm weight not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("q_norm weight not cuda"),
             };
             let qwsl = qwc.as_cuda_slice::<half::bf16>()?;
             let (qwp, _gqw) = qwsl.device_ptr(&stream);
             let (cs, _cl) = rope.cos().storage_and_layout();
             let (ss, _sl) = rope.sin().storage_and_layout();
             let cc = match &*cs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("cos not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("cos not cuda"),
             };
             let sc = match &*ss {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("sin not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("sin not cuda"),
             };
             let csl = cc.as_cuda_slice::<f32>()?;
             let ssl = sc.as_cuda_slice::<f32>()?;
@@ -5236,8 +4592,8 @@ impl E4bFixedCache {
             let (sp, _gs) = ssl.device_ptr(&stream);
             let (rs, _rl) = rope_pos.storage_and_layout();
             let rc2 = match &*rs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("rope_pos not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("rope_pos not cuda"),
             };
             let rsl = rc2.as_cuda_slice::<i32>()?;
             let (rp, _gr) = rsl.device_ptr(&stream);
@@ -5246,8 +4602,8 @@ impl E4bFixedCache {
                 Some(kw) => {
                     let (kws, _l) = kw.storage_and_layout();
                     let kwc = match &*kws {
-                        candle_core::Storage::Cuda(s) => s,
-                        _ => anyhow::bail!("k_norm weight not cuda"),
+                        Storage::Cuda(s) => s,
+                        _ => bail!("k_norm weight not cuda"),
                     };
                     let kwsl = kwc.as_cuda_slice::<half::bf16>()?;
                     let (kwp, _g) = kwsl.device_ptr(&stream);
@@ -5292,7 +4648,7 @@ impl E4bFixedCache {
                 )
             }
         };
-        anyhow::ensure!(rc == 0, "qkv_prep returned {rc}");
+        ensure!(rc == 0, "qkv_prep returned {rc}");
         q_out.reshape((nh, hd)).map_err(Into::into)
     }
 
@@ -5316,7 +4672,7 @@ impl E4bFixedCache {
             &[nh * hd],
         )?;
 
-        let grouped = window == 0 && hd == 512 && nh == nkv * 4 && decode_gqa_full_env_opted_in();
+        let grouped = window == 0 && hd == 512 && nh == nkv * 4;
         let capacity = self.k[buf]
             .as_ref()
             .map(|kb| kb.len() / (nkv * hd))
@@ -5342,8 +4698,8 @@ impl E4bFixedCache {
             let (cvp, _gv) = vc.device_ptr(&stream);
             let (qs, _ql) = q.storage_and_layout();
             let qcuda = match &*qs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("q not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("q not cuda"),
             };
             let qsl = qcuda.as_cuda_slice::<f32>()?;
             let (qp, _gq) = qsl.device_ptr(&stream);
@@ -5387,92 +4743,15 @@ impl E4bFixedCache {
                 }
             }
         };
-        anyhow::ensure!(rc == 0, "flash decode (grouped={grouped}) returned {rc}");
+        ensure!(rc == 0, "flash decode (grouped={grouped}) returned {rc}");
         out_dev.reshape((nh, hd)).map_err(Into::into)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn attend_into(
-        &self,
-        buf: usize,
-        q: &Tensor,
-        delta: i32,
-        out: &Tensor,
-        out_row: usize,
-        nh: usize,
-        nkv: usize,
-        hd: usize,
-        window: usize,
-    ) -> Result<()> {
-        use cudarc::driver::DevicePtr;
-        use half::bf16;
-        let stream = nv_layers::cuda_stream::current_stream(&self.device);
-        let q = q.contiguous()?;
-        anyhow::ensure!(out.dtype() == DType::BF16, "attend_into: out must be bf16");
-        anyhow::ensure!(
-            out.elem_count() >= (out_row + 1) * nh * hd,
-            "attend_into: out too small"
-        );
-
-        let scratch_elems = nv_kernels::cuda::flash_splitk_scratch_elems(nh as i32, hd as i32);
-        let scratch = nv_layers::step_arena::output_tensor_uninitialised_for_a_kernel_to_fill(
-            &Device::Cuda(self.device.clone()),
-            DType::F32,
-            &[scratch_elems],
-        )?;
-        let rc = {
-            let pos_ptr = {
-                let (p, _g) = self.pos.device_ptr(&stream);
-                p as *const i32
-            };
-            let kc = self.k[buf].as_ref().context("attend_into: no k buffer")?;
-            let vc = self.v[buf].as_ref().context("attend_into: no v buffer")?;
-            let (ckp, _gk) = kc.device_ptr(&stream);
-            let (cvp, _gv) = vc.device_ptr(&stream);
-            let (qs, _ql) = q.storage_and_layout();
-            let qcuda = match &*qs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("q not cuda"),
-            };
-            let qsl = qcuda.as_cuda_slice::<f32>()?;
-            let (qp, _gq) = qsl.device_ptr(&stream);
-            let (os, _ol) = out.storage_and_layout();
-            let ocuda = match &*os {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("attend_into: out not cuda"),
-            };
-            let osl = ocuda.as_cuda_slice::<bf16>()?;
-            let (op, _go) = osl.device_ptr(&stream);
-            let op = op + (out_row * nh * hd * 2) as u64;
-            let sp = nv_layers::step_arena::device_ptr_for_a_kernel_to_write(&scratch)?;
-            let (fp, _gf) = self.fan_in.device_ptr(&stream);
-            unsafe {
-                nv_kernels::cuda::flash_decode_fused_bf16kv(
-                    stream.cu_stream() as *mut _,
-                    qp as *const f32,
-                    ckp as *const u16,
-                    cvp as *const u16,
-                    op as *mut u16,
-                    pos_ptr,
-                    delta,
-                    sp as *mut f32,
-                    fp as *mut u32,
-                    nh as i32,
-                    nkv as i32,
-                    hd as i32,
-                    window as i32,
-                )
-            }
-        };
-        anyhow::ensure!(rc == 0, "flash_decode_fused_bf16kv returned {rc}");
-        Ok(())
     }
 }
 
 #[cfg(feature = "cuda")]
 fn cast_tensor_front_bf16(
     t: &Tensor,
-    dst: &mut cudarc::driver::CudaSlice<half::bf16>,
+    dst: &mut CudaSlice<half::bf16>,
     n: usize,
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
 ) -> Result<()> {
@@ -5480,8 +4759,8 @@ fn cast_tensor_front_bf16(
     let t = t.contiguous()?;
     let (ts, _tl) = t.storage_and_layout();
     let tcuda = match &*ts {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("cast_tensor_front_bf16: not cuda"),
+        Storage::Cuda(s) => s,
+        _ => bail!("cast_tensor_front_bf16: not cuda"),
     };
     let tsl = tcuda.as_cuda_slice::<f32>()?;
     let (sp, _gs) = tsl.device_ptr(stream);
@@ -5494,7 +4773,7 @@ fn cast_tensor_front_bf16(
             n as i32,
         )
     };
-    anyhow::ensure!(rc == 0, "cast_f32_bf16 (cache prefill) returned {rc}");
+    ensure!(rc == 0, "cast_f32_bf16 (cache prefill) returned {rc}");
     Ok(())
 }
 
@@ -5531,17 +4810,16 @@ fn softcap(logits: &Tensor, cap: f32) -> Result<Tensor> {
 pub struct GraphedE4bDecoder<'m> {
     model: &'m Gemma4E4b,
     cache: E4bFixedCache,
-    device: candle_core::CudaDevice,
+    device: CudaDevice,
     forked: std::sync::Arc<cudarc::driver::CudaStream>,
     runner: nv_kernels::graph::CudaGraphRunner,
-    token_buf: cudarc::driver::CudaSlice<u32>,
-    rope_src: cudarc::driver::CudaSlice<i32>,
-    ring: cudarc::driver::CudaSlice<u32>,
-    amax_val: cudarc::driver::CudaSlice<f32>,
-    amax_idx: cudarc::driver::CudaSlice<i32>,
+    token_buf: CudaSlice<u32>,
+    rope_src: CudaSlice<i32>,
+    ring: CudaSlice<u32>,
+    amax_val: CudaSlice<f32>,
+    amax_idx: CudaSlice<i32>,
     host_tok: Box<[u32; 1]>,
     arena: Option<nv_layers::step_arena::StepArena>,
-    arena_enabled: bool,
     current_pos: usize,
     call_count: u64,
     capture_active: bool,
@@ -5553,9 +4831,8 @@ const E4B_TOKEN_RING: usize = 64;
 #[cfg(feature = "cuda")]
 impl<'m> GraphedE4bDecoder<'m> {
     fn new(model: &'m Gemma4E4b, cache: E4bFixedCache, start_len: usize) -> Result<Self> {
-        let dev = match &model.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("GraphedE4bDecoder requires cuda"),
+        let Device::Cuda(dev) = model.device.clone() else {
+            bail!("GraphedE4bDecoder requires cuda")
         };
         let raw_ctx = dev.cuda_stream().context().clone();
         crate::gemma4_batch_graph::graph_teardown::disable_event_tracking_before_capture(&raw_ctx);
@@ -5594,12 +4871,7 @@ impl<'m> GraphedE4bDecoder<'m> {
             amax_val,
             amax_idx,
             host_tok: Box::new([0u32; 1]),
-            arena: if step_arena_env_enabled() {
-                Some(nv_layers::step_arena::StepArena::new())
-            } else {
-                None
-            },
-            arena_enabled: step_arena_env_enabled(),
+            arena: Some(nv_layers::step_arena::StepArena::new()),
             current_pos: start_len,
             call_count: 0,
             capture_active: false,
@@ -5614,7 +4886,7 @@ impl<'m> GraphedE4bDecoder<'m> {
         self.capture_active
     }
 
-    pub fn kernel_census_of_the_captured_step(&self) -> std::collections::BTreeMap<String, usize> {
+    pub fn kernel_census_of_the_captured_step(&self) -> BTreeMap<String, usize> {
         self.runner.cached_kernel_name_census()
     }
 
@@ -5622,26 +4894,22 @@ impl<'m> GraphedE4bDecoder<'m> {
         self.runner.cached_node_count()
     }
 
-    pub fn captured_node_type_census(&self) -> std::collections::BTreeMap<u32, usize> {
+    pub fn captured_node_type_census(&self) -> BTreeMap<u32, usize> {
         self.runner
             .cached_node_type_census_type_ids_are_cugraphnodetype()
     }
 
-    pub fn captured_memset_census(&self) -> std::collections::BTreeMap<(u32, u64), usize> {
+    pub fn captured_memset_census(&self) -> BTreeMap<(u32, u64), usize> {
         self.runner
             .cached_memset_census_key_is_element_size_and_bytes()
     }
 
-    pub fn captured_mem_alloc_consumer_census(
-        &self,
-    ) -> std::collections::BTreeMap<(u64, String), usize> {
+    pub fn captured_mem_alloc_consumer_census(&self) -> BTreeMap<(u64, String), usize> {
         self.runner
             .cached_mem_alloc_consumer_census_key_is_bytes_and_kernel_name()
     }
 
-    pub fn captured_memcpy_consumer_census(
-        &self,
-    ) -> std::collections::BTreeMap<(u64, String), usize> {
+    pub fn captured_memcpy_consumer_census(&self) -> BTreeMap<(u64, String), usize> {
         self.runner
             .cached_memcpy_consumer_census_key_is_bytes_and_kernel_name()
     }
@@ -5654,9 +4922,7 @@ impl<'m> GraphedE4bDecoder<'m> {
     }
 
     fn arena_leave(&mut self) {
-        if self.arena_enabled {
-            self.arena = nv_layers::step_arena::uninstall();
-        }
+        self.arena = nv_layers::step_arena::uninstall();
     }
 
     pub fn warm_step(&mut self, token_id: u32) -> Result<u32> {
@@ -5675,7 +4941,7 @@ impl<'m> GraphedE4bDecoder<'m> {
     }
 
     pub fn replay_batch(&mut self, seed_token: u32, k: usize) -> Result<Vec<u32>> {
-        anyhow::ensure!((1..=E4B_TOKEN_RING).contains(&k), "bad batch size {k}");
+        ensure!((1..=E4B_TOKEN_RING).contains(&k), "bad batch size {k}");
 
         let ctx = self.device.cuda_stream().context().clone();
         if ctx.is_event_tracking() {
@@ -5719,26 +4985,14 @@ impl<'m> GraphedE4bDecoder<'m> {
                         .try_clone()
                         .map_err(|e| anyhow::anyhow!("clone rope_src: {e:?}"))?;
                     let ids = {
-                        let storage =
-                            candle_core::CudaStorage::wrap_cuda_slice(tok_clone, dev.clone());
-                        let storage = candle_core::Storage::Cuda(storage);
-                        Tensor::from_storage(
-                            storage,
-                            (1usize,),
-                            candle_core::op::BackpropOp::none(),
-                            false,
-                        )
+                        let storage = CudaStorage::wrap_cuda_slice(tok_clone, dev.clone());
+                        let storage = Storage::Cuda(storage);
+                        Tensor::from_storage(storage, (1usize,), BackpropOp::none(), false)
                     };
                     let pos_t = {
-                        let storage =
-                            candle_core::CudaStorage::wrap_cuda_slice(pos_clone, dev.clone());
-                        let storage = candle_core::Storage::Cuda(storage);
-                        Tensor::from_storage(
-                            storage,
-                            (1usize,),
-                            candle_core::op::BackpropOp::none(),
-                            false,
-                        )
+                        let storage = CudaStorage::wrap_cuda_slice(pos_clone, dev.clone());
+                        let storage = Storage::Cuda(storage);
+                        Tensor::from_storage(storage, (1usize,), BackpropOp::none(), false)
                     };
                     let logits = model.forward_step_fast_body(&ids, &pos_t, cache)?;
                     argmax_into_bufs(
@@ -5782,28 +5036,27 @@ impl Drop for GraphedE4bDecoder<'_> {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 fn argmax_into_bufs(
     logits: &Tensor,
-    pos: &cudarc::driver::CudaSlice<i32>,
-    token_buf: &mut cudarc::driver::CudaSlice<u32>,
-    ring: &mut cudarc::driver::CudaSlice<u32>,
-    amax_val: &mut cudarc::driver::CudaSlice<f32>,
-    amax_idx: &mut cudarc::driver::CudaSlice<i32>,
+    pos: &CudaSlice<i32>,
+    token_buf: &mut CudaSlice<u32>,
+    ring: &mut CudaSlice<u32>,
+    amax_val: &mut CudaSlice<f32>,
+    amax_idx: &mut CudaSlice<i32>,
     ring_mask: i32,
-    dev: &candle_core::CudaDevice,
+    dev: &CudaDevice,
 ) -> Result<()> {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
-    anyhow::ensure!(logits.dtype() == DType::BF16, "argmax expects bf16 logits");
+    ensure!(logits.dtype() == DType::BF16, "argmax expects bf16 logits");
     let n = logits.elem_count();
     let logits_c = logits.contiguous()?;
     let stream = nv_layers::cuda_stream::current_stream(dev);
     let rc = {
         let (ls, _ll) = logits_c.storage_and_layout();
         let lc = match &*ls {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("logits not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("logits not cuda"),
         };
         let lsl = lc.as_cuda_slice::<bf16>()?;
         let (lp, _gl) = lsl.device_ptr(&stream);
@@ -5826,7 +5079,7 @@ fn argmax_into_bufs(
             )
         }
     };
-    anyhow::ensure!(rc == 0, "argmax_bf16 returned {rc}");
+    ensure!(rc == 0, "argmax_bf16 returned {rc}");
     Ok(())
 }
 
@@ -5901,24 +5154,6 @@ mod fast_graph_debug {
 
         assert!(d_embed < 1e-2, "embed diverged: {d_embed}");
         assert!(d_pli < 1e-2, "per_layer_inputs diverged: {d_pli}");
-    }
-
-    #[test]
-    fn graphed_matches_eager_greedy() {
-        let _g = capture_lock();
-        let Some((model, _device)) = load() else {
-            return;
-        };
-        let prompt = [818u32, 5279, 529, 7001, 563];
-        let n = 24;
-        let eos = [999999u32];
-        let base = model.generate_fast(&prompt, n, &eos).unwrap();
-        let graphed = model.generate_graphed(&prompt, n, &eos).unwrap();
-        eprintln!("eager:   {:?}", base);
-        eprintln!("graphed: {:?}", graphed);
-        if nv_config::env_arm_present_at_all_reread_every_call("NV_E4B_FORCE_GEMV") {
-            assert_eq!(base, graphed, "graphed diverged from eager");
-        }
     }
 
     #[test]

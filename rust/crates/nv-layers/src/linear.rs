@@ -82,25 +82,6 @@ fn force_dense_bf16_enabled() -> bool {
     FORCE_DENSE_BF16.with(|c| c.get())
 }
 
-pub fn fp8_scale_mode_from(raw: Option<&str>) -> nv_quant::fp8::Fp8ScaleMode {
-    use nv_quant::fp8::Fp8ScaleMode;
-    match raw {
-        Some(v)
-            if v.eq_ignore_ascii_case("tensor")
-                || v.eq_ignore_ascii_case("per_tensor")
-                || v.eq_ignore_ascii_case("per-tensor")
-                || v == "0" =>
-        {
-            Fp8ScaleMode::PerTensor
-        }
-        _ => Fp8ScaleMode::PerOuterRow,
-    }
-}
-
-pub fn fp8_scale_mode() -> nv_quant::fp8::Fp8ScaleMode {
-    fp8_scale_mode_from(std::env::var("NV_FP8_SCALE_MODE").ok().as_deref())
-}
-
 #[cfg(feature = "cuda")]
 fn fp8_per_row_probe(
     runner: &Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>,
@@ -164,10 +145,10 @@ pub fn fp8_weight_payload(
                 .ok_or_else(|| anyhow::anyhow!("empty checkpoint weight_scale"))?;
             if rows.iter().any(|s| *s != first) {
                 anyhow::bail!(
-                    "NV_FP8_SCALE_MODE=tensor cannot represent this checkpoint: its \
+                    "per-tensor fp8 scales cannot represent this checkpoint: its \
                      weight_scale varies across output rows ({} distinct values), and \
                      collapsing it to one scale would silently coarsen the checkpoint's own \
-                     granularity. Unset NV_FP8_SCALE_MODE to use per-row scaling.",
+                     granularity. Use Fp8ScaleMode::PerOuterRow.",
                     {
                         let mut v = rows.to_vec();
                         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -185,10 +166,6 @@ pub fn fp8_weight_payload(
             Ok((bytes, vec![scale; out_features]))
         }
     }
-}
-
-pub fn small_m_det_from(raw: Option<&str>) -> bool {
-    raw != Some("0")
 }
 
 #[cfg(feature = "cuda")]
@@ -329,7 +306,7 @@ pub const A_ROW_CHUNKED_LT_TILE_RIDES_THE_M6_PLAN_BECAUSE_THE_HEURISTIC_MOVES_PL
      Qwen3.8 checkpoint keep their MLPs e4m3, and that shape's staged-gemv reach is 2, so every \
      verify-sized call lands on this tile) the chosen plan's shared-row outputs form bitwise \
      families {m2,m3} {m4,m5,m6} {m7,m8} -- the suite covering this is \
-     nv-quant/tests/fp8_lt_row0_m_invariance (down_proj family map, and under NV_Q38_VERIFY_TC=1 \
+     nv-quant/tests/fp8_lt_row0_m_invariance (down_proj family map, and under the verify-TC scope \
      the same tile serves every e4m3 projection, where (10240,5120) moves plans at m=7 and \
      (12288,5120) at m=8: the all-shapes span gate). A 7- or 8-row verify therefore computed a \
      different row 0 than the 4..6-row verifies for the same anchor and kv: the one-time 6->7 \
@@ -424,7 +401,6 @@ impl Drop for Qwen38BatchE4m3GroupScopeGuard {
 #[derive(Clone, Copy)]
 enum E4m3GroupPolicy {
     SixOrEightLaneBatchDefault,
-    Disabled,
     Rows(i32),
 }
 
@@ -439,7 +415,7 @@ impl E4m3GroupPolicy {
                 .ok()
                 .filter(|r| [1, 2, 4].contains(r))
                 .map(Self::Rows)
-                .unwrap_or(Self::Disabled),
+                .unwrap_or(Self::SixOrEightLaneBatchDefault),
         }
     }
 
@@ -447,7 +423,6 @@ impl E4m3GroupPolicy {
         match self {
             Self::SixOrEightLaneBatchDefault => QWEN38_BATCH_E4M3_GROUP_SCOPE
                 .with(|scope| matches!(scope.get(), 6 | 8).then_some(2)),
-            Self::Disabled => None,
             Self::Rows(rows) => Some(rows),
         }
     }
@@ -478,8 +453,7 @@ fn e4m3_tile_min_m() -> Option<usize> {
 
 #[cfg(feature = "cuda")]
 fn nvfp4_m1_gemv_opted_in() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NV_NVFP4_M1_GEMV").ok().as_deref() == Some("1"))
+    nv_config::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_NVFP4_M1_GEMV")
 }
 
 #[cfg(feature = "cuda")]
@@ -492,33 +466,6 @@ fn nvfp4_gemv_row_block_ceiling() -> usize {
             .unwrap_or(NVFP4_VERIFY_BLOCK_ROWS_LOOPED_THROUGH_THE_M1_GEMV_SO_A_DRAFT_BLOCK_REPRODUCES_DECODE)
             .max(1)
     })
-}
-
-#[cfg(feature = "cuda")]
-fn small_m_det_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| small_m_det_from(std::env::var("NV_BF16_SMALLM_DET").ok().as_deref()))
-}
-
-#[cfg(feature = "cuda")]
-fn nvfp4_quant_fullpad_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NV_NVFP4_QUANT_FULLPAD").is_ok_and(|v| v != "0"))
-}
-
-#[cfg(feature = "cuda")]
-static CFX_RUNTIME_OVERRIDE_MINUS1_UNSET_0_OFF_1_ON_FOR_INTERLEAVED_AB_ONLY:
-    std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
-
-#[cfg(feature = "cuda")]
-pub fn nvfp4_cfx_set_runtime_override_for_interleaved_ab(on: Option<bool>) {
-    let v = match on {
-        None => -1i8,
-        Some(false) => 0,
-        Some(true) => 1,
-    };
-    CFX_RUNTIME_OVERRIDE_MINUS1_UNSET_0_OFF_1_ON_FOR_INTERLEAVED_AB_ONLY
-        .store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(feature = "cuda")]
@@ -546,20 +493,9 @@ fn nvfp4_cfx_min_context_tokens_the_measured_e2e_crossover_is_between_8k_loss_an
 #[cfg(feature = "cuda")]
 fn nvfp4_cfx_env_opt_in_nv_q38_mlp_fp4_cfx_1_captured_colfax_cubins_beat_dp_k256_by_4_to_5pct_at_the_serving_chunk(
 ) -> bool {
-    match CFX_RUNTIME_OVERRIDE_MINUS1_UNSET_0_OFF_1_ON_FOR_INTERLEAVED_AB_ONLY
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        0 => return false,
-        1 => return true,
-        _ => {}
-    }
-    static FORCE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    if let Some(v) = FORCE.get_or_init(|| match std::env::var("NV_Q38_MLP_FP4_CFX").as_deref() {
-        Ok("1") => Some(true),
-        Ok("0") => Some(false),
-        _ => None,
-    }) {
-        return *v;
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FORCE.get_or_init(|| std::env::var("NV_Q38_MLP_FP4_CFX").as_deref() == Ok("1")) {
+        return true;
     }
     let total = CFX_PREFILL_TOTAL_TOKENS_HINT_0_UNSET_SET_PER_PREFILL_BY_THE_SERVING_LOOP
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -830,7 +766,6 @@ pub fn marlin_fp8_twin_from_e4m3_rows_host(
     );
     let kmajor = nv_quant::marlin_fp8::kmajor_int32_from_e4m3_rows(bytes, n, k);
     let scales = nv_quant::marlin_fp8::marlin_per_channel_scales_bf16(scale_rows, n);
-    #[allow(deprecated)]
     let d_kmajor: cudarc::driver::CudaSlice<u32> = stream
         .clone_htod(&kmajor)
         .map_err(|e| anyhow::anyhow!("marlin fp8 twin htod: {e:?}"))?;
@@ -850,7 +785,6 @@ pub fn marlin_fp8_twin_from_e4m3_rows_host(
         )
     };
     anyhow::ensure!(rc == 0, "marlin fp8 twin repack rc={rc}");
-    #[allow(deprecated)]
     let scales_bf16: cudarc::driver::CudaSlice<u16> = stream
         .clone_htod(&scales)
         .map_err(|e| anyhow::anyhow!("marlin fp8 twin htod scales: {e:?}"))?;
@@ -942,6 +876,8 @@ struct Nvfp4Storage {
     weight_alpha_dev: cudarc::driver::CudaSlice<f32>,
     input_stored_global: f32,
     bf16act_row_limit: usize,
+    weight_scales_row_major_twin_the_bf16act_gemv_reads_as_one_sector_per_warp_step:
+        Option<cudarc::driver::CudaSlice<u8>>,
     a_staging: Mutex<std::collections::HashMap<(usize, usize), StagedActivations>>,
     marlin_w4a16_twin_built_once_from_the_resident_nvfp4_buffers:
         std::sync::OnceLock<Option<Arc<MarlinNvfp4Prepared>>>,
@@ -959,21 +895,15 @@ pub struct MarlinNvfp4Prepared {
     pub folded_pow2: i32,
 }
 
-pub const NV_TRAIN_DX_QUANT_TWIN_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_RESTORES_THE_TRANSIENT_BF16_DEQUANT_THE_INPUT_GRADIENT_OF_A_FROZEN_NVFP4_LINEAR_RUNS_A_MARLIN_W4A16_GEMM_ON_A_TRANSPOSED_NVFP4_TWIN:
-    &str = "NV_TRAIN_DX_QUANT_TWIN";
-
-pub fn train_dx_quant_twin_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_TRAIN_DX_QUANT_TWIN_ENV_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_RESTORES_THE_TRANSIENT_BF16_DEQUANT_THE_INPUT_GRADIENT_OF_A_FROZEN_NVFP4_LINEAR_RUNS_A_MARLIN_W4A16_GEMM_ON_A_TRANSPOSED_NVFP4_TWIN,
-    )
-}
-
+#[cfg(feature = "cuda")]
 struct RunOnDrop<F: FnMut()>(F);
+#[cfg(feature = "cuda")]
 impl<F: FnMut()> Drop for RunOnDrop<F> {
     fn drop(&mut self) {
         (self.0)()
     }
 }
+#[cfg(feature = "cuda")]
 fn scopeguard_like<F: FnMut()>(f: F) -> RunOnDrop<F> {
     RunOnDrop(f)
 }
@@ -1107,7 +1037,6 @@ fn build_dx_marlin_nvfp4_twin_on_the_host_the_bitwise_oracle_of_the_device_build
     drop(rows_t);
     let kmajor = nv_quant::marlin_nvfp4::kmajor_int32_from_packed_rows(&packed.data, k_in, n_out);
     let sc = nv_quant::marlin_nvfp4::marlin_scales_from_linear(&packed.scales, k_in, n_out, 1.0);
-    #[allow(deprecated)]
     let d_kmajor: cudarc::driver::CudaSlice<u32> = stream
         .clone_htod(&kmajor)
         .map_err(|e| anyhow::anyhow!("dx twin htod kmajor: {e:?}"))?;
@@ -1127,11 +1056,9 @@ fn build_dx_marlin_nvfp4_twin_on_the_host_the_bitwise_oracle_of_the_device_build
         )
     };
     anyhow::ensure!(rc == 0, "dx twin repack rc={rc}");
-    #[allow(deprecated)]
     let scales_e5m3: cudarc::driver::CudaSlice<u8> = stream
         .clone_htod(&sc.bytes_e5m3)
         .map_err(|e| anyhow::anyhow!("dx twin htod scales: {e:?}"))?;
-    #[allow(deprecated)]
     let global_scale_dev: cudarc::driver::CudaSlice<f32> = stream
         .clone_htod(&[sc.global_scale_processed])
         .map_err(|e| anyhow::anyhow!("dx twin htod global: {e:?}"))?;
@@ -1192,7 +1119,6 @@ fn build_dx_fp8_twin_of_the_transposed_weight(lin: &Linear, s: &Fp8Storage) -> R
         }
     };
     let stream = s.cuda_device.cuda_stream();
-    #[allow(deprecated)]
     let unit_scales_for_the_k_in_rows: cudarc::driver::CudaSlice<f32> = stream
         .clone_htod(&vec![1f32; k_in])
         .map_err(|e| anyhow::anyhow!("fp8 dx twin htod unit scales: {e:?}"))?;
@@ -1206,7 +1132,6 @@ fn build_dx_fp8_twin_of_the_transposed_weight(lin: &Linear, s: &Fp8Storage) -> R
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 fn fp8_dx_gemm_dy_rowquantized_e4m3_times_the_transposed_twin(
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     s: &Fp8Storage,
@@ -1383,7 +1308,6 @@ fn build_marlin_nvfp4_twin(s: &Nvfp4Storage, n: usize, k: usize) -> Result<Marli
     let kmajor = nv_quant::marlin_nvfp4::kmajor_int32_from_packed_rows(&packed, n, k);
     let global = s.weight_alpha * s.input_stored_global;
     let sc = nv_quant::marlin_nvfp4::marlin_scales_from_swizzled(&swizzled, n, k, global);
-    #[allow(deprecated)]
     let d_kmajor: cudarc::driver::CudaSlice<u32> = stream
         .clone_htod(&kmajor)
         .map_err(|e| anyhow::anyhow!("marlin twin htod kmajor: {e:?}"))?;
@@ -1403,11 +1327,9 @@ fn build_marlin_nvfp4_twin(s: &Nvfp4Storage, n: usize, k: usize) -> Result<Marli
         )
     };
     anyhow::ensure!(rc == 0, "marlin twin repack rc={rc}");
-    #[allow(deprecated)]
     let scales_e5m3: cudarc::driver::CudaSlice<u8> = stream
         .clone_htod(&sc.bytes_e5m3)
         .map_err(|e| anyhow::anyhow!("marlin twin htod scales: {e:?}"))?;
-    #[allow(deprecated)]
     let global_scale_dev: cudarc::driver::CudaSlice<f32> = stream
         .clone_htod(&[sc.global_scale_processed])
         .map_err(|e| anyhow::anyhow!("marlin twin htod global: {e:?}"))?;
@@ -1433,14 +1355,7 @@ struct StagedActivations {
 }
 
 pub(crate) fn this_call_is_building_an_autograd_graph(x: &Tensor) -> bool {
-    if !x.track_op() {
-        return false;
-    }
-    !leaf_gradient_loss_was_explicitly_allowed()
-}
-
-pub(crate) fn leaf_gradient_loss_was_explicitly_allowed() -> bool {
-    std::env::var("NV_ALLOW_LEAF_GRADIENT_LOSS").ok().as_deref() == Some("1")
+    x.track_op()
 }
 
 #[cfg(feature = "cuda")]
@@ -1468,7 +1383,7 @@ impl Bf16LinearOp {
         anyhow::ensure!(
             weight.dims().len() == 2
                 && weight.dtype() == DType::BF16
-                && matches!(weight.device(), Device::Cuda(_)),
+                && weight.device().is_cuda(),
             "Bf16LinearOp needs a 2-D bf16 CUDA weight, got {:?} {:?}",
             weight.dims(),
             weight.dtype()
@@ -1477,8 +1392,7 @@ impl Bf16LinearOp {
             !this_call_is_building_an_autograd_graph(weight),
             "Bf16LinearOp detaches its weight, so a Var-backed or graph-carrying weight \
              would receive zero gradient silently while dx and the loss keep moving -- the \
-             weight would train as a no-op. Use matmul_fallback for a trainable weight, or \
-             set NV_ALLOW_LEAF_GRADIENT_LOSS=1 to accept the loss."
+             weight would train as a no-op. Use matmul_fallback for a trainable weight."
         );
         Ok(Self {
             frozen_weight_kept_inside_the_op_so_candle_sees_one_input_and_never_builds_a_weight_side_graph:
@@ -1866,8 +1780,7 @@ impl candle_core::CustomOp1 for QuantLinearOp {
             },
             &stream,
         );
-        if train_dx_quant_twin_enabled()
-            && m >= DX_TWIN_FROM_64_ROWS_BECAUSE_A_PER_EXPERT_CALL_OF_A_FEW_ROWS_PAYS_MORE_FOR_THE_MARLIN_LAUNCH_THAN_FOR_THE_DEQUANT
+        if m >= DX_TWIN_FROM_64_ROWS_BECAUSE_A_PER_EXPERT_CALL_OF_A_FEW_ROWS_PAYS_MORE_FOR_THE_MARLIN_LAUNCH_THAN_FOR_THE_DEQUANT
         {
             if let (LinearStorage::Fp8E4m3(s), Some(tw)) =
                 (&twin.storage, twin.dx_fp8_twin_of_the_transposed_weight())
@@ -1911,7 +1824,7 @@ impl candle_core::CustomOp1 for QuantLinearOp {
                     };
                     let dy_slice = dy_cuda.as_cuda_slice::<bf16>()?;
                     let (p, _g) = dy_slice.device_ptr(&stream);
-                    p as u64 + (dyl.start_offset() * 2) as u64
+                    p + (dyl.start_offset() * 2) as u64
                 };
                 marlin_nvfp4_dx_gemm(&stream, &tw, dy_ptr, m, &mut dx_dev).map_err(|e| {
                     candle_core::Error::Msg(format!(
@@ -2090,7 +2003,6 @@ impl Linear {
     }
 
     #[cfg(feature = "cuda")]
-    #[allow(clippy::type_complexity)]
     pub fn nvfp4_parts_full(
         &self,
     ) -> Option<(
@@ -2267,13 +2179,11 @@ impl Linear {
             LinearStorage::GgmlQuant(_) => Ok(None),
             LinearStorage::Nvfp4(s) => {
                 let stream = crate::cuda_stream::current_stream(&s.cuda_device);
-                #[allow(deprecated)]
                 let packed = stream
-                    .memcpy_dtov(&s.weight_u8)
+                    .clone_dtoh(&s.weight_u8)
                     .map_err(|e| anyhow::anyhow!("dtoh nvfp4 packed: {e}"))?;
-                #[allow(deprecated)]
                 let scales_sw = stream
-                    .memcpy_dtov(&s.weight_scales_cm)
+                    .clone_dtoh(&s.weight_scales_cm)
                     .map_err(|e| anyhow::anyhow!("dtoh nvfp4 scales: {e}"))?;
                 let vals = nv_quant::nvfp4::dequantize_packed_swizzled(
                     &packed,
@@ -2401,6 +2311,27 @@ impl Linear {
         Ok(())
     }
 
+    pub fn view_sharing_the_resident_weights_without_a_hook(&self) -> Linear {
+        Linear {
+            kind: self.kind,
+            storage: match &self.storage {
+                LinearStorage::Bf16 { weight, weight_t } => LinearStorage::Bf16 {
+                    weight: weight.clone(),
+                    weight_t: weight_t.clone(),
+                },
+                LinearStorage::GgmlQuant(s) => LinearStorage::GgmlQuant(Arc::clone(s)),
+                #[cfg(feature = "cuda")]
+                LinearStorage::Fp8E4m3(s) => LinearStorage::Fp8E4m3(Arc::clone(s)),
+                #[cfg(feature = "cuda")]
+                LinearStorage::Nvfp4(s) => LinearStorage::Nvfp4(Arc::clone(s)),
+            },
+            bias: self.bias.clone(),
+            in_features: self.in_features,
+            out_features: self.out_features,
+            lora: std::sync::RwLock::new(None),
+        }
+    }
+
     pub fn detach_lora(&self) {
         if let Ok(mut slot) = self.lora.write() {
             *slot = None;
@@ -2482,7 +2413,7 @@ impl Linear {
             || self.has_lora()
             || gate.dtype() != DType::BF16
             || up.dtype() != DType::BF16
-            || !matches!(gate.device(), Device::Cuda(_))
+            || !gate.device().is_cuda()
         {
             return Ok(None);
         }
@@ -2566,6 +2497,11 @@ impl Linear {
             }
             LinearStorage::GgmlQuant(s) => {
                 let xdt = x2.dtype();
+                if x2.device().is_cpu() {
+                    if let Some(y) = crate::cpu_qmatvec::matmul(&s.qm, x2)? {
+                        return Ok(if y.dtype() == xdt { y } else { y.to_dtype(xdt)? });
+                    }
+                }
                 let xq = if xdt == candle_core::DType::F32 {
                     x2.clone()
                 } else {
@@ -2610,10 +2546,10 @@ impl Linear {
         use half::bf16;
         use nv_quant::matmul::TensorCoreGemm;
 
-        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+        if x2.device().is_cuda() && this_call_is_building_an_autograd_graph(x2) {
             return self.matmul_bf16_dx_only(weight, x2);
         }
-        if !matches!(x2.device(), Device::Cuda(_)) || x2.dtype() != DType::BF16 {
+        if !x2.device().is_cuda() || x2.dtype() != DType::BF16 {
             return self.matmul_fallback(weight, x2);
         }
         let x_bf = x2.contiguous()?;
@@ -2627,7 +2563,6 @@ impl Linear {
             && !force_dense
             && !force_dense_bf16_enabled()
             && self.in_features.is_multiple_of(2)
-            && std::env::var("NV_LINEAR_BF16_FORCE_CUBLAS").is_err()
         {
             return self.matmul_bf16_gemv(weight, &x_bf, &dev);
         }
@@ -2666,7 +2601,7 @@ impl Linear {
                 gemm.bf16_matmul_row_major_offs(
                     &stream, x_slice, x_off, w_slice, w_off, &mut c_dev, m, n, k, 1.0, 0.0,
                 )?;
-            } else if (2..=16).contains(&leading) && small_m_det_enabled() {
+            } else if (2..=16).contains(&leading) {
                 gemm.bf16_matmul_row_major_bt_det_offs(
                     &stream, x_slice, x_off, w_slice, w_off, &mut c_dev, m, n, k, 1.0, 0.0,
                 )?;
@@ -2811,25 +2746,20 @@ impl Linear {
         use nv_kernels::cuda as nvk;
         use nv_quant::matmul::TensorCoreGemm;
 
-        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+        if x2.device().is_cuda() && this_call_is_building_an_autograd_graph(x2) {
             return self.matmul_bf16_dx_only(&weight.narrow(0, row_off, rows)?, x2);
         }
-        if !matches!(x2.device(), Device::Cuda(_)) || x2.dtype() != DType::BF16 {
+        if !x2.device().is_cuda() || x2.dtype() != DType::BF16 {
             return self.matmul_fallback(&weight.narrow(0, row_off, rows)?, x2);
         }
         let x_bf = x2.contiguous()?;
-        let dev = match x_bf.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = x_bf.device().clone() else {
+            unreachable!()
         };
         let stream = crate::cuda_stream::current_stream(&dev);
         let k = self.in_features;
 
-        if leading == 1
-            && !force_dense_bf16_enabled()
-            && k.is_multiple_of(2)
-            && std::env::var("NV_LINEAR_BF16_FORCE_CUBLAS").is_err()
-        {
+        if leading == 1 && !force_dense_bf16_enabled() && k.is_multiple_of(2) {
             let w_bf = weight.contiguous()?;
             let mut c_dev: cudarc::driver::CudaSlice<bf16> =
                 unsafe { stream.alloc::<bf16>(rows).map_err(|e| anyhow::anyhow!(e))? };
@@ -2961,16 +2891,15 @@ impl Linear {
         use half::bf16;
         use nv_quant::matmul::TensorCoreGemm;
 
-        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+        if x2.device().is_cuda() && this_call_is_building_an_autograd_graph(x2) {
             return self.matmul_bf16_dx_only(weight, x2);
         }
-        if !matches!(x2.device(), Device::Cuda(_)) || x2.dtype() != DType::BF16 {
+        if !x2.device().is_cuda() || x2.dtype() != DType::BF16 {
             return self.matmul_fallback(weight, x2);
         }
         let x_bf = x2.contiguous()?;
-        let dev = match x_bf.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = x_bf.device().clone() else {
+            unreachable!()
         };
         let stream = crate::cuda_stream::current_stream(&dev);
         let w_bf = weight.contiguous()?;
@@ -3035,7 +2964,7 @@ impl Linear {
          and every cpu oracle depends on that upcast";
 
     fn matmul_fallback(&self, weight: &Tensor, x2: &Tensor) -> Result<Tensor> {
-        let on_cpu = matches!(x2.device(), candle_core::Device::Cpu);
+        let on_cpu = x2.device().is_cpu();
         let needs_bf16_upcast =
             on_cpu && (weight.dtype() == DType::BF16 || x2.dtype() == DType::BF16);
         if !needs_bf16_upcast {
@@ -3065,8 +2994,8 @@ impl Linear {
 
     #[cfg(feature = "cuda")]
     fn matmul_bf16_dx_only(&self, weight: &Tensor, x2: &Tensor) -> Result<Tensor> {
-        if !matches!(x2.device(), Device::Cuda(_))
-            || !matches!(weight.device(), Device::Cuda(_))
+        if !x2.device().is_cuda()
+            || !weight.device().is_cuda()
             || weight.dtype() != DType::BF16
         {
             return self.matmul_fallback(weight, x2);
@@ -3087,7 +3016,7 @@ impl Linear {
     fn matmul_fp8(&self, s: &Fp8Storage, x2: &Tensor, leading: usize) -> Result<Tensor> {
         use half::bf16;
 
-        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+        if x2.device().is_cuda() && this_call_is_building_an_autograd_graph(x2) {
             return self.matmul_quant_dx_only(x2);
         }
         let dev = match x2.device() {
@@ -3131,11 +3060,9 @@ impl Linear {
             _ => 1.0,
         };
         let effective_a_scales: Vec<f32> = x_row_scales.iter().map(|v| v * scale_factor).collect();
-        #[allow(deprecated)]
         let x_fp8_dev = stream
             .clone_htod(&x_fp8_bytes)
             .map_err(|e| anyhow::anyhow!(e))?;
-        #[allow(deprecated)]
         let a_scale_dev_call = stream
             .clone_htod(&effective_a_scales)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -3533,34 +3460,10 @@ impl Linear {
 
     #[cfg(feature = "cuda")]
     fn matmul_nvfp4(&self, s: &Nvfp4Storage, x2: &Tensor, leading: usize) -> Result<Tensor> {
-        if matches!(x2.device(), Device::Cuda(_)) && this_call_is_building_an_autograd_graph(x2) {
+        if x2.device().is_cuda() && this_call_is_building_an_autograd_graph(x2) {
             return self.matmul_quant_dx_only(x2);
         }
         self.matmul_nvfp4_impl(s, x2, leading, None, None)
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn forward_nvfp4_gemv_m1_unconditionally_which_a_draft_only_lm_head_requires(
-        &self,
-        x: &Tensor,
-    ) -> Result<Tensor> {
-        let dims = x.dims().to_vec();
-        let leading: usize = dims[..dims.len().saturating_sub(1)].iter().product();
-        anyhow::ensure!(
-            leading == 1,
-            "forward_nvfp4_gemv_m1: draft lm_head serves one row per step, got leading {leading}"
-        );
-        anyhow::ensure!(
-            dims.last() == Some(&self.in_features),
-            "forward_nvfp4_gemv_m1: input last dim {:?} != in_features {}",
-            dims.last(),
-            self.in_features
-        );
-        let x2 = x.reshape((1usize, self.in_features))?;
-        match &self.storage {
-            LinearStorage::Nvfp4(s) => self.matmul_nvfp4_m1_gemv(s, &x2, 1, None),
-            _ => anyhow::bail!("forward_nvfp4_gemv_m1: linear is not NVFP4-resident"),
-        }
     }
 
     #[cfg(feature = "cuda")]
@@ -3577,15 +3480,26 @@ impl Linear {
             anyhow::anyhow!("NVFP4 BF16-activation policy must be set before storage is shared")
         })?;
         storage.bf16act_row_limit = max_rows;
-        Ok(())
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn nvfp4_bf16act_row_limit(&self) -> Option<usize> {
-        match &self.storage {
-            LinearStorage::Nvfp4(storage) => Some(storage.bf16act_row_limit),
-            _ => None,
+        if storage
+            .weight_scales_row_major_twin_the_bf16act_gemv_reads_as_one_sector_per_warp_step
+            .is_none()
+        {
+            let stream = storage.cuda_device.cuda_stream();
+            let swizzled = stream
+                .clone_dtoh(&storage.weight_scales_cm)
+                .map_err(|e| anyhow::anyhow!("dtoh nvfp4 scales: {e:?}"))?;
+            let row_major = nv_quant::nvfp4::unswizzle_scales(
+                &swizzled,
+                self.out_features,
+                self.in_features / 16,
+            );
+            let twin = stream
+                .clone_htod(&row_major)
+                .map_err(|e| anyhow::anyhow!("htod row-major nvfp4 scales: {e:?}"))?;
+            storage.weight_scales_row_major_twin_the_bf16act_gemv_reads_as_one_sector_per_warp_step =
+                Some(twin);
         }
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
@@ -3631,6 +3545,11 @@ impl Linear {
             let (x_ptr, _gx) = x_view.device_ptr(&stream);
             let (w_ptr, _gw) = s.weight_u8.device_ptr(&stream);
             let (s_ptr, _gs) = s.weight_scales_cm.device_ptr(&stream);
+            let s_rm_guard = s
+                .weight_scales_row_major_twin_the_bf16act_gemv_reads_as_one_sector_per_warp_step
+                .as_ref()
+                .map(|t| t.device_ptr(&stream));
+            let s_rm_ptr = s_rm_guard.as_ref().map(|(p, _g)| *p as usize);
             let (d_ptr, _gd) = d.device_ptr_mut(&stream);
             let bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x =
                 s.weight_alpha * s.input_stored_global;
@@ -3638,6 +3557,36 @@ impl Linear {
             let d_row_bytes = self.out_features * std::mem::size_of::<bf16>();
             let x_base = x_ptr as usize;
             let d_base = d_ptr as usize;
+            let launch_rows = |x: usize, y: usize, m: usize| -> i32 {
+                match s_rm_ptr {
+                    Some(rm) => unsafe {
+                        nv_kernels::cuda::nvfp4_gemv_bf16act_mrows_rm(
+                            stream.cu_stream() as *mut c_void,
+                            w_ptr as *const u8,
+                            rm as *const u8,
+                            x as *const u16,
+                            y as *mut u16,
+                            bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
+                            self.out_features as i32,
+                            self.in_features as i32,
+                            m as i32,
+                        )
+                    },
+                    None => unsafe {
+                        nv_kernels::cuda::nvfp4_gemv_bf16act_mrows(
+                            stream.cu_stream() as *mut c_void,
+                            w_ptr as *const u8,
+                            s_ptr as *const u8,
+                            x as *const u16,
+                            y as *mut u16,
+                            bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
+                            self.out_features as i32,
+                            self.in_features as i32,
+                            m as i32,
+                        )
+                    },
+                }
+            };
             match (prenorm, norm_w_kept_alive_past_the_pointer_guard.as_ref()) {
                 (Some(pn), Some(nw)) => {
                     let (w_storage, wl) = nw.storage_and_layout();
@@ -3687,19 +3636,7 @@ impl Linear {
                                 }
                             }
                             if rc_rows == 0 {
-                                rc_rows = unsafe {
-                                    nv_kernels::cuda::nvfp4_gemv_bf16act_mrows(
-                                        stream.cu_stream() as *mut c_void,
-                                        w_ptr as *const u8,
-                                        s_ptr as *const u8,
-                                        xn_base as *const u16,
-                                        d_base as *mut u16,
-                                        bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
-                                        self.out_features as i32,
-                                        self.in_features as i32,
-                                        rows as i32,
-                                    )
-                                };
+                                rc_rows = launch_rows(xn_base, d_base, rows);
                             }
                         } else {
                             for row in 0..rows {
@@ -3732,34 +3669,12 @@ impl Linear {
                     if nvfp4_gemv_mrows_case_instantiated_mirroring_gemv_act_mrows_case_instantiated(
                         rows,
                     ) {
-                        unsafe {
-                            nv_kernels::cuda::nvfp4_gemv_bf16act_mrows(
-                                stream.cu_stream() as *mut c_void,
-                                w_ptr as *const u8,
-                                s_ptr as *const u8,
-                                x_base as *const u16,
-                                d_base as *mut u16,
-                                bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
-                                self.out_features as i32,
-                                self.in_features as i32,
-                                rows as i32,
-                            )
-                        }
+                        launch_rows(x_base, d_base, rows)
                     } else {
                         let mut rc_rows = 0i32;
                         for row in 0..rows {
-                            rc_rows = unsafe {
-                                nv_kernels::cuda::nvfp4_gemv_bf16act(
-                                    stream.cu_stream() as *mut c_void,
-                                    w_ptr as *const u8,
-                                    s_ptr as *const u8,
-                                    (x_base + row * x_row_bytes) as *const u16,
-                                    (d_base + row * d_row_bytes) as *mut u16,
-                                    bf16_act_alpha_refolds_the_input_global_the_mma_route_spends_quantizing_x,
-                                    self.out_features as i32,
-                                    self.in_features as i32,
-                                )
-                            };
+                            rc_rows =
+                                launch_rows(x_base + row * x_row_bytes, d_base + row * d_row_bytes, 1);
                             if rc_rows != 0 {
                                 break;
                             }
@@ -3860,7 +3775,7 @@ impl Linear {
                 .map_err(|e| anyhow::anyhow!(e))?
         };
 
-        let skip_pad = m_padded > m_logical && !nvfp4_quant_fullpad_enabled();
+        let skip_pad = m_padded > m_logical;
         let key = (nv_quant::stream_cache_key(&stream), m_padded);
         let mut staged_map = if skip_pad {
             let mut map = s
@@ -4042,7 +3957,7 @@ impl Linear {
                 static CFX_FIRINGS: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
                 let prev = CFX_FIRINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if prev == 0 && std::env::var("NV_Q38_CFX_TRACE").is_ok() {
+                if prev == 0 && nv_config::env_arm_present_at_all_reread_every_call("NV_Q38_CFX_TRACE") {
                     eprintln!(
                         "[linear] cfx route ENGAGED first fire m={m_padded} n={} k={}",
                         self.out_features, self.in_features
@@ -4111,18 +4026,6 @@ impl Linear {
 
 #[cfg(feature = "cuda")]
 impl Linear {
-    #[doc(hidden)]
-    #[cfg(feature = "cuda")]
-    pub fn nvfp4_staging_diag(&self, stream_key: usize, m_padded: usize) -> Option<(u64, usize)> {
-        match &self.storage {
-            LinearStorage::Nvfp4(s) => s.a_staging.lock().ok().and_then(|m| {
-                m.get(&(stream_key, m_padded))
-                    .map(|e| (e.epoch, e.hwm_rows))
-            }),
-            _ => None,
-        }
-    }
-
     pub fn new_fp8_e4m3(
         weight_u8: cudarc::driver::CudaSlice<u8>,
         weight_scale: f32,
@@ -4143,7 +4046,6 @@ impl Linear {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn new_fp8_e4m3_row_scales(
         weight_u8: cudarc::driver::CudaSlice<u8>,
         weight_scale_rows: Vec<f32>,
@@ -4161,11 +4063,10 @@ impl Linear {
             bias,
             device,
             runner,
-            fp8_scale_mode(),
+            nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn new_fp8_e4m3_row_scales_in_mode(
         weight_u8: cudarc::driver::CudaSlice<u8>,
         weight_scale_rows: Vec<f32>,
@@ -4187,8 +4088,7 @@ impl Linear {
                     "fp8 per-row (OUTER_VEC_32F) scaling is not served by cuBLASLt on this \
                      device, so the default fp8 scale mode cannot run a single GEMM -- \
                      refusing at load instead of failing on the first request. Probe: \
-                     {detail}. Set NV_FP8_SCALE_MODE=tensor to fall back to per-tensor fp8 \
-                     scales, or drop the fp8 opt-in (e.g. unset NV_ATTN_PROJ_QUANT)."
+                     {detail}. Drop the fp8 opt-in (e.g. unset NV_ATTN_PROJ_QUANT)."
                 );
             }
         }
@@ -4204,7 +4104,6 @@ impl Linear {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn new_fp8_e4m3_row_scales_without_the_cublaslt_probe(
         weight_u8: cudarc::driver::CudaSlice<u8>,
         weight_scale_rows: Vec<f32>,
@@ -4226,7 +4125,6 @@ impl Linear {
             _ => anyhow::bail!("Fp8 Linear requires a CUDA device"),
         };
         let stream = crate::cuda_stream::current_stream(&dev);
-        #[allow(deprecated)]
         let a_scale_dev = stream
             .clone_htod(&[1.0f32])
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -4237,11 +4135,9 @@ impl Linear {
         } else {
             1.0
         };
-        #[allow(deprecated)]
         let b_scale_dev = stream
             .clone_htod(&[b_scale_scalar])
             .map_err(|e| anyhow::anyhow!(e))?;
-        #[allow(deprecated)]
         let b_scale_rows_dev = stream
             .clone_htod(&weight_scale_rows)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -4306,7 +4202,7 @@ impl Linear {
             bias,
             device,
             runner,
-            fp8_scale_mode(),
+            nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
         )
     }
 
@@ -4340,7 +4236,6 @@ impl Linear {
             _ => anyhow::bail!("Fp8 Linear requires a CUDA device"),
         };
         let stream = crate::cuda_stream::current_stream(&dev);
-        #[allow(deprecated)]
         let weight_u8 = stream
             .clone_htod(&weight_bytes)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -4440,6 +4335,7 @@ impl Linear {
             weight_alpha_dev,
             input_stored_global,
             bf16act_row_limit: 0,
+            weight_scales_row_major_twin_the_bf16act_gemv_reads_as_one_sector_per_warp_step: None,
             a_staging: Mutex::new(std::collections::HashMap::new()),
             marlin_w4a16_twin_built_once_from_the_resident_nvfp4_buffers: std::sync::OnceLock::new(
             ),
@@ -4608,10 +4504,8 @@ impl Linear {
             _ => anyhow::bail!("NVFP4 Linear requires a CUDA device"),
         };
         let stream = crate::cuda_stream::current_stream(&dev);
-        #[allow(deprecated)]
         let weight_u8 = stream.clone_htod(&q.data).map_err(|e| anyhow::anyhow!(e))?;
         let weight_scales_sw = q.scales_swizzled();
-        #[allow(deprecated)]
         let weight_scales = stream
             .clone_htod(&weight_scales_sw)
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -4652,9 +4546,8 @@ impl Linear {
                 let k = self.in_features;
                 let stream = crate::cuda_stream::current_stream(&s.cuda_device);
                 let bytes_view = s.weight_u8.slice(row0 * k..(row0 + rows) * k);
-                #[allow(deprecated)]
                 let bytes = stream
-                    .memcpy_dtov(&bytes_view)
+                    .clone_dtoh(&bytes_view)
                     .map_err(|e| anyhow::anyhow!("dtoh fp8 rows for nvfp4 draft twin: {e}"))?;
                 let host = fp8_rowscale_dequant_bf16_host(
                     &bytes,
@@ -4774,7 +4667,6 @@ pub const FP8_RESIDENT_WEIGHT_BYTES_PER_PARAM_REPLACING_4_FROM_BF16_DEQUANT_PLUS
     usize = 1;
 
 #[cfg(feature = "cuda")]
-#[cfg(feature = "cuda")]
 pub fn fp8_e4m3_rowscale_checkpoint_resident_linear(
     weights: &nv_weights::WeightLoader,
     module: &str,
@@ -4821,7 +4713,6 @@ pub fn fp8_e4m3_rowscale_checkpoint_resident_linear(
         _ => anyhow::bail!("fp8 resident linear requires a CUDA device"),
     };
     let stream = crate::cuda_stream::current_stream(&dev);
-    #[allow(deprecated)]
     let weight_u8 = stream.clone_htod(bytes).map_err(|e| anyhow::anyhow!(e))?;
     Linear::new_fp8_e4m3_row_scales_without_the_cublaslt_probe(
         weight_u8,
@@ -4882,7 +4773,8 @@ mod tests {
             ];
             for batch_size in [0, 1, 4, 6, 8, 10] {
                 let _scope = Qwen38BatchE4m3GroupScopeGuard::enter(batch_size);
-                for (raw, expected) in cases {
+                for (raw, explicit) in cases {
+                    let expected = explicit.or(matches!(batch_size, 6 | 8).then_some(2));
                     assert_eq!(
                         E4m3GroupPolicy::from_env_value(Some(raw)).rows_per_warp(),
                         expected,
@@ -4912,34 +4804,6 @@ mod tests {
     }
     use candle_core::Device;
     use half::bf16;
-
-    #[test]
-    fn small_m_det_ships_default_on_and_zero_disables() {
-        assert!(small_m_det_from(None));
-        assert!(!small_m_det_from(Some("0")));
-        assert!(small_m_det_from(Some("1")));
-        assert!(small_m_det_from(Some("")));
-    }
-
-    #[test]
-    fn fp8_ships_per_row_scales_and_only_an_explicit_env_coarsens_them() {
-        use nv_quant::fp8::Fp8ScaleMode;
-        assert_eq!(fp8_scale_mode_from(None), Fp8ScaleMode::PerOuterRow);
-        assert_eq!(fp8_scale_mode_from(Some("")), Fp8ScaleMode::PerOuterRow);
-        assert_eq!(fp8_scale_mode_from(Some("row")), Fp8ScaleMode::PerOuterRow);
-        assert_eq!(fp8_scale_mode_from(Some("1")), Fp8ScaleMode::PerOuterRow);
-        assert_eq!(fp8_scale_mode_from(Some("tensor")), Fp8ScaleMode::PerTensor);
-        assert_eq!(fp8_scale_mode_from(Some("TENSOR")), Fp8ScaleMode::PerTensor);
-        assert_eq!(
-            fp8_scale_mode_from(Some("per_tensor")),
-            Fp8ScaleMode::PerTensor
-        );
-        assert_eq!(
-            fp8_scale_mode_from(Some("per-tensor")),
-            Fp8ScaleMode::PerTensor
-        );
-        assert_eq!(fp8_scale_mode_from(Some("0")), Fp8ScaleMode::PerTensor);
-    }
 
     #[test]
     fn fp8_weight_payload_defaults_to_one_scale_per_output_row() {

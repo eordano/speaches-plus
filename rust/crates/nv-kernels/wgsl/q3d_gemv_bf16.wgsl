@@ -40,6 +40,7 @@ fn q3w_gemv_bf16(
     for (var i = lane; i < kw; i = i + 128u) {
         let ww = q3b_w[wbase + i];
         let xw = q3b_x[q3b_p.x_off_words + i];
+        #def b5
         acc = fma(bf16_lo(ww), bf16_lo(xw), acc);
         acc = fma(bf16_hi(ww), bf16_hi(xw), acc);
     }
@@ -51,6 +52,7 @@ fn q3w_gemv_bf16(
         }
         workgroupBarrier();
     }
+        #end
 
     if (q3b_p.out_f32 == 1u) {
         if (lane == 0u && live) {
@@ -72,6 +74,7 @@ fn q3w_gemv_fp8_rowscale(
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
     let tid = lid.x;
+    #def b2
     let half = tid >> 7u;
     let lane = tid & 127u;
     let pair = wid.x + wid.y * q3b_p.groups_x;
@@ -103,6 +106,7 @@ fn q3w_gemv_fp8_rowscale(
     if (q3b_p.out_f32 == 1u) {
         if (lane == 0u && live) {
             let s = q3b_row_scale_folded_2pow120[row];
+    #end
             q3b_y[q3b_p.y_off_words + row] = bitcast<u32>(q3b_red[tid] * s * q3b_p.alpha);
         }
     } else if (tid == 0u) {
@@ -163,37 +167,7 @@ fn q3w_gemv_fp8_rowscale_lora_fold(
     let tid = lid.x;
     q3b_lora_stage_h(tid, q3b_lp.part_base, q3b_lp.n_tiles, q3b_lp.rank, q3b_lp.scale);
     workgroupBarrier();
-    let half = tid >> 7u;
-    let lane = tid & 127u;
-    let pair = wid.x + wid.y * q3b_p.groups_x;
-    let row = pair * 2u + half;
-    let live = row < q3b_p.n_rows;
-    let wbase = select(0u, row * q3b_p.w_row_words, live);
-    let kw = select(0u, q3b_p.k_words, live);
-    let xb = q3b_p.x_off_words;
-
-    var acc = 0.0;
-    for (var i = lane; i < kw; i = i + 128u) {
-        let ww = q3b_w[wbase + i];
-        let x0 = q3b_x[xb + 2u * i];
-        let x1 = q3b_x[xb + 2u * i + 1u];
-        acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 0u)), bf16_lo(x0), acc);
-        acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 1u)), bf16_hi(x0), acc);
-        acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 2u)), bf16_lo(x1), acc);
-        acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 3u)), bf16_hi(x1), acc);
-    }
-    q3b_red[tid] = acc;
-    workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            q3b_red[tid] = q3b_red[tid] + q3b_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-
-    if (q3b_p.out_f32 == 1u) {
-        if (lane == 0u && live) {
-            let s = q3b_row_scale_folded_2pow120[row];
+    #use b2
             let y = q3b_red[tid] * s * q3b_p.alpha;
             let d = q3b_lora_row_delta(q3b_lp.b_base, row, q3b_lp.rank);
             q3b_y[q3b_p.y_off_words + row] = bitcast<u32>(select(y, y + d, d != 0.0));
@@ -245,6 +219,7 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab(
     let gpair = wid.x + wid.y * mg_p.groups_x;
 
     if (gpair < mg_p.qkv_pairs) {
+        #def b6
         let pair = gpair;
         let row = pair * 2u + half;
         let live = row < mg_p.qkv_rows;
@@ -253,6 +228,8 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab(
         var acc = 0.0;
         for (var i = lane; i < kw; i = i + 128u) {
             let ww = q3b_w[wbase + i];
+        #end
+            #def b1
             let x0 = q3b_x[2u * i];
             let x1 = q3b_x[2u * i + 1u];
             acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 0u)), bf16_lo(x0), acc);
@@ -269,6 +246,7 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab(
             workgroupBarrier();
         }
         if (tid == 0u) {
+            #end
             let lo = q3b_red[0] * q3b_row_scale_folded_2pow120[pair * 2u];
             var hi = 0.0;
             if (row + 1u < mg_p.qkv_rows) {
@@ -279,6 +257,7 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab(
         return;
     }
     if (gpair < mg_p.qkv_pairs + mg_p.z_pairs) {
+        #def b4
         let pair = gpair - mg_p.qkv_pairs;
         let row = pair * 2u + half;
         let live = row < mg_p.z_rows;
@@ -287,23 +266,9 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab(
         var acc = 0.0;
         for (var i = lane; i < kw; i = i + 128u) {
             let ww = mg_w_z[wbase + i];
-            let x0 = q3b_x[2u * i];
-            let x1 = q3b_x[2u * i + 1u];
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 0u)), bf16_lo(x0), acc);
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 1u)), bf16_hi(x0), acc);
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 2u)), bf16_lo(x1), acc);
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 3u)), bf16_hi(x1), acc);
-        }
-        q3b_red[tid] = acc;
-        workgroupBarrier();
-        for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-            if (lane < stride) {
-                q3b_red[tid] = q3b_red[tid] + q3b_red[tid + stride];
-            }
-            workgroupBarrier();
-        }
-        if (tid == 0u) {
+            #use b1
             let lo = q3b_red[0] * mg_s_z_folded_2pow120[pair * 2u];
+        #end
             var hi = 0.0;
             if (row + 1u < mg_p.z_rows) {
                 hi = q3b_red[128] * mg_s_z_folded_2pow120[pair * 2u + 1u];
@@ -313,6 +278,7 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab(
         return;
     }
     let pair = gpair - mg_p.qkv_pairs - mg_p.z_pairs;
+    #def b3
     let row = pair * 2u + half;
     let live = row < mg_p.ab_rows;
     let wbase = select(0u, row * mg_p.bf16_row_words, live);
@@ -321,18 +287,9 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab(
     for (var i = lane; i < kw; i = i + 128u) {
         let ww = mg_w_ab[wbase + i];
         let xw = q3b_x[i];
-        acc = fma(bf16_lo(ww), bf16_lo(xw), acc);
-        acc = fma(bf16_hi(ww), bf16_hi(xw), acc);
-    }
-    q3b_red[tid] = acc;
-    workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            q3b_red[tid] = q3b_red[tid] + q3b_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
+        #use b5
     if (tid == 0u) {
+    #end
         let lo = q3b_red[0];
         var hi = 0.0;
         if (row + 1u < mg_p.ab_rows) {
@@ -369,30 +326,8 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab_lora_fold(
     if (gpair < mg_p.qkv_pairs) {
         q3b_lora_stage_h(tid, 0u, mg_lp.n_tiles, mg_lp.rank, mg_lp.scale);
         workgroupBarrier();
-        let pair = gpair;
-        let row = pair * 2u + half;
-        let live = row < mg_p.qkv_rows;
-        let wbase = select(0u, row * mg_p.fp8_row_words, live);
-        let kw = select(0u, mg_p.fp8_row_words, live);
-        var acc = 0.0;
-        for (var i = lane; i < kw; i = i + 128u) {
-            let ww = q3b_w[wbase + i];
-            let x0 = q3b_x[2u * i];
-            let x1 = q3b_x[2u * i + 1u];
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 0u)), bf16_lo(x0), acc);
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 1u)), bf16_hi(x0), acc);
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 2u)), bf16_lo(x1), acc);
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 3u)), bf16_hi(x1), acc);
-        }
-        q3b_red[tid] = acc;
-        workgroupBarrier();
-        for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-            if (lane < stride) {
-                q3b_red[tid] = q3b_red[tid] + q3b_red[tid + stride];
-            }
-            workgroupBarrier();
-        }
-        if (tid == 0u) {
+        #use b6
+            #use b1
             let lo = q3b_red[0] * q3b_row_scale_folded_2pow120[pair * 2u];
             let dlo = q3b_lora_row_delta(mg_lp.b_base.x, pair * 2u, mg_lp.rank);
             let lo2 = select(lo, lo + dlo, dlo != 0.0);
@@ -409,31 +344,7 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab_lora_fold(
     if (gpair < mg_p.qkv_pairs + mg_p.z_pairs) {
         q3b_lora_stage_h(tid, mg_lp.n_tiles * mg_lp.rank, mg_lp.n_tiles, mg_lp.rank, mg_lp.scale);
         workgroupBarrier();
-        let pair = gpair - mg_p.qkv_pairs;
-        let row = pair * 2u + half;
-        let live = row < mg_p.z_rows;
-        let wbase = select(0u, row * mg_p.fp8_row_words, live);
-        let kw = select(0u, mg_p.fp8_row_words, live);
-        var acc = 0.0;
-        for (var i = lane; i < kw; i = i + 128u) {
-            let ww = mg_w_z[wbase + i];
-            let x0 = q3b_x[2u * i];
-            let x1 = q3b_x[2u * i + 1u];
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 0u)), bf16_lo(x0), acc);
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 1u)), bf16_hi(x0), acc);
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 2u)), bf16_lo(x1), acc);
-            acc = fma(e4m3_shift_decode_scale_must_carry_2pow120(byte_at(ww, 3u)), bf16_hi(x1), acc);
-        }
-        q3b_red[tid] = acc;
-        workgroupBarrier();
-        for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-            if (lane < stride) {
-                q3b_red[tid] = q3b_red[tid] + q3b_red[tid + stride];
-            }
-            workgroupBarrier();
-        }
-        if (tid == 0u) {
-            let lo = q3b_red[0] * mg_s_z_folded_2pow120[pair * 2u];
+        #use b4
             let dlo = q3b_lora_row_delta(mg_lp.b_base.y, pair * 2u, mg_lp.rank);
             let lo2 = select(lo, lo + dlo, dlo != 0.0);
             var hi = 0.0;
@@ -456,26 +367,7 @@ fn q3w_gemv_dn_merged_fp8_qkv_fp8_z_bf16_ab_lora_fold(
         mg_lp.scale,
     );
     workgroupBarrier();
-    let row = pair * 2u + half;
-    let live = row < mg_p.ab_rows;
-    let wbase = select(0u, row * mg_p.bf16_row_words, live);
-    let kw = select(0u, mg_p.bf16_row_words, live);
-    var acc = 0.0;
-    for (var i = lane; i < kw; i = i + 128u) {
-        let ww = mg_w_ab[wbase + i];
-        let xw = q3b_x[i];
-        acc = fma(bf16_lo(ww), bf16_lo(xw), acc);
-        acc = fma(bf16_hi(ww), bf16_hi(xw), acc);
-    }
-    q3b_red[tid] = acc;
-    workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            q3b_red[tid] = q3b_red[tid] + q3b_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-    if (tid == 0u) {
+    #use b3
         let ab_row0 = pair * 2u - select(0u, mg_lp.ab_a_rows, ab_slice == 3u);
         let ab_b_base = mg_lp.b_base[ab_slice];
         let lo = q3b_red[0];

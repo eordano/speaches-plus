@@ -1,7 +1,7 @@
 use crate::wgpu_backend::compose;
 use crate::wgpu_backend::kernels::gemv_nvfp4 as g;
 
-pub const WGSL: &str = include_str!("../../../wgsl/gemv_nvfp4_lin.wgsl");
+pub const WGSL: &str = crate::wgsl!("../../../wgsl/gemv_nvfp4_lin.wgsl");
 
 pub const LIN_ENTRY: &str = "gemv_nvfp4_lin_sg";
 pub const SWZ_ENTRY: &str = "gemv_nvfp4_swz_sg";
@@ -13,7 +13,6 @@ pub const V3_NODEC_ENTRY: &str = "gemv_nvfp4_v3_nodec";
 pub const V3_STREAM_ENTRY: &str = "gemv_nvfp4_v3_stream";
 pub const WORKGROUP_SIZE: u32 = 128;
 pub const ROWS_PER_GROUP: u32 = 4;
-pub const V3_ROWS_PER_GROUP: u32 = 4;
 
 pub fn i8map(s: u32) -> u32 {
     let k = s & 0x0707_0707;
@@ -56,10 +55,6 @@ pub fn ws_row_stride(k_blocks: usize) -> usize {
     k_blocks.div_ceil(4) * 4
 }
 
-pub fn linear_scale_len(n: usize, k_blocks: usize) -> usize {
-    n * ws_row_stride(k_blocks)
-}
-
 pub fn linear_scales_from_swizzled(w_scales: &[u8], n: usize, k_blocks: usize) -> Vec<u32> {
     let stride = ws_row_stride(k_blocks);
     let k_tiles = g::k_tiles(k_blocks);
@@ -97,17 +92,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_lin_source_carries_the_shared_decode_block_and_every_entry() {
-        let src = source();
-        for e in [LIN_ENTRY, SWZ_ENTRY, NOSCALE_ENTRY] {
-            assert!(src.contains(e), "missing {e}");
+    fn the_lin_source_carries_every_entry_and_the_row_stride_is_word_aligned() {
+        {
+            let src = source();
+            for e in [LIN_ENTRY, SWZ_ENTRY, NOSCALE_ENTRY] {
+                assert!(src.contains(e), "missing {e}");
+            }
+            assert!(src.contains("fn gemv_dot8("));
+            assert!(src.contains("fn gemv_i8map("));
+            assert!(src.contains("fn nvfp4_scale_byte_index("));
+            assert!(src.contains("subgroupShuffleXor"));
+            assert!(!src.contains("enable subgroups"));
+            assert!(!src.contains("var<workgroup>"));
         }
-        assert!(src.contains("fn gemv_dot8("));
-        assert!(src.contains("fn gemv_i8map("));
-        assert!(src.contains("fn nvfp4_scale_byte_index("));
-        assert!(src.contains("subgroupShuffleXor"));
-        assert!(!src.contains("enable subgroups"));
-        assert!(!src.contains("var<workgroup>"));
+        {
+            for k_blocks in [1usize, 2, 3, 4, 5, 336, 512, 1344] {
+                let s = ws_row_stride(k_blocks);
+                assert!(s >= k_blocks);
+                assert_eq!(s % 4, 0);
+                assert!(s - k_blocks < 4);
+            }
+        }
     }
 
     #[test]
@@ -147,15 +152,5 @@ mod tests {
         }
         assert_eq!(ue4m3_decode(0), 0.0);
         assert_eq!(ue4m3_decode(7), 7.0 * UE4M3_SUBNORMAL_STEP);
-    }
-
-    #[test]
-    fn the_row_stride_is_word_aligned() {
-        for k_blocks in [1usize, 2, 3, 4, 5, 336, 512, 1344] {
-            let s = ws_row_stride(k_blocks);
-            assert!(s >= k_blocks);
-            assert_eq!(s % 4, 0);
-            assert!(s - k_blocks < 4);
-        }
     }
 }

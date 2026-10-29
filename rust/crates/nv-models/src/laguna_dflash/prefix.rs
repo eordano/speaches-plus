@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use half::bf16;
 
 use super::DflashCtxCache;
@@ -20,7 +20,7 @@ impl DflashCtxCache {
             .ring
             .as_ref()
             .context("DFlash prefix refuses legacy context storage")?;
-        anyhow::ensure!(
+        ensure!(
             !ring.k.is_empty()
                 && ring.k.len() == ring.v.len()
                 && ring.k.len() == self.layers.len()
@@ -30,7 +30,7 @@ impl DflashCtxCache {
             "DFlash prefix ring layer/window/capacity mismatch"
         );
         let dims = ring.scratch.dims();
-        anyhow::ensure!(
+        ensure!(
             dims.len() == 4 && dims[0] == 1 && dims[1] == ring.window,
             "DFlash prefix scratch layout mismatch"
         );
@@ -44,10 +44,10 @@ impl DflashCtxCache {
             windows: vec![Some(ring.window); ring.k.len()],
         };
         let re = layout.row_elems()?;
-        anyhow::ensure!(re == ring.row_elems, "DFlash prefix ring row size mismatch");
+        ensure!(re == ring.row_elems, "DFlash prefix ring row size mismatch");
         validate_tensor_rows(&stream, &ring.scratch, 0, ring.window, re)?;
         for (k, v) in ring.k.iter().zip(&ring.v) {
-            anyhow::ensure!(
+            ensure!(
                 k.dims() == [1, ring.cap, layout.n_kv, layout.head_dim] && v.dims() == k.dims(),
                 "DFlash prefix KV capacity mismatch"
             );
@@ -63,7 +63,7 @@ impl DflashCtxCache {
             .ring
             .as_ref()
             .context("DFlash prefix requires a context ring")?;
-        anyhow::ensure!(
+        ensure!(
             self.len > 0
                 && self.len <= i32::MAX as usize
                 && ring.stored <= ring.cap
@@ -109,7 +109,7 @@ impl DflashCtxCache {
             .ring
             .as_ref()
             .context("DFlash prefix requires a context ring")?;
-        anyhow::ensure!(
+        ensure!(
             snapshot.pos > 0
                 && snapshot.pos <= i32::MAX as usize
                 && layout.matches(&snapshot.layout)
@@ -119,7 +119,7 @@ impl DflashCtxCache {
             "DFlash prefix snapshot position/layout/bytes/layers mismatch"
         );
         let need = checked_bytes(snapshot.n_rows, ring.row_elems, 1)?;
-        anyhow::ensure!(
+        ensure!(
             snapshot
                 .rows
                 .iter()
@@ -180,7 +180,7 @@ mod tests {
                     dst.device(),
                 )?;
                 copy_rows_bf16(&stream, &source, 0, dst, 0, 16, 1024)?;
-                stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+                stream.synchronize()?;
             }
         }
         ring.stored = 16;

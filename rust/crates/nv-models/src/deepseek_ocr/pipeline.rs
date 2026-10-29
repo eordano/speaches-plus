@@ -27,14 +27,13 @@ pub enum DecoderPrecision {
     W8,
 }
 
-pub const DSOCR_QUANT_ENV_NVFP4_IS_THE_CUDA_DEFAULT_PER_CER_AB_0_0286_BF16_0_0288_NVFP4_IN_PERF_RUNS_AND_BF16_IS_THE_ESCAPE:
+pub const DSOCR_QUANT_ENV_SELECTS_W4_OR_W8_OVER_THE_NVFP4_CUDA_DEFAULT:
     &str = "NV_OCR_DEEPSEEK_QUANT";
 
 impl DecoderPrecision {
     pub fn from_quant_env_value(raw: Option<&str>, nvfp4_capable: bool) -> Self {
         match raw {
             Some("nvfp4") => Self::Nvfp4,
-            Some("bf16") => Self::Bf16,
             Some("w4") => Self::W4,
             Some("w8") => Self::W8,
             _ if nvfp4_capable => Self::Nvfp4,
@@ -44,7 +43,7 @@ impl DecoderPrecision {
 
     pub fn for_device(device: &Device) -> Self {
         Self::from_quant_env_value(
-            std::env::var(DSOCR_QUANT_ENV_NVFP4_IS_THE_CUDA_DEFAULT_PER_CER_AB_0_0286_BF16_0_0288_NVFP4_IN_PERF_RUNS_AND_BF16_IS_THE_ESCAPE)
+            std::env::var(DSOCR_QUANT_ENV_SELECTS_W4_OR_W8_OVER_THE_NVFP4_CUDA_DEFAULT)
                 .ok()
                 .as_deref(),
             cfg!(feature = "cuda") && device.is_cuda(),
@@ -61,10 +60,6 @@ pub struct DeepSeekOcr2Pipeline {
     graph: Mutex<Option<DsocrDecodeGraph>>,
     #[cfg(feature = "cuda")]
     graph_eligible_checked_once_so_nvfp4_never_reattempts_capture_per_page: bool,
-}
-
-fn retry_alternate_prompt() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_DSOCR_LOOP_RETRY")
 }
 
 impl DeepSeekOcr2Pipeline {
@@ -163,7 +158,7 @@ impl DeepSeekOcr2Pipeline {
         if modes.is_empty() {
             return;
         }
-        if !self.device.is_cuda() && std::env::var("NV_DSOCR_WARMUP").is_err() {
+        if !self.device.is_cuda() && !nv_config::env_arm_present_at_all_reread_every_call("NV_DSOCR_WARMUP") {
             return;
         }
         let img = RgbImage::from_fn(1024, 1024, |x, y| {
@@ -222,8 +217,7 @@ impl DeepSeekOcr2Pipeline {
     ) -> Result<(Vec<u32>, Option<LoopDetection>)> {
         let tokens = build_prompt_tokens(|s| self.encode_text(s), prompt, n_vision_tokens)?;
         #[cfg(feature = "cuda")]
-        if super::decoder_graph::graph_enabled()
-            && self.device.is_cuda()
+        if self.device.is_cuda()
             && self.graph_eligible_checked_once_so_nvfp4_never_reattempts_capture_per_page
         {
             let mut slot = self
@@ -266,7 +260,7 @@ impl DeepSeekOcr2Pipeline {
             return Ok((out, prep, false));
         };
         out.truncate(d.onset);
-        if prompt.trim() == PROMPT_FREE_OCR && retry_alternate_prompt() {
+        if prompt.trim() == PROMPT_FREE_OCR {
             let (mut retry, retry_det) = self.generate_once(
                 &features,
                 prep.vision_tokens(),
@@ -327,43 +321,20 @@ mod precision_default_tests {
     use super::DecoderPrecision;
 
     #[test]
-    fn unset_env_defaults_nvfp4_where_capable_and_bf16_elsewhere() {
-        assert_eq!(
-            DecoderPrecision::from_quant_env_value(None, true),
-            DecoderPrecision::Nvfp4
-        );
-        assert_eq!(
-            DecoderPrecision::from_quant_env_value(None, false),
-            DecoderPrecision::Bf16
-        );
-    }
-
-    #[test]
-    fn explicit_nvfp4_opts_in_and_fails_loudly_off_cuda_instead_of_silently_downgrading() {
-        assert_eq!(
-            DecoderPrecision::from_quant_env_value(Some("nvfp4"), false),
-            DecoderPrecision::Nvfp4
-        );
-    }
-
-    #[test]
-    fn bf16_escape_restores_the_graphed_bf16_decoder_even_where_nvfp4_is_capable() {
-        assert_eq!(
-            DecoderPrecision::from_quant_env_value(Some("bf16"), true),
-            DecoderPrecision::Bf16
-        );
-    }
-
-    #[test]
-    fn unknown_values_follow_the_capability_default_like_unset() {
-        assert_eq!(
-            DecoderPrecision::from_quant_env_value(Some("int8"), true),
-            DecoderPrecision::Nvfp4
-        );
-        assert_eq!(
-            DecoderPrecision::from_quant_env_value(Some("int8"), false),
-            DecoderPrecision::Bf16
-        );
+    fn unset_and_unknown_values_follow_the_capability_default_and_explicit_nvfp4_opts_in() {
+        for (raw, capable, want) in [
+            (None, true, DecoderPrecision::Nvfp4),
+            (None, false, DecoderPrecision::Bf16),
+            (Some("int8"), true, DecoderPrecision::Nvfp4),
+            (Some("int8"), false, DecoderPrecision::Bf16),
+            (Some("nvfp4"), false, DecoderPrecision::Nvfp4),
+        ] {
+            assert_eq!(
+                DecoderPrecision::from_quant_env_value(raw, capable),
+                want,
+                "{raw:?} capable={capable}"
+            );
+        }
     }
 }
 
@@ -372,7 +343,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nvfp4_precision_fails_cleanly_without_cuda() {
+    fn nvfp4_fails_cleanly_without_cuda_and_bf16_reports_the_missing_checkpoint() {
         let Err(err) = DeepSeekOcr2Pipeline::load(
             Path::new("/nonexistent/dsocr-checkpoint"),
             &Device::Cpu,
@@ -389,10 +360,6 @@ mod tests {
             msg.contains("Bf16"),
             "error should point at the working precision: {msg}"
         );
-    }
-
-    #[test]
-    fn bf16_precision_reports_missing_checkpoint_not_panic() {
         let Err(err) = DeepSeekOcr2Pipeline::load(
             Path::new("/nonexistent/dsocr-checkpoint"),
             &Device::Cpu,

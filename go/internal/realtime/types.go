@@ -17,10 +17,6 @@ func (s Samples) ToMillis(sr SampleRate) Millis {
 	return Millis(int64(s) * 1000 / int64(sr))
 }
 
-func MillisToSamples(m Millis, sr SampleRate) Samples {
-	return Samples(int64(m) * int64(sr) / 1000)
-}
-
 func (m Millis) Add(d DurationMs) Millis {
 	return Millis(int64(m) + int64(d))
 }

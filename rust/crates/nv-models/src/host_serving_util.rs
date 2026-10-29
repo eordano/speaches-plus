@@ -103,7 +103,7 @@ impl DeviceArgmaxTokenExit {
         rows: usize,
         vocab: usize,
     ) -> Result<Self> {
-        anyhow::ensure!(rows >= 1, "argmax exit needs at least one row");
+        ensure!(rows >= 1, "argmax exit needs at least one row");
         ctx.bind_to_thread()
             .map_err(|e| anyhow::anyhow!("bind ctx for argmax exit: {e:?}"))?;
         let parts = nv_kernels::cuda::argmax_parts();
@@ -156,13 +156,13 @@ impl DeviceArgmaxTokenExit {
         rows_active: usize,
     ) -> Result<Vec<u32>> {
         let () = Self::CASTS_BF16_TO_F32_THEN_ARGMAX_F32_ROWS_THE_PATH_EVERY_PUBLISHED_IDENTITY_NUMBER_USED_ARGMAX_BF16_ALSO_MATCHES_ARGMAX_CHECKED_SKIPPING_NONFINITE_AND_RETURNING_0_ON_ALL_NAN;
-        anyhow::ensure!(
+        ensure!(
             rows_active >= 1 && rows_active <= self.rows,
             "argmax exit rows_active {rows_active} out of 1..={}",
             self.rows
         );
         let n = rows_active * self.vocab;
-        anyhow::ensure!(
+        ensure!(
             logits_bf16.len() >= n,
             "argmax exit logits len {} < rows_active {rows_active} x vocab {}",
             logits_bf16.len(),
@@ -176,7 +176,7 @@ impl DeviceArgmaxTokenExit {
             let rc = unsafe {
                 nv_kernels::cuda::cast_bf16_f32(cu, lp as *const u16, fp as *mut f32, n as i32)
             };
-            anyhow::ensure!(rc == 0, "serving argmax exit cast_bf16_f32 rc={rc}");
+            ensure!(rc == 0, "serving argmax exit cast_bf16_f32 rc={rc}");
             let (vp, _gv) = self.part_val.device_ptr_mut(stream);
             let (ip, _gi) = self.part_idx.device_ptr_mut(stream);
             let (op, _go) = self.token_out.device_ptr_mut(stream);
@@ -191,7 +191,7 @@ impl DeviceArgmaxTokenExit {
                     op as *mut u32,
                 )
             };
-            anyhow::ensure!(rc == 0, "serving argmax exit argmax_f32_rows rc={rc}");
+            ensure!(rc == 0, "serving argmax exit argmax_f32_rows rc={rc}");
         }
         let host: Vec<u32> = stream
             .clone_dtoh(&self.token_out)
@@ -321,6 +321,8 @@ impl InGraphPhaseEventLadder {
     }
 }
 
+#[cfg(feature = "cuda")]
+use anyhow::ensure;
 pub use nv_config::env_arm::{
     env_arm_dependency_assert_enabled_arm_requires_prerequisite,
     env_arm_opt_in_eq_some_1_reread_every_call,
@@ -334,7 +336,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn phase_ladder_core_renders_the_exact_g4_sol_lane_format() {
+    fn phase_ladder_core_renders_the_exact_g4_sol_lane_format_with_rows_sorted_descending_by_per_step_ms(
+    ) {
         let mut core = PhaseLadderReplayAccumulatorHostCore::new("g4-phase", 2);
         assert!(!core.accumulate_replayed_step_returning_dump_due(&[("attn", 1.0), ("moe", 3.0)]));
         assert!(core.accumulate_replayed_step_returning_dump_due(&[("attn", 1.0), ("moe", 3.0)]));
@@ -345,10 +348,7 @@ mod tests {
         );
         assert_eq!(lines[1], "[g4-phase]   moe               3.0000 ms/step");
         assert_eq!(lines[2], "[g4-phase]   attn              1.0000 ms/step");
-    }
 
-    #[test]
-    fn phase_ladder_core_sorts_rows_descending_by_per_step_ms() {
         let mut core = PhaseLadderReplayAccumulatorHostCore::new("t", 1);
         assert!(core.accumulate_replayed_step_returning_dump_due(&[
             ("small", 0.5),

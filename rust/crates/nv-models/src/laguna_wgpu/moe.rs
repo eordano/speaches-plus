@@ -1,45 +1,45 @@
-use anyhow::Result;
+use anyhow::{anyhow, ensure, Result};
+use wgpu::Buffer;
 
 use super::config::{LagunaShapes, LayerShape, NVFP4_BLOCK};
 use super::gpu::{
     alloc_lin_scratch, alloc_lin_scratch_rows, alloc_pair_scratch, alloc_pair_scratch_rows,
     push_gemv_bf16, push_gemv_bf16_experts, push_gemv_bf16_rows, push_gemv_i8_experts,
     push_gemv_nvfp4, push_lin_gemv, push_lin_gemv_pair, push_lin_gemv_pair_rows,
-    push_lin_gemv_rows, push_quant_rows, push_silu_mul, qshare_enabled, upload_bf16,
+    push_lin_gemv_rows, push_quant_rows, push_silu_mul, upload_bf16,
     upload_experts, upload_lin, Bf16Gpu, Builder, ExpertsGpu, LinGpu, MRows, Sources, W8Scope,
 };
 use super::weights::{HostExperts, HostMoe};
 use super::{rbf, ref_gemv_bf16, ref_gemv_lin, sigmoid, silu};
+use crate::pod;
 
-pub const MOE_WGSL: &str = include_str!("../../../nv-kernels/wgsl/laguna_moe.wgsl");
+pub const MOE_WGSL: &str = nv_kernels::wgsl!("../../../nv-kernels/wgsl/laguna_moe.wgsl");
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct RouterParams {
-    pub n_experts: u32,
-    pub top_k: u32,
-    pub norm_topk: u32,
-    pub softcap: f32,
-    pub routed_scaling: f32,
-    pub pad0: u32,
-    pub pad1: u32,
-    pub pad2: u32,
-}
+pod! {
+    pub struct RouterParams {
+        pub n_experts: u32,
+        pub top_k: u32,
+        pub norm_topk: u32,
+        pub softcap: f32,
+        pub routed_scaling: f32,
+        pub pad0: u32,
+        pub pad1: u32,
+        pub pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct CombineParams {
-    pub hidden_words: u32,
-    pub top_k: u32,
-    pub slot_stride_words: u32,
-    pub routed_scaling: f32,
+    pub struct CombineParams {
+        pub hidden_words: u32,
+        pub top_k: u32,
+        pub slot_stride_words: u32,
+        pub routed_scaling: f32,
+    }
 }
 
 pub const ROUTER_MAX_EXPERTS: usize = 256;
 
 pub struct MoeGpu {
     pub router: Bf16Gpu,
-    pub bias: wgpu::Buffer,
+    pub bias: Buffer,
     pub eg: ExpertsGpu,
     pub eu: ExpertsGpu,
     pub ed: ExpertsGpu,
@@ -52,7 +52,7 @@ fn selection_bias(shapes: &LagunaShapes, w: &HostMoe) -> Result<Vec<f32>> {
     if w.selection_bias.is_empty() {
         return Ok(vec![0f32; shapes.num_experts]);
     }
-    anyhow::ensure!(
+    ensure!(
         w.selection_bias.len() == shapes.num_experts,
         "selection_bias has {} entries for {} experts",
         w.selection_bias.len(),
@@ -64,23 +64,23 @@ fn selection_bias(shapes: &LagunaShapes, w: &HostMoe) -> Result<Vec<f32>> {
 fn check_moe(shapes: &LagunaShapes, layer: &LayerShape, w: &HostMoe) -> Result<()> {
     let hidden = shapes.hidden_size;
     let inter = layer.ffn_intermediate;
-    anyhow::ensure!(
+    ensure!(
         shapes.num_experts > 0 && shapes.top_k > 0,
         "moe layer {} needs num_experts>0 and num_experts_per_tok>0",
         layer.idx
     );
-    anyhow::ensure!(
+    ensure!(
         shapes.top_k <= shapes.num_experts,
         "num_experts_per_tok {} exceeds num_experts {}",
         shapes.top_k,
         shapes.num_experts
     );
-    anyhow::ensure!(
+    ensure!(
         shapes.num_experts <= ROUTER_MAX_EXPERTS,
         "router top-k kernel caps num_experts at {ROUTER_MAX_EXPERTS}, got {}",
         shapes.num_experts
     );
-    anyhow::ensure!(
+    ensure!(
         w.router.n == shapes.num_experts && w.router.k == hidden,
         "router is [{}, {}], want [{}, {hidden}]",
         w.router.n,
@@ -92,7 +92,7 @@ fn check_moe(shapes: &LagunaShapes, layer: &LayerShape, w: &HostMoe) -> Result<(
         ("up", &w.experts_up, inter, hidden),
         ("down", &w.experts_down, hidden, inter),
     ] {
-        anyhow::ensure!(
+        ensure!(
             e.num_experts() == shapes.num_experts && e.n() == n && e.k() == k,
             "expert {name} stack is [{}, {}, {}], want [{}, {n}, {k}]",
             e.num_experts(),
@@ -102,7 +102,7 @@ fn check_moe(shapes: &LagunaShapes, layer: &LayerShape, w: &HostMoe) -> Result<(
         );
     }
     let sinter = shapes.shared_expert_intermediate_size;
-    anyhow::ensure!(
+    ensure!(
         w.shared_gate.n() == sinter
             && w.shared_gate.k() == hidden
             && w.shared_up.n() == sinter
@@ -112,12 +112,12 @@ fn check_moe(shapes: &LagunaShapes, layer: &LayerShape, w: &HostMoe) -> Result<(
         "shared expert shapes disagree with shared_expert_intermediate_size {sinter}"
     );
     let gate_q = matches!(&w.experts_gate, HostExperts::Nvfp4(_));
-    anyhow::ensure!(
+    ensure!(
         gate_q == matches!(&w.experts_up, HostExperts::Nvfp4(_)),
         "expert gate/up dtypes differ; the wgpu path quantizes the token once per slot"
     );
     if gate_q {
-        anyhow::ensure!(
+        ensure!(
             w.experts_gate.input_globals() == w.experts_up.input_globals(),
             "expert gate/up input_global_scale differ; the wgpu path quantizes the token once per slot"
         );
@@ -125,22 +125,21 @@ fn check_moe(shapes: &LagunaShapes, layer: &LayerShape, w: &HostMoe) -> Result<(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn prepare_expert_input(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     stack: &ExpertsGpu,
-    x_packed: &wgpu::Buffer,
-    ids: &wgpu::Buffer,
+    x_packed: &Buffer,
+    ids: &Buffer,
     k_elems: usize,
     slots: usize,
     x_per_slot: bool,
-) -> Result<Option<(wgpu::Buffer, wgpu::Buffer, bool)>> {
+) -> Result<Option<(Buffer, Buffer, bool)>> {
     match stack {
         ExpertsGpu::Bf16(_) | ExpertsGpu::Int8(_) => Ok(None),
         ExpertsGpu::Nvfp4(st) => {
-            let x_shared = qshare_enabled() && st.globals_uniform && !x_per_slot;
+            let x_shared = st.globals_uniform && !x_per_slot;
             let qslots = if x_shared { 1 } else { slots };
             let k_blocks = k_elems / NVFP4_BLOCK;
             let xq = b.zeros(&format!("{label}-xq"), (qslots * k_elems / 2) as u64);
@@ -165,16 +164,15 @@ fn prepare_expert_input(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_expert_gemv(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     stack: &ExpertsGpu,
-    x_packed: &wgpu::Buffer,
-    quant: Option<(&wgpu::Buffer, &wgpu::Buffer, bool)>,
-    y: &wgpu::Buffer,
-    ids: &wgpu::Buffer,
+    x_packed: &Buffer,
+    quant: Option<(&Buffer, &Buffer, bool)>,
+    y: &Buffer,
+    ids: &Buffer,
     slots: usize,
     x_per_slot: bool,
 ) -> Result<()> {
@@ -186,9 +184,8 @@ fn push_expert_gemv(
             b, s, label, st, x_packed, y, ids, slots, true, x_per_slot, 1,
         ),
         ExpertsGpu::Nvfp4(st) => {
-            let (xq, xs, x_shared) = quant.ok_or_else(|| {
-                anyhow::anyhow!("{label}: nvfp4 expert stack needs a quantized x")
-            })?;
+            let (xq, xs, x_shared) =
+                quant.ok_or_else(|| anyhow!("{label}: nvfp4 expert stack needs a quantized x"))?;
             push_gemv_nvfp4(
                 b, s, label, &st.w, &st.scales, xq, xs, y, ids, &st.alphas, st.n, st.k, slots,
                 true, x_shared, 1.0, 1,
@@ -197,15 +194,14 @@ fn push_expert_gemv(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_moe_layer(
     b: &mut Builder,
     s: &Sources,
     shapes: &LagunaShapes,
     layer: &LayerShape,
     w: &HostMoe,
-    x_normed_packed: &wgpu::Buffer,
-    out_packed: &wgpu::Buffer,
+    x_normed_packed: &Buffer,
+    out_packed: &Buffer,
 ) -> Result<MoeGpu> {
     check_moe(shapes, layer, w)?;
 
@@ -414,23 +410,22 @@ pub fn build_moe_layer(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn prepare_expert_input_rows(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     stack: &ExpertsGpu,
-    x_packed: &wgpu::Buffer,
-    ids: &wgpu::Buffer,
+    x_packed: &Buffer,
+    ids: &Buffer,
     k_elems: usize,
     mp: &MRows,
     top_k: usize,
     x_per_slot: bool,
-) -> Result<Option<(wgpu::Buffer, wgpu::Buffer, usize)>> {
+) -> Result<Option<(Buffer, Buffer, usize)>> {
     match stack {
         ExpertsGpu::Bf16(_) | ExpertsGpu::Int8(_) => Ok(None),
         ExpertsGpu::Nvfp4(st) => {
-            let x_shared = qshare_enabled() && st.globals_uniform && !x_per_slot;
+            let x_shared = st.globals_uniform && !x_per_slot;
             let (qslots, sel, quant_div, gemv_div) = if x_shared {
                 (mp.m, &mp.sel0, 1usize, top_k)
             } else if x_per_slot {
@@ -461,16 +456,15 @@ fn prepare_expert_input_rows(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_expert_gemv_rows(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     stack: &ExpertsGpu,
-    x_packed: &wgpu::Buffer,
-    quant: Option<(&wgpu::Buffer, &wgpu::Buffer, usize)>,
-    y: &wgpu::Buffer,
-    ids: &wgpu::Buffer,
+    x_packed: &Buffer,
+    quant: Option<(&Buffer, &Buffer, usize)>,
+    y: &Buffer,
+    ids: &Buffer,
     slots: usize,
     raw_x_div: usize,
 ) -> Result<()> {
@@ -482,9 +476,8 @@ fn push_expert_gemv_rows(
             b, s, label, st, x_packed, y, ids, slots, true, true, raw_x_div,
         ),
         ExpertsGpu::Nvfp4(st) => {
-            let (xq, xs, x_div) = quant.ok_or_else(|| {
-                anyhow::anyhow!("{label}: nvfp4 expert stack needs a quantized x")
-            })?;
+            let (xq, xs, x_div) =
+                quant.ok_or_else(|| anyhow!("{label}: nvfp4 expert stack needs a quantized x"))?;
             push_gemv_nvfp4(
                 b, s, label, &st.w, &st.scales, xq, xs, y, ids, &st.alphas, st.n, st.k, slots,
                 true, false, 1.0, x_div,
@@ -493,15 +486,14 @@ fn push_expert_gemv_rows(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_moe_layer_rows(
     b: &mut Builder,
     s: &Sources,
     shapes: &LagunaShapes,
     layer: &LayerShape,
     g: &MoeGpu,
-    x_rows_packed: &wgpu::Buffer,
-    out_rows_packed: &wgpu::Buffer,
+    x_rows_packed: &Buffer,
+    out_rows_packed: &Buffer,
     mp: &MRows,
 ) -> Result<()> {
     let hidden = shapes.hidden_size;
@@ -702,13 +694,13 @@ pub fn ref_router_topk(
     w: &HostMoe,
     x_normed: &[f32],
 ) -> Result<(Vec<u32>, Vec<f32>)> {
-    anyhow::ensure!(
+    ensure!(
         shapes.top_k > 0 && shapes.top_k <= shapes.num_experts,
         "num_experts_per_tok {} invalid for {} experts",
         shapes.top_k,
         shapes.num_experts
     );
-    anyhow::ensure!(
+    ensure!(
         w.router.n == shapes.num_experts && w.router.k == x_normed.len(),
         "router is [{}, {}], want [{}, {}]",
         w.router.n,
@@ -758,7 +750,7 @@ pub fn ref_router_topk(
 
 pub fn ref_shared_expert(shapes: &LagunaShapes, w: &HostMoe, x_normed: &[f32]) -> Result<Vec<f32>> {
     let sinter = shapes.shared_expert_intermediate_size;
-    anyhow::ensure!(
+    ensure!(
         w.shared_gate.n() == sinter && w.shared_up.n() == sinter && w.shared_down.k() == sinter,
         "shared expert width disagrees with shared_expert_intermediate_size {sinter}"
     );
@@ -776,7 +768,7 @@ pub fn ref_shared_expert(shapes: &LagunaShapes, w: &HostMoe, x_normed: &[f32]) -
 pub fn ref_moe(shapes: &LagunaShapes, w: &HostMoe, x_normed: &[f32]) -> Result<Vec<f32>> {
     let hidden = shapes.hidden_size;
     let inter = shapes.moe_intermediate_size;
-    anyhow::ensure!(
+    ensure!(
         x_normed.len() == hidden,
         "moe input has {} elements, want {hidden}",
         x_normed.len()

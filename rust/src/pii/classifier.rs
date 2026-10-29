@@ -348,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_layout_resolves_in_model_dir() {
+    fn resolve_layout_handles_flat_split_and_direct_file_layouts() {
         let dir = temp_dir();
         touch(&dir.join("model.onnx"));
         touch(&dir.join("tokenizer.json"));
@@ -359,66 +359,58 @@ mod tests {
         assert_eq!(t, dir.join("tokenizer.json"));
         assert_eq!(c, dir.join("config.json"));
         let _ = std::fs::remove_dir_all(&dir);
+        {
+            let snapshot = temp_dir();
+            touch(&snapshot.join("onnx").join("model.onnx"));
+            touch(&snapshot.join("tokenizer.json"));
+            touch(&snapshot.join("config.json"));
+
+            let (m, t, c) = resolve_layout(&snapshot.join("onnx")).unwrap();
+            assert_eq!(m, snapshot.join("onnx").join("model.onnx"));
+            assert_eq!(t, snapshot.join("tokenizer.json"));
+            assert_eq!(c, snapshot.join("config.json"));
+            let _ = std::fs::remove_dir_all(&snapshot);
+        }
+        {
+            let snapshot = temp_dir();
+            touch(&snapshot.join("onnx").join("model.onnx"));
+            touch(&snapshot.join("tokenizer.json"));
+            touch(&snapshot.join("config.json"));
+
+            let (m, t, c) = resolve_layout(&snapshot).unwrap();
+            assert_eq!(m, snapshot.join("onnx").join("model.onnx"));
+            assert_eq!(t, snapshot.join("tokenizer.json"));
+            assert_eq!(c, snapshot.join("config.json"));
+            let _ = std::fs::remove_dir_all(&snapshot);
+        }
+        {
+            let snapshot = temp_dir();
+            touch(&snapshot.join("onnx").join("model.onnx"));
+            touch(&snapshot.join("onnx").join("tokenizer.json"));
+            touch(&snapshot.join("onnx").join("config.json"));
+
+            let (m, t, c) = resolve_layout(&snapshot).unwrap();
+            assert_eq!(m, snapshot.join("onnx").join("model.onnx"));
+            assert_eq!(t, snapshot.join("onnx").join("tokenizer.json"));
+            assert_eq!(c, snapshot.join("onnx").join("config.json"));
+            let _ = std::fs::remove_dir_all(&snapshot);
+        }
+        {
+            let snapshot = temp_dir();
+            touch(&snapshot.join("onnx").join("model.onnx"));
+            touch(&snapshot.join("tokenizer.json"));
+            touch(&snapshot.join("config.json"));
+
+            let (m, t, c) = resolve_layout(&snapshot.join("onnx").join("model.onnx")).unwrap();
+            assert_eq!(m, snapshot.join("onnx").join("model.onnx"));
+            assert_eq!(t, snapshot.join("tokenizer.json"));
+            assert_eq!(c, snapshot.join("config.json"));
+            let _ = std::fs::remove_dir_all(&snapshot);
+        }
     }
 
     #[test]
-    fn split_layout_from_onnx_subdir_finds_tokenizer_in_parent() {
-        let snapshot = temp_dir();
-        touch(&snapshot.join("onnx").join("model.onnx"));
-        touch(&snapshot.join("tokenizer.json"));
-        touch(&snapshot.join("config.json"));
-
-        let (m, t, c) = resolve_layout(&snapshot.join("onnx")).unwrap();
-        assert_eq!(m, snapshot.join("onnx").join("model.onnx"));
-        assert_eq!(t, snapshot.join("tokenizer.json"));
-        assert_eq!(c, snapshot.join("config.json"));
-        let _ = std::fs::remove_dir_all(&snapshot);
-    }
-
-    #[test]
-    fn split_layout_from_snapshot_root_finds_model_under_onnx() {
-        let snapshot = temp_dir();
-        touch(&snapshot.join("onnx").join("model.onnx"));
-        touch(&snapshot.join("tokenizer.json"));
-        touch(&snapshot.join("config.json"));
-
-        let (m, t, c) = resolve_layout(&snapshot).unwrap();
-        assert_eq!(m, snapshot.join("onnx").join("model.onnx"));
-        assert_eq!(t, snapshot.join("tokenizer.json"));
-        assert_eq!(c, snapshot.join("config.json"));
-        let _ = std::fs::remove_dir_all(&snapshot);
-    }
-
-    #[test]
-    fn snapshot_root_finds_assets_that_only_exist_under_onnx() {
-        let snapshot = temp_dir();
-        touch(&snapshot.join("onnx").join("model.onnx"));
-        touch(&snapshot.join("onnx").join("tokenizer.json"));
-        touch(&snapshot.join("onnx").join("config.json"));
-
-        let (m, t, c) = resolve_layout(&snapshot).unwrap();
-        assert_eq!(m, snapshot.join("onnx").join("model.onnx"));
-        assert_eq!(t, snapshot.join("onnx").join("tokenizer.json"));
-        assert_eq!(c, snapshot.join("onnx").join("config.json"));
-        let _ = std::fs::remove_dir_all(&snapshot);
-    }
-
-    #[test]
-    fn a_direct_onnx_file_path_resolves_against_its_own_directory() {
-        let snapshot = temp_dir();
-        touch(&snapshot.join("onnx").join("model.onnx"));
-        touch(&snapshot.join("tokenizer.json"));
-        touch(&snapshot.join("config.json"));
-
-        let (m, t, c) = resolve_layout(&snapshot.join("onnx").join("model.onnx")).unwrap();
-        assert_eq!(m, snapshot.join("onnx").join("model.onnx"));
-        assert_eq!(t, snapshot.join("tokenizer.json"));
-        assert_eq!(c, snapshot.join("config.json"));
-        let _ = std::fs::remove_dir_all(&snapshot);
-    }
-
-    #[test]
-    fn layout_present_accepts_a_snapshot_root_where_the_flat_probe_fails() {
+    fn layout_present_accepts_a_snapshot_root_and_is_false_without_model_or_tokenizer() {
         let snapshot = temp_dir();
         touch(&snapshot.join("onnx").join("model.onnx"));
         touch(&snapshot.join("tokenizer.json"));
@@ -428,23 +420,21 @@ mod tests {
         assert!(layout_present(&snapshot));
         assert!(layout_present(&snapshot.join("onnx")));
         let _ = std::fs::remove_dir_all(&snapshot);
-    }
+        {
+            let root = temp_dir();
+            let snapshot = root.join("snap");
+            std::fs::create_dir_all(&snapshot).unwrap();
+            touch(&snapshot.join("tokenizer.json"));
+            touch(&snapshot.join("config.json"));
+            assert!(!layout_present(&snapshot));
 
-    #[test]
-    fn layout_present_is_false_without_a_model_or_without_the_tokenizer() {
-        let root = temp_dir();
-        let snapshot = root.join("snap");
-        std::fs::create_dir_all(&snapshot).unwrap();
-        touch(&snapshot.join("tokenizer.json"));
-        touch(&snapshot.join("config.json"));
-        assert!(!layout_present(&snapshot));
+            touch(&snapshot.join("onnx").join("model.onnx"));
+            std::fs::remove_file(snapshot.join("tokenizer.json")).unwrap();
+            assert!(!layout_present(&snapshot));
 
-        touch(&snapshot.join("onnx").join("model.onnx"));
-        std::fs::remove_file(snapshot.join("tokenizer.json")).unwrap();
-        assert!(!layout_present(&snapshot));
-
-        assert!(!layout_present(&snapshot.join("does-not-exist")));
-        let _ = std::fs::remove_dir_all(&root);
+            assert!(!layout_present(&snapshot.join("does-not-exist")));
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

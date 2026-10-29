@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from pathlib import Path
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
@@ -238,6 +237,3 @@ def _strip_trailing_nl(line: bytes) -> bytes:
     if line.endswith(b"\n"):
         return line[:-1]
     return line
-
-def _ensure_session_dir() -> Path | None:
-    return session_dir()

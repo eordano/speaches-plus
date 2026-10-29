@@ -34,7 +34,7 @@ pub struct Record {
 fn sha(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 fn head_lines(s: &str, n: usize) -> String {

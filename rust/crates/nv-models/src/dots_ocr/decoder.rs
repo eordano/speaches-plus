@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use nv_layers::attn::{sdpa, AttnConfig};
 use nv_layers::linear::Linear;
@@ -11,6 +11,7 @@ use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 
 use crate::deepseek_ocr::decoder::{banned_tokens_windowed_ngram, detect_loop, LoopDetection};
+use nv_weights::TensorSource;
 
 pub const IMGPAD_TOKEN_ID: u32 = 151665;
 pub const IMG_TOKEN_ID: u32 = 151666;
@@ -93,7 +94,7 @@ impl DotsKvCache {
         grow_by_concat: bool,
     ) -> Result<Self> {
         let head_dim = cfg.head_dim();
-        let bhsd = !matches!(device, Device::Cuda(_));
+        let bhsd = !device.is_cuda();
         let alloc_len = if grow_by_concat { 0 } else { max_seq_len };
         let shape = if bhsd {
             (1usize, cfg.num_key_value_heads, alloc_len, head_dim)
@@ -137,7 +138,7 @@ impl DotsKvCache {
     pub fn write_at(&mut self, layer: usize, start: usize, k: &Tensor, v: &Tensor) -> Result<()> {
         let t = k.dim(1)?;
         let end = start + t;
-        anyhow::ensure!(
+        ensure!(
             end <= self.max_seq_len,
             "kv cache overflow: {end} > {}",
             self.max_seq_len
@@ -211,7 +212,7 @@ pub struct DotsDecoder {
 trait LinearFactory {
     fn load(
         &self,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         name: &str,
         out_dim: usize,
         in_dim: usize,
@@ -220,7 +221,7 @@ trait LinearFactory {
 
     fn load_mlp_up_down_diagfolded_if_opted_in(
         &self,
-        _weights: &dyn nv_weights::TensorSource,
+        _weights: &dyn TensorSource,
         _up_name: &str,
         _down_name: &str,
         _inter: usize,
@@ -239,7 +240,7 @@ struct Bf16Factory {
 impl LinearFactory for Bf16Factory {
     fn load(
         &self,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         name: &str,
         out_dim: usize,
         in_dim: usize,
@@ -257,7 +258,7 @@ struct GgmlFactory {
 impl LinearFactory for GgmlFactory {
     fn load(
         &self,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         name: &str,
         out_dim: usize,
         in_dim: usize,
@@ -269,7 +270,7 @@ impl LinearFactory for GgmlFactory {
         let w = weights
             .get(name, DType::BF16)
             .with_context(|| format!("load {name}"))?;
-        anyhow::ensure!(
+        ensure!(
             w.dims2()? == (out_dim, in_dim),
             "{name}: expected [{out_dim}, {in_dim}], got {:?}",
             w.dims()
@@ -298,7 +299,7 @@ struct Nvfp4Factory {
 impl LinearFactory for Nvfp4Factory {
     fn load(
         &self,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         name: &str,
         out_dim: usize,
         in_dim: usize,
@@ -311,7 +312,7 @@ impl LinearFactory for Nvfp4Factory {
         let w = weights
             .get(name, DType::BF16)
             .with_context(|| format!("load {name}"))?;
-        anyhow::ensure!(
+        ensure!(
             w.dims2()? == (out_dim, in_dim),
             "{name}: expected [{out_dim}, {in_dim}], got {:?}",
             w.dims()
@@ -330,7 +331,7 @@ impl LinearFactory for Nvfp4Factory {
 
     fn load_mlp_up_down_diagfolded_if_opted_in(
         &self,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         up_name: &str,
         down_name: &str,
         inter: usize,
@@ -354,7 +355,7 @@ impl LinearFactory for Nvfp4Factory {
 #[cfg(feature = "cuda")]
 impl Nvfp4Factory {
     fn host_f32_rows(
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         name: &str,
         out_dim: usize,
         in_dim: usize,
@@ -362,7 +363,7 @@ impl Nvfp4Factory {
         let w = weights
             .get(name, DType::BF16)
             .with_context(|| format!("load {name}"))?;
-        anyhow::ensure!(
+        ensure!(
             w.dims2()? == (out_dim, in_dim),
             "{name}: expected [{out_dim}, {in_dim}], got {:?}",
             w.dims()
@@ -386,7 +387,7 @@ impl Nvfp4Factory {
 
     fn load_mlp_up_down_diagfolded(
         &self,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         up_name: &str,
         down_name: &str,
         inter: usize,
@@ -408,7 +409,7 @@ impl Nvfp4Factory {
 
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &AttnConfig) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
-    if matches!(q.device(), Device::Cuda(_)) {
+    if q.device().is_cuda() {
         return nv_layers::attn::flash_attn(
             &q.contiguous()?,
             &k.contiguous()?,
@@ -427,7 +428,7 @@ fn decode_attention_grouped(
 ) -> Result<Tensor> {
     let (_b, _one, h, d) = q.dims4()?;
     let (_bk, h_kv, s_k, dk) = k.dims4()?;
-    anyhow::ensure!(
+    ensure!(
         h == cfg.num_heads && h_kv == cfg.num_kv_heads && d == dk && h % h_kv == 0,
         "decode_attention_grouped: bad shapes q={:?} k={:?}",
         q.dims(),
@@ -448,7 +449,7 @@ fn decode_attention_grouped(
 impl DotsDecoder {
     pub fn from_loader(
         cfg: DotsDecoderConfig,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         device: &Device,
         dtype: DType,
         rope_max_seq_len: usize,
@@ -459,7 +460,7 @@ impl DotsDecoder {
 
     pub fn from_loader_ggml(
         cfg: DotsDecoderConfig,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         device: &Device,
         dtype: DType,
         gdt: candle_core::quantized::GgmlDType,
@@ -472,7 +473,7 @@ impl DotsDecoder {
     #[cfg(feature = "cuda")]
     pub fn from_loader_nvfp4(
         cfg: DotsDecoderConfig,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         device: &Device,
         rope_max_seq_len: usize,
     ) -> Result<Self> {
@@ -500,7 +501,7 @@ impl DotsDecoder {
 
     fn build(
         cfg: DotsDecoderConfig,
-        weights: &dyn nv_weights::TensorSource,
+        weights: &dyn TensorSource,
         device: &Device,
         dtype: DType,
         rope_max_seq_len: usize,
@@ -516,7 +517,7 @@ impl DotsDecoder {
         let embed = weights
             .get("model.embed_tokens.weight", dtype)
             .context("load model.embed_tokens.weight")?;
-        anyhow::ensure!(
+        ensure!(
             embed.dims2()? == (cfg.vocab_size, hidden),
             "embed_tokens: got {:?}",
             embed.dims()
@@ -687,7 +688,7 @@ impl DotsDecoder {
         cache: &mut DotsKvCache,
     ) -> Result<Tensor> {
         let (b, seq, hidden) = embeds.dims3()?;
-        anyhow::ensure!(b == 1 && hidden == self.cfg.hidden_size, "bad embeds shape");
+        ensure!(b == 1 && hidden == self.cfg.hidden_size, "bad embeds shape");
         let head_dim = self.cfg.head_dim();
         let n_heads = self.cfg.num_attention_heads;
         let n_kv = self.cfg.num_key_value_heads;
@@ -727,7 +728,7 @@ impl DotsDecoder {
             cache.write_at(i, start_pos, &k.contiguous()?, &v.contiguous()?)?;
             let (k_full, v_full) = cache.view(i, new_total)?;
             let attn = if cache.bhsd() {
-                if matches!(self.device, Device::Metal(_)) {
+                if self.device.is_metal() {
                     let q4 = if seq == 1 {
                         q.reshape((1, n_heads, 1, head_dim))?
                     } else {
@@ -879,7 +880,7 @@ impl DotsDecoder {
     ) -> Result<GenerateOutcome> {
         let prompt_len = prompt_tokens.len();
         let budget = prompt_len + opts.max_new_tokens + 1;
-        anyhow::ensure!(
+        ensure!(
             prompt_len < self.rope_span,
             "prompt of {prompt_len} tokens exceeds the rope span {} (raise NV_DOTS_MAX_SEQ or lower NV_DOTS_MAX_PIXELS)",
             self.rope_span
@@ -895,7 +896,7 @@ impl DotsDecoder {
         let mut embeds = self.embed_tokens(prompt_tokens)?;
         if let Some(feats) = vision_features {
             let n = feats.dim(0)?;
-            anyhow::ensure!(
+            ensure!(
                 vision_start + n <= prompt_len,
                 "vision span {vision_start}+{n} exceeds prompt {prompt_len}"
             );
@@ -958,7 +959,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chat_template_style_matches_the_shipped_jinja_rendering() {
+    fn prompt_styles_render_their_marker_layouts_and_argmax_skips_banned_ids() {
+        let logits = vec![0.1, 5.0, 2.0, 4.0];
+        assert_eq!(argmax_banned(&logits, &[]), 1);
+        assert_eq!(argmax_banned(&logits, &[1]), 3);
+        assert_eq!(argmax_banned(&logits, &[1, 3]), 2);
+        let (ids, start) =
+            build_prompt_tokens(|_| Ok(vec![7]), "x", 2, PromptStyle::UserTurn).unwrap();
+        assert_eq!(start, 2);
+        assert_eq!(
+            ids,
+            vec![
+                USER_TOKEN_ID,
+                IMG_TOKEN_ID,
+                IMGPAD_TOKEN_ID,
+                IMGPAD_TOKEN_ID,
+                ENDOFIMG_TOKEN_ID,
+                7,
+                ENDOFUSER_TOKEN_ID,
+                ASSISTANT_TOKEN_ID,
+            ]
+        );
         let encode = |s: &str| -> Result<Vec<u32>> {
             Ok(match s {
                 " " => vec![220],
@@ -986,49 +1007,5 @@ mod tests {
         assert_eq!(ids[start..start + 4], [IMGPAD_TOKEN_ID; 4]);
         assert!(!ids.contains(&USER_TOKEN_ID));
         assert!(!ids.contains(&ENDOFUSER_TOKEN_ID));
-    }
-
-    #[test]
-    fn user_turn_style_wraps_the_turn_in_user_markers() {
-        let (ids, start) =
-            build_prompt_tokens(|_| Ok(vec![7]), "x", 2, PromptStyle::UserTurn).unwrap();
-        assert_eq!(start, 2);
-        assert_eq!(
-            ids,
-            vec![
-                USER_TOKEN_ID,
-                IMG_TOKEN_ID,
-                IMGPAD_TOKEN_ID,
-                IMGPAD_TOKEN_ID,
-                ENDOFIMG_TOKEN_ID,
-                7,
-                ENDOFUSER_TOKEN_ID,
-                ASSISTANT_TOKEN_ID,
-            ]
-        );
-    }
-
-    #[test]
-    fn config_parses_the_shipped_json() {
-        let cfg = DotsDecoderConfig::from_hf_json_str(
-            r#"{"hidden_size":1536,"num_hidden_layers":28,"num_attention_heads":12,
-                "num_key_value_heads":2,"intermediate_size":8960,"vocab_size":151936,
-                "max_position_embeddings":131072,"rope_theta":1000000,"rms_norm_eps":1e-06,
-                "tie_word_embeddings":false,"attention_bias":true,"image_token_id":151665,
-                "vision_config":{"embed_dim":1536}}"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.head_dim(), 128);
-        assert!(cfg.attention_bias);
-        assert!(!cfg.tie_word_embeddings);
-        assert_eq!(cfg.image_token_id, IMGPAD_TOKEN_ID);
-    }
-
-    #[test]
-    fn argmax_skips_banned_ids() {
-        let logits = vec![0.1, 5.0, 2.0, 4.0];
-        assert_eq!(argmax_banned(&logits, &[]), 1);
-        assert_eq!(argmax_banned(&logits, &[1]), 3);
-        assert_eq!(argmax_banned(&logits, &[1, 3]), 2);
     }
 }

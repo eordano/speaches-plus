@@ -120,14 +120,15 @@ impl Scheduler {
     }
 
     fn stop_reason(&self, seq: &mut Sequence) -> Option<FinishReason> {
-        if let Some(reason) = seq.check_stop() {
-            return Some(reason);
+        let last_is_an_eos_member = seq.output.last().is_some_and(|last| {
+            self.every_eos_id_by_seq
+                .get(&seq.id)
+                .is_some_and(|ids| ids.contains(last))
+        });
+        if last_is_an_eos_member {
+            return Some(FinishReason::Eos);
         }
-        let last = seq.output.last().copied()?;
-        self.every_eos_id_by_seq
-            .get(&seq.id)
-            .filter(|ids| ids.contains(&last))
-            .map(|_| FinishReason::Eos)
+        seq.check_stop()
     }
 
     pub fn note_drafts_set(&mut self, had_drafts: bool, has_drafts: bool) {
@@ -592,54 +593,45 @@ mod tests {
         }
     }
 
+    fn small_pool(block_size: usize, num_blocks: usize) -> SchedulerConfig {
+        SchedulerConfig {
+            max_batch_size: 4,
+            max_batched_tokens: 1024,
+            block_size,
+            num_blocks,
+        }
+    }
+
     #[test]
-    fn first_step_is_prefill() {
+    fn a_sequence_prefills_then_decodes_and_finishes_on_max_tokens_or_eos() {
         let mut sch = Scheduler::new(cfg());
         sch.enqueue(Sequence::new(1, vec![1, 2, 3, 4, 5], 4));
         let batch = sch.step().unwrap();
         assert_eq!(batch.kind, BatchKind::Prefill);
         assert_eq!(batch.seq_ids, vec![1]);
         assert_eq!(sch.running_seq(1).unwrap().state, SequenceState::Prefill);
-    }
-
-    #[test]
-    fn second_step_is_decode() {
-        let mut sch = Scheduler::new(cfg());
-        sch.enqueue(Sequence::new(1, vec![1, 2, 3, 4, 5], 4));
-        let _ = sch.step().unwrap();
         sch.complete_step(&[42]).unwrap();
         assert_eq!(sch.running_seq(1).unwrap().state, SequenceState::Decode);
         assert_eq!(sch.running_seq(1).unwrap().output, vec![42]);
-
         let batch = sch.step().unwrap();
         assert_eq!(batch.kind, BatchKind::Decode);
         assert_eq!(batch.seq_ids, vec![1]);
-    }
 
-    #[test]
-    fn max_new_tokens_finishes_sequence() {
         let mut sch = Scheduler::new(cfg());
         sch.enqueue(Sequence::new(1, vec![1, 2, 3], 3));
-        let _ = sch.step().unwrap();
-        sch.complete_step(&[10]).unwrap();
-        let _ = sch.step().unwrap();
-        sch.complete_step(&[11]).unwrap();
-        let _ = sch.step().unwrap();
-        sch.complete_step(&[12]).unwrap();
-
+        for tok in [10, 11, 12] {
+            let _ = sch.step().unwrap();
+            sch.complete_step(&[tok]).unwrap();
+        }
         assert!(sch.running.is_empty());
         let done = sch.drain_finished();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].state, SequenceState::Finished);
         assert_eq!(done[0].finish_reason, Some(FinishReason::MaxTokens));
         assert_eq!(done[0].output, vec![10, 11, 12]);
-    }
 
-    #[test]
-    fn eos_finishes_sequence_immediately() {
         let mut sch = Scheduler::new(cfg());
-        let seq = Sequence::new(1, vec![1, 2, 3], 16).with_eos(Some(99));
-        sch.enqueue(seq);
+        sch.enqueue(Sequence::new(1, vec![1, 2, 3], 16).with_eos(Some(99)));
         let _ = sch.step().unwrap();
         sch.complete_step(&[99]).unwrap();
         assert!(sch.running.is_empty());
@@ -652,7 +644,8 @@ mod tests {
     const EOS_IDS_A_31B_CHECKPOINT_CARRIES: [u32; 3] = [1, 50, 106];
 
     #[test]
-    fn decode_finishes_on_a_non_first_eos_member() {
+    fn every_eos_id_stops_decode_and_verify_and_an_eos_on_the_last_allowed_token_is_a_stop_not_a_cut()
+    {
         let mut sch = Scheduler::new(cfg());
         sch.enqueue_with_eos_ids(
             Sequence::new(1, vec![1, 2, 3], 16),
@@ -668,10 +661,24 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].finish_reason, Some(FinishReason::Eos));
         assert_eq!(done[0].output, vec![50]);
-    }
 
-    #[test]
-    fn verify_finishes_on_a_non_first_eos_member() {
+        let mut sch = Scheduler::new(cfg());
+        sch.enqueue_with_eos_ids(
+            Sequence::new(1, vec![1, 2, 3], 2),
+            EOS_IDS_A_31B_CHECKPOINT_CARRIES.to_vec(),
+        );
+        let _ = sch.step().unwrap();
+        sch.complete_step(&[7]).unwrap();
+        let _ = sch.step().unwrap();
+        sch.complete_step(&[106]).unwrap();
+        let done = sch.drain_finished();
+        assert_eq!(
+            done[0].finish_reason,
+            Some(FinishReason::Eos),
+            "the model chose to stop on the max_tokens-th token: every family's loop reports \
+             that as finish_reason stop, so the engine must not call it MaxTokens"
+        );
+
         let mut sch = Scheduler::new(cfg());
         sch.enqueue_with_eos_ids(
             Sequence::new(1, vec![1, 2, 3, 4, 5], 16),
@@ -695,6 +702,7 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].finish_reason, Some(FinishReason::Eos));
         assert_eq!(done[0].output, vec![100, 106]);
+        assert_eq!(sch.num_running_with_drafts, 0);
     }
 
     fn decoding_seq(sch: &mut Scheduler, id: u64, prompt: Vec<u32>, max_new: usize) {
@@ -706,78 +714,43 @@ mod tests {
     }
 
     #[test]
-    fn note_drafts_set_counter_bookkeeping() {
-        let mut sch = Scheduler::new(cfg());
-        assert_eq!(sch.num_running_with_drafts, 0);
-        sch.note_drafts_set(false, true);
-        assert_eq!(sch.num_running_with_drafts, 1);
-        sch.note_drafts_set(true, true);
-        assert_eq!(sch.num_running_with_drafts, 1);
-        sch.note_drafts_set(true, false);
-        assert_eq!(sch.num_running_with_drafts, 0);
-    }
-
-    #[test]
-    fn set_drafts_triggers_verify_mode() {
+    fn verify_rounds_accept_a_prefix_keep_the_bonus_stop_on_eos_and_refuse_complete_step() {
         let mut sch = Scheduler::new(cfg());
         decoding_seq(&mut sch, 1, vec![1, 2, 3, 4, 5], 16);
-
         let batch = sch.step().unwrap();
         assert_eq!(batch.kind, BatchKind::Decode);
         sch.complete_step(&[101]).unwrap();
-
         sch.set_drafts(1, vec![201, 202]).unwrap();
         assert_eq!(sch.num_running_with_drafts, 1);
-
         let batch = sch.step().unwrap();
         assert_eq!(batch.kind, BatchKind::Verify);
         assert_eq!(batch.seq_ids, vec![1]);
-    }
+        assert!(sch.complete_step(&[1]).is_err());
 
-    #[test]
-    fn verify_partial_acceptance_appends_and_advances() {
-        let mut sch = Scheduler::new(cfg());
-        decoding_seq(&mut sch, 1, vec![1, 2, 3, 4, 5], 16);
-        sch.set_drafts(1, vec![201, 202, 203]).unwrap();
-        let batch = sch.step().unwrap();
-        assert_eq!(batch.kind, BatchKind::Verify);
+        for (accepted_count, accepted_drafts, bonus, want_output) in [
+            (1usize, vec![201u32], 999u32, vec![100u32, 201, 999]),
+            (0, vec![], 777, vec![100, 777]),
+        ] {
+            let mut sch = Scheduler::new(cfg());
+            decoding_seq(&mut sch, 1, vec![1, 2, 3, 4, 5], 16);
+            sch.set_drafts(1, vec![201, 202, 203]).unwrap();
+            let batch = sch.step().unwrap();
+            assert_eq!(batch.kind, BatchKind::Verify);
+            sch.complete_verify_step(&[VerifyOutcome {
+                accepted_count,
+                bonus_token: bonus,
+                accepted_drafts,
+            }])
+            .unwrap();
+            let seq = sch.running_seq(1).unwrap();
+            assert_eq!(seq.output, want_output, "accepted_count={accepted_count}");
+            assert_eq!(seq.accepted_token_count, accepted_count);
+            assert!(!seq.has_drafts());
+            assert_eq!(sch.num_running_with_drafts, 0);
+            let batch = sch.step().unwrap();
+            assert_eq!(batch.kind, BatchKind::Decode);
+        }
 
-        sch.complete_verify_step(&[VerifyOutcome {
-            accepted_count: 1,
-            bonus_token: 999,
-            accepted_drafts: vec![201],
-        }])
-        .unwrap();
-
-        let seq = sch.running_seq(1).unwrap();
-        assert_eq!(seq.output, vec![100, 201, 999]);
-        assert_eq!(seq.accepted_token_count, 1);
-        assert!(!seq.has_drafts());
-        assert_eq!(sch.num_running_with_drafts, 0);
-
-        let batch = sch.step().unwrap();
-        assert_eq!(batch.kind, BatchKind::Decode);
-    }
-
-    #[test]
-    fn verify_full_rejection_keeps_only_bonus() {
-        let mut sch = Scheduler::new(cfg());
-        decoding_seq(&mut sch, 1, vec![1, 2, 3, 4, 5], 16);
-        sch.set_drafts(1, vec![201, 202]).unwrap();
-        let _ = sch.step().unwrap();
-        sch.complete_verify_step(&[VerifyOutcome {
-            accepted_count: 0,
-            bonus_token: 777,
-            accepted_drafts: vec![],
-        }])
-        .unwrap();
-        let seq = sch.running_seq(1).unwrap();
-        assert_eq!(seq.output, vec![100, 777]);
-        assert_eq!(sch.num_running_with_drafts, 0);
-    }
-
-    #[test]
-    fn verify_eos_in_drafts_finishes_sequence() {
         let mut sch = Scheduler::new(cfg());
         sch.enqueue(Sequence::new(1, vec![1, 2, 3, 4, 5], 16).with_eos(Some(42)));
         let _ = sch.step().unwrap();
@@ -799,25 +772,14 @@ mod tests {
     }
 
     #[test]
-    fn complete_step_rejects_verify_batch() {
-        let mut sch = Scheduler::new(cfg());
-        decoding_seq(&mut sch, 1, vec![1, 2, 3, 4, 5], 16);
-        sch.set_drafts(1, vec![201]).unwrap();
-        let _ = sch.step().unwrap();
-        assert!(sch.complete_step(&[1]).is_err());
-    }
-
-    #[test]
-    fn complete_step_isolates_aborted_sequence() {
+    fn complete_step_and_complete_verify_step_isolate_an_aborted_sequence() {
         let mut sch = Scheduler::new(cfg());
         sch.enqueue(Sequence::new(1, vec![1, 2, 3], 8));
         sch.enqueue(Sequence::new(2, vec![4, 5, 6], 8));
         let batch = sch.step().unwrap();
         assert_eq!(batch.seq_ids, vec![1, 2]);
-
         sch.abort(1);
         let failures = sch.complete_step(&[10, 20]).unwrap();
-
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].seq_id, 1);
         let seq2 = sch
@@ -825,16 +787,42 @@ mod tests {
             .expect("seq 2 must survive seq 1's failure");
         assert_eq!(seq2.output, vec![20]);
         assert_eq!(seq2.state, SequenceState::Decode);
+
+        let mut sch = Scheduler::new(cfg());
+        decoding_seq(&mut sch, 1, vec![1, 2, 3], 16);
+        decoding_seq(&mut sch, 2, vec![4, 5, 6], 16);
+        sch.set_drafts(1, vec![201]).unwrap();
+        sch.set_drafts(2, vec![202]).unwrap();
+        let batch = sch.step().unwrap();
+        assert_eq!(batch.kind, BatchKind::Verify);
+        assert_eq!(batch.seq_ids, vec![1, 2]);
+        sch.abort(1);
+        let failures = sch
+            .complete_verify_step(&[
+                VerifyOutcome {
+                    accepted_count: 1,
+                    bonus_token: 900,
+                    accepted_drafts: vec![201],
+                },
+                VerifyOutcome {
+                    accepted_count: 1,
+                    bonus_token: 901,
+                    accepted_drafts: vec![202],
+                },
+            ])
+            .unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].seq_id, 1);
+        let seq2 = sch
+            .running_seq(2)
+            .expect("seq 2 must survive seq 1's failure");
+        assert_eq!(seq2.output, vec![100, 202, 901]);
+        assert_eq!(sch.num_running_with_drafts, 0);
     }
 
     #[test]
     fn preempt_youngest_instead_of_abort_on_block_exhaustion() {
-        let mut sch = Scheduler::new(SchedulerConfig {
-            max_batch_size: 4,
-            max_batched_tokens: 1024,
-            block_size: 1,
-            num_blocks: 6,
-        });
+        let mut sch = Scheduler::new(small_pool(1, 6));
         sch.enqueue(Sequence::new(1, vec![1, 2], 8));
         sch.enqueue(Sequence::new(2, vec![3, 4], 8));
         let _ = sch.step().unwrap();
@@ -863,12 +851,7 @@ mod tests {
 
     #[test]
     fn self_preemption_when_sole_running_seq() {
-        let mut sch = Scheduler::new(SchedulerConfig {
-            max_batch_size: 4,
-            max_batched_tokens: 1024,
-            block_size: 1,
-            num_blocks: 5,
-        });
+        let mut sch = Scheduler::new(small_pool(1, 5));
         let mut hog = Sequence::new(99, vec![7, 8, 9], 1);
         hog.block_table = sch.block_manager.allocate_for(&hog).unwrap();
 
@@ -901,12 +884,7 @@ mod tests {
 
     #[test]
     fn abort_when_sequence_exceeds_whole_pool() {
-        let mut sch = Scheduler::new(SchedulerConfig {
-            max_batch_size: 4,
-            max_batched_tokens: 1024,
-            block_size: 1,
-            num_blocks: 2,
-        });
+        let mut sch = Scheduler::new(small_pool(1, 2));
         sch.enqueue(Sequence::new(1, vec![1, 2], 8));
         let _ = sch.step().unwrap();
         let failures = sch.complete_step(&[10]).unwrap();
@@ -920,43 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_verify_step_isolates_aborted_sequence() {
-        let mut sch = Scheduler::new(cfg());
-        decoding_seq(&mut sch, 1, vec![1, 2, 3], 16);
-        decoding_seq(&mut sch, 2, vec![4, 5, 6], 16);
-        sch.set_drafts(1, vec![201]).unwrap();
-        sch.set_drafts(2, vec![202]).unwrap();
-        let batch = sch.step().unwrap();
-        assert_eq!(batch.kind, BatchKind::Verify);
-        assert_eq!(batch.seq_ids, vec![1, 2]);
-
-        sch.abort(1);
-        let failures = sch
-            .complete_verify_step(&[
-                VerifyOutcome {
-                    accepted_count: 1,
-                    bonus_token: 900,
-                    accepted_drafts: vec![201],
-                },
-                VerifyOutcome {
-                    accepted_count: 1,
-                    bonus_token: 901,
-                    accepted_drafts: vec![202],
-                },
-            ])
-            .unwrap();
-
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].seq_id, 1);
-        let seq2 = sch
-            .running_seq(2)
-            .expect("seq 2 must survive seq 1's failure");
-        assert_eq!(seq2.output, vec![100, 202, 901]);
-        assert_eq!(sch.num_running_with_drafts, 0);
-    }
-
-    #[test]
-    fn budget_accounting_with_recycled_sequence() {
+    fn the_batch_budget_charges_a_recycled_sequence_its_generated_tokens_and_makes_the_next_wait() {
         let mut sch = Scheduler::new(SchedulerConfig {
             max_batch_size: 4,
             max_batched_tokens: 6,
@@ -1006,6 +948,20 @@ mod tests {
         let seq2 = sch.running_seq(2).unwrap();
         assert_eq!(seq2.state, SequenceState::Prefill);
         assert_eq!(seq2.num_computed_tokens, 2);
+
+        let mut sch = Scheduler::new(SchedulerConfig {
+            max_batch_size: 4,
+            max_batched_tokens: 5,
+            block_size: 4,
+            num_blocks: 16,
+        });
+        sch.enqueue(Sequence::new(1, vec![1, 2, 3, 4, 5], 4));
+        sch.enqueue(Sequence::new(2, vec![10, 11, 12, 13, 14], 4));
+        let batch = sch.step().unwrap();
+        assert_eq!(batch.kind, BatchKind::Prefill);
+        assert_eq!(batch.seq_ids, vec![1]);
+        assert_eq!(sch.waiting.len(), 1);
+        assert_eq!(sch.waiting.front().unwrap().id, 2);
     }
 
     #[test]
@@ -1196,7 +1152,7 @@ mod tests {
     }
 
     #[test]
-    fn long_prompt_prefills_in_chunks_across_steps() {
+    fn a_long_prompt_prefills_in_chunks_and_only_the_final_chunk_transitions_to_decode() {
         let mut sch = Scheduler::new(chunk_cfg(4));
         sch.enqueue(Sequence::new(1, (1..=10).collect(), 4));
 
@@ -1222,6 +1178,8 @@ mod tests {
         assert_eq!(sch.running_seq(1).unwrap().num_computed_tokens, 8);
 
         let batch = sch.step().unwrap();
+        assert_eq!(batch.kind, BatchKind::Prefill);
+        assert!(batch.items[0].is_prefill);
         assert_eq!(batch.items[0].num_scheduled_tokens, 2);
         assert!(batch.items[0].is_final_prefill_chunk);
         sch.complete_step(&[500]).unwrap();
@@ -1232,30 +1190,10 @@ mod tests {
     }
 
     #[test]
-    fn final_chunk_transitions_to_decode() {
-        let mut sch = Scheduler::new(chunk_cfg(4));
-        sch.enqueue(Sequence::new(1, (1..=6).collect(), 4));
-        let _ = sch.step().unwrap();
-        sch.complete_step(&[]).unwrap();
-
-        let batch = sch.step().unwrap();
-        assert_eq!(batch.kind, BatchKind::Prefill);
-        assert!(batch.items[0].is_prefill);
-        assert!(batch.items[0].is_final_prefill_chunk);
-        assert_eq!(batch.items[0].num_scheduled_tokens, 2);
-        sch.complete_step(&[42]).unwrap();
-        let seq = sch.running_seq(1).unwrap();
-        assert_eq!(seq.state, SequenceState::Decode);
-        assert_eq!(seq.output, vec![42]);
-        assert_eq!(seq.num_computed_tokens, seq.total_len());
-    }
-
-    #[test]
-    fn chunk_and_decode_mix_in_one_batch() {
+    fn decode_mixes_with_prefill_chunks_in_one_batch_and_is_not_starved_by_a_long_prefill() {
         let mut sch = Scheduler::new(chunk_cfg(4));
         decoding_seq(&mut sch, 1, vec![1, 2, 3], 16);
         sch.enqueue(Sequence::new(2, (10..20).collect(), 4));
-
         let batch = sch.step().unwrap();
         assert_eq!(batch.kind, BatchKind::Mixed);
         assert_eq!(
@@ -1278,14 +1216,10 @@ mod tests {
         sch.complete_step(&[7]).unwrap();
         assert_eq!(sch.running_seq(1).unwrap().output, vec![100, 7]);
         assert_eq!(sch.running_seq(2).unwrap().num_computed_tokens, 3);
-    }
 
-    #[test]
-    fn decode_not_starved_by_long_prefill() {
         let mut sch = Scheduler::new(chunk_cfg(5));
         decoding_seq(&mut sch, 1, vec![1, 2, 3], 16);
         sch.enqueue(Sequence::new(2, (100..120).collect(), 4));
-
         for i in 0..4u32 {
             let batch = sch.step().unwrap();
             assert_eq!(batch.kind, BatchKind::Mixed);
@@ -1295,7 +1229,6 @@ mod tests {
             sch.complete_step(&[200 + i]).unwrap();
             assert_eq!(sch.running_seq(1).unwrap().output.len(), 2 + i as usize);
         }
-
         let batch = sch.step().unwrap();
         assert_eq!(batch.kind, BatchKind::Mixed);
         assert!(batch.items[1].is_final_prefill_chunk);
@@ -1349,22 +1282,5 @@ mod tests {
         assert_eq!(batch.kind, BatchKind::Prefill);
         assert_eq!(batch.seq_ids, vec![1]);
         assert_eq!(batch.items[0].num_scheduled_tokens, 4);
-    }
-
-    #[test]
-    fn budget_forces_second_seq_to_wait() {
-        let mut sch = Scheduler::new(SchedulerConfig {
-            max_batch_size: 4,
-            max_batched_tokens: 5,
-            block_size: 4,
-            num_blocks: 16,
-        });
-        sch.enqueue(Sequence::new(1, vec![1, 2, 3, 4, 5], 4));
-        sch.enqueue(Sequence::new(2, vec![10, 11, 12, 13, 14], 4));
-        let batch = sch.step().unwrap();
-        assert_eq!(batch.kind, BatchKind::Prefill);
-        assert_eq!(batch.seq_ids, vec![1]);
-        assert_eq!(sch.waiting.len(), 1);
-        assert_eq!(sch.waiting.front().unwrap().id, 2);
     }
 }

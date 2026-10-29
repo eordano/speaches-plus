@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Voxtral TTS in the browser (WebGPU)</title>
+<style>
+  body { font: 13px/1.5 ui-monospace, Menlo, monospace; background:#111; color:#ddd; margin:1.5em; }
+  pre { white-space: pre-wrap; word-break: break-all; background:#181818; padding:0.8em; border:1px solid #333; }
+  #status { color:#fc6; }
+</style>
+<h1>Voxtral TTS codec, heads and backbone on WebGPU (wasm32, one dedicated worker)</h1>
+<div id="status">running...</div>
+<pre id="report"></pre>
+<script type="module">
+'use strict';
+const out = [];
+function log(s) {
+  out.push(s);
+  document.getElementById('report').textContent = out.join('\n');
+  console.log('TTSW|' + s);
+}
+let done = false;
+function finish(tag, J) {
+  if (done) return;
+  done = true;
+  J.done = tag;
+  J.finished = new Date().toISOString();
+  document.getElementById('status').textContent = 'DONE (' + tag + ')';
+  fetch('/q38-result-tts.json', { method: 'PUT', body: JSON.stringify(J) })
+    .catch(() => {})
+    .finally(() => {
+      console.log('Q38P_DONE');
+      document.title = 'Q38P_DONE';
+    });
+}
+const worker = new Worker('./voxtral_tts_worker.js', { type: 'module', name: location.search.slice(1) });
+worker.onmessage = e => {
+  if (e.data.log !== undefined) log(e.data.log);
+  if (e.data.finish) finish(e.data.finish, e.data.J);
+};
+worker.onerror = e => { log('WORKER_ERROR|' + e.message); finish('worker-error', { error: e.message }); };
+</script>

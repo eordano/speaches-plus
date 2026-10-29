@@ -10,6 +10,7 @@ use crate::laguna_prefix::{
 };
 use crate::laguna_prefix_diagnostics as diagnostics;
 use crate::laguna_step_graph::prefix::{TargetFullSnapshot, TargetSlidingSnapshot};
+use crate::laguna_step_graph::StepCache;
 
 pub(super) struct CkptState {
     sliding: TargetSlidingSnapshot,
@@ -106,13 +107,13 @@ impl<'m> SpecState<'m> {
     pub(super) fn prefix_worker_started(&self) {
         let proof = self.draft.map(|draft| draft.quantization_summary());
         let kv_kind = match self.step.kv() {
-            crate::laguna_step_graph::StepCache::Bf16(_) => "bf16",
-            crate::laguna_step_graph::StepCache::Fp8(cache)
+            StepCache::Bf16(_) => "bf16",
+            StepCache::Fp8(cache)
                 if cache.scale_policy() == crate::laguna_fp8::LagunaFp8ScalePolicy::FixedOne =>
             {
                 "fp8-fixed-one"
             }
-            crate::laguna_step_graph::StepCache::Fp8(_) => "fp8-other",
+            StepCache::Fp8(_) => "fp8-other",
         };
         diagnostics::worker_started(diagnostics::WorkerInfo {
             kv_kind,

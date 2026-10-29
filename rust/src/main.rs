@@ -3,12 +3,12 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 use axum::{
+    Router,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
 };
 use clap::Parser;
 use std::fmt::Write as _;
@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use speaches_plus::audio::decode_any_to_16k_mono;
 use speaches_plus::{
-    diarization, inspect, models, oapi, otel, pii, realtime, AppState, RealtimeQuery,
+    AppState, RealtimeQuery, diarization, inspect, models, oapi, otel, pii, realtime,
 };
 
 #[derive(Debug, Parser)]
@@ -56,11 +56,11 @@ async fn main() -> anyhow::Result<()> {
         registry.init();
     }
 
-    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+    if !nv_config::env_arm_present_at_all_reread_every_call("ORT_DYLIB_PATH") {
         if let Ok(home) = std::env::var("HOME") {
             let candidate = format!("{home}/.nix-profile/lib/libonnxruntime.dylib");
             if std::path::Path::new(&candidate).exists() {
-                std::env::set_var("ORT_DYLIB_PATH", &candidate);
+                unsafe { std::env::set_var("ORT_DYLIB_PATH", &candidate) };
             }
         }
     }
@@ -121,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
     let speaker_encoder = load_speaker_encoder_from_env();
     let tts_talker = oapi::audio_speech_nvtts::Qwen3TtsAudioSpeech::from_env()
         .map(|s| s as Arc<dyn oapi::audio_speech::AudioSpeech + Send + Sync>);
+    oapi::audio_speech_nvtts::voice_design();
     let state = AppState {
         models: models.clone(),
         chat_engine: chat_engine.clone(),
@@ -156,7 +157,11 @@ async fn main() -> anyhow::Result<()> {
                 post(oapi::completions::handle_completions),
             )
             .route("/v1/messages", post(oapi::messages::handle_messages))
-            .route("/v1/laguna/capture", post(oapi::laguna_capture::handle))
+            .route(
+                "/v1/capture",
+                post(oapi::capture::handle).get(oapi::capture::handle_info),
+            )
+            .route("/v1/laguna/capture", post(oapi::capture::handle))
             .route(
                 "/v1/messages/count_tokens",
                 post(oapi::messages::handle_count_tokens),
@@ -305,6 +310,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pii_router = load_pii_classifier_from_env();
     let ocr_router = oapi::ocr::router_from_env();
+    let systemone_router = oapi::systemone::router_from_env();
     let _ = oapi::text_embeddings::warm_embedder_at_boot().await;
     oapi::cold_tier::preload_if_requested().await;
     oapi::cold_tier::spawn_idle_sweeper();
@@ -315,6 +321,7 @@ async fn main() -> anyhow::Result<()> {
         chat_router.is_some(),
         voice_profiles_live,
         pii_router.is_some(),
+        systemone_router.is_some(),
     ));
     if api_key().is_none() && cors().origin == "*" {
         warn!(
@@ -385,6 +392,11 @@ async fn main() -> anyhow::Result<()> {
         app
     };
     let app = app.merge(ocr_router);
+    let app = if let Some(sr) = systemone_router {
+        app.merge(sr)
+    } else {
+        app
+    };
     let app = app
         .merge(oapi::fine_tuning::router())
         .route("/v1/trajectory/label", post(oapi::trajectory::handle_label));
@@ -474,8 +486,8 @@ async fn warming_unavailable() -> Response {
 fn audio_eou_boot_gate() -> anyhow::Result<()> {
     use speaches_plus::defaults::env as env_names;
     use speaches_plus::eou::{
-        audio_eou_gate, audio_eou_missing_message, audio_eou_required, audio_eou_wanted,
-        AudioEouGate, EouConfig,
+        AudioEouGate, EouConfig, audio_eou_gate, audio_eou_missing_message, audio_eou_required,
+        audio_eou_wanted,
     };
 
     let cfg = EouConfig::from_env();
@@ -539,12 +551,16 @@ async fn chat_engines_handler() -> Response {
         .or_else(|| CHAT_MODEL_IDS.get().cloned())
         .unwrap_or_default();
     let wgpu = wgpu_served_ids();
+    let registry = oapi::chat_engine::live_registry();
     let engines: Vec<serde_json::Value> = ids
         .iter()
         .map(|id| {
+            let engine = registry.as_ref().and_then(|r| r.resolve(Some(id)));
             serde_json::json!({
                 "id": id,
                 "backend": if wgpu.contains(id) { "wgpu" } else { "cuda" },
+                "mm_input": engine.as_ref().map(|e| e.supports_mm_input()),
+                "audio_input": engine.as_ref().map(|e| e.supports_audio_input()),
             })
         })
         .collect();
@@ -692,6 +708,7 @@ impl Metrics {
             self.latency_sum_ms.load(Relaxed)
         );
         let _ = writeln!(s, "speaches_request_latency_ms_count {inf_count}");
+        nv_models::session_lru::METRICS.render(&mut s);
         s
     }
 }
@@ -791,13 +808,19 @@ fn build_readiness(
     chat_live: bool,
     voice_profiles_live: bool,
     pii_live: bool,
+    systemone_live: bool,
 ) -> Vec<Subsystem> {
     let model_dir = state.models.model_dir.clone();
-    let chat_configured = std::env::var_os("NV_CHAT_MODEL_DIR").is_some()
-        || std::env::var_os("NV_CHAT_MODEL_DIRS").is_some();
+    let chat_configured = nv_config::env_arm_present_at_all_reread_every_call("NV_CHAT_MODEL_DIR")
+        || nv_config::env_arm_present_at_all_reread_every_call("NV_CHAT_MODEL_DIRS");
     let talker_configured = std::env::var_os(oapi::audio_speech_nvtts::ENV_TALKER_DIR).is_some();
-    let pii_configured = std::env::var_os("REDACT_MODEL_DIR").is_some();
+    let pii_configured = nv_config::env_arm_present_at_all_reread_every_call("REDACT_MODEL_DIR");
     let kokoro_configured = model_dir.join("kokoro-v1.0.onnx").exists();
+    let voxtral_tts_configured = model_dir
+        .join(speaches_plus::tts::voxtral_tts::VOXTRAL_TTS_MODELS_DIR_LINK_NAME)
+        .join("params.json")
+        .exists()
+        || std::env::var_os(speaches_plus::tts::voxtral_tts::VOXTRAL_TTS_MODEL_DIR_ENV).is_some();
     let diar_seg_configured = model_dir.join("diarizen-segmentation.onnx").exists();
     let diar_emb_configured = model_dir.join("wespeaker-resnet293-LM.onnx").exists();
 
@@ -847,6 +870,17 @@ fn build_readiness(
             detail: "kokoro-v1.0.onnx + voices.bin under the model dir".into(),
         },
         Subsystem {
+            name: "tts_voxtral",
+            configured: voxtral_tts_configured,
+            live: state.models.voxtral_tts.is_some(),
+            required: false,
+            detail: format!(
+                "<models>/{} or {} -> /v1/audio/speech",
+                speaches_plus::tts::voxtral_tts::VOXTRAL_TTS_MODELS_DIR_LINK_NAME,
+                speaches_plus::tts::voxtral_tts::VOXTRAL_TTS_MODEL_DIR_ENV
+            ),
+        },
+        Subsystem {
             name: "speaker_encoder",
             configured: talker_configured,
             live: state.speaker_encoder.is_some(),
@@ -868,6 +902,13 @@ fn build_readiness(
             detail: "REDACT_MODEL_DIR ([onnx/]model.onnx + tokenizer.json)".into(),
         },
         Subsystem {
+            name: "systemone",
+            configured: oapi::systemone::configured(),
+            live: systemone_live,
+            required: true,
+            detail: "NV_LAYA_MODEL_DIR (laya/, laya-multilingual/, laya-typed-decisions/) and/or NV_KEV_MODEL_DIRS (scripts/kev_export.py outputs)".into(),
+        },
+        Subsystem {
             name: "diarization",
             configured: diar_seg_configured && diar_emb_configured,
             live: state.models.diar_segmentation.is_some() && state.models.diar_embedding.is_some(),
@@ -878,10 +919,11 @@ fn build_readiness(
 }
 
 async fn metrics_handler() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        METRICS.render(),
-    )
+    #[allow(unused_mut)]
+    let mut body = METRICS.render();
+    #[cfg(feature = "cuda")]
+    body.push_str(&oapi::chat_engine::qwen4_exp_adapter_metrics());
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 async fn metrics_mw(req: Request, next: Next) -> Response {
@@ -984,30 +1026,13 @@ async fn shutdown_signal() {
 }
 
 async fn warm_chat_engine(engine: Arc<dyn oapi::chat::ChatEngine>) {
-    if std::env::var("NV_CHAT_WARMUP").ok().as_deref() == Some("0") {
-        return;
-    }
     let t0 = std::time::Instant::now();
     let req = oapi::chat::ChatGenerateRequest {
         prompt: "Hi".to_string(),
         max_new_tokens: 8,
-        stop: Vec::new(),
         seed: Some(0),
         temperature: Some(0.0),
-        top_p: None,
-        top_k: None,
-        min_p: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        repetition_penalty: None,
-        guided: None,
-        guided_think_close: None,
-        logit_bias: Vec::new(),
-        logprobs: false,
-        top_logprobs: 0,
-        kv_resume: None,
-        kv_store: None,
-        mm: None,
+        ..Default::default()
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
@@ -1036,7 +1061,7 @@ async fn warm_chat_engine(engine: Arc<dyn oapi::chat::ChatEngine>) {
 
 fn load_speaker_encoder_from_env() -> Option<Arc<nv_tts::SpeakerEncoder>> {
     use nv_tts::speaker_encoder::{
-        SpeakerEncoderSource, ENV_KOKORO_QWEN_ENCODER_DIR, ENV_SPEAKER_ENCODER_DIR,
+        ENV_KOKORO_QWEN_ENCODER_DIR, ENV_SPEAKER_ENCODER_DIR, SpeakerEncoderSource,
     };
     let talker =
         std::env::var_os(oapi::audio_speech_nvtts::ENV_TALKER_DIR).map(std::path::PathBuf::from);
@@ -1212,18 +1237,22 @@ fn is_capacity_error(err: &anyhow::Error) -> bool {
 }
 
 fn is_client_sdp_error(err: &anyhow::Error) -> bool {
-    if let Some(w) = err.downcast_ref::<webrtc::Error>() {
+    if let Some(w) = err.downcast_ref::<webrtc::error::Error>() {
+        use webrtc::error::Error as W;
         return matches!(
             w,
-            webrtc::Error::Sdp(_)
-                | webrtc::Error::ErrSessionDescriptionNoFingerprint
-                | webrtc::Error::ErrSessionDescriptionInvalidFingerprint
-                | webrtc::Error::ErrSessionDescriptionConflictingFingerprints
-                | webrtc::Error::ErrSessionDescriptionMissingIceUfrag
-                | webrtc::Error::ErrSessionDescriptionMissingIcePwd
-                | webrtc::Error::ErrSessionDescriptionConflictingIceUfrag
-                | webrtc::Error::ErrSessionDescriptionConflictingIcePwd
-                | webrtc::Error::ErrPeerConnSDPTypeInvalidValue
+            W::SdpInvalidSyntax(_)
+                | W::SdpInvalidValue(_)
+                | W::SdpEmptyTimeDescription
+                | W::OtherSdpErr(_)
+                | W::ErrSessionDescriptionNoFingerprint
+                | W::ErrSessionDescriptionInvalidFingerprint
+                | W::ErrSessionDescriptionConflictingFingerprints
+                | W::ErrSessionDescriptionMissingIceUfrag
+                | W::ErrSessionDescriptionMissingIcePwd
+                | W::ErrSessionDescriptionConflictingIceUfrag
+                | W::ErrSessionDescriptionConflictingIcePwd
+                | W::ErrPeerConnSDPTypeInvalidValue
         );
     }
     is_client_sdp_error_msg(&format!("{err:#}"))
@@ -1347,13 +1376,13 @@ fn check_stt_params(
                             "temperature={t} is not supported by this build: the STT backend \
                              decodes greedily. Omit the field or send 0."
                         ),
-                    ))
+                    ));
                 }
                 Err(_) => {
                     return Err((
                         "temperature",
                         format!("temperature must be a number, got {v:?}"),
-                    ))
+                    ));
                 }
             }
         }
@@ -1550,11 +1579,8 @@ async fn do_stt_post(
                 samples_for_diar,
             ) {
                 (Some(seg), Some(emb), Some(samples)) => {
-                    let mut diarizer = diarization::Diarizer::new(
-                        seg,
-                        emb,
-                        diarization::DiarConfig::default(),
-                    );
+                    let mut diarizer =
+                        diarization::Diarizer::new(seg, emb, diarization::DiarConfig::default());
                     match tokio::task::spawn_blocking(move || {
                         diarizer.diarize_utterance(&samples, 0)
                     })
@@ -1754,13 +1780,8 @@ mod diarized_segments_tests {
     }
 
     #[test]
-    fn build_empty_inputs_yield_empty_array() {
-        let out = build_diarized_segments_json(&[], &[]);
-        assert!(out.is_empty(), "{out:?}");
-    }
-
-    #[test]
     fn build_no_diar_fallback_emits_per_whisper_segment_with_null_speaker() {
+        assert!(build_diarized_segments_json(&[], &[]).is_empty());
         let timed = vec![ts(0, 1000, "hello"), ts(1000, 2000, "world")];
         let out = build_diarized_segments_json(&[], &timed);
         assert_eq!(out.len(), 2);
@@ -1785,6 +1806,13 @@ mod diarized_segments_tests {
         assert_eq!(out[0]["text"], "hi there");
         assert_eq!(out[1]["speaker"], "SPEAKER_01");
         assert_eq!(out[1]["text"], "world");
+
+        let out = build_diarized_segments_json(&[ds(2, 100, 1000)], &[ts(200, 800, "x")]);
+        assert_eq!(out[0]["type"], "transcript.text.segment");
+        assert_eq!(out[0]["id"], "seg_001");
+        assert_eq!(out[0]["speaker"], "SPEAKER_02");
+        assert_eq!(out[0]["start"], 0.1);
+        assert_eq!(out[0]["end"], 1.0);
     }
 
     #[test]
@@ -1808,65 +1836,28 @@ mod diarized_segments_tests {
     }
 
     #[test]
-    fn build_preserves_openai_required_fields() {
-        let diar = vec![ds(2, 100, 1000)];
-        let timed = vec![ts(200, 800, "x")];
-        let out = build_diarized_segments_json(&diar, &timed);
-        assert_eq!(out[0]["type"], "transcript.text.segment");
-        assert_eq!(out[0]["id"], "seg_001");
-        assert_eq!(out[0]["speaker"], "SPEAKER_02");
-
-        assert_eq!(out[0]["start"], 0.1);
-        assert_eq!(out[0]["end"], 1.0);
-    }
-
-    #[test]
-    fn nearest_idx_empty_returns_zero() {
+    fn nearest_idx_cases() {
         assert_eq!(nearest_diar_idx(&[], 500), 0);
-    }
-
-    #[test]
-    fn nearest_idx_before_all_returns_first() {
         let d = vec![ds(0, 1000, 2000), ds(1, 3000, 4000)];
-        assert_eq!(nearest_diar_idx(&d, 100), 0);
+        for (mid, want, label) in [
+            (100, 0, "before all returns first"),
+            (9_000, 1, "after all returns last"),
+            (3500, 1, "inside returns containing"),
+            (2500, 0, "tie breaks to first match"),
+        ] {
+            assert_eq!(nearest_diar_idx(&d, mid), want, "{label}");
+        }
     }
 
     #[test]
-    fn nearest_idx_after_all_returns_last() {
-        let d = vec![ds(0, 1000, 2000), ds(1, 3000, 4000)];
-        assert_eq!(nearest_diar_idx(&d, 9_000), 1);
-    }
-
-    #[test]
-    fn nearest_idx_inside_returns_containing() {
-        let d = vec![ds(0, 1000, 2000), ds(1, 3000, 4000)];
-        assert_eq!(nearest_diar_idx(&d, 3500), 1);
-    }
-
-    #[test]
-    fn nearest_idx_tie_breaks_to_first_match() {
-        let d = vec![ds(0, 1000, 2000), ds(1, 3000, 4000)];
-        assert_eq!(nearest_diar_idx(&d, 2500), 0);
-    }
-
-    #[test]
-    fn join_empty_slice_yields_empty() {
-        let out = join_whisper_segment_text(&[]);
-        assert_eq!(out, "");
-    }
-
-    #[test]
-    fn join_skips_empty_and_whitespace_only() {
+    fn join_skips_empties_and_trims_segment_edges() {
+        assert_eq!(join_whisper_segment_text(&[]), "");
         let s1 = ts(0, 1, "");
         let s2 = ts(0, 1, "   ");
         let s3 = ts(0, 1, "hello");
         let s4 = ts(0, 1, "world");
         let segs: Vec<&TimedSegment> = vec![&s1, &s2, &s3, &s4];
         assert_eq!(join_whisper_segment_text(&segs), "hello world");
-    }
-
-    #[test]
-    fn join_trims_each_segment_edges_but_keeps_internal() {
         let s1 = ts(0, 1, "  hi  ");
         let s2 = ts(0, 1, " there world ");
         let segs: Vec<&TimedSegment> = vec![&s1, &s2];
@@ -1874,22 +1865,13 @@ mod diarized_segments_tests {
     }
 
     #[test]
-    fn aggregate_empty_yields_none() {
+    fn aggregate_mixed_none_averages_only_present_values() {
         let (lp, nsp) = aggregate_segment_stats(&[]);
         assert!(lp.is_none() && nsp.is_none());
-    }
-
-    #[test]
-    fn aggregate_all_none_yields_none() {
         let s1 = ts(0, 1000, "");
         let s2 = ts(1000, 2000, "");
-        let segs: Vec<&TimedSegment> = vec![&s1, &s2];
-        let (lp, nsp) = aggregate_segment_stats(&segs);
+        let (lp, nsp) = aggregate_segment_stats(&[&s1, &s2]);
         assert!(lp.is_none() && nsp.is_none());
-    }
-
-    #[test]
-    fn aggregate_mixed_none_averages_only_present_values() {
         let s1 = ts_stats(0, 1000, "", Some(-1.0), None);
         let s2 = ts_stats(1000, 2000, "", None, Some(0.5));
         let s3 = ts_stats(2000, 3000, "", Some(-0.5), Some(0.1));
@@ -1907,16 +1889,14 @@ mod diarized_segments_tests {
         let segs: Vec<&TimedSegment> = vec![&s1, &s2];
         let (lp, _) = aggregate_segment_stats(&segs);
         assert!((lp.unwrap() - -0.19).abs() < 1e-5, "lp={:?}", lp);
-    }
-
-    #[test]
-    fn aggregate_zero_duration_clamped_to_min_weight_1() {
         let s1 = ts_stats(500, 500, "", Some(-1.0), None);
         let s2 = ts_stats(500, 1500, "", Some(-0.1), None);
-        let segs: Vec<&TimedSegment> = vec![&s1, &s2];
-        let (lp, _) = aggregate_segment_stats(&segs);
-
-        assert!(lp.unwrap() < -0.099 && lp.unwrap() > -0.102, "lp={:?}", lp);
+        let (lp, _) = aggregate_segment_stats(&[&s1, &s2]);
+        assert!(
+            lp.unwrap() < -0.099 && lp.unwrap() > -0.102,
+            "zero duration clamps to a min weight of 1: lp={:?}",
+            lp
+        );
     }
 }
 
@@ -1994,6 +1974,8 @@ mod serving_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "ready");
         assert!(body["down"].as_array().unwrap().is_empty());
+        let (status, _) = readiness_report(&[sub("speaker_encoder", true, false, false)]);
+        assert_eq!(status, StatusCode::OK, "optional subsystems are ignored");
     }
 
     #[test]
@@ -2017,13 +1999,6 @@ mod serving_tests {
     }
 
     #[test]
-    fn readiness_ignores_optional_subsystems() {
-        let subs = vec![sub("speaker_encoder", true, false, false)];
-        let (status, _) = readiness_report(&subs);
-        assert_eq!(status, StatusCode::OK);
-    }
-
-    #[test]
     fn stt_params_accept_absent_and_neutral_values() {
         assert_eq!(check_stt_params(None, None).unwrap(), None);
         assert_eq!(check_stt_params(Some(""), Some("")).unwrap(), None);
@@ -2031,22 +2006,12 @@ mod serving_tests {
         assert_eq!(check_stt_params(Some("AUTO"), None).unwrap(), None);
         assert_eq!(check_stt_params(None, Some("0")).unwrap(), None);
         assert_eq!(check_stt_params(None, Some("0.0")).unwrap(), None);
-    }
-
-    #[test]
-    fn stt_params_pass_through_known_language_codes_lowercased() {
-        assert_eq!(
-            check_stt_params(Some("de"), None).unwrap().as_deref(),
-            Some("de")
-        );
-        assert_eq!(
-            check_stt_params(Some("EN"), None).unwrap().as_deref(),
-            Some("en")
-        );
-        assert_eq!(
-            check_stt_params(Some(" ja "), None).unwrap().as_deref(),
-            Some("ja")
-        );
+        for (raw, want) in [("de", "de"), ("EN", "en"), (" ja ", "ja")] {
+            assert_eq!(
+                check_stt_params(Some(raw), None).unwrap().as_deref(),
+                Some(want)
+            );
+        }
     }
 
     #[test]
@@ -2055,37 +2020,30 @@ mod serving_tests {
         assert_eq!(param, "language");
         assert!(msg.contains("auto"), "{msg}");
         assert!(msg.contains("klingon"), "{msg}");
-    }
-
-    #[test]
-    fn stt_params_reject_nonzero_temperature() {
-        assert_eq!(
-            check_stt_params(None, Some("0.8")).unwrap_err().0,
-            "temperature"
-        );
-        assert_eq!(
-            check_stt_params(None, Some("hot")).unwrap_err().0,
-            "temperature"
-        );
+        for temp in ["0.8", "hot"] {
+            assert_eq!(
+                check_stt_params(None, Some(temp)).unwrap_err().0,
+                "temperature"
+            );
+        }
     }
 
     #[test]
     fn sdp_typed_error_is_classified_as_client_error() {
-        let err = anyhow::Error::new(webrtc::Error::ErrSessionDescriptionMissingIceUfrag)
+        let err = anyhow::Error::new(webrtc::error::Error::ErrSessionDescriptionMissingIceUfrag)
             .context("set_remote_description");
         assert!(is_client_sdp_error(&err));
-    }
-
-    #[test]
-    fn non_sdp_webrtc_error_is_not_a_client_error() {
-        let err = anyhow::Error::new(webrtc::Error::ErrCertificateExpired).context("build PC");
-        assert!(!is_client_sdp_error(&err));
-    }
-
-    #[test]
-    fn non_webrtc_error_falls_back_to_message_match() {
+        let err =
+            anyhow::Error::new(webrtc::error::Error::ErrCertificateExpired).context("build PC");
+        assert!(
+            !is_client_sdp_error(&err),
+            "a non-sdp webrtc error is not a client error"
+        );
         let err = anyhow::anyhow!("something").context("parse offer SDP");
-        assert!(is_client_sdp_error(&err));
+        assert!(
+            is_client_sdp_error(&err),
+            "a non-webrtc error falls back to a message match"
+        );
         let err = anyhow::anyhow!("out of capacity");
         assert!(!is_client_sdp_error(&err));
     }
@@ -2098,12 +2056,7 @@ mod serving_tests {
         .context("transcribe_full_with_task");
         let resp = stt_failure_response(&err);
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn other_transcribe_failures_stay_5xx() {
-        let err = anyhow::anyhow!("decoder blew up");
-        let resp = stt_failure_response(&err);
+        let resp = stt_failure_response(&anyhow::anyhow!("decoder blew up"));
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -2131,10 +2084,7 @@ mod serving_tests {
         assert!(!root.join("model.onnx").exists());
         assert!(pii::classifier::layout_present(&root));
         let _ = std::fs::remove_dir_all(&root);
-    }
 
-    #[test]
-    fn pii_gate_accepts_flat_layout_and_rejects_a_dir_without_a_model() {
         let flat = pii_fixture_dir();
         for p in [
             flat.join("model.onnx"),
@@ -2145,7 +2095,6 @@ mod serving_tests {
         }
         assert!(pii::classifier::layout_present(&flat));
         let _ = std::fs::remove_dir_all(&flat);
-
         let empty = pii_fixture_dir();
         assert!(!pii::classifier::layout_present(&empty));
         let _ = std::fs::remove_dir_all(&empty);

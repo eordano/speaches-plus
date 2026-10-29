@@ -1,10 +1,12 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
+use wgpu::Buffer;
 
 use nv_kernels::wgpu_backend::dispatch::{self, GpuBind, GpuTensor, GpuUniform, Recorded};
 use nv_kernels::wgpu_backend::kernels::assistant_drafter as ad;
 use nv_kernels::wgpu_backend::{compose, WgpuContext};
 
 use crate::gemma4_e4b_wgpu::pack_pairs;
+use crate::pod;
 
 const LABEL: &str = "nv_models_gemma4_assistant_wgpu";
 
@@ -62,10 +64,10 @@ pub struct AssistantWgpuWeights {
 }
 
 pub struct BackboneKvBinding<'a> {
-    pub k_fp8: &'a wgpu::Buffer,
-    pub v_fp8: &'a wgpu::Buffer,
-    pub k_scales: &'a wgpu::Buffer,
-    pub v_scales: &'a wgpu::Buffer,
+    pub k_fp8: &'a Buffer,
+    pub v_fp8: &'a Buffer,
+    pub k_scales: &'a Buffer,
+    pub v_scales: &'a Buffer,
 }
 
 fn default_inv_freq(head_dim: usize, theta: f32) -> Vec<f32> {
@@ -129,13 +131,14 @@ pub struct Gemma4AssistantWgpu {
     _keep: Vec<Box<dyn std::any::Any + Send>>,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct UpkParams {
-    src_off: u32,
-    n_words: u32,
-    pad0: u32,
-    pad1: u32,
+pod! {
+    #[derive(Debug)]
+    struct UpkParams {
+        src_off: u32,
+        n_words: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 }
 
 const UNPACK_HIDDEN_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4a_unpack_hidden.wgsl");
@@ -147,30 +150,29 @@ pub enum PackedHiddenSrc {
 }
 
 impl Gemma4AssistantWgpu {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         spec: AssistantWgpuSpec,
         weights: &AssistantWgpuWeights,
-        embed_chunks: &[wgpu::Buffer],
+        embed_chunks: &[Buffer],
         embed_rows_per_chunk: usize,
         sliding_kv: BackboneKvBinding<'_>,
         full_kv: BackboneKvBinding<'_>,
         max_len: usize,
         k_max: usize,
     ) -> Result<Self> {
-        let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("no wgpu adapter: {e}"))?;
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("no wgpu adapter: {e}"))?;
         let (bh, h, nh) = (spec.backbone_hidden, spec.hidden, spec.n_heads);
         let imm = spec.intermediate;
         let hd_max = spec.sliding_hd.max(spec.full_hd);
         let cand = spec.top_k * spec.vocab_per_centroid();
-        anyhow::ensure!(k_max > 0 && max_len > 0, "empty drafter geometry");
-        anyhow::ensure!(
+        ensure!(k_max > 0 && max_len > 0, "empty drafter geometry");
+        ensure!(
             !spec.layers_sliding.is_empty() && spec.layers_sliding.len() == weights.layers.len(),
             "layer count mismatch: {} types vs {} weight sets",
             spec.layers_sliding.len(),
             weights.layers.len()
         );
-        anyhow::ensure!(
+        ensure!(
             spec.n_heads.is_multiple_of(spec.sliding_nkv)
                 && spec.n_heads.is_multiple_of(spec.full_nkv),
             "n_heads {} not divisible by kv heads {}/{}",
@@ -178,13 +180,13 @@ impl Gemma4AssistantWgpu {
             spec.sliding_nkv,
             spec.full_nkv
         );
-        anyhow::ensure!(
+        ensure!(
             spec.vocab.is_multiple_of(spec.n_centroids),
             "vocab {} not divisible by {} centroids",
             spec.vocab,
             spec.n_centroids
         );
-        anyhow::ensure!(
+        ensure!(
             weights.ordering.len() == spec.vocab,
             "token ordering holds {}, want {}",
             weights.ordering.len(),
@@ -196,7 +198,7 @@ impl Gemma4AssistantWgpu {
         ] {
             let fp8 = (max_len * nkv * hd) as u64;
             let scales = (max_len * nkv * 4) as u64;
-            anyhow::ensure!(
+            ensure!(
                 kv.k_fp8.size() >= fp8
                     && kv.v_fp8.size() >= fp8
                     && kv.k_scales.size() >= scales
@@ -204,7 +206,7 @@ impl Gemma4AssistantWgpu {
                 "{name} kv buffers too small for max_len {max_len} x {nkv} x {hd}"
             );
         }
-        anyhow::ensure!(
+        ensure!(
             !embed_chunks.is_empty()
                 && embed_chunks.len() <= ad::EMBED_MAX_CHUNKS
                 && embed_rows_per_chunk > 0,
@@ -212,7 +214,7 @@ impl Gemma4AssistantWgpu {
             embed_chunks.len(),
             ad::EMBED_MAX_CHUNKS
         );
-        anyhow::ensure!(
+        ensure!(
             embed_chunks.len() * embed_rows_per_chunk >= spec.vocab,
             "embed table chunks cover {} rows, want {}",
             embed_chunks.len() * embed_rows_per_chunk,
@@ -220,7 +222,7 @@ impl Gemma4AssistantWgpu {
         );
 
         let check = |name: &str, data: &[u16], want: usize| -> Result<()> {
-            anyhow::ensure!(
+            ensure!(
                 data.len() == want,
                 "{name}: {} elements, want {want}",
                 data.len()
@@ -389,7 +391,7 @@ impl Gemma4AssistantWgpu {
         let mut push =
             |entry: &str, binds: &[(u32, &dyn GpuBind)], grid: (u32, u32, u32)| -> Result<()> {
                 step.push(ctx, LABEL, &src, entry, binds, grid)
-                    .map_err(|e| anyhow::anyhow!("record {entry}: {e}"))
+                    .map_err(|e| anyhow!("record {entry}: {e}"))
             };
 
         let chunk = |i: usize| embed_chunks.get(i).unwrap_or(&embed_chunks[0]);
@@ -657,8 +659,8 @@ impl Gemma4AssistantWgpu {
 
     pub fn bind_hidden_sources(
         &mut self,
-        decode_hid: &wgpu::Buffer,
-        verify_hid: Option<&wgpu::Buffer>,
+        decode_hid: &Buffer,
+        verify_hid: Option<&Buffer>,
     ) -> Result<()> {
         let n_words = self.spec.backbone_hidden / 2;
         let upk = GpuUniform::new(
@@ -679,7 +681,7 @@ impl Gemma4AssistantWgpu {
         )
         .map_err(err)?;
         let grid = dispatch::workgroup_count_1d(self.ctx, n_words as u64, 256);
-        let mk_rec = |src: &wgpu::Buffer| {
+        let mk_rec = |src: &Buffer| {
             let mut r = Recorded::new();
             r.push_raw(
                 self.ctx,
@@ -696,13 +698,13 @@ impl Gemma4AssistantWgpu {
     }
 
     fn prepare_round(&mut self, last_token: u32, committed: usize, k: usize) -> Result<()> {
-        anyhow::ensure!(committed > 0, "no committed context to draft from");
-        anyhow::ensure!(
+        ensure!(committed > 0, "no committed context to draft from");
+        ensure!(
             committed <= self.max_len,
             "committed {committed} beyond drafter max_len {}",
             self.max_len
         );
-        anyhow::ensure!(
+        ensure!(
             k >= 1 && k <= self.k_max,
             "draft k {k} out of 1..={}",
             self.k_max
@@ -750,7 +752,7 @@ impl Gemma4AssistantWgpu {
         committed: usize,
         k: usize,
     ) -> Result<Vec<u32>> {
-        anyhow::ensure!(
+        ensure!(
             last_hidden.len() == self.spec.backbone_hidden,
             "last_hidden holds {} values, want {}",
             last_hidden.len(),
@@ -803,5 +805,5 @@ impl Gemma4AssistantWgpu {
 }
 
 fn err(e: nv_kernels::wgpu_backend::WgpuError) -> anyhow::Error {
-    anyhow::anyhow!("{e}")
+    anyhow!("{e}")
 }

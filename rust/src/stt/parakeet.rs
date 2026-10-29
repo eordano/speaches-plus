@@ -1,3 +1,4 @@
+use super::TokenLogprob;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -95,9 +96,15 @@ impl ParakeetTdt {
     }
 
     pub fn transcribe(&self, audio_16k_mono: &[f32]) -> Result<String> {
+        Ok(self.transcribe_scored(audio_16k_mono)?.0)
+    }
+
+    pub fn transcribe_scored(&self, audio_16k_mono: &[f32]) -> Result<(String, Vec<TokenLogprob>)> {
         let mut text = String::new();
+        let mut tokens = Vec::new();
         for window in audio_16k_mono.chunks(WINDOW_SAMPLES_BOUNDS_FULL_ATTENTION_COST) {
-            let ids = self.decode_window(window)?;
+            let scored = self.decode_window(window)?;
+            let ids: Vec<i32> = scored.iter().map(|(id, _)| *id).collect();
             let part = self.detokenize(&ids);
             if !part.is_empty() {
                 if !text.is_empty() {
@@ -105,11 +112,15 @@ impl ParakeetTdt {
                 }
                 text.push_str(&part);
             }
+            tokens.extend(scored.into_iter().map(|(id, logprob)| TokenLogprob {
+                token: self.vocab[id as usize].replace('\u{2581}', " "),
+                logprob,
+            }));
         }
-        Ok(text)
+        Ok((text, tokens))
     }
 
-    fn decode_window(&self, audio: &[f32]) -> Result<Vec<i32>> {
+    fn decode_window(&self, audio: &[f32]) -> Result<Vec<(i32, f32)>> {
         if audio.is_empty() {
             return Ok(Vec::new());
         }
@@ -158,7 +169,7 @@ impl ParakeetTdt {
         self.tdt_greedy(&enc, t_len)
     }
 
-    fn tdt_greedy(&self, enc: &[f32], t_len: usize) -> Result<Vec<i32>> {
+    fn tdt_greedy(&self, enc: &[f32], t_len: usize) -> Result<Vec<(i32, f32)>> {
         let mut joint = self
             .joint
             .lock()
@@ -166,7 +177,7 @@ impl ParakeetTdt {
         let mut s1 = vec![0f32; STATE_LAYERS * STATE_DIM];
         let mut s2 = vec![0f32; STATE_LAYERS * STATE_DIM];
         let mut last = BLANK_ID;
-        let mut ids: Vec<i32> = Vec::new();
+        let mut ids: Vec<(i32, f32)> = Vec::new();
         let mut t = 0usize;
         let mut symbols_this_frame = 0usize;
         while t < t_len {
@@ -206,7 +217,7 @@ impl ParakeetTdt {
             let dur = argmax(&logits[TOKEN_LOGITS..TOKEN_LOGITS + TDT_DURATION_BINS.len()]);
             let mut skip = TDT_DURATION_BINS[dur];
             if tok as i32 != BLANK_ID {
-                ids.push(tok as i32);
+                ids.push((tok as i32, log_softmax_at(&logits[..TOKEN_LOGITS], tok)));
                 last = tok as i32;
                 let (_, o1) = out["output_states_1"]
                     .try_extract_tensor::<f32>()
@@ -251,6 +262,12 @@ impl ParakeetTdt {
     }
 }
 
+fn log_softmax_at(logits: &[f32], idx: usize) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let log_sum = logits.iter().map(|&l| (l - max).exp()).sum::<f32>().ln();
+    logits[idx] - max - log_sum
+}
+
 fn argmax(v: &[f32]) -> usize {
     let mut best = 0usize;
     for (i, &x) in v.iter().enumerate() {
@@ -266,7 +283,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vocab_size_mismatch_names_the_head_width() {
+    fn vocab_size_mismatch_names_the_head_width_and_log_softmax_is_a_probability() {
         let dir = std::env::temp_dir().join("parakeet-vocab-mismatch-test");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("vocab.txt"), "a 0\nb 1\n").unwrap();
@@ -275,5 +292,14 @@ mod tests {
         };
         let err = err.to_string();
         assert!(err.contains("1025"), "unexpected error: {err}");
+        {
+            let logits = [1.0f32, 2.0, 3.0];
+            let total: f32 = (0..3)
+                .map(|i| super::log_softmax_at(&logits, i).exp())
+                .sum();
+            assert!((total - 1.0).abs() < 1e-5, "probabilities sum to {total}");
+            assert!(super::log_softmax_at(&logits, 2) > super::log_softmax_at(&logits, 0));
+            assert!(super::log_softmax_at(&[0.0f32, 0.0], 0) < 0.0);
+        }
     }
 }

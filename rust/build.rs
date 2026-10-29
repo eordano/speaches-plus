@@ -5,7 +5,7 @@ fn main() {
     if cfg!(target_os = "macos") && std::env::var_os("CC").is_none() {
         let xcode_clang = "/usr/bin/clang";
         if std::path::Path::new(xcode_clang).exists() {
-            std::env::set_var("CC", xcode_clang);
+            unsafe { std::env::set_var("CC", xcode_clang) };
         }
     }
 
@@ -43,6 +43,11 @@ fn main() {
         println!("cargo:rustc-link-arg-tests=-Wl,-rpath,{}", framework_parent);
     }
 
+    let nix_build_where_walked_libs_are_undeclared_and_gc_deletes_them =
+        std::env::var_os("NIX_BUILD_TOP").is_some();
+    if nix_build_where_walked_libs_are_undeclared_and_gc_deletes_them {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir("/nix/store") else {
         return;
     };

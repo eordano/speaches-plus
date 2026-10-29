@@ -67,6 +67,7 @@ fn lgw_norm_rope(
     let words = hd >> 1u;
     let base = row * lnr_p.src_stride;
 
+    #def b2
     var local = 0.0;
     for (var i = lid; i < hd; i = i + LGA_NR_WG) {
         let word = lnr_src[base + (i >> 1u)];
@@ -92,6 +93,7 @@ fn lgw_norm_rope(
         lnr_a[i] = bf16_pack(bf16_lo(xw) * inv * bf16_lo(ww), bf16_hi(xw) * inv * bf16_hi(ww));
     }
     workgroupBarrier();
+    #end
 
     let row_base = lnr_step[LGA_STEP_POS] * lnr_p.rope_table_half;
     let rh = lnr_p.rot_half;
@@ -119,31 +121,7 @@ fn lgw_norm_rope_rows(
     let words = hd >> 1u;
     let base = tok * lnr_p.tok_stride_words + row * lnr_p.src_stride;
 
-    var local = 0.0;
-    for (var i = lid; i < hd; i = i + LGA_NR_WG) {
-        let word = lnr_src[base + (i >> 1u)];
-        let v = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
-        local = fma(v, v, local);
-    }
-    lnr_red[lid] = local;
-    workgroupBarrier();
-    for (var s = LGA_NR_WG >> 1u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            lnr_red[lid] = lnr_red[lid] + lnr_red[lid + s];
-        }
-        workgroupBarrier();
-    }
-    if (lid == 0u) {
-        lnr_inv = 1.0 / sqrt(lnr_red[0] / f32(hd) + lnr_p.eps);
-    }
-    workgroupBarrier();
-    let inv = lnr_inv;
-    for (var i = lid; i < words; i = i + LGA_NR_WG) {
-        let xw = lnr_src[base + i];
-        let ww = lnr_w[i];
-        lnr_a[i] = bf16_pack(bf16_lo(xw) * inv * bf16_lo(ww), bf16_hi(xw) * inv * bf16_hi(ww));
-    }
-    workgroupBarrier();
+    #use b2
 
     let row_base = lnr_list[tok].y * lnr_p.rope_table_half;
     let rh = lnr_p.rot_half;
@@ -245,6 +223,7 @@ fn lad_score(kbase: u32, hd: u32) -> f32 {
 
 @compute @workgroup_size(256)
 fn lgw_attn_decode(
+    #def b3
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
@@ -253,6 +232,7 @@ fn lgw_attn_decode(
     if (h >= lad_par.n_q_heads) {
         return;
     }
+    #def b6
     let lid = tid.x;
     let hd = lad_par.head_dim;
     let words = hd >> 1u;
@@ -264,9 +244,12 @@ fn lgw_attn_decode(
     if (lad_par.is_sliding == 1u) {
         start = min(lad_step.sstart, total);
     }
+    #end
 
     for (var i = lid; i < hd; i = i + LGA_AD_WG) {
         let word = lad_q[h * words + (i >> 1u)];
+    #end
+        #def b1
         lad_qs[i] = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
         lad_acc[i] = 0.0;
     }
@@ -275,6 +258,7 @@ fn lgw_attn_decode(
     var lmax = -3.0e38;
     for (var j = start + lid; j < total; j = j + LGA_AD_WG) {
         let s = lad_score((j * nkv + kvh) * hd, hd) * lad_par.scale;
+        #def b5
         lmax = max(lmax, s);
     }
     lad_red[lid] = lmax;
@@ -288,6 +272,7 @@ fn lgw_attn_decode(
     let m = lad_red[0];
 
     var lsum = 0.0;
+        #end
     let tile0 = (start / LGA_AD_WG) * LGA_AD_WG;
     for (var base = tile0; base < total; base = base + LGA_AD_WG) {
         let j = base + lid;
@@ -303,6 +288,7 @@ fn lgw_attn_decode(
             var a = 0.0;
             for (var t = 0u; t < tmax; t = t + 1u) {
                 a = fma(lad_pr[t], lad_vval(((base + t) * nkv + kvh) * hd + d), a);
+            #def b4
             }
             lad_acc[d] = lad_acc[d] + a;
         }
@@ -317,12 +303,14 @@ fn lgw_attn_decode(
         }
         workgroupBarrier();
     }
+            #end
     var inv = 0.0;
     if (lad_red[0] > 0.0) {
         inv = 1.0 / lad_red[0];
     }
     for (var i = lid; i < words; i = i + LGA_AD_WG) {
         let e = i * 2u;
+        #end
         lad_out[h * words + i] = bf16_pack(lad_acc[e] * inv, lad_acc[e + 1u] * inv);
     }
 }
@@ -355,62 +343,7 @@ fn lgw_attn_decode_rows(
 
     for (var i = lid; i < hd; i = i + LGA_AD_WG) {
         let word = lad_q[tok_words * tok + h * words + (i >> 1u)];
-        lad_qs[i] = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
-        lad_acc[i] = 0.0;
-    }
-    workgroupBarrier();
-
-    var lmax = -3.0e38;
-    for (var j = start + lid; j < total; j = j + LGA_AD_WG) {
-        let s = lad_score((j * nkv + kvh) * hd, hd) * lad_par.scale;
-        lmax = max(lmax, s);
-    }
-    lad_red[lid] = lmax;
-    workgroupBarrier();
-    for (var s = LGA_AD_WG >> 1u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            lad_red[lid] = max(lad_red[lid], lad_red[lid + s]);
-        }
-        workgroupBarrier();
-    }
-    let m = lad_red[0];
-
-    var lsum = 0.0;
-    let tile0 = (start / LGA_AD_WG) * LGA_AD_WG;
-    for (var base = tile0; base < total; base = base + LGA_AD_WG) {
-        let j = base + lid;
-        var pv = 0.0;
-        if (j >= start && j < total) {
-            pv = exp(lad_score((j * nkv + kvh) * hd, hd) * lad_par.scale - m);
-        }
-        lsum = lsum + pv;
-        lad_pr[lid] = pv;
-        workgroupBarrier();
-        let tmax = min(LGA_AD_WG, total - base);
-        for (var d = lid; d < hd; d = d + LGA_AD_WG) {
-            var a = 0.0;
-            for (var t = 0u; t < tmax; t = t + 1u) {
-                a = fma(lad_pr[t], lad_vval(((base + t) * nkv + kvh) * hd + d), a);
-            }
-            lad_acc[d] = lad_acc[d] + a;
-        }
-        workgroupBarrier();
-    }
-
-    lad_red[lid] = lsum;
-    workgroupBarrier();
-    for (var s = LGA_AD_WG >> 1u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            lad_red[lid] = lad_red[lid] + lad_red[lid + s];
-        }
-        workgroupBarrier();
-    }
-    var inv = 0.0;
-    if (lad_red[0] > 0.0) {
-        inv = 1.0 / lad_red[0];
-    }
-    for (var i = lid; i < words; i = i + LGA_AD_WG) {
-        let e = i * 2u;
+        #use b1
         lad_out[tok_words * tok + h * words + i] = bf16_pack(lad_acc[e] * inv, lad_acc[e + 1u] * inv);
     }
 }
@@ -441,28 +374,7 @@ fn lad_score_abl(kbase: u32, hd: u32) -> f32 {
 
 @compute @workgroup_size(256)
 fn lgw_attn_decode_abl(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x + wg.y * nwg.x;
-    if (h >= lad_par.n_q_heads) {
-        return;
-    }
-    let lid = tid.x;
-    let hd = lad_par.head_dim;
-    let words = hd >> 1u;
-    let nkv = lad_par.n_kv_heads;
-    let kvh = h / lad_par.gqa_group;
-    let cap = lad_par.kv_capacity;
-    let total = min(lad_step.total, cap);
-    var start = 0u;
-    if (lad_par.is_sliding == 1u) {
-        start = min(lad_step.sstart, total);
-    }
-
-    for (var i = lid; i < hd; i = i + LGA_AD_WG) {
-        let word = lad_q[h * words + (i >> 1u)];
+    #use b3
         lad_qs[i] = select(bf16_lo(word), bf16_hi(word), (i & 1u) == 1u);
         lad_acc[i] = 0.0;
     }
@@ -471,19 +383,7 @@ fn lgw_attn_decode_abl(
     var lmax = -3.0e38;
     for (var j = start + lid; j < total; j = j + LGA_AD_WG) {
         let s = lad_score_abl((j * nkv + kvh) * hd, hd) * lad_par.scale;
-        lmax = max(lmax, s);
-    }
-    lad_red[lid] = lmax;
-    workgroupBarrier();
-    for (var s = LGA_AD_WG >> 1u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            lad_red[lid] = max(lad_red[lid], lad_red[lid + s]);
-        }
-        workgroupBarrier();
-    }
-    let m = lad_red[0];
-
-    var lsum = 0.0;
+        #use b5
     let tile0 = (start / LGA_AD_WG) * LGA_AD_WG;
     for (var base = tile0; base < total; base = base + LGA_AD_WG) {
         let j = base + lid;
@@ -499,20 +399,7 @@ fn lgw_attn_decode_abl(
             var a = 0.0;
             for (var t = 0u; t < tmax; t = t + 1u) {
                 a = fma(lad_pr[t], lad_vval_abl(((base + t) * nkv + kvh) * hd + d), a);
-            }
-            lad_acc[d] = lad_acc[d] + a;
-        }
-        workgroupBarrier();
-    }
-
-    lad_red[lid] = lsum;
-    workgroupBarrier();
-    for (var s = LGA_AD_WG >> 1u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            lad_red[lid] = lad_red[lid] + lad_red[lid + s];
-        }
-        workgroupBarrier();
-    }
+            #use b4
     var inv = 0.0;
     if (lad_red[0] > 0.0) {
         inv = 1.0 / lad_red[0];
@@ -544,17 +431,7 @@ fn lgw_attn_decode_split(
         return;
     }
     let slice = wg.z;
-    let lid = tid.x;
-    let hd = lad_par.head_dim;
-    let words = hd >> 1u;
-    let nkv = lad_par.n_kv_heads;
-    let kvh = h / lad_par.gqa_group;
-    let cap = lad_par.kv_capacity;
-    let total = min(lad_step.total, cap);
-    var start = 0u;
-    if (lad_par.is_sliding == 1u) {
-        start = min(lad_step.sstart, total);
-    }
+    #use b6
     let span = total - start;
     let per = (span + lad_sp.n_slices - 1u) / lad_sp.n_slices;
     let s0 = min(start + slice * per, total);
@@ -570,19 +447,7 @@ fn lgw_attn_decode_split(
     var lmax = -3.0e38;
     for (var j = s0 + lid; j < s1; j = j + LGA_AD_WG) {
         let s = lad_score((j * nkv + kvh) * hd, hd) * lad_par.scale;
-        lmax = max(lmax, s);
-    }
-    lad_red[lid] = lmax;
-    workgroupBarrier();
-    for (var s = LGA_AD_WG >> 1u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            lad_red[lid] = max(lad_red[lid], lad_red[lid + s]);
-        }
-        workgroupBarrier();
-    }
-    let m = lad_red[0];
-
-    var lsum = 0.0;
+        #use b5
     let tile0 = (s0 / LGA_AD_WG) * LGA_AD_WG;
     for (var base = tile0; base < s1; base = base + LGA_AD_WG) {
         let j = base + lid;
@@ -598,20 +463,7 @@ fn lgw_attn_decode_split(
             var a = 0.0;
             for (var t = 0u; t < tmax; t = t + 1u) {
                 a = fma(lad_pr[t], lad_vval(((base + t) * nkv + kvh) * hd + d), a);
-            }
-            lad_acc[d] = lad_acc[d] + a;
-        }
-        workgroupBarrier();
-    }
-
-    lad_red[lid] = lsum;
-    workgroupBarrier();
-    for (var s = LGA_AD_WG >> 1u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            lad_red[lid] = lad_red[lid] + lad_red[lid + s];
-        }
-        workgroupBarrier();
-    }
+            #use b4
     let pbase = (h * lad_sp.n_slices + slice) * (hd + 2u);
     if (lid == 0u) {
         lad_part[pbase] = m;

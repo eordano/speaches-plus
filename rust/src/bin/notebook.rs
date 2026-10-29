@@ -464,7 +464,6 @@ struct PageOutcome {
     markdown: String,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_page(
     args: &Args,
     dots: &DotsOcrPipeline,
@@ -976,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_kind_round_trips_and_rejects_junk() {
+    fn reader_kinds_figure_categories_and_slugs_are_well_formed() {
         assert_eq!(ReaderKind::parse("layout"), Some(ReaderKind::Layout));
         assert_eq!(ReaderKind::parse("dots-crop"), Some(ReaderKind::DotsCrop));
         assert_eq!(ReaderKind::parse("dsocr-crop"), Some(ReaderKind::DsocrCrop));
@@ -984,6 +983,20 @@ mod tests {
         assert!(!ReaderKind::Layout.needs_crops());
         assert!(ReaderKind::DotsCrop.needs_crops());
         assert_eq!(ReaderKind::DsocrCrop.as_str(), "dsocr-crop");
+        {
+            assert!(FIGURE_CATEGORIES.contains(&"Picture"));
+            assert!(!FIGURE_CATEGORIES.contains(&"Table"));
+            assert!(!FIGURE_CATEGORIES.contains(&"Formula"));
+            assert!(el("Picture", None, None).is_picture());
+            assert!(!el("Text", None, Some("x")).is_picture());
+        }
+        {
+            let s = slug(Path::new("/scans/notebook 1992 (a).jpg"), 7);
+            assert_eq!(s, "007-notebook-1992--a-");
+            assert!(!s.contains('/'));
+            assert!(!s.contains(' '));
+            assert!(slug(Path::new("b.png"), 2) > slug(Path::new("a.png"), 1));
+        }
     }
 
     #[test]
@@ -1004,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn clamp_box_pads_but_stays_inside_the_page() {
+    fn clamp_box_pads_inside_the_page_and_normalizes_inverted_corners() {
         assert_eq!(
             clamp_box([5.0, 5.0, 20.0, 20.0], 100, 100, 10),
             Some((0, 0, 30, 30))
@@ -1015,14 +1028,12 @@ mod tests {
         );
         assert_eq!(clamp_box([10.0, 10.0, 10.0, 40.0], 100, 100, 0), None);
         assert_eq!(clamp_box([-50.0, -50.0, -10.0, -10.0], 100, 100, 0), None);
-    }
-
-    #[test]
-    fn clamp_box_normalizes_inverted_corners() {
-        assert_eq!(
-            clamp_box([40.0, 60.0, 10.0, 20.0], 100, 100, 0),
-            Some((10, 20, 40, 60))
-        );
+        {
+            assert_eq!(
+                clamp_box([40.0, 60.0, 10.0, 20.0], 100, 100, 0),
+                Some((10, 20, 40, 60))
+            );
+        }
     }
 
     #[test]
@@ -1039,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn agreement_is_markup_and_case_neutral() {
+    fn agreement_levenshtein_and_norm_for_compare_match_known_values() {
         assert_eq!(agreement("Hello world", "hello   world"), 1.0);
         assert_eq!(agreement("**Hello** world", "Hello world"), 1.0);
         assert!(agreement("the cat sat", "the dog sat") < 1.0);
@@ -1047,14 +1058,33 @@ mod tests {
         assert!(agreement("completely different", "xyz") < 0.3);
         assert_eq!(agreement("", ""), 1.0);
         assert_eq!(agreement("", "abc"), 0.0);
+        {
+            let a: Vec<char> = "kitten".chars().collect();
+            let b: Vec<char> = "sitting".chars().collect();
+            assert_eq!(levenshtein(&a, &b), 3);
+            assert_eq!(levenshtein(&[], &b), 7);
+            assert_eq!(levenshtein(&a, &a), 0);
+        }
+        {
+            assert_eq!(
+                norm_for_compare("  Hello, *world*! \n\n 42 ")
+                    .iter()
+                    .collect::<String>(),
+                "hello world 42"
+            );
+        }
     }
 
     #[test]
-    fn heading_prefixes_follow_the_dots_categories() {
+    fn heading_prefixes_follow_the_dots_categories_without_doubling_up() {
         assert_eq!(heading_prefix("Title", "Lecture 6"), "# ");
         assert_eq!(heading_prefix("Section-header", "Fick's law"), "## ");
         assert_eq!(heading_prefix("Text", "body"), "");
         assert_eq!(heading_prefix("List-item", "1. a"), "");
+        {
+            assert_eq!(heading_prefix("Title", "# Lecture 6 - Diffusion"), "");
+            assert_eq!(heading_prefix("Section-header", "  ## already"), "");
+        }
     }
 
     #[test]
@@ -1075,46 +1105,4 @@ mod tests {
         assert!(crop_overran("", &"x".repeat(2001)));
     }
 
-    #[test]
-    fn heading_prefix_does_not_double_up_on_dots_own_markdown() {
-        assert_eq!(heading_prefix("Title", "# Lecture 6 - Diffusion"), "");
-        assert_eq!(heading_prefix("Section-header", "  ## already"), "");
-    }
-
-    #[test]
-    fn figure_category_set_excludes_transcribable_regions() {
-        assert!(FIGURE_CATEGORIES.contains(&"Picture"));
-        assert!(!FIGURE_CATEGORIES.contains(&"Table"));
-        assert!(!FIGURE_CATEGORIES.contains(&"Formula"));
-        assert!(el("Picture", None, None).is_picture());
-        assert!(!el("Text", None, Some("x")).is_picture());
-    }
-
-    #[test]
-    fn slug_is_filesystem_safe_and_page_ordered() {
-        let s = slug(Path::new("/scans/notebook 1992 (a).jpg"), 7);
-        assert_eq!(s, "007-notebook-1992--a-");
-        assert!(!s.contains('/'));
-        assert!(!s.contains(' '));
-        assert!(slug(Path::new("b.png"), 2) > slug(Path::new("a.png"), 1));
-    }
-
-    #[test]
-    fn levenshtein_matches_known_distances() {
-        let a: Vec<char> = "kitten".chars().collect();
-        let b: Vec<char> = "sitting".chars().collect();
-        assert_eq!(levenshtein(&a, &b), 3);
-        assert_eq!(levenshtein(&[], &b), 7);
-        assert_eq!(levenshtein(&a, &a), 0);
-    }
-
-    #[test]
-    fn norm_for_compare_drops_punctuation_and_collapses_space() {
-        assert_eq!(
-            norm_for_compare("  Hello, *world*! \n\n 42 ")
-                .iter()
-                .collect::<String>(),
-            "hello world 42"
-        );
-    }
 }

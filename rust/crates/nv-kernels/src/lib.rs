@@ -1,7 +1,6 @@
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
-#![allow(dead_code)]
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 pub mod sys {
@@ -14,12 +13,27 @@ pub mod graph;
 #[cfg(feature = "cuda")]
 pub mod lora;
 
+#[cfg(feature = "cuda")]
+pub mod voxtral_spec;
+
+#[cfg(feature = "cuda")]
+pub mod voxtral_tts_frame;
+
+#[cfg(feature = "cuda")]
+pub mod voxtral_tts_codec;
+
+#[cfg(feature = "cuda")]
+pub mod voxtral_tts_backbone;
+
+#[cfg(feature = "cuda")]
+pub mod voxtral_tts_flow;
+
 pub mod lora_meta;
 
 mod launcher_registry;
 
 #[cfg(feature = "cuda")]
-extern "C" {
+unsafe extern "C" {
     pub fn nv_kernels_lora_shrink(
         stream: *mut std::ffi::c_void,
         x_bf16: *const u16,
@@ -113,7 +127,9 @@ extern "C" {
     ) -> i32;
 }
 
+pub mod capture_exclusion;
 pub mod shift_decode_fold;
+pub mod wgsl_tmpl;
 
 #[cfg(feature = "wgpu")]
 pub mod wgpu_backend;
@@ -130,7 +146,9 @@ pub mod cuda {
     macro_rules! launchers_forward_to_the_c_symbol_verbatim {
         ($($name:ident = $sym:ident ( $($arg:ident : $ty:ty),* );)*) => {
             $(pub unsafe fn $name($($arg: $ty),*) -> i32 {
-                sys::$sym($($arg),*)
+                unsafe {
+                    sys::$sym($($arg),*)
+                }
             })*
         };
     }
@@ -164,32 +182,6 @@ pub mod cuda {
 
     pub fn gdn_chunk_gemm_scan_workspace_elems(t: i32, h: i32, hk: i32) -> usize {
         (unsafe { sys::nv_kernels_gdn_chunk_gemm_scan_workspace_elems(t, h, hk) }) as usize
-    }
-
-    pub fn gdn_chunk_gemm_graph_replays_total() -> i64 {
-        unsafe { sys::nv_kernels_gdn_chunk_gemm_graph_replays_total() }
-    }
-
-    pub fn gdn_prefill_tc_head_launches_total() -> i64 {
-        unsafe { sys::nv_kernels_gdn_prefill_tc_head_launches_total() }
-    }
-
-    pub fn gdn_scan_tree_compose_floor_workspace_elems(n: i32, h: i32) -> usize {
-        (unsafe { sys::nv_kernels_gdn_scan_tree_compose_floor_workspace_elems(n, h) }) as usize
-    }
-
-    pub unsafe fn gdn_scan_tree_compose_floor(
-        stream: *mut std::ffi::c_void,
-        workspace: *mut f32,
-        workspace_elems: i64,
-        n: i32,
-        h: i32,
-    ) -> i32 {
-        sys::nv_kernels_gdn_scan_tree_compose_floor(stream, workspace, workspace_elems, n, h)
-    }
-
-    pub fn flash_depthgate_knee_tokens() -> usize {
-        (unsafe { sys::nv_kernels_flash_depthgate_knee_tokens() }) as usize
     }
 
     pub fn flash_decode_fp8_splits_pick(nh: i32, window: i32) -> i32 {
@@ -255,15 +247,17 @@ pub mod cuda {
         m_rows: i32,
         k: i32,
     ) -> i32 {
-        sys::nv_kernels_quantize_nvfp4_bf16_rows(
-            stream,
-            x_bf16,
-            packed_out,
-            scales_out_swizzled,
-            stored_global,
-            m_rows,
-            k,
-        )
+        unsafe {
+            sys::nv_kernels_quantize_nvfp4_bf16_rows(
+                stream,
+                x_bf16,
+                packed_out,
+                scales_out_swizzled,
+                stored_global,
+                m_rows,
+                k,
+            )
+        }
     }
 
     #[cfg(all(feature = "rocm", not(feature = "cuda")))]
@@ -276,20 +270,21 @@ pub mod cuda {
         m_rows: i32,
         k: i32,
     ) -> i32 {
-        sys::nv_kernels_quantize_nvfp4_bf16(
-            stream,
-            x_bf16,
-            packed_out,
-            scales_out_swizzled,
-            stored_global,
-            m_rows,
-            m_rows,
-            k,
-        )
+        unsafe {
+            sys::nv_kernels_quantize_nvfp4_bf16(
+                stream,
+                x_bf16,
+                packed_out,
+                scales_out_swizzled,
+                stored_global,
+                m_rows,
+                m_rows,
+                k,
+            )
+        }
     }
 
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn rmsnorm_quantize_nvfp4_bf16(
         stream: *mut c_void,
         x_bf16: *const u16,
@@ -302,18 +297,20 @@ pub mod cuda {
         m_logical: i32,
         k: i32,
     ) -> i32 {
-        sys::nv_kernels_rmsnorm_quantize_nvfp4_bf16(
-            stream,
-            x_bf16,
-            weight_bf16,
-            packed_out,
-            scales_out_swizzled,
-            stored_global,
-            eps,
-            m_padded,
-            m_logical,
-            k,
-        )
+        unsafe {
+            sys::nv_kernels_rmsnorm_quantize_nvfp4_bf16(
+                stream,
+                x_bf16,
+                weight_bf16,
+                packed_out,
+                scales_out_swizzled,
+                stored_global,
+                eps,
+                m_padded,
+                m_logical,
+                k,
+            )
+        }
     }
 
     pub unsafe fn cutlass_moe_grouped_fp4_gemm_sm120_bf16(
@@ -339,91 +336,37 @@ pub mod cuda {
         gemm_workspace: *mut c_void,
         gemm_workspace_bytes: usize,
     ) -> Result<usize, i32> {
-        let mut needed: usize = 0;
-        let rc = sys::nv_kernels_cutlass_moe_grouped_fp4_gemm_sm120_bf16(
-            stream,
-            a_packed,
-            a_scales,
-            b_packed,
-            b_scales,
-            alphas,
-            d_bf16,
-            expert_offsets,
-            sf_offsets,
-            problem_sizes,
-            active_expert_indices,
-            n,
-            k,
-            num_experts,
-            a_row_stride_elems,
-            b_row_stride_elems,
-            c_row_stride_elems,
-            meta_scratch,
-            meta_scratch_bytes,
-            gemm_workspace,
-            gemm_workspace_bytes,
-            &mut needed,
-        );
-        if rc == 0 {
-            Ok(needed)
-        } else {
-            Err(rc)
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn cutlass_moe_grouped_fp4_gemm_sm120_bf16_decode(
-        stream: *mut c_void,
-        a_packed: *const c_void,
-        a_scales: *const c_void,
-        b_packed: *const c_void,
-        b_scales: *const c_void,
-        alphas: *const f32,
-        d_bf16: *mut c_void,
-        expert_offsets: *const i32,
-        sf_offsets: *const i32,
-        problem_sizes: *const i32,
-        active_expert_indices: *const i32,
-        n: i32,
-        k: i32,
-        num_experts: i32,
-        a_row_stride_elems: i64,
-        b_row_stride_elems: i64,
-        c_row_stride_elems: i64,
-        meta_scratch: *mut c_void,
-        meta_scratch_bytes: usize,
-        gemm_workspace: *mut c_void,
-        gemm_workspace_bytes: usize,
-    ) -> Result<usize, i32> {
-        let mut needed: usize = 0;
-        let rc = sys::nv_kernels_cutlass_moe_grouped_fp4_gemm_sm120_bf16_decode(
-            stream,
-            a_packed,
-            a_scales,
-            b_packed,
-            b_scales,
-            alphas,
-            d_bf16,
-            expert_offsets,
-            sf_offsets,
-            problem_sizes,
-            active_expert_indices,
-            n,
-            k,
-            num_experts,
-            a_row_stride_elems,
-            b_row_stride_elems,
-            c_row_stride_elems,
-            meta_scratch,
-            meta_scratch_bytes,
-            gemm_workspace,
-            gemm_workspace_bytes,
-            &mut needed,
-        );
-        if rc == 0 {
-            Ok(needed)
-        } else {
-            Err(rc)
+        unsafe {
+            let mut needed: usize = 0;
+            let rc = sys::nv_kernels_cutlass_moe_grouped_fp4_gemm_sm120_bf16(
+                stream,
+                a_packed,
+                a_scales,
+                b_packed,
+                b_scales,
+                alphas,
+                d_bf16,
+                expert_offsets,
+                sf_offsets,
+                problem_sizes,
+                active_expert_indices,
+                n,
+                k,
+                num_experts,
+                a_row_stride_elems,
+                b_row_stride_elems,
+                c_row_stride_elems,
+                meta_scratch,
+                meta_scratch_bytes,
+                gemm_workspace,
+                gemm_workspace_bytes,
+                &mut needed,
+            );
+            if rc == 0 {
+                Ok(needed)
+            } else {
+                Err(rc)
+            }
         }
     }
 
@@ -441,26 +384,28 @@ pub mod cuda {
         workspace: *mut c_void,
         workspace_bytes: usize,
     ) -> Result<usize, i32> {
-        let mut needed: usize = 0;
-        let rc = sys::nv_kernels_cutlass_fp4_gemm_sm120_bf16(
-            stream,
-            a_fp4,
-            a_sf,
-            b_fp4,
-            b_sf,
-            global_sf,
-            d_bf16,
-            m,
-            n,
-            k,
-            workspace,
-            workspace_bytes,
-            &mut needed,
-        );
-        if rc == 0 {
-            Ok(needed)
-        } else {
-            Err(rc)
+        unsafe {
+            let mut needed: usize = 0;
+            let rc = sys::nv_kernels_cutlass_fp4_gemm_sm120_bf16(
+                stream,
+                a_fp4,
+                a_sf,
+                b_fp4,
+                b_sf,
+                global_sf,
+                d_bf16,
+                m,
+                n,
+                k,
+                workspace,
+                workspace_bytes,
+                &mut needed,
+            );
+            if rc == 0 {
+                Ok(needed)
+            } else {
+                Err(rc)
+            }
         }
     }
 
@@ -478,26 +423,28 @@ pub mod cuda {
         workspace: *mut c_void,
         workspace_bytes: usize,
     ) -> Result<usize, i32> {
-        let mut needed: usize = 0;
-        let rc = sys::nv_kernels_cutlass_fp4_gemm_sm120_bf16_streamk(
-            stream,
-            a_fp4,
-            a_sf,
-            b_fp4,
-            b_sf,
-            global_sf,
-            d_bf16,
-            m,
-            n,
-            k,
-            workspace,
-            workspace_bytes,
-            &mut needed,
-        );
-        if rc == 0 {
-            Ok(needed)
-        } else {
-            Err(rc)
+        unsafe {
+            let mut needed: usize = 0;
+            let rc = sys::nv_kernels_cutlass_fp4_gemm_sm120_bf16_streamk(
+                stream,
+                a_fp4,
+                a_sf,
+                b_fp4,
+                b_sf,
+                global_sf,
+                d_bf16,
+                m,
+                n,
+                k,
+                workspace,
+                workspace_bytes,
+                &mut needed,
+            );
+            if rc == 0 {
+                Ok(needed)
+            } else {
+                Err(rc)
+            }
         }
     }
 
@@ -517,28 +464,30 @@ pub mod cuda {
         workspace: *mut c_void,
         workspace_bytes: usize,
     ) -> Result<usize, i32> {
-        let mut needed: usize = 0;
-        let rc = sys::nv_kernels_cutlass_fp4_gemm_sm120_bf16_tiled(
-            stream,
-            a_fp4,
-            a_sf,
-            b_fp4,
-            b_sf,
-            global_sf,
-            d_bf16,
-            m,
-            n,
-            k,
-            tile,
-            stream_k,
-            workspace,
-            workspace_bytes,
-            &mut needed,
-        );
-        if rc == 0 {
-            Ok(needed)
-        } else {
-            Err(rc)
+        unsafe {
+            let mut needed: usize = 0;
+            let rc = sys::nv_kernels_cutlass_fp4_gemm_sm120_bf16_tiled(
+                stream,
+                a_fp4,
+                a_sf,
+                b_fp4,
+                b_sf,
+                global_sf,
+                d_bf16,
+                m,
+                n,
+                k,
+                tile,
+                stream_k,
+                workspace,
+                workspace_bytes,
+                &mut needed,
+            );
+            if rc == 0 {
+                Ok(needed)
+            } else {
+                Err(rc)
+            }
         }
     }
 
@@ -554,13 +503,15 @@ pub mod cuda {
         n: i32,
         k: i32,
     ) -> Result<(), i32> {
-        let rc = sys::nv_kernels_nvfp4_gemm_sm120_v192_bf16(
-            stream, a_fp4, a_sf, b_fp4, b_sf, global_sf, d_bf16, m, n, k,
-        );
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(rc)
+        unsafe {
+            let rc = sys::nv_kernels_nvfp4_gemm_sm120_v192_bf16(
+                stream, a_fp4, a_sf, b_fp4, b_sf, global_sf, d_bf16, m, n, k,
+            );
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(rc)
+            }
         }
     }
 
@@ -611,7 +562,6 @@ pub mod cuda {
         -1
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn rmsnorm_quantize_nvfp4_bf16(
         _stream: *mut c_void,
         _x_bf16: *const u16,

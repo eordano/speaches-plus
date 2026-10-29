@@ -8,8 +8,8 @@ use nv_layers::{
 };
 use nv_weights::WeightLoader;
 
-use crate::dense::DenseLinear;
-use crate::weight_helpers::load_linear;
+use crate::dense::{DenseLinear, LinearQuant};
+use crate::weight_helpers::{load_linear, load_linear_with_bias};
 use nv_layers::weight_load::load_rmsnorm;
 
 pub const CODEC_PAD_ID: u32 = 2148;
@@ -49,6 +49,8 @@ pub struct Qwen3TtsTalkerConfig {
     pub spk_id: Vec<(String, u32)>,
 
     pub language_id: Vec<(String, u32)>,
+
+    pub quant: LinearQuant,
 }
 
 impl Default for Qwen3TtsTalkerConfig {
@@ -70,6 +72,7 @@ impl Default for Qwen3TtsTalkerConfig {
             dtype: DType::BF16,
             spk_id: Vec::new(),
             language_id: Vec::new(),
+            quant: LinearQuant::Dense,
         }
     }
 }
@@ -161,7 +164,18 @@ impl TextProjection {
     }
 }
 
-struct TalkerLayer {
+#[derive(Clone, Copy)]
+pub(crate) struct LayerShape {
+    pub(crate) hidden: usize,
+    pub(crate) heads: usize,
+    pub(crate) kv_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) inter: usize,
+    pub(crate) eps: f64,
+}
+
+pub(crate) struct DecoderLayer {
+    shape: LayerShape,
     input_norm: RmsNorm,
     q_proj: DenseLinear,
     k_proj: DenseLinear,
@@ -175,76 +189,124 @@ struct TalkerLayer {
     down_proj: DenseLinear,
 }
 
-impl TalkerLayer {
-    fn forward(
+impl DecoderLayer {
+    pub(crate) fn zeros(shape: LayerShape, dtype: DType, device: &Device) -> Result<Self> {
+        let s = shape;
+        let (h, h_q, h_kv) = (s.hidden, s.heads * s.head_dim, s.kv_heads * s.head_dim);
+        let lin = |out: usize, inp: usize| {
+            DenseLinear::new(Tensor::zeros((out, inp), dtype, device)?, None)
+        };
+        let norm = |n: usize| -> Result<RmsNorm> {
+            Ok(RmsNorm::new(Tensor::ones(n, dtype, device)?, s.eps))
+        };
+        Ok(Self {
+            shape,
+            input_norm: norm(h)?,
+            q_proj: lin(h_q, h)?,
+            k_proj: lin(h_kv, h)?,
+            v_proj: lin(h_kv, h)?,
+            o_proj: lin(h, h_q)?,
+            q_norm: norm(s.head_dim)?,
+            k_norm: norm(s.head_dim)?,
+            post_attn_norm: norm(h)?,
+            gate_proj: lin(s.inter, h)?,
+            up_proj: lin(s.inter, h)?,
+            down_proj: lin(h, s.inter)?,
+        })
+    }
+
+    pub(crate) fn load(
+        &mut self,
+        weights: &WeightLoader,
+        p: &str,
+        dtype: DType,
+        quant: &LinearQuant,
+    ) -> Result<()> {
+        let s = self.shape;
+        let (h, h_q, h_kv) = (s.hidden, s.heads * s.head_dim, s.kv_heads * s.head_dim);
+        let lin = |name: &str, out: usize, inp: usize| {
+            load_linear(weights, &format!("{p}.{name}.weight"), out, inp, dtype, quant)
+        };
+        let norm = |name: &str, n: usize| {
+            load_rmsnorm(weights, &format!("{p}.{name}.weight"), n, s.eps, dtype)
+        };
+        self.input_norm = norm("input_layernorm", h)?;
+        self.post_attn_norm = norm("post_attention_layernorm", h)?;
+        self.q_proj = lin("self_attn.q_proj", h_q, h)?;
+        self.k_proj = lin("self_attn.k_proj", h_kv, h)?;
+        self.v_proj = lin("self_attn.v_proj", h_kv, h)?;
+        self.o_proj = lin("self_attn.o_proj", h, h_q)?;
+        self.q_norm = norm("self_attn.q_norm", s.head_dim)?;
+        self.k_norm = norm("self_attn.k_norm", s.head_dim)?;
+        self.gate_proj = lin("mlp.gate_proj", s.inter, h)?;
+        self.up_proj = lin("mlp.up_proj", s.inter, h)?;
+        self.down_proj = lin("mlp.down_proj", h, s.inter)?;
+        Ok(())
+    }
+
+    pub(crate) fn forward(
         &self,
         x: &Tensor,
         positions: &Tensor,
         rope: &Rope,
-        cfg: &Qwen3TtsTalkerConfig,
+        mrope_section: &[usize],
         cache: Option<(&mut Qwen3TtsKvCache, usize)>,
     ) -> Result<Tensor> {
+        let s = self.shape;
         let dims = x.dims().to_vec();
         if dims.len() != 3 {
-            anyhow::bail!("TalkerLayer.forward: expected [B,T,H], got {:?}", dims);
+            anyhow::bail!("DecoderLayer.forward: expected [B,T,H], got {:?}", dims);
         }
-        let (b, t, _h) = (dims[0], dims[1], dims[2]);
-        let h_q = cfg.num_attention_heads * cfg.head_dim;
-        let h_kv = cfg.num_key_value_heads * cfg.head_dim;
+        let (b, t) = (dims[0], dims[1]);
 
         let normed = self.input_norm.forward(x)?;
         let q = self.q_proj.forward(&normed)?;
         let k = self.k_proj.forward(&normed)?;
         let v = self.v_proj.forward(&normed)?;
-
-        let q = q.reshape((b, t, cfg.num_attention_heads, cfg.head_dim))?;
-        let k = k.reshape((b, t, cfg.num_key_value_heads, cfg.head_dim))?;
-        let v = v.reshape((b, t, cfg.num_key_value_heads, cfg.head_dim))?;
+        let q = q.reshape((b, t, s.heads, s.head_dim))?;
+        let k = k.reshape((b, t, s.kv_heads, s.head_dim))?;
+        let v = v.reshape((b, t, s.kv_heads, s.head_dim))?;
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
-        let (q_rot, k_rot) = rope.apply_mrope(
-            &q,
-            &k,
-            &[positions, positions, positions],
-            &cfg.mrope_section,
-        )?;
+        if mrope_section.iter().sum::<usize>() != s.head_dim / 2 {
+            anyhow::bail!(
+                "DecoderLayer.forward: mrope_section sum != head_dim/2 ({:?})",
+                mrope_section
+            );
+        }
+        let pos_axes: Vec<&Tensor> = vec![positions; mrope_section.len()];
+        let (q_rot, k_rot) = rope.apply_mrope(&q, &k, &pos_axes, mrope_section)?;
 
         let (k_full, v_full) = if let Some((cache_ref, layer_idx)) = cache {
             let write_start = cache_ref.current_len();
-            let new_total = write_start + t;
             cache_ref.write_at(
                 layer_idx,
                 write_start,
                 &k_rot.contiguous()?,
                 &v.contiguous()?,
             )?;
-            cache_ref.view(layer_idx, new_total)?
+            cache_ref.view(layer_idx, write_start + t)?
         } else {
             (k_rot.contiguous()?, v.contiguous()?)
         };
 
         let attn_cfg = AttnConfig {
-            num_heads: cfg.num_attention_heads,
-            num_kv_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-            softmax_scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+            num_heads: s.heads,
+            num_kv_heads: s.kv_heads,
+            head_dim: s.head_dim,
+            softmax_scale: 1.0 / (s.head_dim as f32).sqrt(),
             causal: true,
         };
         let attn_out = sdpa(&q_rot, &k_full, &v_full, &attn_cfg)?;
-
-        let attn_out = attn_out.reshape((b, t, h_q))?;
-        let _ = h_kv;
-        let attn_out = self.o_proj.forward(&attn_out)?;
-
-        let x = x.add(&attn_out)?;
+        let attn_out = attn_out.reshape((b, t, s.heads * s.head_dim))?;
+        let x = x.add(&self.o_proj.forward(&attn_out)?)?;
 
         let normed = self.post_attn_norm.forward(&x)?;
         let gate = self.gate_proj.forward(&normed)?;
         let up = self.up_proj.forward(&normed)?;
         let act = candle_nn::ops::silu(&gate)?.mul(&up)?;
-        let mlp_out = self.down_proj.forward(&act)?;
-        Ok(x.add(&mlp_out)?)
+        Ok(x.add(&self.down_proj.forward(&act)?)?)
     }
 }
 
@@ -260,21 +322,39 @@ pub struct Qwen3TtsKvCache {
 
 impl Qwen3TtsKvCache {
     pub fn new(cfg: &Qwen3TtsTalkerConfig, max_seq_len: usize, device: &Device) -> Result<Self> {
-        let shape = (1usize, max_seq_len, cfg.num_key_value_heads, cfg.head_dim);
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for _ in 0..cfg.num_hidden_layers {
-            let k = Tensor::zeros(shape, cfg.dtype, device)?;
-            let v = Tensor::zeros(shape, cfg.dtype, device)?;
+        Self::for_layers(
+            cfg.num_hidden_layers,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.dtype,
+            max_seq_len,
+            device,
+        )
+    }
+
+    pub(crate) fn for_layers(
+        num_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        dtype: DType,
+        max_seq_len: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let shape = (1usize, max_seq_len, n_kv_heads, head_dim);
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            let k = Tensor::zeros(shape, dtype, device)?;
+            let v = Tensor::zeros(shape, dtype, device)?;
             layers.push((k, v));
         }
         Ok(Self {
             layers,
             current_len: 0,
             max_seq_len,
-            n_kv_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
+            n_kv_heads,
+            head_dim,
             device: device.clone(),
-            dtype: cfg.dtype,
+            dtype,
         })
     }
 
@@ -364,7 +444,7 @@ impl Qwen3TtsKvCache {
         Ok((k, v))
     }
 
-    fn advance(&mut self, n: usize) {
+    pub(crate) fn advance(&mut self, n: usize) {
         self.current_len += n;
     }
 }
@@ -375,7 +455,7 @@ pub struct Qwen3TtsTalker {
     text_embedding: Option<Tensor>,
     text_projection: TextProjection,
     codec_embedding: Tensor,
-    layers: Vec<TalkerLayer>,
+    layers: Vec<DecoderLayer>,
     final_norm: RmsNorm,
     codec_head: DenseLinear,
     rope: Rope,
@@ -394,9 +474,6 @@ impl Qwen3TtsTalker {
         let dtype = cfg.dtype;
         let h = cfg.hidden_size;
         let th = cfg.text_hidden_size;
-        let inter = cfg.intermediate_size;
-        let h_q = cfg.num_attention_heads * cfg.head_dim;
-        let h_kv = cfg.num_key_value_heads * cfg.head_dim;
 
         let zeros_2d = |out: usize, inp: usize| -> Result<Tensor> {
             Ok(Tensor::zeros((out, inp), dtype, device)?)
@@ -412,22 +489,17 @@ impl Qwen3TtsTalker {
 
         let codec_embedding = Tensor::zeros((cfg.speech_vocab_size, h), dtype, device)?;
 
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for _ in 0..cfg.num_hidden_layers {
-            layers.push(TalkerLayer {
-                input_norm: RmsNorm::new(ones_1d(h)?, cfg.rms_norm_eps),
-                q_proj: DenseLinear::new(zeros_2d(h_q, h)?, None)?,
-                k_proj: DenseLinear::new(zeros_2d(h_kv, h)?, None)?,
-                v_proj: DenseLinear::new(zeros_2d(h_kv, h)?, None)?,
-                o_proj: DenseLinear::new(zeros_2d(h, h_q)?, None)?,
-                q_norm: RmsNorm::new(ones_1d(cfg.head_dim)?, cfg.rms_norm_eps),
-                k_norm: RmsNorm::new(ones_1d(cfg.head_dim)?, cfg.rms_norm_eps),
-                post_attn_norm: RmsNorm::new(ones_1d(h)?, cfg.rms_norm_eps),
-                gate_proj: DenseLinear::new(zeros_2d(inter, h)?, None)?,
-                up_proj: DenseLinear::new(zeros_2d(inter, h)?, None)?,
-                down_proj: DenseLinear::new(zeros_2d(h, inter)?, None)?,
-            });
-        }
+        let shape = LayerShape {
+            hidden: h,
+            heads: cfg.num_attention_heads,
+            kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            inter: cfg.intermediate_size,
+            eps: cfg.rms_norm_eps,
+        };
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|_| DecoderLayer::zeros(shape, dtype, device))
+            .collect::<Result<Vec<_>>>()?;
 
         let final_norm = RmsNorm::new(ones_1d(h)?, cfg.rms_norm_eps);
         let codec_head = DenseLinear::new(zeros_2d(cfg.speech_vocab_size, h)?, None)?;
@@ -457,6 +529,7 @@ impl Qwen3TtsTalker {
 
     pub fn load_weights(&mut self, weights: &WeightLoader) -> Result<()> {
         let dtype = self.cfg.dtype;
+        let quant = self.cfg.quant.clone();
         let prefix = "talker";
 
         self.text_projection.fc1 = load_linear_with_bias(
@@ -489,84 +562,9 @@ impl Qwen3TtsTalker {
         }
 
         let h = self.cfg.hidden_size;
-        let h_q = self.cfg.num_attention_heads * self.cfg.head_dim;
-        let h_kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
-        let inter = self.cfg.intermediate_size;
         let eps = self.cfg.rms_norm_eps;
-        for i in 0..self.cfg.num_hidden_layers {
-            let p = format!("{prefix}.model.layers.{i}");
-            let l = &mut self.layers[i];
-            l.input_norm = load_rmsnorm(
-                weights,
-                &format!("{p}.input_layernorm.weight"),
-                h,
-                eps,
-                dtype,
-            )?;
-            l.post_attn_norm = load_rmsnorm(
-                weights,
-                &format!("{p}.post_attention_layernorm.weight"),
-                h,
-                eps,
-                dtype,
-            )?;
-            l.q_proj = load_linear(
-                weights,
-                &format!("{p}.self_attn.q_proj.weight"),
-                h_q,
-                h,
-                dtype,
-            )?;
-            l.k_proj = load_linear(
-                weights,
-                &format!("{p}.self_attn.k_proj.weight"),
-                h_kv,
-                h,
-                dtype,
-            )?;
-            l.v_proj = load_linear(
-                weights,
-                &format!("{p}.self_attn.v_proj.weight"),
-                h_kv,
-                h,
-                dtype,
-            )?;
-            l.o_proj = load_linear(
-                weights,
-                &format!("{p}.self_attn.o_proj.weight"),
-                h,
-                h_q,
-                dtype,
-            )?;
-            l.q_norm = load_rmsnorm(
-                weights,
-                &format!("{p}.self_attn.q_norm.weight"),
-                self.cfg.head_dim,
-                eps,
-                dtype,
-            )?;
-            l.k_norm = load_rmsnorm(
-                weights,
-                &format!("{p}.self_attn.k_norm.weight"),
-                self.cfg.head_dim,
-                eps,
-                dtype,
-            )?;
-            l.gate_proj = load_linear(
-                weights,
-                &format!("{p}.mlp.gate_proj.weight"),
-                inter,
-                h,
-                dtype,
-            )?;
-            l.up_proj = load_linear(weights, &format!("{p}.mlp.up_proj.weight"), inter, h, dtype)?;
-            l.down_proj = load_linear(
-                weights,
-                &format!("{p}.mlp.down_proj.weight"),
-                h,
-                inter,
-                dtype,
-            )?;
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            l.load(weights, &format!("{prefix}.model.layers.{i}"), dtype, &quant)?;
         }
         self.final_norm = load_rmsnorm(
             weights,
@@ -581,6 +579,7 @@ impl Qwen3TtsTalker {
             self.cfg.speech_vocab_size,
             h,
             dtype,
+            &LinearQuant::Dense,
         )?;
 
         let te_name = format!("{prefix}.model.text_embedding.weight");
@@ -655,7 +654,7 @@ impl Qwen3TtsTalker {
 
         let mut x = residual.clone();
         for layer in &self.layers {
-            x = layer.forward(&x, &positions, &self.rope, &self.cfg, None)?;
+            x = layer.forward(&x, &positions, &self.rope, &self.cfg.mrope_section, None)?;
         }
         let x = self.final_norm.forward(&x)?;
 
@@ -727,33 +726,6 @@ impl Qwen3TtsTalker {
         let residual = self.build_residual(text_hidden, prev_speech)?;
         let logits = self.forward_last_logits(&residual)?;
         argmax_u32(&logits)
-    }
-
-    pub fn step_with_hidden(
-        &self,
-        text_hidden: &Tensor,
-        prev_speech: &[u32],
-    ) -> Result<(u32, Tensor)> {
-        let residual = self.build_residual(text_hidden, prev_speech)?;
-        let (logits, hidden) = self.forward_last_logits_and_hidden(&residual)?;
-        let tok = argmax_u32(&logits)?;
-        Ok((tok, hidden))
-    }
-
-    pub fn step_full_frame(
-        &self,
-        text_hidden: &Tensor,
-        prev_speech: &[u32],
-        code_predictor: &crate::code_predictor::Qwen3TtsCodecDecoder,
-        prev_extras: &[[u32; crate::code_predictor::NUM_EXTRA_CODEBOOKS]],
-    ) -> Result<(u32, [u32; crate::code_predictor::NUM_EXTRA_CODEBOOKS])> {
-        self.step_full_frame_with_speaker(
-            text_hidden,
-            None,
-            prev_speech,
-            code_predictor,
-            prev_extras,
-        )
     }
 
     pub fn step_full_frame_with_speaker(
@@ -845,7 +817,13 @@ impl Qwen3TtsTalker {
 
         let mut x = residual.clone();
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x, &positions, &self.rope, &self.cfg, Some((cache, i)))?;
+            x = layer.forward(
+                &x,
+                &positions,
+                &self.rope,
+                &self.cfg.mrope_section,
+                Some((cache, i)),
+            )?;
         }
         cache.advance(t);
 
@@ -959,9 +937,9 @@ impl Qwen3TtsTalker {
         self.embed_codec(ids)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn build_nonstreaming_prefill(
         &self,
+        instruct_ids: &[u32],
         role_ids: &[u32],
         body_ids: &[u32],
         speaker_embed: Option<&Tensor>,
@@ -1013,39 +991,13 @@ impl Qwen3TtsTalker {
 
         let last = tts_pad.add(&self.embed_codec(&[CODEC_BOS_ID])?)?;
 
-        let prefill = Tensor::cat(&[&role, &aligned, &text_block, &last], 1)?;
-        Ok((prefill, tts_pad))
+        let mut parts = vec![role, aligned, text_block, last];
+        if !instruct_ids.is_empty() {
+            parts.insert(0, self.project_text_ids(instruct_ids)?);
+        }
+        Ok((Tensor::cat(&parts, 1)?, tts_pad))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_frames_sampled(
-        &self,
-        prefill: &Tensor,
-        tts_pad_embed: &Tensor,
-        code_predictor: &crate::code_predictor::Qwen3TtsCodecDecoder,
-        max_steps: usize,
-        min_steps: usize,
-        talker_sampler: &mut crate::sampling::Sampler,
-        sub_sampler: &mut crate::sampling::Sampler,
-    ) -> Result<Vec<[u32; nv_omni::vocoder::NUM_CODEBOOKS]>> {
-        let mut frames: Vec<[u32; nv_omni::vocoder::NUM_CODEBOOKS]> = Vec::with_capacity(max_steps);
-        self.generate_frames_streaming(
-            prefill,
-            tts_pad_embed,
-            code_predictor,
-            max_steps,
-            min_steps,
-            talker_sampler,
-            sub_sampler,
-            &mut |frame| {
-                frames.push(frame);
-                Ok(true)
-            },
-        )?;
-        Ok(frames)
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub fn generate_frames_streaming(
         &self,
         prefill: &Tensor,
@@ -1107,32 +1059,6 @@ impl Qwen3TtsTalker {
     }
 }
 
-fn load_linear_with_bias(
-    weights: &WeightLoader,
-    prefix: &str,
-    out_features: usize,
-    in_features: usize,
-    dtype: DType,
-) -> Result<DenseLinear> {
-    let wname = format!("{prefix}.weight");
-    let w = weights
-        .get(&wname, dtype)
-        .with_context(|| format!("load {wname}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != out_features || d[1] != in_features {
-        anyhow::bail!("linear {wname}: expected [{out_features}, {in_features}], got {d:?}");
-    }
-    let bname = format!("{prefix}.bias");
-    let b = weights
-        .get(&bname, dtype)
-        .with_context(|| format!("load {bname}"))?;
-    let bd = b.dims();
-    if bd.len() != 1 || bd[0] != out_features {
-        anyhow::bail!("linear bias {bname}: expected [{out_features}], got {bd:?}");
-    }
-    DenseLinear::new(w, Some(b))
-}
-
 fn argmax_u32(logits: &Tensor) -> Result<u32> {
     let d = logits.dims();
     if d.len() != 2 {
@@ -1185,27 +1111,21 @@ mod tests {
             dtype: DType::F32,
             spk_id: Vec::new(),
             language_id: Vec::new(),
+            quant: LinearQuant::Dense,
         }
     }
 
     #[test]
-    fn builds_on_cpu_with_zero_weights() {
-        let dev = cpu();
-        let cfg = tiny_cfg();
-        let t = Qwen3TtsTalker::new(cfg.clone(), &dev).expect("build");
-        assert_eq!(t.cfg.num_hidden_layers, cfg.num_hidden_layers);
-        assert_eq!(
-            t.codec_embedding.dims(),
-            &[cfg.speech_vocab_size, cfg.hidden_size]
-        );
-        assert_eq!(t.layers.len(), cfg.num_hidden_layers);
-    }
-
-    #[test]
-    fn step_produces_valid_token_id() {
+    fn a_zero_weight_talker_builds_and_steps_to_token_zero_with_or_without_a_prefix() {
         let dev = cpu();
         let cfg = tiny_cfg();
         let talker = Qwen3TtsTalker::new(cfg.clone(), &dev).expect("build");
+        assert_eq!(talker.cfg.num_hidden_layers, cfg.num_hidden_layers);
+        assert_eq!(
+            talker.codec_embedding.dims(),
+            &[cfg.speech_vocab_size, cfg.hidden_size]
+        );
+        assert_eq!(talker.layers.len(), cfg.num_hidden_layers);
 
         let text_hidden =
             Tensor::ones((1usize, 4, cfg.text_hidden_size), DType::F32, &dev).unwrap();
@@ -1219,18 +1139,45 @@ mod tests {
             tok, 0,
             "zero-weight talker should return argmax-of-zeros = 0"
         );
+        let tok = talker.step(&text_hidden, &[1u32, 2, 3]).expect("step w/prefix");
+        assert!((tok as usize) < cfg.speech_vocab_size);
     }
 
     #[test]
-    fn step_handles_prev_speech_prefix() {
+    fn a_voice_design_instruction_is_a_projected_text_prefix_ahead_of_the_unchanged_prefill() {
         let dev = cpu();
-        let cfg = tiny_cfg();
-        let talker = Qwen3TtsTalker::new(cfg.clone(), &dev).expect("build");
-        let text_hidden =
-            Tensor::ones((1usize, 2, cfg.text_hidden_size), DType::F32, &dev).unwrap();
-        let prev = vec![1u32, 2, 3];
-        let tok = talker.step(&text_hidden, &prev).expect("step w/prefix");
-        assert!((tok as usize) < cfg.speech_vocab_size);
+        let cfg = Qwen3TtsTalkerConfig {
+            speech_vocab_size: 2160,
+            ..tiny_cfg()
+        };
+        let mut talker = Qwen3TtsTalker::new(cfg.clone(), &dev).expect("build");
+        talker.text_embedding = Some(
+            Tensor::randn(0f32, 1.0, (cfg.text_vocab_size, cfg.text_hidden_size), &dev).unwrap(),
+        );
+        talker.codec_embedding =
+            Tensor::randn(0f32, 1.0, (cfg.speech_vocab_size, cfg.hidden_size), &dev).unwrap();
+        let (th, h) = (cfg.text_hidden_size, cfg.hidden_size);
+        let randn = |r: usize, c: usize| Tensor::randn(0f32, 1.0, (r, c), &dev).unwrap();
+        talker.text_projection = TextProjection {
+            fc1: DenseLinear::new(randn(th, th), None).unwrap(),
+            fc2: DenseLinear::new(randn(h, th), None).unwrap(),
+        };
+        let prefill = |instruct: &[u32]| {
+            talker
+                .build_nonstreaming_prefill(instruct, &[1, 2, 3], &[4, 5], None, None, 6, 7, 8)
+                .expect("prefill")
+                .0
+        };
+        let plain = prefill(&[]);
+        let designed = prefill(&[9, 10, 11, 12]);
+        let n = plain.dims()[1];
+        assert_eq!(designed.dims()[1], n + 4);
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(flat(&designed.narrow(1, 4, n).unwrap()), flat(&plain));
+        assert_eq!(
+            flat(&designed.narrow(1, 0, 4).unwrap()),
+            flat(&talker.project_text_ids(&[9, 10, 11, 12]).unwrap())
+        );
     }
 
     #[test]

@@ -145,10 +145,6 @@ fn parse_args() -> Result<Args> {
 }
 
 fn main() -> Result<()> {
-    if std::env::var_os("NV_OCR_BSN").is_none() {
-        std::env::set_var("NV_OCR_BSN", "0");
-        eprintln!("[ocr-batch-bench] pinning NV_OCR_BSN=0: this tool sweeps the legacy scheduler's slots/prep_threads, which the bs=N engine ignores; set NV_OCR_BSN=1 to override");
-    }
     let args = parse_args()?;
     let prompt = if args.markdown {
         PROMPT_GROUNDING_MARKDOWN
@@ -536,7 +532,6 @@ fn main() -> Result<()> {
                 slots: 1,
                 prep_threads: 1,
                 queue_depth: 4,
-                loop_retry: true,
             },
         );
         for (_, bytes) in &images {

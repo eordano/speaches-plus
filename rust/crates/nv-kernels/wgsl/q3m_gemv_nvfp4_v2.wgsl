@@ -45,6 +45,7 @@ fn q34_pk_word(lo_acc: f32, hi_acc: f32, row: u32, a: f32) -> u32 {
 
 @compute @workgroup_size(NV2_WG)
 fn q3w_gemv_nvfp4_fmlut(
+    #def b2
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
@@ -74,6 +75,7 @@ fn q3w_gemv_nvfp4_fmlut(
 
     for (var p = lane; p < pairs; p = p + NV2_LANES) {
         let xv = q34_x4[x4base + p];
+    #end
         let b0 = p << 1u;
         let xsi = xsfbase + b0;
         let xsw = q34_xs[xsi >> 2u];
@@ -95,6 +97,7 @@ fn q3w_gemv_nvfp4_fmlut(
             let d1 = nv2_mdot8(wv.w, xe3, xo3, nv2_mdot8(wv.z, xe2, xo2, 0.0));
             acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi)), d0, acc[m]);
             acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi + 1u)), d1, acc[m]);
+        #def b4
         }
     }
 
@@ -113,6 +116,7 @@ fn q3w_gemv_nvfp4_fmlut(
         }
     }
 }
+        #end
 
 fn q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
     wv: vec4<u32>,
@@ -131,35 +135,8 @@ fn q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
 
 @compute @workgroup_size(NV2_WG)
 fn q3w_gemv_nvfp4_mrow(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let slot = wid.z;
-    let e = q34_sel[slot];
-    let row0 = (wid.x + wid.y * q34_p.groups_x) * (NV2_SGS * NV2_MR) + sgid * NV2_MR;
-    let pairs = q34_p.k_blocks >> 1u;
-    let stride = q34_p.k_blocks >> 1u;
-    let webase = e * (q34_p.w_e_stride_vec2 >> 1u);
-    let sfbase = e * q34_p.sf_e_stride_bytes;
-    let x4base = slot * (q34_p.x_slot_stride_vec2 >> 1u);
-    let xsfbase = slot * q34_p.xsf_slot_stride_bytes;
-
-    var live: array<u32, NV2_MR>;
-    var wbase: array<u32, NV2_MR>;
-    var srow: array<u32, NV2_MR>;
-    var acc: array<f32, NV2_MR>;
-    for (var m = 0u; m < NV2_MR; m = m + 1u) {
-        let r = row0 + m;
-        let ok = r < q34_p.n_rows;
-        live[m] = select(0u, 1u, ok);
-        wbase[m] = select(0u, webase + r * stride, ok);
-        srow[m] = select(0u, r, ok);
-        acc[m] = 0.0;
-    }
-
-    for (var p = lane; p < pairs; p = p + NV2_LANES) {
-        let xv = q34_x4[x4base + p];
+    #use b2
+        #def b3
         let xm0 = nv2_i8map(xv.x);
         let xm1 = nv2_i8map(xv.x >> 4u);
         let xm2 = nv2_i8map(xv.y);
@@ -173,6 +150,7 @@ fn q3w_gemv_nvfp4_mrow(
         let xsw = q34_xs[xsi >> 2u];
         let xs0 = nv2_ue4m3(byte_at(xsw, xsi));
         let xs1 = nv2_ue4m3(byte_at(xsw, xsi + 1u));
+        #end
         for (var m = 0u; m < NV2_MR; m = m + 1u) {
             let wv = q34_w4[wbase[m] + p];
             let wsi = sfbase + nvfp4_scale_byte_index(srow[m], b0, q34_p.k_tiles);
@@ -183,24 +161,7 @@ fn q3w_gemv_nvfp4_mrow(
             let d1 = dd.y;
             acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi)) * xs0, f32(d0) * 0.25, acc[m]);
             acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi + 1u)) * xs1, f32(d1) * 0.25, acc[m]);
-        }
-    }
-
-    var tot: array<f32, NV2_MR>;
-    for (var m = 0u; m < NV2_MR; m = m + 1u) {
-        tot[m] = nv2_bfly(acc[m]);
-    }
-    if (lane == 0u) {
-        let a = q34_alpha(e);
-        let ybase = slot * q34_p.y_slot_stride_words;
-        for (var m = 0u; m < NV2_MR; m = m + 2u) {
-            if (live[m] == 1u) {
-                q34_y[ybase + ((row0 + m) >> 1u)] =
-                    q34_pk_word(tot[m], tot[m + 1u], row0 + m, a);
-            }
-        }
-    }
-}
+        #use b4
 
 @compute @workgroup_size(NV2_WG)
 fn q3w_gemv_nvfp4_mrow2(
@@ -211,6 +172,7 @@ fn q3w_gemv_nvfp4_mrow2(
     let slot = wid.z;
     let e = q34_sel[slot];
     let row0 = (wid.x + wid.y * q34_p.groups_x) * (NV2_SGS * 2u) + sgid * 2u;
+    #def b1
     let row1 = row0 + 1u;
     let pairs = q34_p.k_blocks >> 1u;
     let stride = q34_p.k_blocks >> 1u;
@@ -229,19 +191,8 @@ fn q3w_gemv_nvfp4_mrow2(
     var acc1 = 0.0;
     for (var p = lane; p < pairs; p = p + NV2_LANES) {
         let xv = q34_x4[x4base + p];
-        let xm0 = nv2_i8map(xv.x);
-        let xm1 = nv2_i8map(xv.x >> 4u);
-        let xm2 = nv2_i8map(xv.y);
-        let xm3 = nv2_i8map(xv.y >> 4u);
-        let xm4 = nv2_i8map(xv.z);
-        let xm5 = nv2_i8map(xv.z >> 4u);
-        let xm6 = nv2_i8map(xv.w);
-        let xm7 = nv2_i8map(xv.w >> 4u);
-        let b0 = p << 1u;
-        let xsi = xsfbase + b0;
-        let xsw = q34_xs[xsi >> 2u];
-        let xs0 = nv2_ue4m3(byte_at(xsw, xsi));
-        let xs1 = nv2_ue4m3(byte_at(xsw, xsi + 1u));
+        #use b3
+    #end
 
         let wv0 = q34_w4[wb0 + p];
         let wsi0 = sfbase + nvfp4_scale_byte_index(sr0, b0, q34_p.k_tiles);
@@ -256,6 +207,7 @@ fn q3w_gemv_nvfp4_mrow2(
         let wv1 = q34_w4[wb1 + p];
         let wsi1 = sfbase + nvfp4_scale_byte_index(sr1, b0, q34_p.k_tiles);
         let wsw1 = q34_ws[wsi1 >> 2u];
+        #def b5
         let dd_wv1 = q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
             wv1, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
         let b0d = dd_wv1.x;
@@ -267,6 +219,7 @@ fn q3w_gemv_nvfp4_mrow2(
     let t0 = nv2_bfly(acc0);
     let t1 = nv2_bfly(acc1);
     if (lane == 0u && live0) {
+        #end
         q34_y[slot * q34_p.y_slot_stride_words + (row0 >> 1u)] =
             q34_pk_word(t0, t1, row0, q34_alpha(e));
     }
@@ -286,37 +239,7 @@ fn q3w_gemv_nvfp4_mrow2_2w(
     let e = q34_sel[slot];
     let second = wid.y == 1u;
     let row0 = wid.x * (NV2_SGS * 2u) + sgid * 2u;
-    let row1 = row0 + 1u;
-    let pairs = q34_p.k_blocks >> 1u;
-    let stride = q34_p.k_blocks >> 1u;
-    let webase = e * (q34_p.w_e_stride_vec2 >> 1u);
-    let sfbase = e * q34_p.sf_e_stride_bytes;
-    let x4base = slot * (q34_p.x_slot_stride_vec2 >> 1u);
-    let xsfbase = slot * q34_p.xsf_slot_stride_bytes;
-    let live0 = row0 < q34_p.n_rows;
-    let live1 = row1 < q34_p.n_rows;
-    let wb0 = select(0u, webase + row0 * stride, live0);
-    let wb1 = select(0u, webase + row1 * stride, live1);
-    let sr0 = select(0u, row0, live0);
-    let sr1 = select(0u, row1, live1);
-
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    for (var p = lane; p < pairs; p = p + NV2_LANES) {
-        let xv = q34_x4[x4base + p];
-        let xm0 = nv2_i8map(xv.x);
-        let xm1 = nv2_i8map(xv.x >> 4u);
-        let xm2 = nv2_i8map(xv.y);
-        let xm3 = nv2_i8map(xv.y >> 4u);
-        let xm4 = nv2_i8map(xv.z);
-        let xm5 = nv2_i8map(xv.z >> 4u);
-        let xm6 = nv2_i8map(xv.w);
-        let xm7 = nv2_i8map(xv.w >> 4u);
-        let b0 = p << 1u;
-        let xsi = xsfbase + b0;
-        let xsw = q34_xs[xsi >> 2u];
-        let xs0 = nv2_ue4m3(byte_at(xsw, xsi));
-        let xs1 = nv2_ue4m3(byte_at(xsw, xsi + 1u));
+    #use b1
 
         var wv0: vec4<u32>;
         var wsw0: u32;
@@ -342,17 +265,7 @@ fn q3w_gemv_nvfp4_mrow2_2w(
         acc0 = fma(nv2_ue4m3(byte_at(wsw0, wsi0)) * xs0, f32(a0) * 0.25, acc0);
         acc0 = fma(nv2_ue4m3(byte_at(wsw0, wsi0 + 1u)) * xs1, f32(a1) * 0.25, acc0);
 
-        let dd_wv1 = q34_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
-            wv1, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
-        let b0d = dd_wv1.x;
-        let b1d = dd_wv1.y;
-        acc1 = fma(nv2_ue4m3(byte_at(wsw1, wsi1)) * xs0, f32(b0d) * 0.25, acc1);
-        acc1 = fma(nv2_ue4m3(byte_at(wsw1, wsi1 + 1u)) * xs1, f32(b1d) * 0.25, acc1);
-    }
-
-    let t0 = nv2_bfly(acc0);
-    let t1 = nv2_bfly(acc1);
-    if (lane == 0u && live0) {
+        #use b5
         let yi = slot * q34_p.y_slot_stride_words + (row0 >> 1u);
         let pk = q34_pk_word(t0, t1, row0, q34_alphas[u32(second)]);
         if (second) {
@@ -397,6 +310,7 @@ fn q3w_gemv_nvfp4_fdec(
             nv2_fblock(wc.x, wc.y, xc.x, xc.y), acc);
         acc = fma(nv2_ue4m3(byte_at(wsw, wsi + 3u)) * nv2_ue4m3(byte_at(xsw, 3u)),
             nv2_fblock(wc.z, wc.w, xc.z, xc.w), acc);
+    #def b6
     }
 
     let total = nv2_bfly(acc);
@@ -412,6 +326,7 @@ fn q3w_gemv_nvfp4_fdec(
         q34_y[slot * q34_p.y_slot_stride_words + (row >> 1u)] = word;
     }
 }
+    #end
 
 const Q34_SLOTSHARED_MAX_SLOTS: u32 = 16u;
 
@@ -516,18 +431,4 @@ fn q3w_gemv_nvfp4_warp(
         let wv = q34_w2[wb + kb];
         let xv = q34_x2[x2base + kb];
         acc = fma(bs, nv2_iblock(wv.x, wv.y, xv.x, xv.y), acc);
-    }
-
-    let total = nv2_bfly(acc);
-    if (lane == 0u) {
-        q34_pk_bits[sgid] = bf16_encode(total * q34_alpha(e)) & 0xffffu;
-    }
-    workgroupBarrier();
-    if ((sgid & 1u) == 0u && lane == 0u && live) {
-        var word = q34_pk_bits[sgid];
-        if (row + 1u < q34_p.n_rows) {
-            word = word | (q34_pk_bits[sgid + 1u] << 16u);
-        }
-        q34_y[slot * q34_p.y_slot_stride_words + (row >> 1u)] = word;
-    }
-}
+    #use b6

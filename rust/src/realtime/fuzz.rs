@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
@@ -226,30 +225,26 @@ mod tests {
     use std::thread;
 
     #[test]
-    fn fuzzer_5000_steps_seed_0() {
+    fn fuzzer_holds_invariants_across_seeds_with_a_repeatable_lcg() {
         run_random_walk(0, 5000).expect("invariant violation");
-    }
-
-    #[test]
-    fn fuzzer_seed_diversity() {
-        for seed in [1, 7, 42, 99, 2024] {
-            run_random_walk(seed, 1000).unwrap_or_else(|(i, op, v)| {
-                panic!("seed={seed} step={i} op={op:?}: {v}");
-            });
+        {
+            for seed in [1, 7, 42, 99, 2024] {
+                run_random_walk(seed, 1000).unwrap_or_else(|(i, op, v)| {
+                    panic!("seed={seed} step={i} op={op:?}: {v}");
+                });
+            }
+        }
+        {
+            let mut a = Lcg::new(42);
+            let mut b = Lcg::new(42);
+            for _ in 0..100 {
+                assert_eq!(a.next(), b.next());
+            }
         }
     }
 
     #[test]
-    fn lcg_repeatable_for_same_seed() {
-        let mut a = Lcg::new(42);
-        let mut b = Lcg::new(42);
-        for _ in 0..100 {
-            assert_eq!(a.next(), b.next());
-        }
-    }
-
-    #[test]
-    fn concurrent_invariants_hold_8_workers_5000_ops() {
+    fn concurrent_invariants_hold_across_workers_seeds_and_isolated_sessions() {
         let state = std::sync::Arc::new(StdMutex::new(SessionState::default()));
         let workers = 8_u64;
         let ops_per_worker = 5_000_u64;
@@ -278,41 +273,62 @@ mod tests {
         for h in handles {
             h.join().expect("worker thread panicked");
         }
-    }
-
-    #[test]
-    fn concurrent_invariants_hold_multi_seed() {
-        let mut seed_threads = Vec::new();
-        for seed in [1_u64, 7, 42, 99, 2024, 31_337] {
-            seed_threads.push(thread::spawn(move || {
-                let state = std::sync::Arc::new(StdMutex::new(SessionState::default()));
-                let mut workers = Vec::new();
-                for w in 0..6_u64 {
-                    let s = std::sync::Arc::clone(&state);
-                    let worker_seed = seed.wrapping_mul(0x100000001b3).wrapping_add(w);
-                    workers.push(thread::spawn(move || {
-                        let mut rng = Lcg::new(worker_seed);
-                        for i in 0..1_500_u64 {
-                            let op = *rng.pick(ALL_OPS);
-                            let mut g = s.lock().expect("state mutex poisoned");
-                            let idx = w.wrapping_mul(1_000_000).wrapping_add(i);
-                            apply(op, &mut g, idx);
-                            if let Err(v) = check_state(&g) {
-                                panic!(
-                                    "invariant violation: seed={seed} worker={w} \
-                                     step={i} op={op:?} v={v:?}",
-                                );
+        {
+            let mut seed_threads = Vec::new();
+            for seed in [1_u64, 7, 42, 99, 2024, 31_337] {
+                seed_threads.push(thread::spawn(move || {
+                    let state = std::sync::Arc::new(StdMutex::new(SessionState::default()));
+                    let mut workers = Vec::new();
+                    for w in 0..6_u64 {
+                        let s = std::sync::Arc::clone(&state);
+                        let worker_seed = seed.wrapping_mul(0x100000001b3).wrapping_add(w);
+                        workers.push(thread::spawn(move || {
+                            let mut rng = Lcg::new(worker_seed);
+                            for i in 0..1_500_u64 {
+                                let op = *rng.pick(ALL_OPS);
+                                let mut g = s.lock().expect("state mutex poisoned");
+                                let idx = w.wrapping_mul(1_000_000).wrapping_add(i);
+                                apply(op, &mut g, idx);
+                                if let Err(v) = check_state(&g) {
+                                    panic!(
+                                        "invariant violation: seed={seed} worker={w} \
+                                         step={i} op={op:?} v={v:?}",
+                                    );
+                                }
                             }
-                        }
-                    }));
-                }
-                for w in workers {
-                    w.join().expect("worker thread panicked");
-                }
-            }));
+                        }));
+                    }
+                    for w in workers {
+                        w.join().expect("worker thread panicked");
+                    }
+                }));
+            }
+            for t in seed_threads {
+                t.join().expect("seed thread panicked");
+            }
         }
-        for t in seed_threads {
-            t.join().expect("seed thread panicked");
+        {
+            let mut handles = Vec::new();
+            for sess_idx in 0..16_u64 {
+                handles.push(thread::spawn(move || {
+                    let mut state = SessionState::default();
+                    let mut rng = Lcg::new(0xDEAD_BEEF_u64.wrapping_add(sess_idx));
+                    for i in 0..1_500_u64 {
+                        let op = *rng.pick(ALL_OPS);
+                        let idx = sess_idx.wrapping_mul(1_000_000).wrapping_add(i);
+                        apply(op, &mut state, idx);
+                        if let Err(v) = check_state(&state) {
+                            panic!(
+                                "invariant violation in isolated session: \
+                                 sess={sess_idx} step={i} op={op:?} v={v:?}",
+                            );
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("session thread panicked");
+            }
         }
     }
 
@@ -441,28 +457,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn multi_session_no_cross_contamination() {
-        let mut handles = Vec::new();
-        for sess_idx in 0..16_u64 {
-            handles.push(thread::spawn(move || {
-                let mut state = SessionState::default();
-                let mut rng = Lcg::new(0xDEAD_BEEF_u64.wrapping_add(sess_idx));
-                for i in 0..1_500_u64 {
-                    let op = *rng.pick(ALL_OPS);
-                    let idx = sess_idx.wrapping_mul(1_000_000).wrapping_add(i);
-                    apply(op, &mut state, idx);
-                    if let Err(v) = check_state(&state) {
-                        panic!(
-                            "invariant violation in isolated session: \
-                             sess={sess_idx} step={i} op={op:?} v={v:?}",
-                        );
-                    }
-                }
-            }));
-        }
-        for h in handles {
-            h.join().expect("session thread panicked");
-        }
-    }
 }

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use cudarc::driver::{CudaSlice, CudaStream};
 use nv_kernels::graph::CudaGraphRunner;
@@ -132,12 +132,12 @@ fn bucket_resident_bytes(
 }
 
 fn capture_supported_for(tower: &Gemma4VisionTower) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         matches!(tower.dtype, DType::BF16 | DType::F16),
         "vision graph capture needs a bf16/f16 tower (NV_MM_VISION_DTYPE=bf16); an f32 tower's \
          linears route through a per-call transposed-weight copy that is not layout-info-free"
     );
-    anyhow::ensure!(
+    ensure!(
         tower.patch_embedder.input_proj.dense_weight().is_some()
             && tower.embedding_projection.dense_weight().is_some(),
         "vision graph capture needs dense weights; int8/nvfp4 vision modes route through \
@@ -153,7 +153,7 @@ fn capture_supported_for(tower: &Gemma4VisionTower) -> Result<()> {
             &layer.up_proj,
             &layer.down_proj,
         ] {
-            anyhow::ensure!(
+            ensure!(
                 lin.dense_weight().is_some(),
                 "vision graph capture needs dense weights; int8/nvfp4 vision modes route \
                  through non-capturable per-call kernels"
@@ -450,7 +450,7 @@ impl Gemma4VisionGraph {
         let pp = tower.config().patch_pixels();
         let pk = tower.config().pooling_kernel_size;
         let n = grid_w * grid_h;
-        anyhow::ensure!(
+        ensure!(
             pixels.len() == n * pp,
             "vision graph forward: {} pixels for grid {grid_w}x{grid_h} needing {}",
             pixels.len(),
@@ -693,7 +693,7 @@ fn copy_all_f32(
     };
     let slice = cuda.as_cuda_slice::<f32>()?;
     let len = slice.len();
-    anyhow::ensure!(
+    ensure!(
         len >= expected,
         "vision embedding len {len} < expected {expected}"
     );
@@ -725,7 +725,8 @@ mod tests {
     }
 
     #[test]
-    fn a_bucket_larger_than_the_whole_budget_is_refused_because_no_eviction_can_fit_it() {
+    fn bucket_admission_refuses_oversize_evicts_nothing_within_budget_and_otherwise_evicts_largest_first_deterministically(
+    ) {
         assert!(matches!(
             plan_bucket_admission(&[], 101, 100),
             BucketAdmission::RefusedBecauseOneBucketAloneExceedsTheBudget
@@ -734,16 +735,10 @@ mod tests {
             plan_bucket_admission(&[((8, 8), 40)], 101, 100),
             BucketAdmission::RefusedBecauseOneBucketAloneExceedsTheBudget
         ));
-    }
 
-    #[test]
-    fn admission_within_budget_evicts_nothing() {
         assert!(evictions(&[], 100, 100).is_empty());
         assert!(evictions(&[((8, 8), 30), ((12, 8), 40)], 30, 100).is_empty());
-    }
 
-    #[test]
-    fn admission_over_budget_evicts_the_largest_buckets_first_and_only_as_many_as_needed() {
         let resident = [((8, 8), 20), ((16, 16), 50), ((12, 8), 30)];
         assert_eq!(
             evictions(&resident, 40, 100),
@@ -762,10 +757,7 @@ mod tests {
             "a budget-sized bucket may evict everything, never refuse: the vision tower \
              re-captures evicted grids on their next miss, so eviction is correct, just slow"
         );
-    }
 
-    #[test]
-    fn eviction_order_is_deterministic_for_equal_sizes() {
         let resident = [((12, 8), 40), ((8, 12), 40), ((8, 8), 40)];
         assert_eq!(
             evictions(&resident, 90, 120),

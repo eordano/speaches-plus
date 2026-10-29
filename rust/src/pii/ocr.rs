@@ -104,22 +104,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_unavailable_error_is_the_503_shape_the_handler_matches_on() {
-        let msg =
-            "ocr not available: set NV_OCR_TESSDATA to a directory containing eng.traineddata";
-        assert!(
-            msg.contains("not available"),
-            "image_handler::analyze_post maps only messages containing \"not available\" to 503"
-        );
-    }
-
-    #[test]
     fn tessdata_root_prefers_the_env_var() {
-        std::env::set_var("NV_OCR_TESSDATA", "/tmp/some-tessdata-dir");
+        unsafe { std::env::set_var("NV_OCR_TESSDATA", "/tmp/some-tessdata-dir") };
         assert_eq!(
             tessdata_root(),
             Some(PathBuf::from("/tmp/some-tessdata-dir"))
         );
-        std::env::remove_var("NV_OCR_TESSDATA");
+        unsafe { std::env::remove_var("NV_OCR_TESSDATA") };
     }
 }

@@ -43,16 +43,6 @@ impl PixelRect {
     pub fn area(&self) -> i64 {
         self.width().max(0) as i64 * self.height().max(0) as i64
     }
-
-    pub fn iou(&self, other: &PixelRect) -> f64 {
-        let inter = self.intersection_area(other);
-        let union = self.area() + other.area() - inter;
-        if union <= 0 {
-            0.0
-        } else {
-            inter as f64 / union as f64
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -298,10 +288,6 @@ pub fn estimate_skew_scored(bin: &BinImage) -> (f32, f64) {
     (fine, ratio)
 }
 
-pub fn estimate_skew(bin: &BinImage) -> f32 {
-    estimate_skew_scored(bin).0
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Deskew {
     pub deg: f32,
@@ -391,10 +377,6 @@ pub fn rotate_grey_with(g: &GreyImage, dsk: &Deskew, bg: u8) -> GreyImage {
         }
     }
     out
-}
-
-pub fn rotate_grey(g: &GreyImage, deg: f32, bg: u8) -> GreyImage {
-    rotate_grey_with(g, &Deskew::new(g.w, g.h, deg, false), bg)
 }
 
 fn median_i32(vals: &mut [i32]) -> i32 {

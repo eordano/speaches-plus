@@ -41,34 +41,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn source_declares_the_mrows_entry_and_its_prelude() {
-        let src = source();
-        assert!(src.contains("fn gemm_w4a16_affine_mrows("));
-        assert!(src.contains("fn bf16_decode("));
-        assert!(src.contains("fn bf16_encode("));
-        assert!(src.contains(&format!("W4AFFM_MAX_M: u32 = {MAX_M}u")));
-    }
-
-    #[test]
-    fn the_workgroup_byte_const_tracks_every_workgroup_declaration() {
-        assert!(WGSL.contains("W4AFFM_WORKGROUP_BYTES_TOTAL_VS_METAL_LIMIT_32768: u32 = 8192u"));
-        assert_eq!(
-            WGSL.matches("var<workgroup>").count(),
-            1,
-            "a new var<workgroup> must be summed into W4AFFM_WORKGROUP_BYTES_TOTAL_VS_METAL_LIMIT_32768 because Metal executes over-limit pipelines with aliased tiles"
-        );
-        assert!(WGSL.contains("var<workgroup> w4affm_xf_tile: array<vec4<f32>, 512>"));
-    }
-
-    #[test]
-    fn the_rules_refuse_what_the_body_cannot_express() {
-        assert!(grain_rule(16).is_err());
-        assert!(grain_rule(48).is_err());
-        assert!(grain_rule(32).is_ok());
-        assert!(grain_rule(64).is_ok());
-        assert!(m_rule(0).is_err());
-        assert!(m_rule(17).is_err());
-        assert!(m_rule(1).is_ok());
-        assert!(m_rule(16).is_ok());
+    fn the_source_declares_its_entry_tracks_its_workgroup_bytes_and_refuses_what_the_body_cannot_express(
+    ) {
+        {
+            let src = source();
+            assert!(src.contains("fn gemm_w4a16_affine_mrows("));
+            assert!(src.contains("fn bf16_decode("));
+            assert!(src.contains("fn bf16_encode("));
+            assert!(src.contains(&format!("W4AFFM_MAX_M: u32 = {MAX_M}u")));
+        }
+        {
+            assert!(WGSL.contains("W4AFFM_WORKGROUP_BYTES_TOTAL_VS_METAL_LIMIT_32768: u32 = 8192u"));
+            assert_eq!(
+                WGSL.matches("var<workgroup>").count(),
+                1,
+                "a new var<workgroup> must be summed into W4AFFM_WORKGROUP_BYTES_TOTAL_VS_METAL_LIMIT_32768 because Metal executes over-limit pipelines with aliased tiles"
+            );
+            assert!(WGSL.contains("var<workgroup> w4affm_xf_tile: array<vec4<f32>, 512>"));
+        }
+        {
+            assert!(grain_rule(16).is_err());
+            assert!(grain_rule(48).is_err());
+            assert!(grain_rule(32).is_ok());
+            assert!(grain_rule(64).is_ok());
+            assert!(m_rule(0).is_err());
+            assert!(m_rule(17).is_err());
+            assert!(m_rule(1).is_ok());
+            assert!(m_rule(16).is_ok());
+        }
     }
 }

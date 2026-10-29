@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkPlan {
@@ -50,49 +49,110 @@ pub fn sampling_params_for(cfg: &nv_engine::SamplingConfig) -> nv_layers::sample
 }
 
 #[cfg(feature = "cuda")]
+struct SeqState<C> {
+    cache: C,
+    params: nv_layers::sampler::SamplingParams,
+    rng: rand_pcg::Pcg64,
+    counts: std::collections::HashMap<u32, u32>,
+
+    prompt_tokens: Vec<u32>,
+}
+
+#[cfg(feature = "cuda")]
+impl<C> SeqState<C> {
+    fn note_prompt(&mut self, tokens: &[u32]) {
+        if (self.params.repetition_penalty - 1.0).abs() > f32::EPSILON {
+            let mut ids = tokens.to_vec();
+            ids.sort_unstable();
+            ids.dedup();
+            self.prompt_tokens = ids;
+        }
+    }
+
+    fn sample(&mut self, logits: &[f32]) -> u32 {
+        use nv_layers::sampler;
+        use rand_core::Rng;
+        if self.params.is_greedy() && !self.params.has_penalties() {
+            return sampler::argmax(logits);
+        }
+        let mut lg = logits.to_vec();
+        if self.params.has_penalties() {
+            let seen: Vec<(u32, u32)> = self.counts.iter().map(|(&t, &c)| (t, c)).collect();
+            sampler::apply_penalties_with_prompt(&mut lg, &seen, &self.prompt_tokens, &self.params);
+        }
+        let raw = self.rng.next_u64() >> 11;
+        let u = ((raw as f64) / ((1u64 << 53) as f64)) as f32;
+        let tok = sampler::sample_token(&lg, &self.params, u);
+        *self.counts.entry(tok).or_insert(0) += 1;
+        tok
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn seat_cache_keeping_a_recomputed_sequences_sampler<'a, C>(
+    state: &'a mut std::collections::HashMap<u64, SeqState<C>>,
+    seq_id: u64,
+    sampling: Option<&nv_engine::SamplingConfig>,
+    cache: C,
+) -> &'a mut SeqState<C> {
+    use rand_core::SeedableRng;
+    use std::collections::hash_map::Entry;
+    match state.entry(seq_id) {
+        Entry::Occupied(recomputed) => {
+            let st = recomputed.into_mut();
+            st.cache = cache;
+            st
+        }
+        Entry::Vacant(first_seen) => {
+            let cfg = sampling.cloned().unwrap_or_default();
+            first_seen.insert(SeqState {
+                cache,
+                params: sampling_params_for(&cfg),
+                rng: rand_pcg::Pcg64::seed_from_u64(cfg.seed.unwrap_or(0)),
+                counts: std::collections::HashMap::new(),
+                prompt_tokens: Vec::new(),
+            })
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn seat_prompt_and_sample<C>(
+    state: &mut std::collections::HashMap<u64, SeqState<C>>,
+    seq_id: u64,
+    sampling: Option<&nv_engine::SamplingConfig>,
+    cache: C,
+    tokens: &[u32],
+    row: &[f32],
+) -> u32 {
+    let st = seat_cache_keeping_a_recomputed_sequences_sampler(state, seq_id, sampling, cache);
+    st.note_prompt(tokens);
+    st.sample(row)
+}
+
+#[cfg(feature = "cuda")]
+fn last_row(logits: &candle_core::Tensor) -> anyhow::Result<Vec<f32>> {
+    use candle_core::IndexOp;
+    let dims = logits.dims();
+    anyhow::ensure!(
+        dims.len() == 3 && dims[0] == 1,
+        "expected logits [1, seq, vocab], got {dims:?}"
+    );
+    let last = logits.i((0usize, dims[1] - 1, ..))?;
+    Ok(last.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?)
+}
+
+#[cfg(feature = "cuda")]
 mod gemma4 {
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use anyhow::{anyhow, Result};
-    use candle_core::{Device, IndexOp, Tensor};
+    use candle_core::{Device, Tensor};
     use nv_engine::{BatchStepper, PrefillInput, SeqInput, StepResult};
     use nv_models::gemma4::{Gemma4, Gemma4KvCacheFp8};
-    use rand_core::{Rng, SeedableRng};
-    use rand_pcg::Pcg64;
 
-    struct SeqState {
-        cache: Gemma4KvCacheFp8,
-        params: nv_layers::sampler::SamplingParams,
-        rng: Pcg64,
-        counts: HashMap<u32, u32>,
-
-        prompt_tokens: Vec<u32>,
-    }
-
-    impl SeqState {
-        fn sample(&mut self, logits: &[f32]) -> u32 {
-            use nv_layers::sampler;
-            if self.params.is_greedy() && !self.params.has_penalties() {
-                return sampler::argmax(logits);
-            }
-            let mut lg = logits.to_vec();
-            if self.params.has_penalties() {
-                let seen: Vec<(u32, u32)> = self.counts.iter().map(|(&t, &c)| (t, c)).collect();
-                sampler::apply_penalties_with_prompt(
-                    &mut lg,
-                    &seen,
-                    &self.prompt_tokens,
-                    &self.params,
-                );
-            }
-            let raw = self.rng.next_u64() >> 11;
-            let u = ((raw as f64) / ((1u64 << 53) as f64)) as f32;
-            let tok = sampler::sample_token(&lg, &self.params, u);
-            *self.counts.entry(tok).or_insert(0) += 1;
-            tok
-        }
-    }
+    type SeqState = super::SeqState<Gemma4KvCacheFp8>;
 
     pub struct Gemma4BatchStepper {
         model: Arc<Gemma4>,
@@ -112,16 +172,6 @@ mod gemma4 {
                 state: HashMap::new(),
             }
         }
-
-        fn last_row(logits: &Tensor) -> Result<Vec<f32>> {
-            let dims = logits.dims();
-            anyhow::ensure!(
-                dims.len() == 3 && dims[0] == 1,
-                "expected logits [1, seq, vocab], got {dims:?}"
-            );
-            let last = logits.i((0usize, dims[1] - 1, ..))?;
-            Ok(last.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?)
-        }
     }
 
     impl BatchStepper for Gemma4BatchStepper {
@@ -132,9 +182,6 @@ mod gemma4 {
         fn prefill(&mut self, items: &[PrefillInput]) -> Result<Vec<StepResult>> {
             let mut out = Vec::with_capacity(items.len());
             for it in items {
-                let cfg = self.sampling.get(&it.seq_id).cloned().unwrap_or_default();
-                let params = super::sampling_params_for(&cfg);
-                let seed = cfg.seed.unwrap_or(0);
                 let mut cache = self
                     .model
                     .new_kv_cache_fp8(self.kv_max_seq_len)
@@ -148,25 +195,15 @@ mod gemma4 {
                     .model
                     .forward_with_cache(&tokens, &positions_t, &mut cache)
                     .map_err(|e| anyhow!("prefill seq {}: {e}", it.seq_id))?;
-                let row = Self::last_row(&logits)?;
-
-                let prompt_tokens = if (params.repetition_penalty - 1.0).abs() > f32::EPSILON {
-                    let mut ids = it.tokens.clone();
-                    ids.sort_unstable();
-                    ids.dedup();
-                    ids
-                } else {
-                    Vec::new()
-                };
-                let mut st = SeqState {
+                let row = super::last_row(&logits)?;
+                let token = super::seat_prompt_and_sample(
+                    &mut self.state,
+                    it.seq_id,
+                    self.sampling.get(&it.seq_id),
                     cache,
-                    params,
-                    rng: Pcg64::seed_from_u64(seed),
-                    counts: HashMap::new(),
-                    prompt_tokens,
-                };
-                let token = st.sample(&row);
-                self.state.insert(it.seq_id, st);
+                    &it.tokens,
+                    &row,
+                );
                 out.push(StepResult {
                     seq_id: it.seq_id,
                     token,
@@ -188,7 +225,7 @@ mod gemma4 {
                     .model
                     .forward_with_cache(&tokens, &positions_t, &mut st.cache)
                     .map_err(|e| anyhow!("decode seq {}: {e}", it.seq_id))?;
-                let row = Self::last_row(&logits)?;
+                let row = super::last_row(&logits)?;
                 let token = st.sample(&row);
                 out.push(StepResult {
                     seq_id: it.seq_id,
@@ -215,41 +252,8 @@ mod paged {
     use nv_engine::{BatchStepper, PrefillChunk, PrefillInput, SeqInput, StepResult};
     use nv_models::gemma4::Gemma4;
     use nv_models::paged_fp8::{PagedGemma4Cache, PagedKvFp8Pool, PagedPoolConfig};
-    use rand_core::{Rng, SeedableRng};
-    use rand_pcg::Pcg64;
 
-    struct SeqState {
-        cache: PagedGemma4Cache,
-        params: nv_layers::sampler::SamplingParams,
-        rng: Pcg64,
-        counts: HashMap<u32, u32>,
-
-        prompt_tokens: Vec<u32>,
-    }
-
-    impl SeqState {
-        fn sample(&mut self, logits: &[f32]) -> u32 {
-            use nv_layers::sampler;
-            if self.params.is_greedy() && !self.params.has_penalties() {
-                return sampler::argmax(logits);
-            }
-            let mut lg = logits.to_vec();
-            if self.params.has_penalties() {
-                let seen: Vec<(u32, u32)> = self.counts.iter().map(|(&t, &c)| (t, c)).collect();
-                sampler::apply_penalties_with_prompt(
-                    &mut lg,
-                    &seen,
-                    &self.prompt_tokens,
-                    &self.params,
-                );
-            }
-            let raw = self.rng.next_u64() >> 11;
-            let u = ((raw as f64) / ((1u64 << 53) as f64)) as f32;
-            let tok = sampler::sample_token(&lg, &self.params, u);
-            *self.counts.entry(tok).or_insert(0) += 1;
-            tok
-        }
-    }
+    type SeqState = super::SeqState<PagedGemma4Cache>;
 
     pub struct Gemma4PagedBatchStepper {
         model: Arc<Gemma4>,
@@ -310,16 +314,6 @@ mod paged {
             Ok(())
         }
 
-        fn last_row(logits: &Tensor) -> Result<Vec<f32>> {
-            let dims = logits.dims();
-            anyhow::ensure!(
-                dims.len() == 3 && dims[0] == 1,
-                "expected logits [1, seq, vocab], got {dims:?}"
-            );
-            let last = logits.i((0usize, dims[1] - 1, ..))?;
-            Ok(last.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?)
-        }
-
         fn row(logits: &Tensor, i: usize) -> Result<Vec<f32>> {
             let dims = logits.dims();
             anyhow::ensure!(dims.len() == 2, "expected logits [B, vocab], got {dims:?}");
@@ -336,10 +330,6 @@ mod paged {
         fn prefill(&mut self, items: &[PrefillInput]) -> Result<Vec<StepResult>> {
             let mut out = Vec::with_capacity(items.len());
             for it in items {
-                let cfg = self.sampling.get(&it.seq_id).cloned().unwrap_or_default();
-                let params = super::sampling_params_for(&cfg);
-                let seed = cfg.seed.unwrap_or(0);
-
                 let mut cache = PagedGemma4Cache::new(self.pool.clone(), &self.device)?;
                 cache.set_block_table(&it.block_table)?;
 
@@ -365,25 +355,15 @@ mod paged {
                 }
                 let logits = logits_opt
                     .ok_or_else(|| anyhow!("paged prefill seq {}: empty prompt", it.seq_id))?;
-                let row = Self::last_row(&logits)?;
-
-                let prompt_tokens = if (params.repetition_penalty - 1.0).abs() > f32::EPSILON {
-                    let mut ids = it.tokens.clone();
-                    ids.sort_unstable();
-                    ids.dedup();
-                    ids
-                } else {
-                    Vec::new()
-                };
-                let mut st = SeqState {
+                let row = super::last_row(&logits)?;
+                let token = super::seat_prompt_and_sample(
+                    &mut self.state,
+                    it.seq_id,
+                    self.sampling.get(&it.seq_id),
                     cache,
-                    params,
-                    rng: Pcg64::seed_from_u64(seed),
-                    counts: HashMap::new(),
-                    prompt_tokens,
-                };
-                let token = st.sample(&row);
-                self.state.insert(it.seq_id, st);
+                    &it.tokens,
+                    &row,
+                );
                 out.push(StepResult {
                     seq_id: it.seq_id,
                     token,
@@ -472,19 +452,12 @@ mod paged {
                 .map_err(|e| anyhow!("paged step_mixed seq {}: {e}", c.seq_id))?;
 
                 if plan.fresh_cache {
-                    let cfg = self.sampling.get(&c.seq_id).cloned().unwrap_or_default();
-                    let params = super::sampling_params_for(&cfg);
-                    let seed = cfg.seed.unwrap_or(0);
                     let cache = PagedGemma4Cache::new(self.pool.clone(), &self.device)?;
-                    self.state.insert(
+                    super::seat_cache_keeping_a_recomputed_sequences_sampler(
+                        &mut self.state,
                         c.seq_id,
-                        SeqState {
-                            cache,
-                            params,
-                            rng: Pcg64::seed_from_u64(seed),
-                            counts: HashMap::new(),
-                            prompt_tokens: Vec::new(),
-                        },
+                        self.sampling.get(&c.seq_id),
+                        cache,
                     );
                 }
                 let st = self
@@ -520,13 +493,8 @@ mod paged {
                 }
                 let logits = logits_opt
                     .ok_or_else(|| anyhow!("paged chunk prefill seq {}: empty chunk", c.seq_id))?;
-                let row = Self::last_row(&logits)?;
-                if (st.params.repetition_penalty - 1.0).abs() > f32::EPSILON {
-                    let mut ids = c.tokens.clone();
-                    ids.sort_unstable();
-                    ids.dedup();
-                    st.prompt_tokens = ids;
-                }
+                let row = super::last_row(&logits)?;
+                st.note_prompt(&c.tokens);
                 let token = st.sample(&row);
                 out.push(StepResult {
                     seq_id: c.seq_id,
@@ -577,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn first_chunk_gets_a_fresh_cache_even_over_stale_state() {
+    fn prefill_chunk_plans_fresh_and_continuation_caches_and_refuses_desync() {
         assert_eq!(
             plan_prefill_chunk(0, 4, None, false).unwrap(),
             ChunkPlan {
@@ -594,42 +562,71 @@ mod tests {
                 emit: true
             }
         );
+        {
+            assert_eq!(
+                plan_prefill_chunk(4, 8, Some(4), false).unwrap(),
+                ChunkPlan {
+                    fresh_cache: false,
+                    new_start: 4,
+                    emit: false
+                }
+            );
+            assert_eq!(
+                plan_prefill_chunk(8, 10, Some(8), true).unwrap(),
+                ChunkPlan {
+                    fresh_cache: false,
+                    new_start: 8,
+                    emit: true
+                }
+            );
+        }
+        {
+            assert!(plan_prefill_chunk(4, 8, Some(3), false)
+                .unwrap_err()
+                .to_string()
+                .contains("desync"));
+            assert!(plan_prefill_chunk(4, 8, None, false)
+                .unwrap_err()
+                .to_string()
+                .contains("no prior cache state"));
+            assert!(plan_prefill_chunk(8, 8, Some(8), true)
+                .unwrap_err()
+                .to_string()
+                .contains("no new tokens"));
+        }
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
-    fn continuation_chunk_forwards_only_the_new_tokens() {
-        assert_eq!(
-            plan_prefill_chunk(4, 8, Some(4), false).unwrap(),
-            ChunkPlan {
-                fresh_cache: false,
-                new_start: 4,
-                emit: false
-            }
-        );
-        assert_eq!(
-            plan_prefill_chunk(8, 10, Some(8), true).unwrap(),
-            ChunkPlan {
-                fresh_cache: false,
-                new_start: 8,
-                emit: true
-            }
-        );
-    }
+    fn a_recompute_replaces_only_the_cache_and_keeps_the_penalty_counts_and_the_rng() {
+        use super::{seat_cache_keeping_a_recomputed_sequences_sampler as seat, SeqState};
+        let sampling = nv_engine::SamplingConfig {
+            temperature: 1.0,
+            seed: Some(7),
+            frequency_penalty: Some(0.5),
+            ..Default::default()
+        };
+        let mut state: std::collections::HashMap<u64, SeqState<&str>> =
+            std::collections::HashMap::new();
+        let mut logits = vec![0.0f32; 8];
+        logits[5] = 80.0;
+        let st = seat(&mut state, 1, Some(&sampling), "prefill cache");
+        assert_eq!(st.sample(&logits), 5);
+        let rng_after_token_5 = st.rng.clone();
 
-    #[test]
-    fn desync_missing_state_and_empty_chunks_are_errors() {
-        assert!(plan_prefill_chunk(4, 8, Some(3), false)
-            .unwrap_err()
-            .to_string()
-            .contains("desync"));
-        assert!(plan_prefill_chunk(4, 8, None, false)
-            .unwrap_err()
-            .to_string()
-            .contains("no prior cache state"));
-        assert!(plan_prefill_chunk(8, 8, Some(8), true)
-            .unwrap_err()
-            .to_string()
-            .contains("no new tokens"));
+        let st = seat(&mut state, 1, Some(&sampling), "recompute cache");
+        assert_eq!(st.cache, "recompute cache");
+        assert_eq!(
+            st.counts.get(&5),
+            Some(&1),
+            "a preempted sequence re-prefilled from token 0 still generated token 5: forgetting \
+             it stops penalizing the repetition the request asked to suppress"
+        );
+        assert!(
+            st.rng == rng_after_token_5,
+            "a seeded request must continue its random stream across a recompute, or its output \
+             depends on whether the pool preempted it"
+        );
     }
 
     #[cfg(feature = "cuda")]

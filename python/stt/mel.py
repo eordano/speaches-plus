@@ -117,7 +117,6 @@ class MelExtractor:
             src = max(len(audio_30s) - 2 - i, 0)
             padded[pad + len(audio_30s) + i] = audio_30s[src]
 
-        n_bins = N_FFT // 2 + 1
         frame_starts = np.arange(N_FRAMES) * HOP_LENGTH
         frames = np.empty((N_FRAMES, N_FFT), dtype=np.float32)
         for i, start in enumerate(frame_starts):

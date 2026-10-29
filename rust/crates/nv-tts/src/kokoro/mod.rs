@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn stage1_front_end_matches_torch_reference() -> Result<()> {
+    fn front_end_prosody_decoder_and_generator_match_torch_reference() -> Result<()> {
         let Some((weights, reference)) = env_paths() else {
             eprintln!("SKIP: set KOKORO_SAFETENSORS and KOKORO_REF");
             return Ok(());
@@ -230,7 +230,7 @@ mod tests {
         let r = candle_core::safetensors::load(&reference, &dev)?;
         let ids = r["input_ids"].to_dtype(DType::U32)?;
         let ref_s = &r["ref_s"];
-        let (_dec_s, pro_s) = KokoroFrontEnd::split_style(ref_s)?;
+        let (dec_s, pro_s) = KokoroFrontEnd::split_style(ref_s)?;
         let bert = m.bert.forward(&ids)?;
         let e0 = assert_close("bert_dur", &bert, &r["bert_dur"], 2e-3)?;
         let (d_en, d, logits) = m.duration.forward(&bert, &pro_s)?;
@@ -248,22 +248,7 @@ mod tests {
         let e4 = assert_close("t_en", &t_en, &r["t_en"], 5e-3)?;
         eprintln!("stage1 max abs diffs: bert {e0:.2e} d_en {e1:.2e} d {e2:.2e} logits {e3:.2e} t_en {e4:.2e}; duration mismatches {mism}/{}", dur.len());
         assert!(mism <= 1, "durations differ from torch on {mism} tokens");
-        Ok(())
-    }
 
-    #[test]
-    fn stage2_3_prosody_and_decoder_match_torch_reference() -> Result<()> {
-        let Some((weights, reference)) = env_paths() else {
-            eprintln!("SKIP: set KOKORO_SAFETENSORS and KOKORO_REF");
-            return Ok(());
-        };
-        let dev = Device::Cpu;
-        let m = KokoroFrontEnd::load(&weights, &dev)?;
-        let r = candle_core::safetensors::load(&reference, &dev)?;
-        let ids = r["input_ids"].to_dtype(DType::U32)?;
-        let (dec_s, pro_s) = KokoroFrontEnd::split_style(&r["ref_s"])?;
-
-        let ref_dur: Vec<i64> = r["pred_dur"].to_vec1()?;
         let dur: Vec<usize> = ref_dur.iter().map(|d| *d as usize).collect();
         let aln = alignment(&dur, &dev)?.unsqueeze(0)?;
         let en = r["d"].transpose(1, 2)?.contiguous()?.matmul(&aln)?;
@@ -271,7 +256,6 @@ mod tests {
         let (f0, n) = m.prosody.forward(&en, &pro_s)?;
         let e1 = assert_close("F0_pred", &f0, &r["F0_pred"], 5e-3)?;
         let e2 = assert_close("N_pred", &n, &r["N_pred"], 5e-3)?;
-        let t_en = m.text_encoder.forward(&ids)?;
         let asr = t_en.matmul(&aln)?;
         let e3 = assert_close("asr", &asr, &r["asr"], 5e-3)?;
         let (enc, pre_gen) = m
@@ -280,11 +264,68 @@ mod tests {
         let e4 = assert_close("dec_encode", &enc, &r["dec_encode"], 5e-3)?;
         let e5 = assert_close("dec_pre_gen", &pre_gen, &r["dec_pre_gen"], 1e-2)?;
         eprintln!("stage2/3 max abs diffs: en {e0:.2e} F0 {e1:.2e} N {e2:.2e} asr {e3:.2e} dec_encode {e4:.2e} dec_pre_gen {e5:.2e}");
+
+        let mut rng = Rng(1);
+        let f0v: Vec<f32> = r["F0_pred"].flatten_all()?.to_vec1()?;
+        let src = m.generator.source.forward(&f0v, &dev, true, &mut rng)?;
+        if let Some(ref_src) = r.get("har_source") {
+            let e = assert_close("har_source", &src, ref_src, 2e-2);
+            let sv: Vec<f32> = src.flatten_all()?.to_vec1()?;
+            let rv: Vec<f32> = ref_src.flatten_all()?.to_vec1()?;
+            let first_bad = sv.iter().zip(&rv).position(|(a, b)| (a - b).abs() > 1e-2);
+            eprintln!("har_source: len {} vs {}, first sample off by >1e-2 at {:?}; sample[0..4] ours {:?} ref {:?}; result {:?}",
+                sv.len(), rv.len(), first_bad, &sv[..4], &rv[..4], e.map(|x| format!("{x:.2e}")));
+        }
+        let har = m
+            .generator
+            .harmonic_spectrogram(&r["F0_pred"], true, &mut rng)?;
+        let bins = 11;
+        let (mag_o, ph_o) = (har.narrow(1, 0, bins)?, har.narrow(1, bins, bins)?);
+        let (mag_r, ph_r) = (
+            r["har"].narrow(1, 0, bins)?,
+            r["har"].narrow(1, bins, bins)?,
+        );
+        let e0 = assert_close("har magnitude", &mag_o, &mag_r, 1e-2)?;
+        let e0p = assert_close(
+            "har re",
+            &mag_o.mul(&ph_o.cos()?)?,
+            &mag_r.mul(&ph_r.cos()?)?,
+            1e-2,
+        )?
+        .max(assert_close(
+            "har im",
+            &mag_o.mul(&ph_o.sin()?)?,
+            &mag_r.mul(&ph_r.sin()?)?,
+            1e-2,
+        )?);
+        let audio = m
+            .generator
+            .forward_with_har(&r["dec_pre_gen"], &dec_s, &r["har"])?;
+        let rel = (&audio - &r["audio_det"])?
+            .sqr()?
+            .sum_all()?
+            .to_scalar::<f32>()?
+            .sqrt()
+            / r["audio_det"]
+                .sqr()?
+                .sum_all()?
+                .to_scalar::<f32>()?
+                .sqrt()
+                .max(1e-9);
+        let e1 = assert_close("audio_det", &audio, &r["audio_det"], 2e-2)?;
+        eprintln!("stage4 audio_det relative L2 error {rel:.3e}");
+        assert!(rel < 5e-3, "audio relative L2 error {rel}");
+        let noisy =
+            m.generator
+                .forward(&r["dec_pre_gen"], &dec_s, &r["F0_pred"], false, &mut rng)?;
+        let ref_len = r["audio"].dim(0)?;
+        eprintln!("stage4 max abs diffs: har mag {e0:.2e} phase {e0p:.2e} audio_det {e1:.2e}; noisy len {} vs ref {ref_len}", noisy.dim(0)?);
+        assert_eq!(noisy.dim(0)?, ref_len);
         Ok(())
     }
 
     #[test]
-    fn conv_transpose_via_conv1d_matches_native() -> Result<()> {
+    fn conv_transpose_via_conv1d_and_differentiable_log_mel_match_their_references() -> Result<()> {
         use candle_nn::VarMap;
         let dev = Device::Cpu;
         for &(cin, cout, k, stride, pad, opad, groups) in &[
@@ -317,12 +358,6 @@ mod tests {
             let b = ct.forward_via_conv1d(&x)?;
             layers::assert_close(&format!("convT k{k} s{stride} g{groups}"), &b, &a, 1e-4)?;
         }
-        Ok(())
-    }
-
-    #[test]
-    fn differentiable_log_mel_matches_cpu_reference() -> Result<()> {
-        let dev = Device::Cpu;
         let wav: Vec<f32> = (0..24_000 * 2)
             .map(|i| ((i as f32) * 0.02).sin() * 0.3 + ((i as f32) * 0.0031).cos() * 0.1)
             .collect();
@@ -335,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn wespeaker_candle_matches_onnxruntime() -> Result<()> {
+    fn wespeaker_candle_matches_onnxruntime_and_accepts_odd_frame_counts() -> Result<()> {
         let (Some(dir), Some(reference)) = (
             std::env::var_os("WESPEAKER_CANDLE"),
             std::env::var_os("WESPEAKER_REF"),
@@ -358,6 +393,13 @@ mod tests {
             cos > 0.9999 && cos2 > 0.999,
             "wespeaker cosine {cos} / {cos2}"
         );
+        for frames in [487usize, 486, 301] {
+            let feats = Tensor::randn(0f32, 1.0, (frames, 80), &dev)?;
+            let e = ws
+                .embed_feats(&feats)
+                .map_err(|e| anyhow!("frames {frames}: {e:#}"))?;
+            assert_eq!(e.dim(0)?, 256, "odd frame counts are accepted");
+        }
         Ok(())
     }
 
@@ -446,26 +488,6 @@ mod tests {
             "base weights not restored after a rejected adapter"
         );
         Ok(())
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore = "loads the converted Kokoro weights on the GPU"]
-    fn serve_handle_applies_cpu_adapter_on_cuda() -> Result<()> {
-        let weights = std::env::var_os("KOKORO_SAFETENSORS")
-            .or_else(|| std::env::var_os("KOKORO_CANDLE_WEIGHTS"))
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "models/kokoro-v1_0.safetensors".into());
-        let dev = Device::cuda_if_available(0)?;
-        if !dev.is_cuda() || !weights.is_file() {
-            eprintln!("SKIP: need a CUDA device and {}", weights.display());
-            return Ok(());
-        }
-        let h = KokoroCandle::load(&weights, None, &dev)?;
-        let ids: Vec<u32> = vec![0, 50, 83, 54, 156, 57, 135, 16, 65, 156, 87, 158, 54, 46, 0];
-        let style: Vec<f32> = (0..256).map(|i| (i as f32 * 0.37).sin() * 0.3).collect();
-        swap_and_restore(&h, &ids, &style, &Device::Cpu)?;
-        swap_and_restore(&h, &ids, &style, &dev)
     }
 
     #[test]
@@ -613,99 +635,6 @@ mod tests {
         }
         set_differentiable(false);
         assert!(losses[2] < losses[0], "loss did not decrease: {losses:?}");
-        Ok(())
-    }
-
-    #[test]
-    fn stage4_generator_matches_noise_free_torch_reference() -> Result<()> {
-        let Some((weights, reference)) = env_paths() else {
-            eprintln!("SKIP: set KOKORO_SAFETENSORS and KOKORO_REF");
-            return Ok(());
-        };
-        let dev = Device::Cpu;
-        let m = KokoroFrontEnd::load(&weights, &dev)?;
-        let r = candle_core::safetensors::load(&reference, &dev)?;
-        let (dec_s, _pro_s) = KokoroFrontEnd::split_style(&r["ref_s"])?;
-        let mut rng = Rng(1);
-
-        let f0v: Vec<f32> = r["F0_pred"].flatten_all()?.to_vec1()?;
-        let src = m.generator.source.forward(&f0v, &dev, true, &mut rng)?;
-        if let Some(ref_src) = r.get("har_source") {
-            let e = assert_close("har_source", &src, ref_src, 2e-2);
-            let sv: Vec<f32> = src.flatten_all()?.to_vec1()?;
-            let rv: Vec<f32> = ref_src.flatten_all()?.to_vec1()?;
-            let first_bad = sv.iter().zip(&rv).position(|(a, b)| (a - b).abs() > 1e-2);
-            eprintln!("har_source: len {} vs {}, first sample off by >1e-2 at {:?}; sample[0..4] ours {:?} ref {:?}; result {:?}",
-                sv.len(), rv.len(), first_bad, &sv[..4], &rv[..4], e.map(|x| format!("{x:.2e}")));
-        }
-        let har = m
-            .generator
-            .harmonic_spectrogram(&r["F0_pred"], true, &mut rng)?;
-
-        let bins = 11;
-        let (mag_o, ph_o) = (har.narrow(1, 0, bins)?, har.narrow(1, bins, bins)?);
-        let (mag_r, ph_r) = (
-            r["har"].narrow(1, 0, bins)?,
-            r["har"].narrow(1, bins, bins)?,
-        );
-        let e0 = assert_close("har magnitude", &mag_o, &mag_r, 1e-2)?;
-        let e0p = assert_close(
-            "har re",
-            &mag_o.mul(&ph_o.cos()?)?,
-            &mag_r.mul(&ph_r.cos()?)?,
-            1e-2,
-        )?
-        .max(assert_close(
-            "har im",
-            &mag_o.mul(&ph_o.sin()?)?,
-            &mag_r.mul(&ph_r.sin()?)?,
-            1e-2,
-        )?);
-        let audio = m
-            .generator
-            .forward_with_har(&r["dec_pre_gen"], &dec_s, &r["har"])?;
-        let rel = (&audio - &r["audio_det"])?
-            .sqr()?
-            .sum_all()?
-            .to_scalar::<f32>()?
-            .sqrt()
-            / r["audio_det"]
-                .sqr()?
-                .sum_all()?
-                .to_scalar::<f32>()?
-                .sqrt()
-                .max(1e-9);
-        let e1 = assert_close("audio_det", &audio, &r["audio_det"], 2e-2)?;
-        eprintln!("stage4 audio_det relative L2 error {rel:.3e}");
-        assert!(rel < 5e-3, "audio relative L2 error {rel}");
-        let noisy =
-            m.generator
-                .forward(&r["dec_pre_gen"], &dec_s, &r["F0_pred"], false, &mut rng)?;
-        let ref_len = r["audio"].dim(0)?;
-        eprintln!("stage4 max abs diffs: har mag {e0:.2e} phase {e0p:.2e} audio_det {e1:.2e}; noisy len {} vs ref {ref_len}", noisy.dim(0)?);
-        assert_eq!(noisy.dim(0)?, ref_len);
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod wespeaker_shape_tests {
-    use super::*;
-    #[test]
-    fn wespeaker_accepts_odd_frame_counts() -> Result<()> {
-        let Some(dir) = std::env::var_os("WESPEAKER_CANDLE") else {
-            eprintln!("SKIP");
-            return Ok(());
-        };
-        let dev = Device::Cpu;
-        let ws = WeSpeaker::load(Path::new(&dir), &dev)?;
-        for frames in [487usize, 486, 301] {
-            let feats = Tensor::randn(0f32, 1.0, (frames, 80), &dev)?;
-            let e = ws
-                .embed_feats(&feats)
-                .map_err(|e| anyhow!("frames {frames}: {e:#}"))?;
-            assert_eq!(e.dim(0)?, 256);
-        }
         Ok(())
     }
 }

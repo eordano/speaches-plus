@@ -1,6 +1,6 @@
 # Build and Testing
 
-The previous chapters described what the system *is*. This one describes how to
+The previous chapters described what the system is. This one describes how to
 make it exist on a machine and how to find out whether it works. Two ideas carry
 most of the weight: the environment is a nix flake, not a README of `apt install`
 lines; and a green test in this repo is not by itself evidence that anything ran.
@@ -26,7 +26,15 @@ name, twice on Linux:
   transformers env plus pybind11 build helpers for the in-tree `ct2_bindings/`
   and `whisper_bindings/` extensions, and a `shellHook` that symlinks ONNX and
   GGML model files into `rust/models/` and `go/models/` so the Rust and Go test
-  runners find them offline.
+  runners find them offline. The hook's `_ln` wrapper swallows `ln -sfn` errors:
+  a symlink that already points into the read-only nix store fails with EPERM
+  rather than being overwritten, and if it already points at the right store
+  path the test runners are served either way. It skips a tree entirely when the
+  checkout is missing. On Linux it also exports `LD_LIBRARY_PATH` for
+  ctranslate2 and whisper-cpp: setuptools does not emit `-Wl,-rpath` for nix
+  store paths, so without it `_ct2.so`/`_whisper.so` fail at import with
+  "libctranslate2.so.4: cannot open shared object file"; macOS needs nothing —
+  dylibs encode their absolute install_name.
 
 Under CUDA the shell is built with `pkgs.mkShell.override { stdenv =
 cudaPackages.backendStdenv; }` because nvcc 12.x rejects gcc ≥ 15 and
@@ -54,7 +62,7 @@ sourced env snapshot is not enough.
 
 Weights are treated as build inputs, not as something you download. `mkModels` declares each model exactly once with `url`, `rev`,
 `fileTreeHash`, optional include/exclude `filters`, and — crucially — the list of
-**env vars the binary reads to locate it**. Each entry's `drv` is
+env vars the binary reads to locate it. Each entry's `drv` is
 `nix-hug.lib.<system>.fetchModel`, so a checkpoint is a content-addressed
 derivation like any other. `snapshot` records the
 `models--<org>--<repo>/snapshots/<rev>` path that HF-cache-shaped consumers
@@ -64,7 +72,7 @@ expect.
 `model_visual.safetensors` and `model_mtp.safetensors` to get a text-only view of
 the same revision that `qwen36-mm` includes in full. Two profiles, one pin.
 
-A **profile** is a list of model names. `mkSpeachesModelsHub` maps a profile through `mkModels` and hands the derivations to
+A profile is a list of model names. `mkSpeachesModelsHub` maps a profile through `mkModels` and hands the derivations to
 `nix-hug.lib.buildCache`, producing a directory laid out exactly like a
 HuggingFace hub cache. `mkProfileEnv` then walks the same list and emits, for
 each model, every one of its declared `envVars` pointing at
@@ -81,9 +89,9 @@ and `models`.
 Entering a hub-bearing shell realizes real weights into the store. `.#no-models`
 and `.#cuda-no-models` exist precisely so you can compile without that.
 
-**The hub overrides your env, not the other way round.** The shell (and the
+The hub overrides your env, not the other way round. The shell (and the
 snapshot `nvk.sh` sources) assigns `NV_CHAT_MODEL_DIR`, `NV_EMBEDDING_MODEL_DIR`
-and `HF_HUB_CACHE`. Sourcing happens *after* caller env, so a
+and `HF_HUB_CACHE`. Sourcing happens after caller env, so a
 `NV_CHAT_MODEL_DIR=... nvk.sh ...` prefix is silently discarded and you measure a
 different checkpoint than you named. Read the `loading … from` boot line, or
 source first and override second.
@@ -111,18 +119,25 @@ backend (cpu / cuda / vulkan) instead of twelve, a dependency compile never wait
 on a 25 GB hub, and repinning a model rebuilds no Rust. The profile's own hub and
 env are still on the package — `pkg.modelsHub`, `pkg.profileEnv`, `pkg.profile`
 via passthru, realized only when read — and that is what a unit wires; nothing
-reads them out of the build. Building a profile package therefore does *not*
+reads them out of the build. Building a profile package therefore does not
 fetch its models: build `speaches-models-hub-<profile>` for those.
+
+The application build's `preBuild` deletes every `*/out/build/CMakeCache.txt`
+under the cargo target dir before compiling: the deps-only stage leaves each
+cmake build script's cache pinned to its own sandbox dir, and when a fingerprint
+change re-runs one in the application sandbox (cc 1.9 re-ran sentencepiece-sys),
+cmake refuses the foreign cache; dropping the caches makes a re-run reconfigure
+in place.
 
 `apps.<system>` are `strip-comments` (also `default`) and `fetch-models`.
 
 ## `rust/scripts/nvk.sh`, and what breaks without it
 
-**Rust work goes through `rust/scripts/nvk.sh`.** Not `nix develop`, not bare
+Rust work goes through `rust/scripts/nvk.sh`. Not `nix develop`, not bare
 `cargo`. The wrapper is not a convenience alias; it owns five things that are
 each individually load-bearing.
 
-1. **A cached dev environment.** It runs `nix print-dev-env` once into
+1. A cached dev environment. It runs `nix print-dev-env` once into
    `$NVK_CACHE/devenv-<shell>.sh`, keyed on an md5 of `flake.nix` + `flake.lock`
    + the nix-hug override, and sources that file thereafter. Re-entering
    `nix develop` yields a subtly different environment each time, which trips
@@ -131,31 +146,31 @@ each individually load-bearing.
    recompiles every `.cu` on every invocation. `NVK_REFRESH=1` forces
    regeneration.
 
-2. **`CUDA_ARCH_LIST`, by assignment.** `crates/nv-kernels/build.rs`'s arch list defaults to `"8.9;12.0"`,
+2. `CUDA_ARCH_LIST`, by assignment. `crates/nv-kernels/build.rs`'s arch list defaults to `"8.9;12.0"`,
    and so does the dev shell, because `cudaCapabilities` in `flake.nix` keeps
    `8.9` for the nixpkgs CUDA package set's binary-cache hits. On a single-SM120
    box that compiles a dead Ada architecture into every object. `nvk.sh`
-   *assigns* `CUDA_ARCH_LIST` after sourcing the env and derives
+   assigns `CUDA_ARCH_LIST` after sourcing the env and derives
    `CMAKE_CUDA_ARCHITECTURES` from it, because a `${VAR:-default}` cannot
    override a variable the sourced snapshot already set to a non-empty value.
    Override with `NVK_CUDA_ARCH`.
 
-3. **A Vulkan loader.** The dev shell ships none, so wgpu enumerates zero
+3. A Vulkan loader. The dev shell ships none, so wgpu enumerates zero
    adapters and every wgpu GPU test returns early — while still printing a
    passing result. `nvk.sh` exports `VK_ICD_FILENAMES` from
    `/run/opengl-driver` and prepends the store's vulkan-loader to
-   `LD_LIBRARY_PATH`, and it must do so *after* sourcing the snapshot for the
+   `LD_LIBRARY_PATH`, and it must do so after sourcing the snapshot for the
    same overwrite reason as above. Override with `NVK_VULKAN_LOADER`. A wgpu
    parity or timing claim produced without a loader present rests on nothing —
    see 05-backends.md.
 
-4. **A per-lane `CARGO_TARGET_DIR`.** `$NVK_CACHE/tgt-$NVK_LANE`, default lane
+4. A per-lane `CARGO_TARGET_DIR`. `$NVK_CACHE/tgt-$NVK_LANE`, default lane
    `base`.
 
-5. **ccache.** Since every lane has its own target dir, N lanes recompile the
+5. ccache. Since every lane has its own target dir, N lanes recompile the
    same `.cu` sources N times. `nvk.sh` sets `NVK_NVCC_WRAPPER` (consumed by
    `crates/nv-kernels/build.rs`'s `nvcc_launcher`, which generates a shim in `OUT_DIR` — the
-   `cc` crate calls `cc::Build::compiler()` explicitly and does *not* consult
+   `cc` crate calls `cc::Build::compiler()` explicitly and does not consult
    `RUSTC_WRAPPER`) plus `CMAKE_{CUDA,C,CXX}_COMPILER_LAUNCHER` for the
    cmake-driven sub-builds. It is ccache and not sccache: sccache parses
    `nvcc --dryrun` output and treats any line not matching `^([_A-Z]+)=` as a
@@ -163,13 +178,13 @@ each individually load-bearing.
    `#$ compiler-bindir=/nix/store/…`, which fails that regex and kills every
    compile. Disable with `NVK_CCACHE=0`.
 
-6. **sccache for rustc — opt-in, and not what it looks like.** `NVK_SCCACHE=1`
+6. sccache for rustc — opt-in, and not what it looks like. `NVK_SCCACHE=1`
    sets `RUSTC_WRAPPER` (plus `CARGO_INCREMENTAL=0`, which sccache requires).
    The obvious hope — lane #2 reuses lane #1's compiled crates — is falsified
    by measurement: sccache's rust cache key includes the per-lane target-dir
    path, so a fresh lane hits 0% of a cache another lane just filled and comes
-   out *slower* than bare (nv-models `--release` lane-cold: 5m52s vs 5m31s).
-   The one case that pays is rebuilding a lane under the **same name** after
+   out slower than bare (nv-models `--release` lane-cold: 5m52s vs 5m31s).
+   The one case that pays is rebuilding a lane under the same name after
    its target dir was reaped: 100% hit rate, 4m39s vs 5m31s (~16% — the
    remaining wall is linking, build scripts, and proc-macro crates, which
    sccache does not cache). Hence default 0; `NVK_SCCACHE_DIR` (default
@@ -187,15 +202,16 @@ Selection knobs: `NVK_PKG` (default `nv-kernels`), `NVK_FEATURES` (default
 features: anything containing `cuda` selects `.#cuda`, otherwise `.#default`.
 
 ```sh
-rust/scripts/nvk.sh test --test parity_rope -- --nocapture
-NVK_LANE=rope rust/scripts/nvk.sh test --test parity_rope
+rust/scripts/nvk.sh test --test rope -- --nocapture
+NVK_LANE=rope rust/scripts/nvk.sh test --test rope
 NVK_FEATURES=wgpu rust/scripts/nvk.sh test --test wgpu_rope
-NVK_PKG=nv-models rust/scripts/nvk.sh test --release --test laguna_smoke
+NVK_PKG=nv-models rust/scripts/nvk.sh test --release --test laguna_fa2_contract
 rust/scripts/nvk.sh --help
 ```
 
 `NVK_FEATURES=wgpu` skips every nvcc invocation and is the fast edit loop for
-backend work — but see the trap: it also silences every `parity_*` suite.
+backend work — but see the trap: it also silences every suite cfg'd on `cuda`,
+including the cross-backend ones.
 
 The CUDA build is large and memory-hungry. `NVK_JOBS` defaults deliberately low;
 raising it, or running several lanes at once, can drive load high enough to
@@ -205,7 +221,7 @@ one.
 ## The per-lane convention
 
 Concurrent agents work directly in the tree on `main` — no branches, no
-worktrees — and are isolated by **disjoint file ownership** plus **disjoint
+worktrees — and are isolated by disjoint file ownership plus **disjoint
 lanes**. Every concurrent worker must set its own `NVK_LANE`; sharing a lane
 means two cargo processes fighting over one target dir.
 
@@ -231,62 +247,54 @@ timer, because deleting build state is a decision, not a side effect.
 Four kinds of test live in this tree, with different costs and different
 preconditions.
 
-**Unit and source-invariant tests.** Ordinary `#[test]` functions in `src/`, plus
-a category of *inventory* tests that assert properties of the source itself.
-`rust/tests/parity_inventory.rs` reads
-`crates/nv-models/src/{gemma4,qwen3_5_moe,gemma4_e4b}_wgpu.rs` and asserts they
-still contain `decode_step`/`decode_step_logits` and still do *not* mention
-`candle_nn`, `candle_core::Device` or `Device::new_cuda` — i.e. it mechanically
-enforces the claim in `docs/book/05.1-wgpu-status.md` that the wgpu decoders use candle
-only to stage host weights, never for the forward pass. These are cheap, need no
-GPU, and are the reason a documentation claim in 05-backends.md can be trusted
-between measurements.
+Unit and source-invariant tests. Ordinary `#[test]` functions in `src/`, plus
+a category of inventory tests that assert properties of the source itself:
+`rust/tests/backends_report_route.rs` reads `main.rs` to prove the binary mounts
+the backends report. These are cheap and need no GPU.
 
-**Numerical parity.** There is no golden-fixture tier ladder; see
+Numerical parity. There is no golden-fixture tier ladder; see
 the private status ledger's Numerics row for what its absence ungates. The repo-wide rule
 it modeled still stands: without the parent `nano-qwen3-omni` repo present, scaffolds get
 architectural verification — real weights load with the right shapes, forward
 produces the right output shape — and nothing may be called numerical parity.
 
-*Backend parity* is the `parity_*` suite in `rust/crates/nv-kernels/tests/`
-(`parity_rope`, `parity_gemm_nvfp4`, `parity_flash_decode`, `parity_kv_fp8`,
-`parity_tree_verify`, …), which runs the same kernel on CUDA and on wgpu and
-compares. These are the executable form of the equivalence claims in
-04-kernels-and-quantization.md and 05-backends.md.
+Backend parity is thin. `rust/scripts/parity-audit.sh` ratchets the suites it
+lists (today `wgpu_quantize_nvfp4_bf16_cpu_ref`); the `wgpu_*` suites in
+`rust/crates/nv-kernels/tests/` hold wgpu kernels to host oracles. These are the
+executable form of the equivalence claims in 04-kernels-and-quantization.md and
+05-backends.md.
 
-**Conformance fixtures.** A language-agnostic corpus under `conformance/`,
+Conformance fixtures. A language-agnostic corpus under `conformance/`,
 described in its own section below.
 
-**Real-weight tests.** Anything that loads a checkpoint or touches the GPU is
+Real-weight tests. Anything that loads a checkpoint or touches the GPU is
 `#[ignore]`d, usually `#[cfg(feature = "cuda")]`, and additionally gated on an
 opt-in environment variable. The canonical shape, from
-`crates/nv-models/tests/gemma4_moe.rs`:
+`crates/nv-models/tests/gemma4_vision_graph_capture.rs` (the file is
+`#![cfg(feature = "cuda")]`):
 
 ```rust
-#[cfg(feature = "cuda")]
 #[test]
 #[ignore]
-fn real_26b_a4b_weights_load_and_forward() {
-    if std::env::var("NV_GEMMA4_MOE_TEST").as_deref() != Ok("1") {
-        eprintln!("skip: set NV_GEMMA4_MOE_TEST=1 to run");
-        return;
+fn e4b_real_tower_graph_parity_and_encode_wall() {
+    if std::env::var("NV_GEMMA4_VISION_REAL_TEST").ok().as_deref() != Some("1") {
+        panic!("… NV_GEMMA4_VISION_REAL_TEST=1 is not set. This is a SKIP, not a pass.");
     }
     …
 }
 ```
 
-There are many such variables — `NV_LAGUNA_TEST` (also gates
-`laguna_prefix_reuse`, the sequenced CUDA checkpoint/HTTP gate), `NV_WGPU_SERVE_TEST`,
-`NV_GEMMA4_WGPU_TEST`, `NV_E4B_WGPU_TEST`, `NV_QWEN36_TEST`, `NV_DFLASH_TEST`,
-`NV_PARITY_T5_TEST`, `NV_TOOLS_REAL_TEST`, and more. Each names the assets it
-needs. None of them belong in a CI run without a GPU.
+There are many such variables — `NV_LAGUNA_TEST`, `NV_WGPU_SERVE_TEST`,
+`NV_GEMMA4_WGPU_TEST`, `NV_E4B_WGPU_TEST`, `NV_TOOLS_REAL_TEST`, and more. Each
+names the assets it needs. None of them belong in a CI run without a GPU.
 
 A gate that `panic!`s when its variable is unset is stronger than one that
 prints `skip` and returns, because the second shape is indistinguishable from a
-pass in the harness output. `rust/tests/gemma4_mm_e2e.rs` is the panic-shaped
-example.
+pass in the harness output. `rust/tests/guided_json_stress.rs` still has the
+skip shape; `rust/tests/gemma4_mm_e2e.rs` and the example above have the panic
+shape.
 
-**Laguna prefix checkpoints.** Validation is specific to the recorded serving
+Laguna prefix checkpoints. Validation is specific to the recorded serving
 composition, KV/draft arm and chunk size.
 [`05.9-prefix-cache-scope.md`](05.9-prefix-cache-scope.md#running-the-gates)
 provides the exact commands and coverage boundaries. The planner's
@@ -294,9 +302,7 @@ provides the exact commands and coverage boundaries. The planner's
 LRU selection and backtracking without GPU execution. The three ignored
 `prefix_cuda_gate` fixtures need `NV_LAGUNA_PREFIX_CUDA_TEST=1` and actual CUDA;
 they cover BF16/FixedOne target snapshots and ring draft context, not full-model
-numerics. The separate
-`buffered_and_sse_usage_preserve_prestarted_cached_tokens` fixture checks HTTP
-usage serialization without model loading.
+numerics.
 
 The separate shared-prefill lifecycle suite
 (`laguna_serve::shared_prefill_handoff_cuda_tests`) requires
@@ -311,48 +317,6 @@ execution, throughput and model quality require separate validation. The
 errors, client-close observation, reservations and capability-based context-tail
 routing without claiming recovery from a CUDA call that never returns.
 
-The ignored real-model
-`checkpoint_http_reuse_backtracks_restores_and_refuses_unbudgeted_copies` requires
-`NV_LAGUNA_TEST=1`, `NV_LAGUNA_PREFIX_TEST_KV=bf16|fp8-fixed-one`,
-`NV_LAGUNA_PREFIX_TEST_DRAFT=0|1`, the explicit pinned `NV_LAGUNA_DIR` and, when
-enabled, `NV_LAGUNA_DFLASH_DIR`, plus a new `NV_LAGUNA_PREFIX_ARTIFACT_DIR`.
-Missing paths, renderer preconditions, producer diagnostics or real cache hits
-fail the gate. It compares cold and reused emitted IDs and HTTP results, checks
-thinking-strip backtracking, off-device restore, pre-header cancellation/recovery
-and refusal before copying under a one-byte snapshot budget. It pins exact
-extension off, uses in-process HTTP, and produces diagnostic artifacts rather
-than performance rows; it does not qualify exact extension, cross-theta reuse or
-sticky-driver recovery. Use `nvk.sh probe` for the ignored CUDA tests and retain
-the raw artifacts, nonzero test count and successful terminal markers.
-
-The larger-chunk test
-`checkpoint_http_large_chunk_layout_guard_cold_misses_and_reuses` requires draft
-`0` and tests both 1024/2048 boundaries. The deep test
-`checkpoint_http_168k_chunk1024_fixed_one_packed_draft_resident_reuse` requires
-FixedOne KV and packed draft `1`; it checks actual 168000-token resident reuse
-with a 2 GiB budget and at most 48 outputs. These packed gates use strict-window
-eager CUDA proposals; `NV_LAGUNA_DFLASH_GRAPH=1` alone does not establish graph
-execution.
-
-The two separate relaxed-window filters are
-`checkpoint_http_relaxed_graph_reuse_backtracks_and_restores` and
-`checkpoint_http_168k_chunk1024_fixed_one_packed_graph_resident_reuse`.
-Both require FixedOne KV and packed draft `1`, and assert positive graph-proposal
-rounds with zero eager rounds through `laguna_prefix_diagnostics::draft_round`.
-The deep graph filter emits 256 tokens; it is distinct from the 48-output
-strict-window filter. Select each test with `--exact` and a new artifact
-directory, since their modes and output budgets differ.
-
-The sealed HostB graph scope contains 17 planner passes, two real-model passes,
-18 HTTP responses and 12 exact emitted-ID comparisons. Its deep cold/reuse pair
-has 110 graph rounds each, resident position 167936 and 74072064 charged bytes,
-with no additional snapshot copy. The evidence applies to that HostB parent and
-in-process HTTP composition, not the compiled combined central package or
-canonical numerical/throughput qualification. Current central diagnostic/test
-sources still require composed-build and producer-hook validation. The central
-archive/restore workflow remains a separate qualification from the HostB gate's
-admitted 4096-position archive restore.
-
 Unset `NV_LAGUNA_PREFILL_BF16_HANDOFF` for the ordinary prefix gates. The
 default-off handoff requires explicit `NV_LAGUNA_PREFIX_REUSE=0`:
 ordinary checkpoint operations address the step cache, while handoff prefill
@@ -360,22 +324,22 @@ writes a separate BF16 source. Source-unaware reuse
 must refuse at startup. Its combined central build and handoff-plus-prefix
 composition remain unqualified; the ordinary prefix tests do not cover them.
 
-**Laguna optional decode kernels.** `NV_LAGUNA_VERIFY_ROUTER_GEMV=1` selects
+Laguna optional decode kernels. `NV_LAGUNA_VERIFY_ROUTER_GEMV=1` selects
 the fused router and activation staging for eligible verifier rows 2–8.
-Its arithmetic differs from the replaced GEMM. The suite covering router
-staging (`moe_mchain_mrow_parity`) compares against per-row GEMV, not that GEMM.
-`NV_LAGUNA_QKVO_ROWS` (unset is on) routes verifier rows 1-8 through the
-fused FP8 q|k|v|gate, norm+rope and gated o_proj row kernels;
-`NV_LAGUNA_QKVO_RSTD_FUSE=1` additionally folds the rstd reduction into the
+Its arithmetic differs from the replaced GEMM, and no suite in the tree covers
+router staging. Verifier rows 1-8 on the rows-w8 path always run the fused FP8
+q|k|v|gate and norm+rope row kernels, and the gated o_proj is fused whenever its
+shape fits (the unfused q8 rows o_proj is the n_q > 64 or head_dim % 8
+fallback); `NV_LAGUNA_QKVO_RSTD_FUSE=1` additionally folds the rstd reduction into the
 projection at M1. The suite covering row projections (`laguna_r3_rows_gemv`,
 `NV_LAGUNA_ROWS_GEMV_TEST=1`) checks every row 1..8 bit for bit against the
 m=1 decode kernels and compares fused and separate normalization for FP8
 and int8 weights. `NV_LAGUNA_VERIFY_ROUTER_GEMV` and the rstd fold default
-off; all three are read at graph construction. Preserve actual route markers and validate
+off; both are read at graph construction. Preserve actual route markers and validate
 the composed binary through `nvk.sh`; an older host result does not qualify a
 selective source port or the overall model trajectory.
 
-**Multimodal chat serving.** 06-serving-surface.md owns the engine behaviour
+Multimodal chat serving. 06-serving-surface.md owns the engine behaviour
 (`Gemma4MmTowers::from_model_dir`, `NvEngineChat::supports_mm_input`,
 `NV_MM_TOWERS_DIR`, `NV_MM_TOWERS=vision|audio`); what belongs here is its gate.
 Media requests take the eager per-request loop on every arm — `mm_present`
@@ -398,23 +362,24 @@ property.
 bug.** Five distinct mechanisms produce a passing report from a suite that ran
 no work:
 
-1. **`cfg`'d out.** Every `parity_*` suite opens with
-   `#![cfg(all(feature = "cuda", feature = "wgpu"))]`. Run one under
+1. `cfg`'d out. A cross-backend suite is cfg'd on both features
+   (`#[cfg(all(feature = "cuda", feature = "wgpu"))]`, as in
+   `fp8_contract_e4m3.rs`). Run one under
    `NVK_FEATURES=wgpu` and it compiles to an empty binary that reports zero tests
    passing in no time. That is a skip wearing a pass's clothes. Never use the
    feature override on a CUDA parity gate.
-2. **Env-gated early return.** The `#[ignore]` + `NV_*_TEST` pattern above
-   returns before doing anything, and the harness counts the test as **passed**.
-   A *non-zero* pass count, so it does not even look like a skip.
-3. **No adapter / no device.** Without the Vulkan loader `nvk.sh` wires, every
+2. Env-gated early return. The `#[ignore]` + `NV_*_TEST` pattern above
+   returns before doing anything, and the harness counts the test as passed.
+   A non-zero pass count, so it does not even look like a skip.
+3. No adapter / no device. Without the Vulkan loader `nvk.sh` wires, every
    wgpu test that requests an adapter returns early and reports ok — the whole
    wgpu surface measured on nothing.
-4. **Missing dependency guard.** `let Some(models) = models() else { return };`
+4. Missing dependency guard. `let Some(models) = models() else { return };`
    is invisible in output, and silently skips every suite needing a models
    directory.
-5. **A fixture that is free.** A "heavy" wgpu kernel written as a constant-trip
+5. A fixture that is free. A "heavy" wgpu kernel written as a constant-trip
    affine recurrence has a closed form; the shader compiler reduced it to
-   constant work, and the test concluded the *profiler* was broken.
+   constant work, and the test concluded the profiler was broken.
 
 Detection, in order of cost:
 
@@ -425,18 +390,14 @@ Detection, in order of cost:
   checkpoint or touches a GPU cannot legitimately report a single instant pass.
 - Set the require-flags. `NV_KERNELS_PARITY_REQUIRE=1` (which `nvk.sh` sets by
   default) converts "no CUDA device 0" from a silent early return into a
-  `panic!` — see the `require()`/`backends()` helpers at the top of
-  `crates/nv-kernels/tests/parity_rope.rs` and its siblings, and
+  `panic!` — see the `require()`/`backends()` helpers in
+  `crates/nv-kernels/tests/common/mod.rs` and
   `crates/nv-layers/tests/backend_select.rs`. This is the only one of the five
   mechanisms with a mechanical off switch; use it.
-- Prefer suites that assert their own inputs. `run_goldens.rs` has
-  `required_fixtures_present`, which fails if any of the ten expected golden
-  files is missing, so an empty `golden/` directory cannot pass as "all goldens
-  pass". The same suite prints, for the externally-driven T5 tier, an explicit
-  line stating that it does **not** evaluate that tier and that a green
-  `all_goldens_pass` is not evidence for it.
+- Prefer suites that assert their own inputs, so an empty fixture directory
+  cannot pass as "every fixture passes".
 
-And before claiming a fix or a regression: **baseline on a reverted tree**.
+And before claiming a fix or a regression: baseline on a reverted tree.
 Multiple "regressions" here were tests that had never previously run and only
 started executing because of the change under test. The procedure is
 `git diff -- <files> > x.patch; git checkout -- <files>; run; git apply x.patch`.
@@ -454,15 +415,15 @@ hermetic).
 
 Bands and kinds:
 
-- **001–015, wire-trace.** `input.jsonl` (phase ops driving the realtime state
+- 001–015, wire-trace. `input.jsonl` (phase ops driving the realtime state
   machine) + `expected.jsonl` (the canonical wire trace) + `README.md` pinning
   spec sections. Compared after canonicalization: session/item/response IDs are
   renumbered in first-appearance order and volatile fields (timestamps, nonces,
   audio bytes) stripped, so traces are comparable across implementations.
-- **020 / 030 / 040, endpoint manifests.** `fixture.json` with an `endpoint`
+- 020 / 030 / 040, endpoint manifests. `fixture.json` with an `endpoint`
   block or a `steps` array, `expected_response`, `comparison_strategy`,
   `ref_outputs`, `skip_when_no_model`. Drivable over HTTP.
-- **050 / 060 / 070 / 071, declarative manifests.** Consumed in-process by Go and
+- 050 / 060 / 070 / 071, declarative manifests. Consumed in-process by Go and
   Rust tests rather than over the wire — diarization hop sweep, EOU parity,
   OCR and OCR-layout gates.
 
@@ -486,7 +447,7 @@ install. `run_fixture.py` drives the wire-trace corpus through
 `lib/trace_invariants.py` directly, optionally restricted to the W-invariant
 subset (`W1`…`W8`) with `--strict`; it validates `expected.jsonl` against the
 canonical assertions without needing any implementation, which makes it the cheap
-gate. `run_endpoint_fixture.py` structurally validates *every* `fixture.json` in
+gate. `run_endpoint_fixture.py` structurally validates every `fixture.json` in
 the corpus: name equals directory name, family matches the numeric band, required
 fields present, every path in `input_artifacts` and every `field@` multipart
 reference exists on disk, declared WAV headers match. In placeholder mode
@@ -504,7 +465,7 @@ them.
 
 ## No comments, and the canonical formatter
 
-The repo convention is **no comments by default**. `scripts/strip-comments.py`
+The repo convention is no comments by default. `scripts/strip-comments.py`
 is the canonical formatter and is run on new files before committing; past agents
 wrote dense docstrings and expected-key tables, and their removal is the desired
 state, not a loss.
@@ -531,7 +492,7 @@ use as a gate. `SKIP_DIRS` excludes `.git`, `target`, `vendor`, `node_modules`,
 
 Where explanation is genuinely load-bearing, it goes into `docs/` — which is what
 this book is — not into the source. The handful of comments that survive in
-`flake.nix` and `nvk.sh` are of a specific type: they record a *falsified*
+`flake.nix` and `nvk.sh` are of a specific type: they record a falsified
 hypothesis or an upstream bug (why sccache cannot wrap nvcc, why NCCL is disabled
 in onnxruntime, why CUTLASS is pinned out of tree, why `:-` failed to override
 `CUDA_ARCH_LIST`). That is the bar.

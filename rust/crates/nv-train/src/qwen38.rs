@@ -1,18 +1,21 @@
 use anyhow::{bail, ensure, Context, Result};
-use candle_core::{DType, Device, Tensor, Var};
-use candle_nn::optim::Optimizer;
+use candle_core::{DType, Device, Tensor, Var, D};
+use candle_nn::optim::{AdamW, Optimizer};
 use half::bf16;
 use nv_layers::linear::{Linear, LoraDeltaHook};
 use nv_layers::linear_attn::LinearAttentionConfig;
 use nv_layers::norm::RmsNorm;
 use nv_layers::rope::{Rope, RopeConfig, RopeKind};
-use nv_weights::WeightLoader;
+use nv_weights::{StDtype, WeightLoader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::qwen38_gdn_chunked as chunked;
-use crate::{LoraConfig, LoraTrainable, RawLora, TrainingLoraHook};
+use crate::{qwen38_gdn_chunked as chunked, LoraConfig, LoraTrainable, RawLora, TrainingLoraHook};
+#[cfg(feature = "cuda")]
+use nv_quant::nvfp4::Nvfp4GemmRunner;
+use std::env;
+use std::time::Instant;
 
 pub const THE_FROZEN_PREFIX_IS_CACHED_AS_HIDDEN_STATES_WHICH_IS_ONLY_SOUND_BECAUSE_NO_TRAINABLE_PARAMETER_LIVES_BELOW_THE_WINDOW: &str =
     "Layers below window_start hold no LoRA and no Var, so their output for a fixed token \
@@ -239,7 +242,7 @@ pub struct HostDequantWeights {
     loader: WeightLoader,
     device: Device,
     #[cfg(feature = "cuda")]
-    serving_w4a4_runner: Option<Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>>,
+    serving_w4a4_runner: Option<Arc<Mutex<Nvfp4GemmRunner>>>,
     #[cfg(feature = "cuda")]
     resident_fp8_runner: Option<Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>>,
 }
@@ -274,10 +277,7 @@ impl HostDequantWeights {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn with_serving_w4a4_arm(
-        mut self,
-        runner: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
-    ) -> Self {
+    pub fn with_serving_w4a4_arm(mut self, runner: Arc<Mutex<Nvfp4GemmRunner>>) -> Self {
         self.serving_w4a4_runner = Some(runner);
         self
     }
@@ -285,7 +285,7 @@ impl HostDequantWeights {
     #[cfg(feature = "cuda")]
     pub fn with_quant_resident_arms(
         mut self,
-        nvfp4: Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>,
+        nvfp4: Arc<Mutex<Nvfp4GemmRunner>>,
         fp8: Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>,
     ) -> Self {
         self.serving_w4a4_runner = Some(nvfp4);
@@ -297,7 +297,7 @@ impl HostDequantWeights {
         self.loader.names().iter().any(|n| {
             n.ends_with(".weight_packed")
                 || (n.ends_with(".weight")
-                    && self.loader.st_dtype_of(n) == Some(nv_weights::StDtype::F8_E4M3)
+                    && self.loader.st_dtype_of(n) == Some(StDtype::F8_E4M3)
                     && self.loader.has(&format!("{n}_scale")))
         })
     }
@@ -332,11 +332,10 @@ impl HostDequantWeights {
             .loader
             .st_dtype_of(&wname)
             .ok_or_else(|| anyhow::anyhow!("{wname}: no dtype"))?;
-        if dt == nv_weights::StDtype::F8_E4M3 && self.loader.has(&format!("{module}.weight_scale"))
-        {
+        if dt == StDtype::F8_E4M3 && self.loader.has(&format!("{module}.weight_scale")) {
             return Ok((ModuleStorage::Fp8RowScale, shape[0], shape[1]));
         }
-        if dt == nv_weights::StDtype::BF16 || dt == nv_weights::StDtype::F32 {
+        if dt == StDtype::BF16 || dt == StDtype::F32 {
             return Ok((ModuleStorage::Bf16, shape[0], shape[1]));
         }
         bail!("{wname}: storage dtype {dt:?} has no host dequant for training")
@@ -465,7 +464,7 @@ impl HostDequantWeights {
             .st_dtype_of(name)
             .ok_or_else(|| anyhow::anyhow!("{name}: no dtype"))?;
         ensure!(
-            dt == nv_weights::StDtype::BF16,
+            dt == StDtype::BF16,
             "{name}: embedding row gather expects BF16 storage, got {dt:?}"
         );
         let mut out: Vec<bf16> = Vec::with_capacity(ids.len() * hidden);
@@ -498,7 +497,7 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 fn l2_normalize_last(x: &Tensor) -> Result<Tensor> {
     let in_dt = x.dtype();
     let xf = x.to_dtype(DType::F32)?;
-    let sum_sq = xf.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
+    let sum_sq = xf.sqr()?.sum_keepdim(D::Minus1)?;
     let eps_t = Tensor::new(1e-6f32, x.device())?;
     let denom = sum_sq.broadcast_add(&eps_t)?.sqrt()?;
     Ok(xf.broadcast_div(&denom)?.to_dtype(in_dt)?)
@@ -507,7 +506,7 @@ fn l2_normalize_last(x: &Tensor) -> Result<Tensor> {
 fn rmsnorm_last(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     let in_dt = x.dtype();
     let xf = x.to_dtype(DType::F32)?;
-    let var = xf.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
+    let var = xf.sqr()?.mean_keepdim(D::Minus1)?;
     let eps_t = Tensor::new(eps as f32, x.device())?;
     let denom = var.broadcast_add(&eps_t)?.sqrt()?;
     let normed = xf.broadcast_div(&denom)?;
@@ -529,7 +528,6 @@ pub struct TrainGdn {
 }
 
 impl TrainGdn {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: LinearAttentionConfig,
         in_proj_qkv: Linear,
@@ -767,7 +765,6 @@ pub struct GdnParts {
     pub t: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn gdn_scan(
     q: &Tensor,
     k: &Tensor,
@@ -791,12 +788,31 @@ pub fn gdn_scan(
     #[cfg(feature = "cuda")]
     if chunked::fused_scan_kernel_serves(q, d_k, d_v) {
         let fwd = chunked::scan_chunked_fwd(q, k, v, g_exp, beta, b, t, n_v, d_k, d_v, t)?;
-        if std::env::var("NV_Q38_GDN_SCAN_CHECK_PRINTS_THE_KERNEL_VS_CANDLE_DIVERGENCE_PER_CALL").as_deref() == Ok("1") {
-            std::env::set_var(chunked::NV_Q38_GDN_SCAN_KERNEL_DEFAULT_ON_0_RESTORES_THE_PER_TOKEN_CANDLE_SCAN_WHOSE_TEN_LAUNCHES_PER_TOKEN_MADE_THE_WINDOW_BACKWARD_2_1_S_OF_A_3_0_S_STEP, "0");
-            let reference = gdn_scan(q, k, v, g_exp, beta, b, t, n_v, d_k, d_v);
-            std::env::remove_var(chunked::NV_Q38_GDN_SCAN_KERNEL_DEFAULT_ON_0_RESTORES_THE_PER_TOKEN_CANDLE_SCAN_WHOSE_TEN_LAUNCHES_PER_TOKEN_MADE_THE_WINDOW_BACKWARD_2_1_S_OF_A_3_0_S_STEP);
-            let reference = reference?;
-            let diff = fwd.out.sub(&reference)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        if env::var("NV_Q38_GDN_SCAN_CHECK_PRINTS_THE_KERNEL_VS_CANDLE_DIVERGENCE_PER_CALL")
+            .as_deref()
+            == Ok("1")
+        {
+            let cpu = |x: &Tensor| x.to_device(&Device::Cpu);
+            let reference = gdn_scan(
+                &cpu(q)?,
+                &cpu(k)?,
+                &cpu(v)?,
+                &cpu(g_exp)?,
+                &cpu(beta)?,
+                b,
+                t,
+                n_v,
+                d_k,
+                d_v,
+            )?
+            .to_device(q.device())?;
+            let diff = fwd
+                .out
+                .sub(&reference)?
+                .abs()?
+                .flatten_all()?
+                .max(0)?
+                .to_scalar::<f32>()?;
             let scale = reference.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
             let gmin = g_exp.flatten_all()?.min(0)?.to_scalar::<f32>()?;
             let gmax = g_exp.flatten_all()?.max(0)?.to_scalar::<f32>()?;
@@ -898,11 +914,15 @@ impl TrainAttn {
         let k_normed = self.k_norm.forward_candle(&k)?;
 
         #[cfg(feature = "cuda")]
-        let fused_rope = if nv_layers::rope::train_rope_op_serves(&q_normed) && q_normed.dtype() == k_normed.dtype() {
+        let fused_rope = if nv_layers::rope::train_rope_op_serves(&q_normed)
+            && q_normed.dtype() == k_normed.dtype()
+        {
             let rd = self.rotary_dim.min(hd);
             Some((
-                rope.apply_train_partial_scaled(&q_normed, positions, rd, hd, 1.0)?.to_dtype(in_dtype)?,
-                rope.apply_train_partial_scaled(&k_normed, positions, rd, hd, 1.0)?.to_dtype(in_dtype)?,
+                rope.apply_train_partial_scaled(&q_normed, positions, rd, hd, 1.0)?
+                    .to_dtype(in_dtype)?,
+                rope.apply_train_partial_scaled(&k_normed, positions, rd, hd, 1.0)?
+                    .to_dtype(in_dtype)?,
             ))
         } else {
             None
@@ -1130,42 +1150,47 @@ impl TrainLayer {
             )
         })?;
         let core_var = Var::from_tensor(&fwd.out)?;
-        let (gs_tail, d_core) = crate::train_prof::phase(&dev, "gdn_bwd_tail_mlp_forward_and_surrogate_backward", || {
-            let mixed = gdn.tail(core_var.as_tensor(), &p.z, in_dtype, p.b, p.t)?;
-            let after_mix = x_var.as_tensor().add(&mixed)?;
-            let normed_post = self.post_norm.forward_candle(&after_mix)?;
-            let ffn = self.mlp.forward(&normed_post)?;
-            let out = after_mix.add(&ffn)?;
-            let surrogate_tail = out
-                .to_dtype(DType::F32)?
-                .mul(&grad_next.detach().to_dtype(DType::F32)?)?
-                .sum_all()?;
-            let gs_tail = surrogate_tail.backward()?;
-            let d_core = gs_tail
-                .get(core_var.as_tensor())
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("no grad reached the scan output seam"))?;
-            Ok((gs_tail, d_core))
-        })?;
+        let (gs_tail, d_core) = crate::train_prof::phase(
+            &dev,
+            "gdn_bwd_tail_mlp_forward_and_surrogate_backward",
+            || {
+                let mixed = gdn.tail(core_var.as_tensor(), &p.z, in_dtype, p.b, p.t)?;
+                let after_mix = x_var.as_tensor().add(&mixed)?;
+                let normed_post = self.post_norm.forward_candle(&after_mix)?;
+                let ffn = self.mlp.forward(&normed_post)?;
+                let out = after_mix.add(&ffn)?;
+                let surrogate_tail = out
+                    .to_dtype(DType::F32)?
+                    .mul(&grad_next.detach().to_dtype(DType::F32)?)?
+                    .sum_all()?;
+                let gs_tail = surrogate_tail.backward()?;
+                let d_core = gs_tail
+                    .get(core_var.as_tensor())
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("no grad reached the scan output seam"))?;
+                Ok((gs_tail, d_core))
+            },
+        )?;
         let mut acc: Vec<Option<Tensor>> = vars.iter().map(|v| gs_tail.get(v).cloned()).collect();
 
-        let (dq, dk, dv, dg, dbe) = crate::train_prof::phase(&dev, "gdn_bwd_scan_input_grads", || {
-            chunked::scan_chunked_input_grads(
-                &p.q_scaled,
-                &p.k_grp,
-                &p.v_f,
-                &p.g_exp,
-                &p.beta,
-                &d_core,
-                &fwd.checkpoints,
-                p.b,
-                p.t,
-                n_v,
-                d_k,
-                d_v,
-                chunk,
-            )
-        })?;
+        let (dq, dk, dv, dg, dbe) =
+            crate::train_prof::phase(&dev, "gdn_bwd_scan_input_grads", || {
+                chunked::scan_chunked_input_grads(
+                    &p.q_scaled,
+                    &p.k_grp,
+                    &p.v_f,
+                    &p.g_exp,
+                    &p.beta,
+                    &d_core,
+                    &fwd.checkpoints,
+                    p.b,
+                    p.t,
+                    n_v,
+                    d_k,
+                    d_v,
+                    chunk,
+                )
+            })?;
 
         let gs_head = crate::train_prof::phase(&dev, "gdn_bwd_head_surrogate_backward", || {
             let surrogate_head = p
@@ -1423,7 +1448,7 @@ fn run_inner(
     let rope = build_rope(&cfg, args.seq_len, device)?;
     let positions = flat_positions(1, args.seq_len, device)?;
 
-    let t_prefix = std::time::Instant::now();
+    let t_prefix = Instant::now();
     let mut hidden: Vec<Tensor> = Vec::with_capacity(args.examples);
     for ex in &inputs {
         let rows = src.embed_rows(EMBED_TOKENS, ex, cfg.hidden_size)?;
@@ -1442,7 +1467,7 @@ fn run_inner(
     }
     let prefix_seconds = t_prefix.elapsed().as_secs_f64();
 
-    let t_window = std::time::Instant::now();
+    let t_window = Instant::now();
     let mut window: Vec<TrainLayer> = Vec::with_capacity(args.grad_layers);
     for li in window_start..cfg.num_hidden_layers {
         window.push(
@@ -1658,7 +1683,6 @@ pub(crate) fn loss_and_grads_from_one_backward(
     Ok((lv, vars.iter().map(|v| grads.get(v).cloned()).collect()))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn window_loss_and_grads_checkpointed(
     window: &[TrainLayer],
     final_norm: &RmsNorm,
@@ -1684,7 +1708,6 @@ fn window_loss_and_grads_checkpointed(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn window_loss_and_grads_checkpointed_rows(
     window: &[TrainLayer],
     final_norm: &RmsNorm,
@@ -1787,17 +1810,17 @@ fn window_loss_and_grads_checkpointed_rows(
 }
 
 pub(crate) enum WindowOptimizer {
-    Single(candle_nn::optim::AdamW),
+    Single(AdamW),
     SplitBecauseLoraPlusRunsBFactorsHotter {
         a_vars: Vec<Var>,
-        a_opt: candle_nn::optim::AdamW,
+        a_opt: AdamW,
         b_vars: Vec<Var>,
-        b_opt: candle_nn::optim::AdamW,
+        b_opt: AdamW,
     },
 }
 
-fn adamw(vars: Vec<Var>, lr: f64) -> Result<candle_nn::optim::AdamW> {
-    Ok(candle_nn::optim::AdamW::new(
+fn adamw(vars: Vec<Var>, lr: f64) -> Result<AdamW> {
+    Ok(AdamW::new(
         vars,
         candle_nn::optim::ParamsAdamW {
             lr,
@@ -1903,7 +1926,7 @@ fn train_steps(
     }
     let mut opt = WindowOptimizer::new(vars, lr, b_lr_ratio)?;
     for step in 0..steps {
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
         let mut loss_sum = 0f32;
         for i in 0..n_examples {
@@ -1945,7 +1968,6 @@ struct CoTrainStepOutcome {
     all_head_grads_finite: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn co_train_steps(
     vars: &[Var],
     loras: &[(String, Arc<LoraTrainable>)],
@@ -1976,7 +1998,7 @@ fn co_train_steps(
     let mut opt = WindowOptimizer::new(vars, lr, b_lr_ratio)?;
     let mut head_opt = WindowOptimizer::new(head_vars, head_lr, b_lr_ratio)?;
     for step in 0..steps {
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let mut acc: Vec<Option<Tensor>> = vec![None; vars.len()];
         let mut head_acc: Vec<Option<Tensor>> = vec![None; head_vars.len()];
         let mut loss_sum = 0f32;
@@ -2168,7 +2190,6 @@ impl Q38MtpTrainHead {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn shifted_draft_ce(
         &self,
         emb: &Tensor,
@@ -2211,7 +2232,7 @@ impl Q38MtpTrainHead {
         };
         let norm_emb = self.pre_fc_norm_embedding.forward_candle(emb)?;
         let norm_hid = self.pre_fc_norm_hidden.forward_candle(&shifted)?;
-        let fused = Tensor::cat(&[&norm_emb, &norm_hid], candle_core::D::Minus1)?.contiguous()?;
+        let fused = Tensor::cat(&[&norm_emb, &norm_hid], D::Minus1)?.contiguous()?;
         let h0 = self.fc.forward(&fused)?;
         let normed = self.input_layernorm.forward_candle(&h0)?;
         let x = h0.add(&self.attn.forward(&normed, rope, positions)?)?;
@@ -2296,7 +2317,6 @@ struct MtpCoTrainEngine {
 }
 
 impl MtpCoTrainEngine {
-    #[allow(clippy::too_many_arguments)]
     fn build(
         co: &Q38MtpCoTrainArgs,
         cfg: &Q38Config,
@@ -2331,7 +2351,6 @@ impl MtpCoTrainEngine {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn head_loss_and_grads(
         &self,
         i: usize,
@@ -2377,7 +2396,7 @@ pub const GRAD_LAYERS_ABOVE_WHICH_RUN_JSONL_CHECKPOINTS_THE_WINDOW_BECAUSE_A_DEE
 fn window_checkpointing_with_nv_train_ckpt_as_the_named_tristate_escape_hatch(
     grad_layers: usize,
 ) -> bool {
-    match std::env::var("NV_TRAIN_CKPT").ok().as_deref() {
+    match env::var("NV_TRAIN_CKPT").ok().as_deref() {
         Some("1") => true,
         Some("0") => false,
         _ => {
@@ -2432,13 +2451,12 @@ pub const NV_Q38_EVAL_W4A4_SCORES_HELDOUT_ROWS_UNDER_THE_SERVING_QUANTIZED_FORWA
     "NV_Q38_EVAL_W4A4";
 
 pub const W4A4_EVAL_ARM_STAYS_ALONGSIDE_QUANT_RESIDENT_TRAINING_BECAUSE_IT_SCORES_A_HOST_DEQUANT_TRAINED_ADAPTER_UNDER_THE_SERVING_FORWARD: &str =
-    "Default training runs host-dequantized dense weights (HostDequantWeights::dense_linear -> \
-     bf16 Linear storage); serving keeps packed NVFP4 resident and quantizes activations per \
-     call (matmul_nvfp4_impl -> quantize_nvfp4_bf16), a W4A4 GEMM no upstream QLoRA trainer \
-     runs. NV_Q38_EVAL_W4A4=1 trains once under the dense-bf16 forward, then scores the same \
-     held-out rows under both forwards; NV_TRAIN_QUANT_RESIDENT=1 instead trains WITH the \
-     resident forward via QuantLinearOp (dx-only backward), so the two arms answer different \
-     questions and neither supersedes the other. W4A4 results go to stderr and \
+    "Serving keeps packed NVFP4 resident and quantizes activations per call \
+     (matmul_nvfp4_impl -> quantize_nvfp4_bf16), a W4A4 GEMM no upstream QLoRA trainer runs. \
+     NV_Q38_EVAL_W4A4=1 trains once under the dense-bf16 forward, then scores the same held-out \
+     rows under both forwards; quant-resident training instead trains WITH the resident forward \
+     via QuantLinearOp (dx-only backward), so the two answer different questions and neither \
+     supersedes the other. W4A4 results go to stderr and \
      <out>/w4a4_eval.json because Q38JsonlSummary's field set is mirrored by an exhaustive \
      literal in src/oapi/fine_tuning.rs.";
 
@@ -2448,53 +2466,25 @@ fn w4a4_eval_arm_opted_in() -> bool {
     )
 }
 
-pub const NV_TRAIN_QUANT_RESIDENT_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_IS_THE_HOST_DEQUANT_ORACLE_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM: &str =
-    "NV_TRAIN_QUANT_RESIDENT";
-
 pub const QUANT_RESIDENT_TRAINS_THROUGH_QUANT_LINEAR_OP_AND_LEAVES_BF16_MODULES_HOST_DEQUANT: &str =
-    "With NV_TRAIN_QUANT_RESIDENT=1 every checkpoint module classified Nvfp4Packed or \
+    "On CUDA every checkpoint module classified Nvfp4Packed or \
      Fp8RowScale is ingested as a quantized-resident Linear (the serving loaders' storage), so \
      the frozen prefix runs the serving quantized GEMM as-is and window Linears exercise \
      QuantLinearOp: forward is the serving quantized GEMM, backward is dx-only through a device \
      dequant of the frozen base, and the LoRA delta hook carries the only trainable parameters. \
      Bf16-stored modules (and the MTP head, which loads through its own small \
-     HostDequantWeights) stay host-dequant. This is the default since the 2026-09-13 ruling \
-     that training is quantized always; NV_TRAIN_QUANT_RESIDENT=0 is the host-dequant oracle \
-     the byte-identity test keeps, not a measured arm.";
+     HostDequantWeights) stay host-dequant, per the 2026-09-13 ruling that training is \
+     quantized always.";
 
 pub const QUANT_RESIDENT_REFUSES_AN_ALL_BF16_CHECKPOINT_BECAUSE_A_SILENT_FALLTHROUGH_WOULD_FAKE_THE_ARM: &str =
     "the refuses-loudly design: a checkpoint with no Nvfp4Packed/Fp8RowScale linear would make \
-     NV_TRAIN_QUANT_RESIDENT=1 an exact no-op, and a ppl row labelled resident that ran the \
+     the quantized-resident load an exact no-op, and a ppl row labelled resident that ran the \
      host-dequant path is worse than no row";
-
-pub fn quant_resident_arm_opted_in() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_TRAIN_QUANT_RESIDENT_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_IS_THE_HOST_DEQUANT_ORACLE_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM,
-    )
-}
-
-pub const A_BF16_ONLY_CHECKPOINT_UNDER_THE_QUANTIZED_ALWAYS_DEFAULT_IS_THE_TEST_ORACLE_AND_TRAINS_HOST_DEQUANT_ONLY_AN_EXPLICIT_1_REFUSES_IT: &str =
-    "the 2026-09-13 ruling keeps bf16 only as an internal test oracle: a checkpoint with no \
-     nvfp4-packed or fp8-rowscale linear (the tiny fixtures) has nothing to keep resident, so \
-     under the default it trains on the host-dequant path and says so; NV_TRAIN_QUANT_RESIDENT=1 \
-     set by hand still refuses it, because that arm must never be a silent no-op";
-
-fn quant_resident_set_by_hand() -> bool {
-    std::env::var(
-        NV_TRAIN_QUANT_RESIDENT_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_IS_THE_HOST_DEQUANT_ORACLE_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM,
-    )
-    .as_deref()
-        == Ok("1")
-}
 
 pub fn open_train_weights(base: &Path, device: &Device) -> Result<(HostDequantWeights, bool)> {
     let src = HostDequantWeights::open_dir(base, device)?;
-    if !quant_resident_arm_opted_in() {
-        return Ok((src, false));
-    }
     let _ = QUANT_RESIDENT_TRAINS_THROUGH_QUANT_LINEAR_OP_AND_LEAVES_BF16_MODULES_HOST_DEQUANT;
-    if !quant_resident_set_by_hand() && (!src.has_any_quantized_linear() || !device.is_cuda()) {
-        let _ = A_BF16_ONLY_CHECKPOINT_UNDER_THE_QUANTIZED_ALWAYS_DEFAULT_IS_THE_TEST_ORACLE_AND_TRAINS_HOST_DEQUANT_ONLY_AN_EXPLICIT_1_REFUSES_IT;
+    if !src.has_any_quantized_linear() || !device.is_cuda() {
         eprintln!(
             "[q38-lora-train] {} holds no quantized linear or runs on {:?}: host-dequant oracle path",
             base.display(),
@@ -2502,24 +2492,12 @@ pub fn open_train_weights(base: &Path, device: &Device) -> Result<(HostDequantWe
         );
         return Ok((src, false));
     }
-    ensure!(
-        src.has_any_quantized_linear(),
-        "NV_TRAIN_QUANT_RESIDENT=1 but {} holds no nvfp4-packed or fp8-rowscale linear -- {}",
-        base.display(),
-        QUANT_RESIDENT_REFUSES_AN_ALL_BF16_CHECKPOINT_BECAUSE_A_SILENT_FALLTHROUGH_WOULD_FAKE_THE_ARM
-    );
     #[cfg(feature = "cuda")]
     {
-        let cuda = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => bail!(
-                "NV_TRAIN_QUANT_RESIDENT=1 needs a CUDA device: quantized-resident storages do \
-                 not exist on CPU"
-            ),
+        let Device::Cuda(cuda) = device.clone() else {
+            bail!("quantized-resident storages need a CUDA device")
         };
-        let nvfp4 = Arc::new(Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
-            cuda.cuda_stream(),
-        )?));
+        let nvfp4 = Arc::new(Mutex::new(Nvfp4GemmRunner::new(cuda.cuda_stream())?));
         let fp8 = Arc::new(Mutex::new(nv_quant::fp8::Fp8GemmRunner::new(
             cuda.cuda_stream(),
         )?));
@@ -2527,10 +2505,7 @@ pub fn open_train_weights(base: &Path, device: &Device) -> Result<(HostDequantWe
     }
     #[cfg(not(feature = "cuda"))]
     {
-        bail!(
-            "NV_TRAIN_QUANT_RESIDENT=1 but this build has no cuda feature; quantized-resident \
-             storages only exist under cuda"
-        )
+        bail!("quantized-resident storages only exist under the cuda feature")
     }
 }
 
@@ -2617,7 +2592,6 @@ fn row0_logits(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 fn run_w4a4_eval_arm(
     args: &Q38JsonlArgs,
     cfg: &Q38Config,
@@ -2635,13 +2609,10 @@ fn run_w4a4_eval_arm(
     eval_ce_base_bf16: &[f32],
     eval_ce_adapter_bf16: &[f32],
 ) -> Result<()> {
-    let cuda = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => bail!("NV_Q38_EVAL_W4A4=1 needs a CUDA device: the serving W4A4 GEMM has no CPU path"),
+    let Device::Cuda(cuda) = device.clone() else {
+        bail!("NV_Q38_EVAL_W4A4=1 needs a CUDA device: the serving W4A4 GEMM has no CPU path")
     };
-    let runner = Arc::new(Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
-        cuda.cuda_stream(),
-    )?));
+    let runner = Arc::new(Mutex::new(Nvfp4GemmRunner::new(cuda.cuda_stream())?));
     let src = HostDequantWeights::open_dir(&args.base, device)?.with_serving_w4a4_arm(runner);
     let mut exs = embed_shifted_rows(&src, eval_rows, cfg.hidden_size, dtype, device)?;
     for li in 0..window_start {
@@ -2736,7 +2707,6 @@ fn run_w4a4_eval_arm(
 }
 
 #[cfg(not(feature = "cuda"))]
-#[allow(clippy::too_many_arguments)]
 fn run_w4a4_eval_arm(
     _args: &Q38JsonlArgs,
     _cfg: &Q38Config,
@@ -2788,7 +2758,7 @@ pub fn window_rows_per_graph_adaptive(device_total_gib: f64, used_by_others_gib:
 }
 
 fn window_rows_per_graph(device: &Device) -> usize {
-    if let Some(rows) = std::env::var(
+    if let Some(rows) = env::var(
         WINDOW_ROWS_PER_GRAPH_ENV_DEFAULT_4_BECAUSE_FOUR_512_ROWS_THROUGH_THE_CHECKPOINTED_CHUNKED_WALK_RUN_2_81_S_AT_29_GIB_AND_EIGHT_RUN_2_59_S_AT_51_GIB_1_RESTORES_ONE_ROW_PER_GRAPH,
     )
     .ok()
@@ -2822,6 +2792,7 @@ fn window_rows_per_graph(device: &Device) -> usize {
     4
 }
 
+#[cfg(feature = "cuda")]
 static DEVICE_USED_BY_THIS_PROCESS_GIB_AT_LOAD: Mutex<f64> = Mutex::new(0.0);
 
 #[cfg(feature = "cuda")]

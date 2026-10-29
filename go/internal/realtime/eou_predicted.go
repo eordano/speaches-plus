@@ -40,12 +40,6 @@ func (b *PredictedTokenBuffer) Push(tok string) {
 	b.inner = append(b.inner, tok)
 }
 
-func (b *PredictedTokenBuffer) Cap() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.cap
-}
-
 func (b *PredictedTokenBuffer) Len() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()

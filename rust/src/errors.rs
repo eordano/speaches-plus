@@ -69,17 +69,6 @@ pub fn error_type_for(code: &str) -> &'static str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn debug_assert_known_code_accepts_registered() {
-        debug_assert_known_code(code::INVALID_REQUEST_ERROR);
-        debug_assert_known_code(code::RESPONSE_ALREADY_ACTIVE);
-        debug_assert_known_code(code::INPUT_AUDIO_BUFFER_COMMIT_EMPTY);
-        debug_assert_known_code(code::VAD_FAILED);
-        debug_assert_known_code(code::CLIENT_TOO_SLOW);
-        debug_assert_known_code(code::INTERNAL_STATE_ERROR);
-        debug_assert_known_code(code::MODEL_LOAD_FAILED);
-    }
-
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "unknown error code")]
@@ -88,24 +77,41 @@ mod tests {
     }
 
     #[test]
-    fn known_codes_unique() {
-        let mut sorted: Vec<&&str> = KNOWN_CODES.iter().collect();
-        sorted.sort();
-        let len_before = sorted.len();
-        sorted.dedup();
-        assert_eq!(
-            len_before,
-            sorted.len(),
-            "duplicate entry in KNOWN_CODES: {sorted:?}"
-        );
-    }
-
-    #[test]
-    fn is_known_code_smoke() {
+    fn known_codes_are_unique_registered_and_typed() {
         assert!(is_known_code(code::CLIENT_TOO_SLOW));
         assert!(is_known_code(code::SESSION_NOT_ACTIVE));
         assert!(!is_known_code("not_a_real_code"));
         assert!(!is_known_code(""));
+        {
+            debug_assert_known_code(code::INVALID_REQUEST_ERROR);
+            debug_assert_known_code(code::RESPONSE_ALREADY_ACTIVE);
+            debug_assert_known_code(code::INPUT_AUDIO_BUFFER_COMMIT_EMPTY);
+            debug_assert_known_code(code::VAD_FAILED);
+            debug_assert_known_code(code::CLIENT_TOO_SLOW);
+            debug_assert_known_code(code::INTERNAL_STATE_ERROR);
+            debug_assert_known_code(code::MODEL_LOAD_FAILED);
+        }
+        {
+            let mut sorted: Vec<&&str> = KNOWN_CODES.iter().collect();
+            sorted.sort();
+            let len_before = sorted.len();
+            sorted.dedup();
+            assert_eq!(
+                len_before,
+                sorted.len(),
+                "duplicate entry in KNOWN_CODES: {sorted:?}"
+            );
+        }
+        {
+            assert_eq!(
+                error_type_for(code::EOU_KIND_UNSUPPORTED),
+                "invalid_request_error"
+            );
+            assert_eq!(
+                error_type_for(code::EOU_FUSION_RULE_UNSUPPORTED),
+                "invalid_request_error"
+            );
+        }
     }
 
     #[test]
@@ -185,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_site_scan_rejects_dispatch_only_mentions() {
+    fn emit_site_scan_rejects_dispatch_only_mentions_and_test_modules() {
         let dispatch =
             "        c if c == errcode::STT_FAILED => state::TerminationReason::SttFailed,";
         assert!(
@@ -200,23 +206,10 @@ mod tests {
         let payload = "json!({ \"code\": errcode::STT_FAILED })";
         assert!(emits_code(payload, code::STT_FAILED));
         assert!(!emits_code(emit, code::MODEL_LOAD_FAILED));
+        {
+            let src = "fn f() {}\n#[cfg(test)]\nmod tests {\n    assert_eq!(e.code, errcode::VAD_FAILED);\n}\n";
+            assert!(!emits_code(production_only(src), code::VAD_FAILED));
+        }
     }
 
-    #[test]
-    fn emit_site_scan_ignores_test_modules() {
-        let src = "fn f() {}\n#[cfg(test)]\nmod tests {\n    assert_eq!(e.code, errcode::VAD_FAILED);\n}\n";
-        assert!(!emits_code(production_only(src), code::VAD_FAILED));
-    }
-
-    #[test]
-    fn eou_unsupported_codes_are_client_faults() {
-        assert_eq!(
-            error_type_for(code::EOU_KIND_UNSUPPORTED),
-            "invalid_request_error"
-        );
-        assert_eq!(
-            error_type_for(code::EOU_FUSION_RULE_UNSUPPORTED),
-            "invalid_request_error"
-        );
-    }
 }

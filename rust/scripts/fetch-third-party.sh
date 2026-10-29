@@ -10,6 +10,7 @@ crates=(
   "wgpu 30.0.0 6d8f4bd44d92da5270f03409dba9f952dab24f128e05d6a554926101d1bf9114"
   "wgpu-hal 30.0.0 cf765132d8d5f50e192e7880464890c13f4e7457aafe8e5466e8174586e9f101"
   "candle-core 0.11.0 5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706"
+  "candle-metal-kernels 0.11.0 242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e"
 )
 mlx_tag=v0.32.2
 forge=${FORGE_URL:-https://git.decent.foundation}
@@ -17,7 +18,7 @@ upstream=${THIRD_PARTY_UPSTREAM:-0}
 [ "${1:-}" = --upstream ] && upstream=1
 
 crate_url() {
-  if [ "$upstream" = 1 ]; then
+  if [ "${3:-$upstream}" = 1 ]; then
     echo "https://static.crates.io/crates/$1/$1-$2.crate"
   else
     echo "$forge/api/packages/mirrors/generic/$1/$2/$1-$2.crate"
@@ -25,7 +26,7 @@ crate_url() {
 }
 
 mlx_url() {
-  if [ "$upstream" = 1 ]; then
+  if [ "${2:-$upstream}" = 1 ]; then
     echo "https://raw.githubusercontent.com/ml-explore/mlx/$mlx_tag/$1"
   else
     echo "$forge/mirrors/mlx/raw/tag/$mlx_tag/$1"
@@ -41,12 +42,16 @@ sha256() {
 }
 
 fetch() {
-  local url=$1 dest=$2 want=$3 got
+  local url=$1 dest=$2 want=$3 fallback=$4 got
   if [ -f "$dest" ] && [ "$(sha256 "$dest")" = "$want" ]; then
     return
   fi
   mkdir -p "$(dirname "$dest")"
-  curl -fsSL --retry 3 -o "$dest.tmp" "$url"
+  if ! curl -fsSL --retry 3 -o "$dest.tmp" "$url"; then
+    [ "$url" != "$fallback" ] || exit 1
+    echo "fetch: $url is unavailable; trying $fallback (the pinned sha256 still decides)" >&2
+    curl -fsSL --retry 3 -o "$dest.tmp" "$fallback"
+  fi
   got=$(sha256 "$dest.tmp")
   if [ "$got" != "$want" ]; then
     rm -f "$dest.tmp"
@@ -65,7 +70,7 @@ for entry in "${crates[@]}"; do
     echo "$name-$ver: up to date"
     continue
   fi
-  fetch "$(crate_url "$name" "$ver")" "$cache/$name-$ver.crate" "$sha"
+  fetch "$(crate_url "$name" "$ver")" "$cache/$name-$ver.crate" "$sha" "$(crate_url "$name" "$ver" 1)"
   rm -rf "$dir"
   tar -xzf "$cache/$name-$ver.crate" -C "$tp"
   patch -d "$dir" -p1 -s < "$patchfile"
@@ -75,6 +80,6 @@ done
 
 mlx=$tp/mlx-steel-attn
 while read -r sha path; do
-  fetch "$(mlx_url "$path")" "$mlx/$path" "$sha"
+  fetch "$(mlx_url "$path")" "$mlx/$path" "$sha" "$(mlx_url "$path" 1)"
 done < "$mlx/FILES"
 echo "mlx-steel-attn: $(wc -l < "$mlx/FILES") headers verified"

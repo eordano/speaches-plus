@@ -1,92 +1,31 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use bytemuck::{bytes_of, cast_slice};
+use half::bf16;
+use nv_weights::WeightLoader;
+use std::env;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+use wgpu::{BindGroup, Buffer, BufferUsages, CommandBuffer, ComputePipeline, ErrorFilter};
 
+use super::vision_wgpu::bind_entries;
 use nv_kernels::wgpu_backend::dispatch;
 use nv_kernels::wgpu_backend::kernels as wk;
 use nv_kernels::wgpu_backend::{compose, WgpuContext};
 
 use crate::gemma4_wgpu_shared::{pack_pairs, rope_tables_from_inv_freq};
 use crate::nvfp4_host::{quantize_nvfp4_host, upload_nvfp4, Nvfp4Gpu, NVFP4_BLOCK};
+use crate::wgpu_ledger::{env_not_off, env_on};
 use crate::wgpu_ledger::{VramLedger, VramReport};
 
 use super::decode_gemv_msl;
 use super::decoder::{argmax_banned, DotsDecoderConfig, GenerateOptions, GenerateOutcome};
 use crate::deepseek_ocr::decoder::{banned_tokens_windowed_ngram, detect_loop};
+use crate::pod;
 
 const LAGUNA_COMMON_WGSL: &str = include_str!("../../../nv-kernels/wgsl/laguna_common.wgsl");
 const LAGUNA_GEMV_BF16_WGSL: &str = include_str!("../../../nv-kernels/wgsl/laguna_gemv_bf16.wgsl");
-const LAGUNA_QUANT_ROWS_WGSL: &str =
-    include_str!("../../../nv-kernels/wgsl/laguna_quant_rows.wgsl");
 
 pub const NVFP4_GEMV_WGSL: &str = r#"
-struct DgGemv4Params {
-    alpha: f32,
-    n_rows: u32,
-    k_blocks: u32,
-    k_tiles: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-};
-
-@group(0) @binding(10) var<storage, read> dg4_w: array<vec2<u32>>;
-@group(0) @binding(11) var<storage, read> dg4_ws: array<u32>;
-@group(0) @binding(12) var<storage, read> dg4_x: array<vec2<u32>>;
-@group(0) @binding(13) var<storage, read> dg4_xs: array<u32>;
-@group(0) @binding(14) var<uniform> dg4_p: DgGemv4Params;
-@group(0) @binding(15) var<storage, read_write> dg4_y: array<u32>;
-
-var<workgroup> dg4_red: array<f32, 256>;
-
-const DG4_LANES_PER_ROW: u32 = 32u;
-const DG4_ROWS_PER_GROUP: u32 = 8u;
-
-@compute @workgroup_size(256)
-fn dg_gemv_nvfp4(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let slot = tid / DG4_LANES_PER_ROW;
-    let lane = tid % DG4_LANES_PER_ROW;
-    let group = wid.x + wid.y * dg4_p.groups_x;
-    let row = group * DG4_ROWS_PER_GROUP + slot;
-    let live = row < dg4_p.n_rows;
-    let wbase = select(0u, row * dg4_p.k_blocks, live);
-    let blocks = select(0u, dg4_p.k_blocks, live);
-
-    var acc = 0.0;
-    for (var kb = lane; kb < blocks; kb = kb + DG4_LANES_PER_ROW) {
-        let wsi = nvfp4_scale_byte_index(row, kb, dg4_p.k_tiles);
-        let ws = byte_at(dg4_ws[wsi >> 2u], wsi);
-        let xs = byte_at(dg4_xs[kb >> 2u], kb);
-        let block_scale = gemv_ue4m3_decode(ws) * gemv_ue4m3_decode(xs);
-        let wv = dg4_w[wbase + kb];
-        let xv = dg4_x[kb];
-        var dot = 0.0;
-        dot = gemv_dot8(wv.x, xv.x, dot);
-        dot = gemv_dot8(wv.y, xv.y, dot);
-        acc = fma(block_scale, dot, acc);
-    }
-    dg4_red[tid] = acc;
-    workgroupBarrier();
-    for (var stride = DG4_LANES_PER_ROW >> 1u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            dg4_red[tid] = dg4_red[tid] + dg4_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-
-    if (lane == 0u && (slot & 1u) == 0u && row < dg4_p.n_rows) {
-        let lo = dg4_red[tid] * dg4_p.alpha;
-        var hi = 0.0;
-        if (row + 1u < dg4_p.n_rows) {
-            hi = dg4_red[tid + DG4_LANES_PER_ROW] * dg4_p.alpha;
-        }
-        dg4_y[row >> 1u] = bf16_pack(lo, hi);
-    }
-}
-
 struct DgnParams {
     alpha: f32,
     n_rows: u32,
@@ -186,12 +125,6 @@ fn dg_gemv_nvfp4_mrow4(
     }
 }
 "#;
-
-pub const NVFP4_GEMV_CALLS_ONE_DOT4I8PACKED_PER_STATEMENT_BECAUSE_THE_MSL_POLYFILL_COLLIDES: &str =
-    "naga's MSL backend polyfills dot4I8Packed with local declarations that collide when two \
-     calls are inlined into one expression, so this entry reaches for nv-kernels' gemv_dot8, \
-     which is written one call per statement for exactly that reason. The otherwise identical \
-     laguna_gemv_nvfp4 entry inlines both calls and silently returns wrong products on Metal.";
 
 pub const QWEN2_BIAS_ROPE_WGSL: &str = r#"
 struct DgRopeParams {
@@ -336,8 +269,6 @@ struct DgKvParams {
 @group(0) @binding(13) var<storage, read_write> dgk_kc: array<u32>;
 @group(0) @binding(14) var<storage, read_write> dgk_vc: array<u32>;
 
-const DG_KT: u32 = 0u;
-
 const DGKV16: u32 = 0u;
 
 fn dgkv_store(w: u32) -> u32 {
@@ -362,10 +293,7 @@ fn dgkv_hi(w: u32) -> f32 {
 }
 
 fn dg_kword(j: u32, kvh: u32, w: u32, kv_words: u32, words: u32, cap: u32) -> u32 {
-    if (DG_KT == 1u) {
-        return (kvh * words + w) * cap + j;
-    }
-    return j * kv_words + kvh * words + w;
+    return (kvh * words + w) * cap + j;
 }
 
 @compute @workgroup_size(64)
@@ -498,7 +426,6 @@ fn dga_score(j: u32, kvh: u32, hd: u32) -> f32 {
     return a;
 }
 
-const DGA_V2: u32 = 1u;
 const DGA_SG: u32 = 1u;
 const DGA_SC_CAP: u32 = 1024u;
 
@@ -2133,78 +2060,6 @@ fn dg_bias_rope_kvw_b(
     }
 }
 
-fn dga_range_attend(slot: u32, h: u32, lid: u32, start: u32, total: u32) {
-    if (DGA_V2 == 1u) {
-        dga_range_attend_v2(slot, h, lid, start, total);
-        return;
-    }
-    let hd = dga_p.head_dim;
-    let words = hd >> 1u;
-    let nkv = dga_p.n_kv_heads;
-    let kvh = h / dga_p.gqa_group;
-    let qbase = slot * dga_p.q_slot_words + h * words;
-
-    for (var i = lid; i < hd; i = i + DG_ATTN_WG) {
-        let w = dga_q[qbase + (i >> 1u)];
-        dga_qs[i] = select(bf16_lo(w), bf16_hi(w), (i & 1u) == 1u);
-        dga_acc[i] = 0.0;
-    }
-    workgroupBarrier();
-
-    var lmax = -3.0e38;
-    for (var j = start + lid; j < total; j = j + DG_ATTN_WG) {
-        lmax = max(lmax, dga_score(j, kvh, hd) * dga_p.scale);
-    }
-    dga_red[lid] = lmax;
-    workgroupBarrier();
-    for (var s = DG_ATTN_WG >> 1u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            dga_red[lid] = max(dga_red[lid], dga_red[lid + s]);
-        }
-        workgroupBarrier();
-    }
-    let m = dga_red[0];
-
-    var lsum = 0.0;
-    for (var base = start; base < total; base = base + DG_ATTN_WG) {
-        let j = base + lid;
-        var pv = 0.0;
-        if (j < total) {
-            pv = exp(dga_score(j, kvh, hd) * dga_p.scale - m);
-        }
-        lsum = lsum + pv;
-        dga_pr[lid] = pv;
-        workgroupBarrier();
-        let tmax = min(DG_ATTN_WG, total - base);
-        for (var d = lid; d < hd; d = d + DG_ATTN_WG) {
-            var a = 0.0;
-            for (var t = 0u; t < tmax; t = t + 1u) {
-                a = fma(dga_pr[t], dga_vval(((base + t) * nkv + kvh) * hd + d), a);
-            }
-            dga_acc[d] = dga_acc[d] + a;
-        }
-        workgroupBarrier();
-    }
-
-    dga_red[lid] = lsum;
-    workgroupBarrier();
-    for (var s = DG_ATTN_WG >> 1u; s > 0u; s = s >> 1u) {
-        if (lid < s) {
-            dga_red[lid] = dga_red[lid] + dga_red[lid + s];
-        }
-        workgroupBarrier();
-    }
-    var inv = 0.0;
-    if (dga_red[0] > 0.0) {
-        inv = 1.0 / dga_red[0];
-    }
-    let obase = slot * dga_p.out_slot_words + h * words;
-    for (var i = lid; i < words; i = i + DG_ATTN_WG) {
-        let e = i * 2u;
-        dga_out[obase + i] = dg_act_pack(dga_acc[e] * inv, dga_acc[e + 1u] * inv);
-    }
-}
-
 @compute @workgroup_size(256)
 fn dg_attn_r(
     @builtin(workgroup_id) wg: vec3<u32>,
@@ -2217,7 +2072,7 @@ fn dg_attn_r(
     }
     let start = dga_step[DG_STEP_KVBASE];
     let total = min(start + dga_step[DG_STEP_POS] + slot + 1u, dga_p.kv_capacity);
-    dga_range_attend(slot, h, tid.x, start, total);
+    dga_range_attend_v2(slot, h, tid.x, start, total);
 }
 
 @group(0) @binding(36) var<storage, read> dga_brange: array<u32>;
@@ -2234,7 +2089,7 @@ fn dg_attn_b(
     }
     let start = dga_brange[2u * slot];
     let total = min(start + dga_brange[2u * slot + 1u], dga_p.kv_capacity);
-    dga_range_attend(slot, h, tid.x, start, total);
+    dga_range_attend_v2(slot, h, tid.x, start, total);
 }
 
 struct DgRowGatherParams {
@@ -2310,7 +2165,6 @@ struct DgFusedParams {
 @group(0) @binding(87) var<storage, read> dgf_la: array<f32>;
 @group(0) @binding(89) var<storage, read> dgf_lb: array<f32>;
 const DGF_STEP_POS: u32 = 1u;
-const DGF_KT: u32 = 0u;
 const DGF_CAUSAL: u32 = 1u;
 const DGF_LOG2E: f32 = 1.4426950408889634;
 
@@ -2331,10 +2185,7 @@ fn dgf_kv_hi(w: u32) -> f32 {
 }
 
 fn dgf_kword(j: u32, kvh: u32, w: u32) -> u32 {
-    if (DGF_KT == 1u) {
-        return (kvh * (dgf_p.head_dim >> 1u) + w) * dgf_p.kv_capacity + j;
-    }
-    return j * dgf_p.kv_words + kvh * (dgf_p.head_dim >> 1u) + w;
+    return (kvh * (dgf_p.head_dim >> 1u) + w) * dgf_p.kv_capacity + j;
 }
 
 fn dgf_cap16() -> u32 {
@@ -2514,7 +2365,6 @@ struct DgScvtParams {
 @group(0) @binding(8) var<storage, read> dsc_oh: array<u32>;
 @group(0) @binding(9) var<storage, read_write> dsc_out: array<u32>;
 @group(0) @binding(10) var<storage, read_write> dsc_sp: array<u32>;
-const DSC_KT: u32 = 0u;
 const DSC_KV16: u32 = 0u;
 const DSC_STEP_POS: u32 = 1u;
 
@@ -2552,12 +2402,8 @@ fn dg_scvt_kv(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (pos >= dsc_p.capacity) {
         return;
     }
-    var kidx = pos * dsc_p.kv_words + w;
-    if (DSC_KT == 1u) {
-        kidx = w * dsc_p.capacity + pos;
-    }
     let o = pos * dsc_p.kv_words + w;
-    dsc_kh[o] = dsc_kv_h16(dsc_ksrc[kidx]);
+    dsc_kh[o] = dsc_kv_h16(dsc_ksrc[w * dsc_p.capacity + pos]);
     dsc_vh[o] = dsc_kv_h16(dsc_vsrc[pos * dsc_p.kv_words + w]);
 }
 
@@ -2601,24 +2447,11 @@ fn dg_scvt_kv_r(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (src >= dsc_p.capacity) {
         return;
     }
-    var kidx = src * dsc_p.kv_words + w;
-    if (DSC_KT == 1u) {
-        kidx = w * dsc_p.capacity + src;
-    }
     let o = pos * dsc_p.kv_words + w;
-    dsc_kh[o] = dsc_kv_h16(dsc_ksrc[kidx]);
+    dsc_kh[o] = dsc_kv_h16(dsc_ksrc[w * dsc_p.capacity + src]);
     dsc_vh[o] = dsc_kv_h16(dsc_vsrc[src * dsc_p.kv_words + w]);
 }
 "#;
-
-pub const NVFP4_GEMV_ROWS_PER_WORKGROUP: usize = 8;
-
-pub const NVFP4_GEMV_SPENDS_32_LANES_ON_A_ROW_SO_A_1536_WIDE_K_STILL_AMORTIZES_THE_REDUCTION: &str =
-    "A decode GEMV row of k=1536 is 96 nvfp4 blocks. Spread over 128 lanes that is under \
-            one block each, and the seven-step tree reduction then costs more than the arithmetic \
-            it reduces; 32 lanes per row give three blocks each and a five-step tree, and the \
-            workgroup carries eight rows instead of two so a projection launches a quarter of the \
-            workgroups.";
 
 pub const PREFILL_GEMM_SLOTS_PER_DISPATCH_ARE_THE_TWO_VEC4_ACCUMULATORS_OF_DG_GEMM_M8: usize = 8;
 
@@ -2641,24 +2474,6 @@ pub const PREFILL_M_WIDE: usize = 128;
 pub const COOP_PLAN_TM4_TN4_SG4_KU2_WON_EVERY_SHAPE_OF_THE_WIDTH_LADDER: (u32, u32, u32, u32) =
     (4, 4, 4, 2);
 
-pub const COOP_ENV: &str = "NV_DOTS_COOP_PREFILL";
-
-pub const COOP_PREFILL_PAYS_ONLY_AT_THE_WIDE_CHUNK: &str =
-    "The tile-8 f32 cooperative matrix loses at m=32 and wins from m=128, so it rides the wide \
-     list of the progressive chunker and the narrow list keeps dg_gemm_m8. It is wired on the \
-     gate/up projection, which is 59% of a layer's weights and the shape the width ladder put at \
-     5.44x. f32 staging rather than f16 keeps the operands exact, and the logits stay bit- \
-     identical to the hand kernel through it. The cost is a second copy of that projection in \
-     f32, about 3.1 GiB.";
-
-pub fn coop_prefill_enabled() -> bool {
-    let _ = COOP_PREFILL_PAYS_ONLY_AT_THE_WIDE_CHUNK;
-    !matches!(
-        std::env::var(COOP_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
 pub const DEC_W4_ENV: &str = "NV_DOTS_DEC_W4";
 
 pub const DEC_ABLATE_ENV: &str = "NV_DOTS_DEC_ABLATE";
@@ -2680,11 +2495,11 @@ pub const DEC_ABLATE_IS_THE_DECODE_DELETED_WORK_BRACKET_BECAUSE_TIMESTAMP_PROFIL
 fn dec_ablate() -> Option<String> {
     let _ =
         DEC_ABLATE_IS_THE_DECODE_DELETED_WORK_BRACKET_BECAUSE_TIMESTAMP_PROFILES_INVERTED_THRICE;
-    std::env::var(DEC_ABLATE_ENV).ok().filter(|v| !v.is_empty())
+    env::var(DEC_ABLATE_ENV).ok().filter(|v| !v.is_empty())
 }
 
 fn dec_grid1() -> bool {
-    matches!(std::env::var(DEC_GRID1_ENV).ok().as_deref(), Some("1"))
+    matches!(env::var(DEC_GRID1_ENV).ok().as_deref(), Some("1"))
 }
 
 pub const DEC_SUBMIT_CHUNK_ENV: &str = "NV_DOTS_DEC_SUBMIT_CHUNK";
@@ -2708,7 +2523,7 @@ const DEC_SUBMIT_CHUNK_DEFAULT_64_OVERLAPS_ENCODE_WITH_EXEC_MINUS_A_QUARTER_MS_B
 
 fn dec_submit_chunk() -> usize {
     let _ = DEC_PASS_BOUNDARY_IS_METAL_SERIAL_DISPATCH_DRAIN_NOT_CPU_ISSUE;
-    std::env::var(DEC_SUBMIT_CHUNK_ENV)
+    env::var(DEC_SUBMIT_CHUNK_ENV)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(
@@ -2716,8 +2531,6 @@ fn dec_submit_chunk() -> usize {
                 as usize,
         )
 }
-
-pub const DEC_RUNAHEAD_ENV: &str = "NV_DOTS_DEC_RUNAHEAD";
 
 pub const DEC_TOKEN_TRACE_ENV: &str = "NV_DOTS_TOKEN_TRACE";
 
@@ -2732,14 +2545,6 @@ pub const DEC_RUNAHEAD_IS_EXACT_BECAUSE_THE_BAN_LIST_IS_KNOWN_BEFORE_THE_TOKEN: 
      The only run-ahead waste is one discarded trailing step when eos, loop-detect or the kv \
      bound ends generation: it emits nothing, its kv row dies with the session's reset, and \
      pos ends one higher than the serial loop's.";
-
-const DEC_RUNAHEAD_DEFAULT_ON_HIDES_THE_READBACK_AND_ENCODE_GAP_MINUS_44MS_CORPUS_MEAN: &str =
-    "=0 restores the serial loop that waits for each token before encoding the next step";
-
-fn dec_runahead() -> bool {
-    let _ = DEC_RUNAHEAD_DEFAULT_ON_HIDES_THE_READBACK_AND_ENCODE_GAP_MINUS_44MS_CORPUS_MEAN;
-    !matches!(std::env::var(DEC_RUNAHEAD_ENV).ok().as_deref(), Some("0"))
-}
 
 pub struct BoundaryRep {
     pub total_ms: f64,
@@ -2771,16 +2576,6 @@ fn dec_ablate_drops(class: &str, want: &str) -> bool {
     want == "all" || want == class || (want == "gemv" && class.starts_with("gemv"))
 }
 
-pub const MSL_GEMV_ENV: &str = "NV_DOTS_MSL_GEMV";
-
-pub fn msl_gemv_enabled() -> bool {
-    let _ = decode_gemv_msl::MSL_GEMV_EXISTS_BECAUSE_THE_FIVE_ISSUE_SLOT_BOUND_WAS_NAGAS_NOT_THE_MACHINES;
-    !matches!(
-        std::env::var(MSL_GEMV_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
 pub const DEC_W4_PAYS_ONLY_AFTER_THE_BF16_GEMV_REACHED_ITS_EQUILIBRIUM_AND_ONLY_CONSISTENTLY: &str =
     "The first w4 verdict -- this adapter never pays for the bytes it saves -- was earned \
      against a bf16 gemv that was issue-bound, and it flipped the day that gemv reached its \
@@ -2797,28 +2592,7 @@ pub const DEC_W4_PAYS_ONLY_AFTER_THE_BF16_GEMV_REACHED_ITS_EQUILIBRIUM_AND_ONLY_
 
 pub fn dec_w4_enabled() -> bool {
     let _ = DEC_W4_PAYS_ONLY_AFTER_THE_BF16_GEMV_REACHED_ITS_EQUILIBRIUM_AND_ONLY_CONSISTENTLY;
-    matches!(
-        std::env::var(DEC_W4_ENV).ok().as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
-}
-
-pub const COOP_PROJ_ENV: &str = "NV_DOTS_COOP_PROJ";
-
-pub const COOP_PROJ_COVERS_THE_OTHER_41_PERCENT_BECAUSE_THE_ABLATION_NAMED_PROJECTIONS_THE_WALL:
-    &str = "The deleted-work ablation read projections at 62.1 percent of the 3412-token \
-     prefill wall against attention's 34, inverting the per-pass-timestamp profile that had \
-     capped coop coverage at the gate/up pair. This arm extends the same tile-8 f32 \
-     cooperative GEMM to qkv, o_proj and down on the wide chunk list, with the same f32 \
-     weight copy the gate/up arm carries and the narrow list keeping dg_gemm_m8; the qkv \
-     output was already f32 so that leg needs no convert out.";
-
-pub fn coop_proj_enabled() -> bool {
-    let _ = COOP_PROJ_COVERS_THE_OTHER_41_PERCENT_BECAUSE_THE_ABLATION_NAMED_PROJECTIONS_THE_WALL;
-    !matches!(
-        std::env::var(COOP_PROJ_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
+    env_on(DEC_W4_ENV)
 }
 
 pub const PREFILL_WIDTH_KNEE_MOVED_WHEN_ATTENTION_STARTED_SHARING_K_ACROSS_QUERY_ROWS: &str =
@@ -2836,7 +2610,7 @@ pub const PREFILL_BIG_ENV: &str = "NV_DOTS_PREFILL_BIG";
 pub const PREFILL_BIG_3456_COVERS_THE_STANDARD_PAGE_IN_ONE_CHUNK: usize = 3456;
 
 fn prefill_big() -> usize {
-    let raw = std::env::var(PREFILL_BIG_ENV)
+    let raw = env::var(PREFILL_BIG_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(PREFILL_BIG_3456_COVERS_THE_STANDARD_PAGE_IN_ONE_CHUNK);
@@ -2880,7 +2654,7 @@ pub fn prefill_widths() -> Vec<usize> {
 }
 
 pub fn prefill_m() -> usize {
-    let raw = std::env::var(PREFILL_M_ENV)
+    let raw = env::var(PREFILL_M_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(
@@ -2901,34 +2675,6 @@ pub const PREFILL_IS_A_SECOND_PASS_LIST_OVER_THE_SAME_WEIGHTS: &str =
      GEMM that reads each weight word once for all eight, and one attention dispatch that carries \
      eight positions, so the same graph serves both shapes off one upload.";
 
-pub const FOLDING_THE_GQA_GROUP_LOSES_MORE_PARALLELISM_THAN_THE_REUSE_IS_WORTH: &str =
-    "Six query heads share each KV head, so dg_attn_split reads every K and V word of a slice six \
-     times, and dg_attn_fold removes exactly that redundancy: one workgroup takes F query heads \
-     of one KV head and spends each loaded word on all F. It is bitwise identical and it is \
-     slower at every factor. Kernel ms of a 28-call bf16 step at 3412, F = 1/2/3/6: 4.221, 5.198, \
-     5.881, 7.964. The reason is arithmetic the ladder makes plain -- the grid is (n_q, n_splits) \
-     so folding divides the workgroup count by F, taking 324 workgroups to 54 at F=6, and this \
-     adapter has never once paid for traffic it did not have to move while paying every time for \
-     work it could run at once. The K transpose does not rescue it either: at F=2 with the \
-     transpose on the kernel is 5.247, slightly worse than the 5.198 without, because a folded \
-     grid is short of workgroups rather than short of coalescing. This is the fifth traffic-\
-     reduction attempt on this file to measure a loss, and it is the cleanest of them, since the \
-     fold changes nothing but the workgroup count and the number of times a word is read.";
-
-pub const TRANSPOSING_K_TO_HEAD_MAJOR_IS_THE_ONE_LAYOUT_CHANGE_THAT_PAID: &str =
-    "Decode attention reads K with 256 threads whose addresses sit 512 B apart, because the cache \
-     is [token][kv_head][head_dim] and a thread owns a token. Writing K as \
-     [kv_head][dim_pair][token], with dims 2w and 2w+1 of one token in a word so the write stays \
-     race-free, makes adjacent threads read adjacent words. Kernel ms of a 28-call step at 3412: \
-     dg_attn_split 4.221 -> 2.978, and the whole decode step 12.43 -> 11.20 in bf16 and 12.64 -> \
-     11.40 in nvfp4, all bitwise identical. V is deliberately left token-major: its accumulation \
-     loop has thread d reading V[t][kvh][d] at a fixed t, which already coalesces, and moving it \
-     would break what works. This is a layout change rather than a traffic change, which is why \
-     it pays where the fold above does not -- it moves the same bytes in the same number of \
-     workgroups and only changes which thread asks for which word.";
-
-pub const ATTN_SPLIT_ENV: &str = "NV_DOTS_ATTN_SPLIT";
-
 pub const ATTN_SPLIT_MAX: usize = 64;
 
 pub const ATTN_SPLIT_TOKENS_PER_SLICE: usize = 128;
@@ -2947,48 +2693,7 @@ pub const ATTN_SPLIT_TURNS_TWELVE_WORKGROUPS_INTO_TWELVE_TIMES_THE_SLICES: &str 
      log-sum-exp rescale. Short contexts keep the single-pass kernel, which is why the graph \
      carries both and picks by the position it is decoding at.";
 
-pub fn attn_split_enabled() -> bool {
-    !matches!(
-        std::env::var(ATTN_SPLIT_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
-pub const ATTN_SG_ENV: &str = "NV_DOTS_ATTN_SG";
-
 pub const ATTN_ABL_ENV: &str = "NV_DOTS_ATTN_ABL";
-
-pub const BATTN_ENV: &str = "NV_DOTS_BATTN";
-
-pub const BATTN_V2_REGROUPS_FETCHES_WITHOUT_TOUCHING_ANY_PER_ELEMENT_FMA_CHAIN: &str =
-    "The batched range walk (dga_range_attend behind dg_attn_r and dg_attn_b; dg_attn \
-     keeps its own inline body) priced as issue-bound on its load chains, not on unique \
-     bytes: deleting both chains at plen 200-260 recovers 2-3 ms of the 12.6-14.4 ms \
-     bstep while the issued-byte model implies apparent bandwidth at or above the DRAM \
-     roof, so the GQA-redundant re-reads are cache-served and a fold that dedupes them \
-     would buy bytes the cache already absorbs at the price of a 384->64 workgroup grid \
-     (the recorded fold loss). The v2 walk deletes issued work bitwise: pass 2 reuses \
-     pass 1's RAW dot from a workgroup cache rather than re-walking K (recompute past \
-     DGA_SC_CAP keeps any span exact), K loads hoist 4-wide with the fma order \
-     untouched, and the two one-shot reductions take the ATTN_SG exact-pairing forms -- \
-     11.1/11.8/12.8/14.6 -> 10.2/10.9/11.8/12.7 ms/bstep at plen 64/120/200/260 x 32 \
-     rows, two agreeing flock stamps per arm. Two banked findings: the cache MUST hold \
-     the pre-scale dot, because caching score*scale rounds the product that Metal's \
-     fp-contraction folds into exp's (raw*scale - m) as one fma, and that single-ulp \
-     class moved every real-weight logit bit while the tiny gate stayed clean (the \
-     RMS_FUSE compiled-value-vs-recompute hazard in its fp-contract form); and the \
-     lane-owned V-word regroup is a banked NEGATIVE here -- halving the V walk's active \
-     lanes halves its outstanding loads and lost 0.3 ms at plen200, so the tpw pattern \
-     does not transfer to a walk with spare lanes and the per-element 128-lane V loop \
-     stays. NV_DOTS_BATTN=0 restores the v1 walk.";
-
-pub fn battn_v2_enabled() -> bool {
-    let _ = BATTN_V2_REGROUPS_FETCHES_WITHOUT_TOUCHING_ANY_PER_ELEMENT_FMA_CHAIN;
-    !matches!(
-        std::env::var(BATTN_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
 
 pub const BATTN_ABL_ENV: &str = "NV_DOTS_BATTN_ABL";
 
@@ -3011,13 +2716,8 @@ pub const ATTN_PIPE_ISSUES_EIGHT_LOADS_AHEAD_BECAUSE_THE_SPLIT_PASS_IS_A_LATENCY
 
 pub fn attn_pipe_enabled() -> bool {
     let _ = ATTN_PIPE_ISSUES_EIGHT_LOADS_AHEAD_BECAUSE_THE_SPLIT_PASS_IS_A_LATENCY_CHAIN;
-    matches!(
-        std::env::var(ATTN_PIPE_ENV).ok().as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
+    env_on(ATTN_PIPE_ENV)
 }
-
-pub const ROPE_KV_FUSE_ENV: &str = "NV_DOTS_ROPE_KV_FUSE";
 
 pub const ROPE_KV_FUSE_DELETES_ONE_PASS_PER_LAYER_BECAUSE_THE_BRACKET_PRICED_EVERY_PASS_BOUNDARY:
     &str = "The decode-step bracket priced the serial-encoder pass boundary at ~7us on trivial \
@@ -3025,15 +2725,7 @@ pub const ROPE_KV_FUSE_DELETES_ONE_PASS_PER_LAYER_BECAUSE_THE_BRACKET_PRICED_EVE
      pass exists to be deleted, not just to be made faster. dg_bias_rope_kvw writes the k/v \
      rows' rotated words to the caches at dg_kv_write's exact addresses while it writes \
      qkv_rot, and the kv-write pass is not recorded -- byte-identical stores, one boundary \
-     fewer per layer. The batched-region and prefill paths keep their own kv writers. \
-     NV_DOTS_ROPE_KV_FUSE=0 restores the separate pass.";
-
-pub fn rope_kv_fuse_enabled() -> bool {
-    !matches!(
-        std::env::var(ROPE_KV_FUSE_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
+     fewer per layer. The batched-region and prefill paths keep their own kv writers.";
 
 pub const RMS_GEMV_FUSE_ENV: &str = "NV_DOTS_RMS_GEMV_FUSE";
 
@@ -3060,28 +2752,12 @@ pub const RMS_GEMV_FUSE_IS_A_BANKED_NEGATIVE_TOLERANCE_CLASS_AND_A_WALL_LOSS: &s
 
 pub fn rms_gemv_fuse_mode() -> (bool, bool) {
     let _ = RMS_GEMV_FUSE_IS_A_BANKED_NEGATIVE_TOLERANCE_CLASS_AND_A_WALL_LOSS;
-    match std::env::var(RMS_GEMV_FUSE_ENV).ok().as_deref() {
+    match env::var(RMS_GEMV_FUSE_ENV).ok().as_deref() {
         Some("qkv") => (true, false),
         Some("gu") => (false, true),
         Some("1") | Some("all") | Some("on") | Some("true") => (true, true),
         _ => (false, false),
     }
-}
-
-pub const DEC_GSILU_ENV: &str = "NV_DOTS_DEC_GSILU";
-
-const DEC_GSILU_DEFAULT_ON_DELETES_THE_SILU_PASS_BOUNDARY_PER_LAYER_BITWISE: &str =
-    "=0 restores the standalone dg_silu_mul pass after the gate-up gemv; the rms-fuse \
-     measurement arms and lora keep the standalone pass so every banked row keeps its \
-     pre-flip meaning (see \
-     GSILU_FUSE_KEEPS_EVERY_REDUCTION_IN_ITS_KERNEL_AND_REPLAYS_THE_SILU_PASS_VERBATIM)";
-
-pub fn dec_gsilu_enabled() -> bool {
-    let _ = DEC_GSILU_DEFAULT_ON_DELETES_THE_SILU_PASS_BOUNDARY_PER_LAYER_BITWISE;
-    !matches!(
-        std::env::var(DEC_GSILU_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
 }
 
 pub const ATTN_ABL_DELETES_THE_SPLIT_KERNELS_LOAD_CHAINS_TO_PRICE_LATENCY_NOT_BANDWIDTH: &str =
@@ -3091,25 +2767,6 @@ pub const ATTN_ABL_DELETES_THE_SPLIT_KERNELS_LOAD_CHAINS_TO_PRICE_LATENCY_NOT_BA
      pass as latency-bound (one workgroup costs what the whole grid costs) and the subgroup \
      barrier cut recovered only ~1.5us of the ~54us pass -- the serial cost had to be named \
      before any restructure.";
-
-pub const ATTN_SG_CUTS_THE_SPLIT_KERNELS_BARRIER_CHAIN_KEEPING_THE_EXACT_REDUCTION_PAIRING: &str =
-    "The decode-step bracket read the attention class at 31 us per pass with the grid collapsed \
-     to ONE workgroup costing the same 34 -- the kernel is latency-bound on its in-workgroup \
-     serial chain of ~21 workgroupBarrier sweeps per chunk, not on bandwidth or occupancy. The \
-     subgroup form keeps every arithmetic pairing of the shipped tree: max reduces by \
-     subgroupMax (max is pairing-free bit-for-bit), the sum keeps the cross-simd tree levels \
-     s=128/64/32 in shared memory and finishes s=16..1 with subgroupShuffleDown steps that \
-     reproduce red[l] += red[l+s] exactly, and lsum lives on lane 0 alone so no broadcast \
-     barrier is needed -- 21 barriers become 7 with bit-identical logits. NV_DOTS_ATTN_SG=0 \
-     restores the tree form.";
-
-pub fn attn_sg_enabled() -> bool {
-    let _ = ATTN_SG_CUTS_THE_SPLIT_KERNELS_BARRIER_CHAIN_KEEPING_THE_EXACT_REDUCTION_PAIRING;
-    !matches!(
-        std::env::var(ATTN_SG_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
 
 pub const SG_TREE_ENV: &str = "NV_DOTS_SG_TREE";
 
@@ -3152,7 +2809,7 @@ pub fn sg_tree_sites_from(env: Option<&str>, subgroup_width: Option<u32>) -> SgT
 }
 
 pub fn sg_tree_sites(subgroup_width: Option<u32>) -> SgTreeSites {
-    sg_tree_sites_from(std::env::var(SG_TREE_ENV).ok().as_deref(), subgroup_width)
+    sg_tree_sites_from(env::var(SG_TREE_ENV).ok().as_deref(), subgroup_width)
 }
 
 const DG_SGLESS_STUBS_WGSL: &str = r#"
@@ -3172,45 +2829,6 @@ fn swap_dead_subgroup_calls_for_stubs(src: &str) -> String {
          device without the subgroups capability"
     );
     format!("{DG_SGLESS_STUBS_WGSL}\n{out}")
-}
-
-pub const DECODE_HAS_NO_DISPATCH_RESIDUAL_AND_ITS_ONLY_HOST_COST_IS_THE_LOGIT_READBACK: &str =
-    "Decode was suspected of spending a fifth of its time outside the kernels, on the theory that \
-     285 dispatches a step cost something each. Wall clock around a whole step, readback included, \
-     at 3412 on an uncontended adapter: the full step is 11.486 ms, the same step reading back only \
-     the 4-byte argmax token is 11.016, the 151936-float logit readback is 0.470 and the host \
-     argmax over it is 0.181, so a generate-shaped step is 11.667 ms and 85.7 tok/s. Summed pass \
-     timestamps for the same step read 11.20, which is within the cost of the timestamp writes \
-     themselves, so there is no per-dispatch residual to divide by 285 and the orchestration \
-     theory is dead. Context growth is not hiding it either: 384 steps walking 3412 to 3796 \
-     median 11.107 over the first 64 and 11.277 over the last, a 1.5 percent drift across a whole \
-     page of output. What is left is 0.65 ms of host cost, 5.6 percent, and all of it is the \
-     logit vector: the graph already computes its own argmax into a 4-byte buffer, and generate \
-     copies 0.6 MB back every step only so the host can redo that argmax against an n-gram ban \
-     list that is empty on almost every step.";
-
-pub const KV_TRANSPOSE_ENV: &str = "NV_DOTS_KT";
-
-pub const KV_TRANSPOSE_IS_THE_ACCESS_PATTERN_FIX_THE_DECODE_ATTENTION_ABLATION_ASKED_FOR: &str =
-    "Decode attention was never starved of bandwidth: at 3392 context, of the 3.67 ms the K score \
-     read costs, giving it a coalesced index recovers 2.56 and giving it a constant address only \
-     1.11 more, so two thirds of the cost is the ACCESS PATTERN and one third is volume. Laying \
-     the K cache out as [kv_head][dim_pair][token] puts consecutive lanes on consecutive \
-     addresses and collects exactly that: dg_attn 4.221 -> 2.978 ms at 3412 context, 29 percent \
-     of the kernel and 9.9 percent of the whole decode step, 12.43 -> 11.20 ms bf16. It is \
-     BITWISE IDENTICAL -- a transpose moves which thread reads which word and changes no \
-     arithmetic and no reduction order -- so it is gated on bits rather than on tokens, and \
-     NV_DOTS_KT=0 restores the untransposed layout. Contrast the GQA fold, which attacked the \
-     same reads from the volume side and lost at every factor because the grid is (n_q, \
-     n_splits): folding six query heads onto one kv head divides 324 workgroups by six, and no \
-     amount of deleted redundant reading pays for a grid that no longer fills the machine.";
-
-pub fn kv_transpose_enabled() -> bool {
-    let _ = KV_TRANSPOSE_IS_THE_ACCESS_PATTERN_FIX_THE_DECODE_ATTENTION_ABLATION_ASKED_FOR;
-    !matches!(
-        std::env::var(KV_TRANSPOSE_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
 }
 
 pub const KV_F16_ENV: &str = "NV_DOTS_KV_F16";
@@ -3242,10 +2860,7 @@ pub const KV_F16_REENCODES_THE_STORED_WORD_SO_BYTES_CANNOT_CHANGE_AND_ONLY_RANGE
 pub fn kv_f16_enabled() -> bool {
     let _ =
         KV_F16_REENCODES_THE_STORED_WORD_SO_BYTES_CANNOT_CHANGE_AND_ONLY_RANGE_EDGES_CAN_DIVERGE;
-    matches!(
-        std::env::var(KV_F16_ENV).ok().as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
+    env_on(KV_F16_ENV)
 }
 
 pub const ATTN_FOLD_ENV: &str = "NV_DOTS_ATTN_FOLD";
@@ -3256,7 +2871,7 @@ pub const ATTN_FOLD_MAX_HEAD_DIM: usize = 128;
 
 pub fn attn_fold_factor(cfg: &DotsDecoderConfig) -> usize {
     let group = cfg.num_attention_heads / cfg.num_key_value_heads;
-    let want = std::env::var(ATTN_FOLD_ENV)
+    let want = env::var(ATTN_FOLD_ENV)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(1)
@@ -3318,98 +2933,11 @@ pub const GEMM_SLOTS_16_HALVED_THE_TRAFFIC_AND_COST_15_PERCENT_SO_8_STAYS: &str 
 pub fn gemm_slots() -> usize {
     let _ = GEMM_SLOTS_16_HALVED_THE_TRAFFIC_AND_COST_15_PERCENT_SO_8_STAYS;
     let _ = GEMM_M8_ACTIVATION_LOADS_ARE_ONLY_14_PERCENT_SO_A_VECTOR_DECODE_HAS_NO_ROOM;
-    match std::env::var(GEMM_SLOTS_ENV).ok().as_deref() {
+    match env::var(GEMM_SLOTS_ENV).ok().as_deref() {
         Some("16") => 16,
         _ => PREFILL_GEMM_SLOTS_PER_DISPATCH_ARE_THE_TWO_VEC4_ACCUMULATORS_OF_DG_GEMM_M8,
     }
 }
-
-pub const NVFP4_MROW4_ENV: &str = "NV_DOTS_NVFP4_MROW4";
-
-pub const DECODE_ATTENTION_IS_UNCOALESCED_ON_K_NOT_STARVED_OF_BANDWIDTH: &str =
-    "Decode attention reads 97.8 MB of KV per step at 3412 context and takes 7.44 ms, which reads \
-     as 13 GB/s and invites the conclusion that it is starved. Three ablations at 3392 context, \
-     dg_attn_split of 6.51 ms: giving the K score read a constant address drops it to 2.84, so K \
-     reads cost 3.67; giving the K read the same volume but an index that puts consecutive lanes \
-     on consecutive addresses drops it to 3.95, so 2.56 of that 3.67 is the ACCESS PATTERN and \
-     only 1.11 is volume; giving V a constant address drops it to 5.75, so V costs 0.76 and is \
-     already coalesced. The remaining 2.08 ms is softmax, reductions and barriers. The cache is \
-     [token][kv_head][head_dim], so a thread walking one K vector reads 128 contiguous elements \
-     while its neighbours sit 512 B away -- every lane on its own cache line. V escapes because \
-     its loop puts consecutive lanes on consecutive head dims. Transposing the K cache alone to \
-     [kv_head][dim_pair][token], leaving V's layout untouched, is what the measurement points \
-     at; it would recover about 2.56 ms and cost a strided write of one token against 3412 \
-     coalesced reads. It does NOT make the kernel bandwidth-bound: a third of it is arithmetic \
-     and a third of the K cost is irreducible, so the ceiling is about 4.9 ms, not 1.";
-
-pub const PREFILL_IS_TWO_THIRDS_ATTENTION_AND_ITS_GEMMS_ARE_ALREADY_FAST: &str =
-    "Prefill has been priced as a GEMM problem and it is not one. Kernel ms of one 128-row chunk \
-     at 3412, which is 1/27th of the prompt and scales to it: dg_attn_reg 90.547 ms at 63.3 \
-     percent, dg_gemm_m8 over every projection 51.043 at 35.7, and everything else together under \
-     1. Converting those to rates settles which half is slow. A chunk does 0.335 TFLOP of \
-     projection against 0.0376 TFLOP of attention, so the projections run at 6.57 TFLOP/s and the \
-     attention at 0.415 -- a factor of 16 apart, with the fast one already carrying nine tenths \
-     of the arithmetic. The aggregate 2.6 TFLOP/s that prefill reports is therefore not a GEMM \
-     that needs a better kernel; it is a fast GEMM averaged with an attention kernel an order of \
-     magnitude behind it. Extending the coop path to the projections it does not yet cover is \
-     bounded by that 35.7 percent no matter how fast it gets: making every projection free leaves \
-     prefill at 2460 ms against 3887, and cannot approach a 749 ms target on its own. Bringing \
-     attention to the rate the projections already reach is worth more than the whole GEMM budget \
-     and is the one prefill kernel nobody has attacked. It is also two matmuls, QK-transpose and \
-     PV, which is the shape the coop path is good at.";
-
-pub const COOP_WAS_REJECTED_AT_A_CHUNK_WIDTH_CHOSEN_FOR_A_DIFFERENT_KERNEL: &str =
-    "The tile-8 f32 cooperative matrix was measured at m=32 and rejected as a thin GEMM. m=32 \
-     was our parameter, picked by a ladder against dg_gemm_m8, whose time is flat in m; it is \
-     not a property of the workload. Re-measured across widths, best plan of five per point, \
-     coop TFLOP/s against dg_gemm_m8 on the same data: at m=32 qkv 0.40x, gateup 3.30x, down \
-     0.42x; at m=128 2.55x, 5.44x, 1.48x; at m=256 4.73x, 7.15x, 2.47x; at m=512 6.02x, 7.08x, \
-     3.23x. Coop reaches 11.11 TFLOP/s at m=256 gateup where the hand kernel reaches 1.55. The \
-     thin-GEMM diagnosis was right about m=32 and wrong as a verdict on coop.";
-
-pub const WHAT_MOVES_A_KERNEL_ON_THIS_ADAPTER_IN_THE_ORDER_WORTH_TRYING: &str =
-    "Eleven controlled experiments in this file, M2 Ultra via wgpu-Metal, in the order a next \
-     kernel should try them. FIRST, ablate rather than reason: replace one suspected cost with a \
-     constant and measure -- one probe run settles in minutes what four rounds of argument did \
-     not, and reasoning about arithmetic was wrong four times running. WHAT PAID: adding \
-     parallelism that did not exist (split-KV decode attention, 12 workgroups to 12*n_splits, \
-     5.7x); raising arithmetic per loaded value (register-tiled prefill attention, one K word \
-     spent on eight query rows instead of one, 1.92x); batching rows per submit (8-row prefill \
-     chunk, 2.8-4.0x); and raising the launch count (nvfp4 GEMV workgroup 32 rows to 4, 9%). \
-     WHAT DID NOT: spending fewer bytes, four times -- staging K/V cut traffic 8x for 2%, a \
-     16-slot GEMM halved traffic and cost 15%, nvfp4 quartered weight bytes and lost 32%, and a \
-     cooperative-matrix route measured 0.29-1.36x because M=32 is too thin to fill its \
-     fragments; and cutting instructions per byte -- a vec4 nibble decode measured null twice, \
-     and removing seven of eight activation loads from the prefill GEMM bought 14%. THE RULE: \
-     this hardware punishes low occupancy and rewards reuse per load; bytes are the currency in \
-     exactly one kernel here, the bf16 decode GEMV, which already runs at 75% of roofline. \
-     Measure occupancy and reuse first, traffic last.";
-
-pub const NVFP4_GEMV_FOUR_HYPOTHESES_ONLY_OCCUPANCY_PAID: &str =
-    "Four structural changes were measured on this GEMV at 3412 context, kernel ms of a 112-call \
-     step: sharing one activation decode across four rows 5.49 -> 5.71 (null), decoding four \
-     nibbles into a vec4 and spending them in dot() instead of eight scalar decode+fma pairs \
-     5.71 -> 5.71 (null), giving the block scale a constant address to remove its 4 KB stride \
-     5.71 -> 5.60 (2%), and cutting the workgroup from 32 rows to 4 so a projection launches \
-     eight times the workgroups 5.71 -> 5.18 (9%). Only the last moved, which is the same answer \
-     the rest of this file gave: the kernel is issue and occupancy bound, and neither the bytes \
-     it reads nor the instructions it spends decoding them are what it is waiting on. What \
-     remains unexplained is the 155 GB/s it reaches against the bf16 GEMV's 598 on the same \
-     step, and no hypothesis tried here accounts for it.";
-
-pub const THE_Q4_GEMV_IS_ALU_BOUND_SO_ITS_GB_PER_SECOND_WAS_THE_WRONG_SCORE: &str =
-    "The 155 GB/s this GEMV reached against the bf16 GEMV's 598 was read for a whole round as a \
-     bandwidth failure. Two ablations at 3412 context, kernel ms of a 112-call step, say it was \
-     the wrong ceiling to score against: pointing every row at one weight block so the entire \
-     weight stream becomes cache resident takes 5.200 -> 4.431, and removing the e2m1 unpack \
-     while leaving both loads in place takes 5.200 -> 3.735. Deleting all of the traffic buys 15 \
-     percent and deleting the dequant arithmetic buys 28, so this kernel is ALU bound on the \
-     unpack and a memory roofline never applied to it. That also retires the search for a faster \
-     unpack: hoisting the activation bf16 decode out of the row loop, which the source repeats \
-     four times, measured 5.200 -> 5.186 because the compiler had already hoisted it, and the \
-     magnitude decode is five vector ops in every closed form tried. A nibble format costs the \
-     28 percent to read. The lever for q4 decode is fewer or wider GEMV calls, not a better \
-     kernel, and any future GB/s quoted for it should be quoted against issue rate instead.";
 
 pub const NVFP4_MROW4_SHARES_ONE_ACTIVATION_DECODE_ACROSS_FOUR_ROWS: &str =
     "The block-scale decode, the nibble unpack and the activation read are per row in a one-row-\
@@ -3420,45 +2948,7 @@ pub const NVFP4_MROW4_SHARES_ONE_ACTIVATION_DECODE_ACROSS_FOUR_ROWS: &str =
      separate quantize pass the arm used to run before every projection, which was 4.06 ms of a \
      19.39 ms step and which the bf16 arm never paid.";
 
-pub fn nvfp4_mrow4_enabled() -> bool {
-    let _ = NVFP4_MROW4_SHARES_ONE_ACTIVATION_DECODE_ACROSS_FOUR_ROWS;
-    let _ = NVFP4_GEMV_FOUR_HYPOTHESES_ONLY_OCCUPANCY_PAID;
-    let _ = FOLDING_THE_GQA_GROUP_LOSES_MORE_PARALLELISM_THAN_THE_REUSE_IS_WORTH;
-    let _ = TRANSPOSING_K_TO_HEAD_MAJOR_IS_THE_ONE_LAYOUT_CHANGE_THAT_PAID;
-    let _ = DECODE_HAS_NO_DISPATCH_RESIDUAL_AND_ITS_ONLY_HOST_COST_IS_THE_LOGIT_READBACK;
-    let _ = THE_Q4_GEMV_IS_ALU_BOUND_SO_ITS_GB_PER_SECOND_WAS_THE_WRONG_SCORE;
-    let _ = WHAT_MOVES_A_KERNEL_ON_THIS_ADAPTER_IN_THE_ORDER_WORTH_TRYING;
-    let _ = COOP_WAS_REJECTED_AT_A_CHUNK_WIDTH_CHOSEN_FOR_A_DIFFERENT_KERNEL;
-    let _ = PREFILL_IS_TWO_THIRDS_ATTENTION_AND_ITS_GEMMS_ARE_ALREADY_FAST;
-    let _ = DECODE_ATTENTION_IS_UNCOALESCED_ON_K_NOT_STARVED_OF_BANDWIDTH;
-    let _ = THE_PAGE_HAS_NO_UNACCOUNTED_TIME_AND_ITS_CONVERSIONS_ARE_NOT_THE_LEVER;
-    let _ = THE_TWO_DOTS_DECODERS_SPLIT_PREFILL_FROM_DECODE;
-    !matches!(
-        std::env::var(NVFP4_MROW4_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
 pub const ATTN_REG_ENV: &str = "NV_DOTS_ATTN_REG";
-
-pub const ATTN_FUSED_ENV: &str = "NV_DOTS_ATTN_FUSED";
-
-pub const ATTN_FUSED_IS_TWO_COOP_GEMMS_BECAUSE_A_128_ROW_CHUNK_MAKES_THE_SCORE_SLAB_CHEAP: &str =
-    "Flash fusion exists to avoid materialising the score matrix; at a 128-row chunk that \
-     matrix is 768 rows by the kv length, ten megabytes, and materialising it lets both \
-     matmuls run as the proven 8x8-f32 cooperative GEMM instead of a bespoke kernel. S = Q K^T \
-     stacks the six heads of one GQA group into m=768 against an f32 K mirror; a row-parallel \
-     exp2 softmax masks and normalises in place; O = P V rides a V mirror stored dim-major. \
-     Three hand-fused flash forms lost to dg_attn_reg first (4024.8, 5419.9, 5172.4 ms against \
-     its 3808 on the 3412-token wall) because this WGSL coop extension exposes no per-element \
-     fragment access, so online-softmax rescale forces either a per-block spill or a second \
-     QK pass, and at 8x8 tiles those overheads eat the matrix unit. The GEMM form measures \
-     2813.3 ms, minus 26 percent, attention by ablation arithmetic about 305 ms from 1295. The \
-     static graph replays one pass list at every chunk position, so the GEMM shapes are sized \
-     for capacity and a two-line patch on the generated source reads the true kv length from \
-     the step buffer at run time: dead column blocks and dead k iterations fold to a zero loop \
-     bound, never a return, which is what naga's coop uniformity analysis accepts. DGF_CAUSAL \
-     folds away in dg_asoftmax so a non-causal caller is a source replace, not a fork.";
 
 pub const PAD_ROWS_COST_NOTHING_BECAUSE_CAUSALITY_SHIELDS_THEM_AND_DECODE_OVERWRITES_THEM: &str =
     "A prompt tail shorter than a chunk used to run one 11 ms decode step per token; padding it \
@@ -3474,61 +2964,8 @@ pub const ATTN_FUSED_HEAD_DIM: usize = 128;
 
 pub const ATTN_FUSED_QUERY_ROWS: usize = 8;
 
-pub fn attn_fused_enabled() -> bool {
-    let _ = ATTN_FUSED_IS_TWO_COOP_GEMMS_BECAUSE_A_128_ROW_CHUNK_MAKES_THE_SCORE_SLAB_CHEAP;
-    !matches!(
-        std::env::var(ATTN_FUSED_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
-pub const PF_STEEL_ENV: &str = "NV_DOTS_PF_STEEL";
-
-pub const PF_STEEL_FEEDS_HALF_MIRRORS_BECAUSE_THE_KERNEL_IS_TYPED_HALF_AND_THE_MATH_STAYS_F32:
-    &str = "The causal steel arm replaces the GEMM-form ten-pass attention with three word-wide \
-    conversion passes and one fused dispatch. Q, K and V convert from the graph's packed bf16 \
-    into half buffers -- steel is instantiated at half, loads convert on the way into \
-    threadgroup memory, and every accumulator is float, so half is a storage format here, not \
-    an arithmetic one. The K and V mirrors are per-layer and incremental like the fused arm's \
-    f32 mirrors at a quarter the bytes, and the rectangle the GEMM arm paid for in full is cut \
-    to the causal triangle by the kernel's own block skip. O converts back to packed bf16 in \
-    the heads buffer so every downstream consumer is untouched. NV_DOTS_PF_STEEL=0 restores \
-    the GEMM-form arm.";
-
-pub fn pf_steel_enabled() -> bool {
-    let _ = PF_STEEL_FEEDS_HALF_MIRRORS_BECAUSE_THE_KERNEL_IS_TYPED_HALF_AND_THE_MATH_STAYS_F32;
-    !matches!(
-        std::env::var(PF_STEEL_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
-pub const PF_STEEL_PROJ_ENV: &str = "NV_DOTS_PF_STEEL_PROJ";
-
 pub const PF_STEEL_PROJ_CONFIG_IS_THE_VISION_LADDERS_CROWN: (u32, u32, u32, u32, u32) =
     (64, 64, 32, 2, 2);
-
-pub const PF_STEEL_PROJ_DELETES_THE_F32_WEIGHT_COPIES_BECAUSE_BF16_TO_F16_IS_EXACT_IN_WEIGHT_RANGE:
-    &str = "The four prefill projections run the vendored steel gemm the vision ladder crowned \
-    (bm64 bn64 bk32 wm2 wn2, 1.25-1.40x over the coop incumbent on every k-divisible shape), \
-    dispatched raw-MSL through the shared per-device pipeline cache. The nt pattern is the \
-    projection layout as-is, so the only new pass is a word-wide bf16-to-half cvt on the \
-    activations; every bf16 weight whose exponent sits in half's normal range converts \
-    exactly, so the f16 weight copies carry the same values the f32 mirrors did at half the \
-    bytes, and the f32 mirrors are not uploaded at all when this arm is on. U=float lands \
-    the output in the same f32 buffers the coop arm wrote, so rope, the out-cvts and every \
-    other consumer are untouched, and the trunk k values 1536 and 8960 are both whole \
-    numbers of k-blocks. NV_DOTS_PF_STEEL_PROJ=0 restores the coop-f32 staged projections \
-    and their f32 weight copies unchanged.";
-
-pub fn pf_steel_proj_enabled() -> bool {
-    let _ =
-        PF_STEEL_PROJ_DELETES_THE_F32_WEIGHT_COPIES_BECAUSE_BF16_TO_F16_IS_EXACT_IN_WEIGHT_RANGE;
-    !matches!(
-        std::env::var(PF_STEEL_PROJ_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
 
 pub const PF_STEEL_CFG_ENV: &str = "NV_DOTS_PF_STEEL_CFG";
 
@@ -3542,7 +2979,7 @@ pub const PF_STEEL_CFG_IS_BITWISE_CLASS_BECAUSE_EVERY_TILE_WALKS_K_AS_THE_SAME_A
 pub fn pf_steel_proj_cfg() -> (u32, u32, u32, u32, u32) {
     let _ =
         PF_STEEL_CFG_IS_BITWISE_CLASS_BECAUSE_EVERY_TILE_WALKS_K_AS_THE_SAME_ASCENDING_MMA_CHAIN;
-    std::env::var(PF_STEEL_CFG_ENV)
+    env::var(PF_STEEL_CFG_ENV)
         .ok()
         .and_then(|v| {
             let p: Vec<u32> = v.split(',').filter_map(|t| t.trim().parse().ok()).collect();
@@ -3570,7 +3007,7 @@ pub const PF_STEEL_NARROW_CONFIG: (u32, u32, u32, u32, u32) = (32, 32, 16, 2, 2)
 pub fn pf_steel_proj_cfg_for(m: usize) -> (u32, u32, u32, u32, u32) {
     let _ =
         PF_STEEL_NARROW_TILE_IS_32_32_16_BECAUSE_SUB1024_TRUNKS_ARE_GRID_STARVED_AT_THE_CROWN_TILE;
-    if std::env::var(PF_STEEL_CFG_ENV).is_ok() {
+    if env::var(PF_STEEL_CFG_ENV).is_ok() {
         return pf_steel_proj_cfg();
     }
     if m <= PF_STEEL_NARROW_MAX_WIDTH {
@@ -3580,13 +3017,10 @@ pub fn pf_steel_proj_cfg_for(m: usize) -> (u32, u32, u32, u32, u32) {
     }
 }
 
-pub const TRUNK_SPLITK_ENV: &str = "NV_DOTS_TRUNK_SPLITK";
-
 pub const TRUNK_SPLITK_IS_TOLERANCE_CLASS_DEFAULT_ON_BECAUSE_ITS_ONLY_TEXT_MOVES_ARE_WHITESPACE:
     &str = "The default serves each m<=32 trunk projection as ONE grid-z steel dispatch of S \
     k-slices landing f32 partials plus one ascending-order reduce, against the single starved \
-    dispatch NV_DOTS_TRUNK_SPLITK=0 restores byte-identically (=1 keeps its pre-flip opt-in \
-    spelling). The m=32 trunk ran 4.6x over its byte floor because 24-64-workgroup grids \
+    dispatch. The m=32 trunk ran 4.6x over its byte floor because 24-64-workgroup grids \
     leave the k-walk latency-bound and slice-per-dispatch forms die on the Metal serial \
     drain, so concurrency comes from grid z inside one dispatch. The partial-sum add \
     reassociates the ascending MMA k-chain, so the arm can move logit bits at the ulp scale \
@@ -3622,13 +3056,9 @@ fn trunk_splitk_target(f: ProjFamily) -> usize {
     }
 }
 
-pub fn trunk_splitk_enabled() -> bool {
-    let _ = TRUNK_SPLITK_IS_TOLERANCE_CLASS_DEFAULT_ON_BECAUSE_ITS_ONLY_TEXT_MOVES_ARE_WHITESPACE;
-    std::env::var(TRUNK_SPLITK_ENV).as_deref() != Ok("0")
-}
-
 pub fn trunk_splitk_s(f: ProjFamily, m: usize, k: usize, bk: u32) -> usize {
-    if !trunk_splitk_enabled() || m > TRUNK_SPLITK_MAX_WIDTH {
+    let _ = TRUNK_SPLITK_IS_TOLERANCE_CLASS_DEFAULT_ON_BECAUSE_ITS_ONLY_TEXT_MOVES_ARE_WHITESPACE;
+    if m > TRUNK_SPLITK_MAX_WIDTH {
         return 1;
     }
     let mut s = trunk_splitk_target(f);
@@ -3638,34 +3068,18 @@ pub fn trunk_splitk_s(f: ProjFamily, m: usize, k: usize, bk: u32) -> usize {
     s
 }
 
-pub const TRUNK_BF16OUT_ENV: &str = "NV_DOTS_TRUNK_BF16OUT";
-
-pub const TRUNK_ABF16_ENV: &str = "NV_DOTS_TRUNK_ABF16";
-
 pub const TRUNK_CVT_FUSIONS_DELETE_196_MIRROR_PASSES_PER_BSTEP_AND_STAY_IN_THE_BITWISE_CLASS: &str =
     "The batched-step crumb census prices dg_scvt_q at 112 passes/0.73 ms and dg_cvt at \
     84 passes/0.65 ms per m=32 step -- both essentially pure Metal serial-drain boundary \
-    around the trunk steel GEMMs. NV_DOTS_TRUNK_ABF16 folds the bf16->f16 activation mirror \
+    around the trunk steel GEMMs. The trunk folds the bf16->f16 activation mirror \
     into a replicated A-side block loader that stages the identical half values (bf16 bits \
-    shift to f32 exactly, one f32->f16 RNE, dg_scvt_q's own chain), and NV_DOTS_TRUNK_BF16OUT \
+    shift to f32 exactly, one f32->f16 RNE, dg_scvt_q's own chain), and \
     folds the f32->bf16e output conversion into the store walker on the same live accumulator \
     dg_cvt re-read (qkv keeps its f32 sink -- rope consumes it directly). No reduction moves \
     between kernels: the MMA k-chain is untouched and both conversions are single-op \
-    elementwise, the gsilu/resadd event class. Both default on; =0 restores the standalone \
-    mirror passes byte-identically. Splitk families keep f32 partials and ride the sk_abf16 \
-    loader variant when ABF16 is on; their output fold lives in the reduce store (dg_sk_red_bf16) \
+    elementwise, the gsilu/resadd event class. Splitk families keep f32 partials and ride the \
+    sk_abf16 loader variant; their output fold lives in the reduce store (dg_sk_red_bf16) \
     per TRUNK_BF16OUT_FOLDS_THE_SPLITK_REDUCE_STORE_BECAUSE_THE_F32_PARTIAL_SUM_NEVER_MOVES.";
-
-pub fn trunk_bf16out_enabled() -> bool {
-    let _ = TRUNK_CVT_FUSIONS_DELETE_196_MIRROR_PASSES_PER_BSTEP_AND_STAY_IN_THE_BITWISE_CLASS;
-    std::env::var(TRUNK_BF16OUT_ENV).as_deref() != Ok("0")
-}
-
-pub fn trunk_abf16_enabled() -> bool {
-    std::env::var(TRUNK_ABF16_ENV).as_deref() != Ok("0")
-}
-
-pub const ROPE_KV_FUSE_B_ENV: &str = "NV_DOTS_ROPE_KV_FUSE_B";
 
 pub const ROPE_KV_FUSE_B_PORTS_THE_SERIAL_FUSE_TO_THE_BATCHED_STEP: &str =
     "dg_kv_write_b is 28 passes/0.23 ms of pure copy per batched step: it re-reads the k/v \
@@ -3673,14 +3087,8 @@ pub const ROPE_KV_FUSE_B_PORTS_THE_SERIAL_FUSE_TO_THE_BATCHED_STEP: &str =
     dg_bias_rope_kvw_b writes the cache in the rope pass's own store loop from the identical \
     packed word, exactly as the serial decode's dg_bias_rope_kvw does from the step position; \
     the only difference is the slot source (dgk_bslot per row vs step pos), so the batched \
-    fuse inherits the serial fuse's bitwise argument wholesale. Default on; =0 restores the \
-    separate dg_kv_write_b pass byte-identically. The rpf and pack arms keep their own kv \
-    passes untouched.";
-
-pub fn rope_kv_fuse_b_enabled() -> bool {
-    let _ = ROPE_KV_FUSE_B_PORTS_THE_SERIAL_FUSE_TO_THE_BATCHED_STEP;
-    std::env::var(ROPE_KV_FUSE_B_ENV).as_deref() != Ok("0")
-}
+    fuse inherits the serial fuse's bitwise argument wholesale. The rpf and pack arms keep \
+    their own kv passes untouched.";
 
 pub const SPEC_PROBE_ENV: &str = "NV_DOTS_SPEC_PROBE";
 
@@ -3707,7 +3115,7 @@ pub const SPEC_PROBE_MEASURES_FIRST_N_AGREEMENT_BECAUSE_ACCEPTANCE_IS_THE_ONE_UN
 
 fn spec_probe_layers(layers: usize) -> Vec<usize> {
     let _ = SPEC_PROBE_MEASURES_FIRST_N_AGREEMENT_BECAUSE_ACCEPTANCE_IS_THE_ONE_UNKNOWN;
-    std::env::var(SPEC_PROBE_ENV)
+    env::var(SPEC_PROBE_ENV)
         .ok()
         .map(|v| {
             v.split(',')
@@ -3738,7 +3146,7 @@ pub const G4_ROWS_SMALL_ENV: &str = "NV_DOTS_G4_ROWS_SMALL";
 pub const G4_ROWS_LM_ENV: &str = "NV_DOTS_G4_ROWS_LM";
 
 fn g4_env(name: &str, default: u32) -> u32 {
-    std::env::var(name)
+    env::var(name)
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|r| [2, 4, 8, 16, 32].contains(r))
@@ -3757,11 +3165,11 @@ fn g4_rows_for(n: usize) -> u32 {
 
 fn pf_ablated(part: &str) -> bool {
     let _ = PF_ABLATE_DELETES_WORK_BECAUSE_SUMMED_PASS_TIMESTAMPS_INVERTED_THE_PREFILL_PROFILE;
-    std::env::var(PF_ABLATE_ENV).ok().as_deref() == Some(part)
+    env::var(PF_ABLATE_ENV).ok().as_deref() == Some(part)
 }
 
 fn pf_ablate_shader_phase() -> u32 {
-    match std::env::var(PF_ABLATE_ENV).ok().as_deref() {
+    match env::var(PF_ABLATE_ENV).ok().as_deref() {
         Some("qk") => 1,
         Some("softmax") => 2,
         Some("pv") => 3,
@@ -3782,18 +3190,12 @@ pub const ATTN_REG_HOLDS_EIGHT_QUERY_ROWS_PER_LOADED_K_VALUE: &str =
 
 pub fn attn_reg_enabled() -> bool {
     let _ = ATTN_REG_HOLDS_EIGHT_QUERY_ROWS_PER_LOADED_K_VALUE;
-    !matches!(
-        std::env::var(ATTN_REG_ENV).ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
+    env_not_off(ATTN_REG_ENV)
 }
 
 pub fn attn_tiled_enabled() -> bool {
     let _ = ATTN_TILE_STAGES_25664_OF_THE_32768_BYTE_WORKGROUP_BUDGET;
-    matches!(
-        std::env::var(ATTN_TILED_ENV).ok().as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
+    env_on(ATTN_TILED_ENV)
 }
 
 pub const ARGMAX_GROUPS: usize = 256;
@@ -3804,48 +3206,11 @@ pub const STAGING_FLUSH_BYTES: u64 = 256 << 20;
 
 pub const DOTS_GRAPH_VRAM_ENV: &str = "NV_DOTS_GRAPH_VRAM";
 
-pub const THE_TWO_DOTS_DECODERS_SPLIT_PREFILL_FROM_DECODE: &str =
-    "Two dots.ocr decoders exist in this tree: this graph, and the q3d bias arm in \
-     dots_ocr::decoder_wgpu on the mlx 4-bit checkpoint. Measured against each other at matched \
-     context, readback-terminated, decode tok/s theirs/mine: 109.8/107.2 at 64, 105.9/105.4 at \
-     512, 95.4/83.2 at 2048, 90.2/67.9 at 3412; prompt tok/s theirs/mine: 118.3/202.3, \
-     120.7/698.8, 115.2/896.6, 110.5/890.6. They split. Their decode scales better with context \
-     and is 1.33x at page length; this graph's chunked prefill is 8.1x at the same length \
-     because theirs prefills a token at a time. Composed over an invoice page of 3412 prompt \
-     and 414 generated tokens that is 9.93 s here against 35.47 s there, so this graph serves \
-     the page and their decode attention is the technique worth taking, not their decoder.";
-
 pub const PAGE_PROFILE_ENV: &str = "NV_DOTS_PAGE_PROFILE";
 
-pub const THE_PAGE_HAS_NO_UNACCOUNTED_TIME_AND_ITS_CONVERSIONS_ARE_NOT_THE_LEVER: &str =
-    "Instrumenting recognize() end to end on the invoice page, wgpu tower and graph decoder: \
-     wall 18.43 s = prepare 0.010 + vision 7.766 + prompt 0.000 + prefill 3.919 + decode 6.672 + \
-     post 0.000, residual 0.000. Nothing is missing; earlier ledgers were short because their \
-     prefill and decode components predated the coop and split-kv work. The format conversions \
-     on that path price out the same way: staging the tower's host f32 into a candle bf16 tensor \
-     costs 0.002 s, pulling it back to host f32 for the decoder costs 0.064, and repacking it to \
-     bf16 per chunk costs 0.007 -- 0.073 s of an 18.43 s page, so the whole round trip through \
-     candle is removable waste worth four tenths of one percent. The coop path's f32 staging and \
-     its two converts per layer are net positive, since the arm they enable measures 1.74x on \
-     prefill with them included, and the f32 q/k/v intermediate is load bearing: it is what fixed \
-     the bias cancellation, 0.133 to 0.026 relative on the tiny fixture.";
-
 pub fn page_profile_enabled() -> bool {
-    matches!(
-        std::env::var(PAGE_PROFILE_ENV).ok().as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
+    env_on(PAGE_PROFILE_ENV)
 }
-
-pub const NVFP4_ACTIVATION_GLOBAL_2POW7_LANDS_DECODE_BLOCK_SCALES_INSIDE_THE_E4M3_WINDOW: f32 =
-    128.0;
-
-pub const NVFP4_ACTIVATION_GLOBAL_IS_A_POWER_OF_TWO_SO_IT_ADDS_NO_ROUNDING: &str =
-    "The nvfp4 block scale is a ue4m3 byte, so a block whose amax lands below 6 * 2^-9 quantizes \
-     to the zero scale and the whole block is lost. A bf16 checkpoint carries no calibrated \
-     input_global_scale, so the activation global is a fixed power of two: it shifts every block \
-     scale into the e4m3 window without adding a rounding step of its own, and the weight alpha \
-     divides it back out.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DotsGraphQuant {
@@ -3869,257 +3234,195 @@ impl DotsGraphQuant {
     }
 }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct DgW4Params {
-    n_rows: u32,
-    k_elems: u32,
-    w_row_words: u32,
-    scale_row_stride: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+pod! {
+    struct DgW4Params {
+        n_rows: u32,
+        k_elems: u32,
+        w_row_words: u32,
+        scale_row_stride: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct DgG4Params {
-    n_rows: u32,
-    k_vecs: u32,
-    w_row_vecs: u32,
-    groups_x: u32,
-    out_f32: u32,
-    y_off_words: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct DgG4Params {
+        n_rows: u32,
+        k_vecs: u32,
+        w_row_vecs: u32,
+        groups_x: u32,
+        out_f32: u32,
+        y_off_words: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct GemvBf16Params {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    out_f32: u32,
-    w_row_words: u32,
-    x_off_words: u32,
-    y_off_words: u32,
-    pad0: u32,
-    alpha: f32,
-    pad1: u32,
-    pad2: u32,
-    pad3: u32,
-}
+    struct GemvBf16Params {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        out_f32: u32,
+        w_row_words: u32,
+        x_off_words: u32,
+        y_off_words: u32,
+        pad0: u32,
+        alpha: f32,
+        pad1: u32,
+        pad2: u32,
+        pad3: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct GemvNvfp4Params {
-    alpha: f32,
-    n_rows: u32,
-    k_blocks: u32,
-    k_tiles: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct RmsParams {
+        hidden: u32,
+        batch: u32,
+        eps: f32,
+        words_per_row: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct QuantRowsParams {
-    k_blocks: u32,
-    n_slots: u32,
-    use_sel: u32,
-    x_slot_stride_elems: u32,
-    x_slot_div_zero_means_one_padding_the_shared_lgq_layout: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct GatherParams {
+        row_off: u32,
+        n_rows: u32,
+        hidden_words: u32,
+        vocab: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct RmsParams {
-    hidden: u32,
-    batch: u32,
-    eps: f32,
-    words_per_row: u32,
-}
+    struct SiluMulParams {
+        n_words: u32,
+        gate_off_words: u32,
+        up_off_words: u32,
+        src_slot_words: u32,
+        dst_slot_words: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct GatherParams {
-    row_off: u32,
-    n_rows: u32,
-    hidden_words: u32,
-    vocab: u32,
-}
+    struct ArgmaxParams {
+        n: u32,
+        groups: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct SiluMulParams {
-    n_words: u32,
-    gate_off_words: u32,
-    up_off_words: u32,
-    src_slot_words: u32,
-    dst_slot_words: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct RowGatherParams {
+        words: u32,
+        src_slot_words: u32,
+        row: u32,
+        pad0: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct ArgmaxParams {
-    n: u32,
-    groups: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct BiasRopeParams {
+        n_rows: u32,
+        head_dim: u32,
+        half: u32,
+        rope_rows: u32,
+        has_bias: u32,
+        src_f32: u32,
+        src_slot_words: u32,
+        dst_slot_words: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct RowGatherParams {
-    words: u32,
-    src_slot_words: u32,
-    row: u32,
-    pad0: u32,
-}
+    struct KvWriteParams {
+        kv_words: u32,
+        kv_capacity: u32,
+        k_off_words: u32,
+        v_off_words: u32,
+        src_slot_words: u32,
+        n_kv_heads: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct BiasRopeParams {
-    n_rows: u32,
-    head_dim: u32,
-    half: u32,
-    rope_rows: u32,
-    has_bias: u32,
-    src_f32: u32,
-    src_slot_words: u32,
-    dst_slot_words: u32,
-}
+    struct AttnParams {
+        n_q_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        gqa_group: u32,
+        kv_capacity: u32,
+        q_slot_words: u32,
+        out_slot_words: u32,
+        scale: f32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct KvWriteParams {
-    kv_words: u32,
-    kv_capacity: u32,
-    k_off_words: u32,
-    v_off_words: u32,
-    src_slot_words: u32,
-    n_kv_heads: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct SplitAttnParams {
+        n_q_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        gqa_group: u32,
+        kv_capacity: u32,
+        n_splits: u32,
+        part_stride: u32,
+        scale: f32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct AttnParams {
-    n_q_heads: u32,
-    n_kv_heads: u32,
-    head_dim: u32,
-    gqa_group: u32,
-    kv_capacity: u32,
-    q_slot_words: u32,
-    out_slot_words: u32,
-    scale: f32,
-}
+    struct GemvNvfp4Mrow4Params {
+        alpha: f32,
+        n_rows: u32,
+        k_blocks: u32,
+        k_tiles: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct SplitAttnParams {
-    n_q_heads: u32,
-    n_kv_heads: u32,
-    head_dim: u32,
-    gqa_group: u32,
-    kv_capacity: u32,
-    n_splits: u32,
-    part_stride: u32,
-    scale: f32,
-}
+    struct CvtParams {
+        n_elems: u32,
+        src_slot: u32,
+        dst_slot: u32,
+        to_f32: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct GemvNvfp4Mrow4Params {
-    alpha: f32,
-    n_rows: u32,
-    k_blocks: u32,
-    k_tiles: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct CoopGemmParams {
+        n_rows: u32,
+        k_elems: u32,
+        m_rows: u32,
+        blocks_n: u32,
+        y_stride: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct CvtParams {
-    n_elems: u32,
-    src_slot: u32,
-    dst_slot: u32,
-    to_f32: u32,
-}
+    struct TileAttnParams {
+        n_q_heads: u32,
+        n_kv_heads: u32,
+        head_dim: u32,
+        gqa_group: u32,
+        kv_capacity: u32,
+        chunk: u32,
+        q_slot_words: u32,
+        out_slot_words: u32,
+        kv_words: u32,
+        scale: f32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct CoopGemmParams {
-    n_rows: u32,
-    k_elems: u32,
-    m_rows: u32,
-    blocks_n: u32,
-    y_stride: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct GemmMParams {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        w_row_words: u32,
+        x_slot_words: u32,
+        y_slot_words: u32,
+        out_f32: u32,
+        slot_base: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct TileAttnParams {
-    n_q_heads: u32,
-    n_kv_heads: u32,
-    head_dim: u32,
-    gqa_group: u32,
-    kv_capacity: u32,
-    chunk: u32,
-    q_slot_words: u32,
-    out_slot_words: u32,
-    kv_words: u32,
-    scale: f32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct GatherMParams {
+        row_off: u32,
+        n_rows: u32,
+        hidden_words: u32,
+        pad0: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct GemmMParams {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    w_row_words: u32,
-    x_slot_words: u32,
-    y_slot_words: u32,
-    out_f32: u32,
-    slot_base: u32,
-}
-
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct GatherMParams {
-    row_off: u32,
-    n_rows: u32,
-    hidden_words: u32,
-    pad0: u32,
-}
-
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct StepUniform {
-    tok: u32,
-    pos: u32,
-    total: u32,
-    sliding_start: u32,
+    struct StepUniform {
+        tok: u32,
+        pos: u32,
+        total: u32,
+        sliding_start: u32,
+    }
 }
 
 pub const DOTS_GRAPH_LORA_DIR_ENV_HOT_LOADS_A_PEFT_ADAPTER_ON_THE_GRAPH_ARM: &str =
@@ -4302,7 +3605,7 @@ fn dg_lora_leaf_path(leaf: &str) -> String {
 }
 
 fn dg_pack_bf16_rows(t: &candle_core::Tensor, n: usize, k: usize) -> Result<Vec<u32>> {
-    anyhow::ensure!(
+    ensure!(
         t.dims() == [n, k],
         "lora factor {:?} != [{n}, {k}]",
         t.dims()
@@ -4313,8 +3616,8 @@ fn dg_pack_bf16_rows(t: &candle_core::Tensor, n: usize, k: usize) -> Result<Vec<
         .to_vec1()?;
     let mut out = Vec::with_capacity(n * k / 2);
     for pair in v.chunks_exact(2) {
-        let lo = half::bf16::from_f32(pair[0]).to_bits() as u32;
-        let hi = half::bf16::from_f32(pair[1]).to_bits() as u32;
+        let lo = bf16::from_f32(pair[0]).to_bits() as u32;
+        let hi = bf16::from_f32(pair[1]).to_bits() as u32;
         out.push(lo | (hi << 16));
     }
     Ok(out)
@@ -4358,7 +3661,7 @@ impl DgLora {
                 let Some(w) = adapter.loras.get(&module) else {
                     continue;
                 };
-                anyhow::ensure!(
+                ensure!(
                     !w.is_embedding,
                     "{module}: embedding lora is not servable on the graph arm"
                 );
@@ -4369,13 +3672,13 @@ impl DgLora {
                 } else {
                     w.lora_b
                         .affine(w.scaling, 0.0)
-                        .map_err(|e| anyhow::anyhow!("{module}: fold scaling: {e}"))?
+                        .map_err(|e| anyhow!("{module}: fold scaling: {e}"))?
                 };
-                anyhow::ensure!(
+                ensure!(
                     r % 2 == 0,
                     "{module}: rank {r} must be even (the expand kernel walks bf16 pairs)"
                 );
-                anyhow::ensure!(
+                ensure!(
                     rank == 0 || rank == r,
                     "{module}: rank {r} != adapter rank {rank}; mixed ranks are not servable"
                 );
@@ -4394,7 +3697,7 @@ impl DgLora {
             }
             layers.push(map);
         }
-        anyhow::ensure!(
+        ensure!(
             matched > 0,
             "lora adapter {origin} matched no dots graph projection; expected modules like \
              model.language_model.layers.0.self_attn.q_proj after normalization"
@@ -4407,7 +3710,7 @@ impl DgLora {
     }
 
     pub fn from_env(cfg: &DotsDecoderConfig) -> Result<Option<Self>> {
-        match std::env::var(DOTS_GRAPH_LORA_DIR_ENV_HOT_LOADS_A_PEFT_ADAPTER_ON_THE_GRAPH_ARM) {
+        match env::var(DOTS_GRAPH_LORA_DIR_ENV_HOT_LOADS_A_PEFT_ADAPTER_ON_THE_GRAPH_ARM) {
             Ok(d) if !d.is_empty() => {
                 let lora = Self::from_peft_dir(std::path::Path::new(&d), cfg)?;
                 eprintln!(
@@ -4430,9 +3733,9 @@ impl DgLora {
 }
 
 struct DgLoraLeafGpu {
-    a: wgpu::Buffer,
-    b: wgpu::Buffer,
-    part: wgpu::Buffer,
+    a: Buffer,
+    b: Buffer,
+    part: Buffer,
     rank: usize,
     n: usize,
     k: usize,
@@ -4471,15 +3774,14 @@ fn upload_dg_lora_layer(
     DgLoraLayerGpu { leaves }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_dg_lora_slices(
     b: &mut Builder,
     label: &str,
     layer: &DgLoraLayerGpu,
     slices: &[(&'static str, usize)],
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_fmt: DgAct16,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_fmt: DgSink,
     y_row: usize,
     m: usize,
@@ -4488,7 +3790,7 @@ fn push_dg_lora_slices(
         let Some(g) = layer.leaves.get(leaf) else {
             continue;
         };
-        anyhow::ensure!(
+        ensure!(
             y_off % 2 == 0 && y_row.is_multiple_of(2) && g.n % 2 == 0 && g.k % 2 == 0,
             "{label}/{leaf}: lora slice geometry must be pair-aligned \
              (y_off {y_off}, y_row {y_row}, n {}, k {})",
@@ -4512,7 +3814,7 @@ fn push_dg_lora_slices(
             y_off: *y_off as u32,
             y_row: y_row as u32,
         };
-        anyhow::ensure!(
+        ensure!(
             g.rank <= 65535 && m <= 65535,
             "{label}/{leaf}: lora grid (rank {}, m {m}) exceeds the 65535 dispatch limit",
             g.rank
@@ -4539,7 +3841,6 @@ fn push_dg_lora_slices(
 }
 
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn dg_lora_probe(
     x_bf16: &[u16],
     a_bf16: &[u16],
@@ -4555,7 +3856,7 @@ pub fn dg_lora_probe(
     y_row: usize,
 ) -> Result<Vec<u32>> {
     let ctx = nv_kernels::wgpu_backend::WgpuContext::shared()
-        .map_err(|e| anyhow::anyhow!("no wgpu adapter: {e}"))?;
+        .map_err(|e| anyhow!("no wgpu adapter: {e}"))?;
     let mut b = Builder::new(ctx);
     let xw = b.upload_u32("dgl-probe-x", &pack_pairs(x_bf16));
     let aw = b.upload_u32("dgl-probe-a", &pack_pairs(a_bf16));
@@ -4604,13 +3905,12 @@ pub fn dg_lora_probe(
     } else {
         m * y_row / 2
     };
-    dispatch::read_back(ctx, &y, want_words)
-        .map_err(|e| anyhow::anyhow!("dg lora probe readback: {e}"))
+    dispatch::read_back(ctx, &y, want_words).map_err(|e| anyhow!("dg lora probe readback: {e}"))
 }
 
 struct Pass {
-    pipeline: std::sync::Arc<wgpu::ComputePipeline>,
-    bind: wgpu::BindGroup,
+    pipeline: Arc<ComputePipeline>,
+    bind: BindGroup,
     grid: (u32, u32, u32),
     entry: String,
 }
@@ -4618,7 +3918,6 @@ struct Pass {
 struct Sources {
     gemv_bf16: String,
     gemv_nvfp4: String,
-    quant: String,
     common: String,
     rms: String,
     _rmsres: String,
@@ -4629,15 +3928,11 @@ struct Sources {
 }
 
 impl Sources {
-    fn new(fold: usize, kt: bool, attn_tree: bool) -> Self {
+    fn new(fold: usize, attn_tree: bool) -> Self {
         let rope_raw = QWEN2_BIAS_ROPE_WGSL
             .replace(
                 "const DG_FOLD_F: u32 = 1u;",
                 &format!("const DG_FOLD_F: u32 = {fold}u;"),
-            )
-            .replace(
-                "const DG_KT: u32 = 0u;",
-                &format!("const DG_KT: u32 = {}u;", u32::from(kt)),
             )
             .replace(
                 "const DGW_ABLATE: u32 = 0u;",
@@ -4647,7 +3942,7 @@ impl Sources {
                 "const DGX_SG: u32 = 0u;",
                 &format!(
                     "const DGX_SG: u32 = {}u;",
-                    u32::from(attn_sg_enabled() && !attn_tree)
+                    u32::from(!attn_tree)
                 ),
             )
             .replace(
@@ -4658,7 +3953,7 @@ impl Sources {
                 "const DGX_ABL: u32 = 0u;",
                 &format!(
                     "const DGX_ABL: u32 = {}u;",
-                    std::env::var(ATTN_ABL_ENV)
+                    env::var(ATTN_ABL_ENV)
                         .ok()
                         .and_then(|v| v.parse::<u32>().ok())
                         .unwrap_or(0)
@@ -4669,14 +3964,10 @@ impl Sources {
                 &format!("const DGX_PIPE: u32 = {}u;", u32::from(attn_pipe_enabled())),
             )
             .replace(
-                "const DGA_V2: u32 = 1u;",
-                &format!("const DGA_V2: u32 = {}u;", u32::from(battn_v2_enabled())),
-            )
-            .replace(
                 "const DGA_ABL: u32 = 0u;",
                 &format!("const DGA_ABL: u32 = {}u;", {
                     let _ = BATTN_ABL_DELETES_THE_MONOLITHIC_WALKS_LOAD_CHAINS_TO_SPLIT_BYTES_FROM_LATENCY;
-                    std::env::var(BATTN_ABL_ENV)
+                    env::var(BATTN_ABL_ENV)
                         .ok()
                         .and_then(|v| v.parse::<u32>().ok())
                         .unwrap_or(0)
@@ -4694,11 +3985,6 @@ impl Sources {
         Self {
             gemv_bf16: compose(LAGUNA_GEMV_BF16_WGSL),
             gemv_nvfp4: format!("{}\n{}", wk::gemv_nvfp4::gemv_source(), NVFP4_GEMV_WGSL),
-            quant: format!(
-                "{}\n{}",
-                wk::gemv_nvfp4::quantize_source(),
-                LAGUNA_QUANT_ROWS_WGSL
-            ),
             common: compose(LAGUNA_COMMON_WGSL),
             rms: compose(wk::rmsnorm::WGSL),
             _rmsres: compose(wk::rmsnorm_residual::WGSL),
@@ -4706,33 +3992,16 @@ impl Sources {
             rope_act16: compose(
                 &rope_raw.replace("const DGACT16: u32 = 0u;", "const DGACT16: u32 = 1u;"),
             ),
-            fused: compose(DG_ATTN_FUSED_WGSL)
-                .replace(
-                    "const DGF_KT: u32 = 0u;",
-                    &format!("const DGF_KT: u32 = {}u;", u32::from(kt)),
-                )
-                .replace(
+            fused: compose(DG_ATTN_FUSED_WGSL).replace(
                     "const DGF_KV16: u32 = 0u;",
                     &format!("const DGF_KV16: u32 = {}u;", u32::from(kv_f16_enabled())),
                 ),
-            scvt: compose(DG_STEEL_CVT_WGSL)
-                .replace(
-                    "const DSC_KT: u32 = 0u;",
-                    &format!("const DSC_KT: u32 = {}u;", u32::from(kt)),
-                )
-                .replace(
+            scvt: compose(DG_STEEL_CVT_WGSL).replace(
                     "const DSC_KV16: u32 = 0u;",
                     &format!("const DSC_KV16: u32 = {}u;", u32::from(kv_f16_enabled())),
                 ),
         }
     }
-}
-
-fn staging_flush_enabled() -> bool {
-    !matches!(
-        std::env::var("NV_DOTS_GRAPH_STAGING_FLUSH").ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
 }
 
 struct Builder {
@@ -4742,7 +4011,7 @@ struct Builder {
     split: Vec<Pass>,
     pf_target: Option<usize>,
     split_mode: bool,
-    state: Vec<wgpu::Buffer>,
+    state: Vec<Buffer>,
     sk_families: u64,
     bf16out_families: u64,
     abf16_families: u64,
@@ -4765,7 +4034,7 @@ impl std::ops::DerefMut for Builder {
 impl Builder {
     fn new(ctx: &'static WgpuContext) -> Self {
         Self {
-            core: VramLedger::new(ctx, "dg-", staging_flush_enabled, STAGING_FLUSH_BYTES),
+            core: VramLedger::new(ctx, "dg-", STAGING_FLUSH_BYTES),
             passes: Vec::new(),
             pf_lists: Vec::new(),
             split: Vec::new(),
@@ -4779,7 +4048,7 @@ impl Builder {
         }
     }
 
-    fn state_zeros(&mut self, label: &str, bytes: u64) -> wgpu::Buffer {
+    fn state_zeros(&mut self, label: &str, bytes: u64) -> Buffer {
         let b = self.zeros(label, bytes);
         self.state.push(b.clone());
         b
@@ -4790,11 +4059,11 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
         let pass = Pass {
             pipeline,
@@ -4817,11 +4086,11 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<Pass> {
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
         Ok(Pass {
             pipeline,
@@ -4834,8 +4103,8 @@ impl Builder {
     fn push_prebuilt(
         &mut self,
         entry: &str,
-        pipeline: std::sync::Arc<wgpu::ComputePipeline>,
-        bind: wgpu::BindGroup,
+        pipeline: Arc<ComputePipeline>,
+        bind: BindGroup,
         grid: (u32, u32, u32),
     ) {
         let pass = Pass {
@@ -4865,9 +4134,9 @@ impl Builder {
 }
 
 struct StepBuffers {
-    tok: wgpu::Buffer,
-    step: wgpu::Buffer,
-    uni: wgpu::Buffer,
+    tok: Buffer,
+    step: Buffer,
+    uni: Buffer,
 }
 
 impl StepBuffers {
@@ -4884,15 +4153,13 @@ impl StepBuffers {
     }
 
     fn write_base(&self, ctx: &WgpuContext, token: u32, pos: u32, total: u32, kv_base: u32) {
-        ctx.queue
-            .write_buffer(&self.tok, 0, bytemuck::bytes_of(&token));
+        ctx.queue.write_buffer(&self.tok, 0, bytes_of(&token));
         let slots: [u32; 4] = [token, pos, total, kv_base];
-        ctx.queue
-            .write_buffer(&self.step, 0, bytemuck::cast_slice(&slots));
+        ctx.queue.write_buffer(&self.step, 0, cast_slice(&slots));
         ctx.queue.write_buffer(
             &self.uni,
             0,
-            bytemuck::bytes_of(&StepUniform {
+            bytes_of(&StepUniform {
                 tok: token,
                 pos,
                 total,
@@ -4903,40 +4170,33 @@ impl StepBuffers {
 }
 
 enum Lin {
-    Bf16 { w: wgpu::Buffer, n: usize, k: usize },
+    Bf16 { w: Buffer, n: usize, k: usize },
     Nvfp4(Nvfp4Gpu),
 }
 
 struct Act {
-    x: wgpu::Buffer,
+    x: Buffer,
     k: usize,
-    xq: wgpu::Buffer,
-    xs: wgpu::Buffer,
 }
 
 struct PfBuffers {
     m: usize,
-    tok: wgpu::Buffer,
-    mask: wgpu::Buffer,
-    splice: wgpu::Buffer,
-    res: wgpu::Buffer,
-    normed: wgpu::Buffer,
-    normed_post: wgpu::Buffer,
-    qkv: wgpu::Buffer,
-    qkv_rot: wgpu::Buffer,
-    heads: wgpu::Buffer,
-    attn_out: wgpu::Buffer,
-    ffn_out: wgpu::Buffer,
-    y_gu: wgpu::Buffer,
-    act: wgpu::Buffer,
-    x_f32: wgpu::Buffer,
-    y_f32: wgpu::Buffer,
-    zero: wgpu::Buffer,
-}
-
-struct SingleSlot {
-    sel0: wgpu::Buffer,
-    global1: wgpu::Buffer,
+    tok: Buffer,
+    mask: Buffer,
+    splice: Buffer,
+    res: Buffer,
+    normed: Buffer,
+    normed_post: Buffer,
+    qkv: Buffer,
+    qkv_rot: Buffer,
+    heads: Buffer,
+    attn_out: Buffer,
+    ffn_out: Buffer,
+    y_gu: Buffer,
+    act: Buffer,
+    x_f32: Buffer,
+    y_f32: Buffer,
+    zero: Buffer,
 }
 
 fn wbytes(elems: usize) -> u64 {
@@ -4947,12 +4207,12 @@ fn load_bf16(w: &dyn nv_weights::TensorSource, name: &str, shape: &[usize]) -> R
     let t = w
         .get(name, candle_core::DType::BF16)
         .with_context(|| format!("load {name}"))?;
-    anyhow::ensure!(
+    ensure!(
         t.dims() == shape,
         "{name}: shape {:?} != {shape:?}",
         t.dims()
     );
-    let v: Vec<half::bf16> = t.flatten_all()?.to_vec1()?;
+    let v: Vec<bf16> = t.flatten_all()?.to_vec1()?;
     Ok(v.into_iter().map(|x| x.to_bits()).collect())
 }
 
@@ -5244,9 +4504,9 @@ fn w4g_source(rows: usize, tree: bool) -> String {
 }
 
 struct DgAffine {
-    w: wgpu::Buffer,
-    scales: wgpu::Buffer,
-    biases: wgpu::Buffer,
+    w: Buffer,
+    scales: Buffer,
+    biases: Buffer,
     n: usize,
     k: usize,
 }
@@ -5278,7 +4538,7 @@ fn prep_lin_w4(
             W4_GROUP as usize,
         )
         .iter()
-        .map(|v| half::bf16::from_f32(*v).to_bits())
+        .map(|v| bf16::from_f32(*v).to_bits())
         .collect()
     } else {
         host
@@ -5296,13 +4556,13 @@ pub const MLX_SNAPSHOT_IS_THE_LOAD_TIME_QUANTIZER_ALREADY_RUN: &str =
      bf16 prefill twins come from the same dequant expression prep_lin_w4 applies";
 
 pub struct DgMlxWeights<'a> {
-    loader: &'a nv_weights::WeightLoader,
+    loader: &'a WeightLoader,
 }
 
 impl<'a> DgMlxWeights<'a> {
-    pub fn new(loader: &'a nv_weights::WeightLoader) -> Result<Self> {
+    pub fn new(loader: &'a WeightLoader) -> Result<Self> {
         let _ = MLX_SNAPSHOT_IS_THE_LOAD_TIME_QUANTIZER_ALREADY_RUN;
-        anyhow::ensure!(
+        ensure!(
             loader.has("language_model.model.embed_tokens.scales"),
             "not an mlx affine-u4 dots.ocr snapshot: \
              language_model.model.embed_tokens.scales is missing"
@@ -5334,13 +4594,13 @@ impl<'a> DgMlxWeights<'a> {
     }
 
     fn raw_bf16_f32(&self, name: &str, expect: usize) -> Result<Vec<f32>> {
-        anyhow::ensure!(
+        ensure!(
             self.loader.st_dtype_of(name) == Some(nv_weights::StDtype::BF16),
             "{name}: expected BF16 storage, got {:?}",
             self.loader.st_dtype_of(name)
         );
         let bytes = self.loader.raw_bytes(name)?;
-        anyhow::ensure!(
+        ensure!(
             bytes.len() == 2 * expect,
             "{name}: {} bytes != {expect} bf16 values",
             bytes.len()
@@ -5355,17 +4615,17 @@ impl<'a> DgMlxWeights<'a> {
         let gs = W4_GROUP as usize;
         let mapped = Self::map(name);
         let scales_name = Self::scales_name(&mapped)
-            .ok_or_else(|| anyhow::anyhow!("{name}: mlx w4 reads .weight tensors"))?;
+            .ok_or_else(|| anyhow!("{name}: mlx w4 reads .weight tensors"))?;
         let shape = self
             .loader
             .shape_of(&mapped)
-            .ok_or_else(|| anyhow::anyhow!("{mapped}: missing from the mlx snapshot"))?;
-        anyhow::ensure!(
+            .ok_or_else(|| anyhow!("{mapped}: missing from the mlx snapshot"))?;
+        ensure!(
             shape == [n, k / 8],
             "{mapped}: packed shape {shape:?} != [{n}, {}]",
             k / 8
         );
-        anyhow::ensure!(
+        ensure!(
             self.loader.st_dtype_of(&mapped) == Some(nv_weights::StDtype::U32),
             "{mapped}: expected U32 packed nibbles, got {:?}",
             self.loader.st_dtype_of(&mapped)
@@ -5393,16 +4653,16 @@ impl nv_weights::TensorSource for DgMlxWeights<'_> {
             let shape = self
                 .loader
                 .shape_of(&mapped)
-                .ok_or_else(|| anyhow::anyhow!("{mapped}: missing from the mlx snapshot"))?;
-            anyhow::ensure!(
+                .ok_or_else(|| anyhow!("{mapped}: missing from the mlx snapshot"))?;
+            ensure!(
                 shape.len() == 2,
                 "{mapped}: packed shape {shape:?} is not 2-d"
             );
             let (n, k) = (shape[0], shape[1] * 8);
-            let host: Vec<half::bf16> = self
+            let host: Vec<bf16> = self
                 .dequant_bf16_host(name, n, k)?
                 .into_iter()
-                .map(half::bf16::from_bits)
+                .map(bf16::from_bits)
                 .collect();
             let t = candle_core::Tensor::from_vec(host, (n, k), &candle_core::Device::Cpu)?;
             return Ok(if dtype == candle_core::DType::BF16 {
@@ -5437,7 +4697,7 @@ fn dequant_mlx_bf16_host(
                 let g = k_idx / gs;
                 let q = ((word >> (4 * e)) & 0xF) as f32;
                 let v = q * scales[row * groups + g] + biases[row * groups + g];
-                out[row * k + k_idx] = half::bf16::from_f32(v).to_bits();
+                out[row * k + k_idx] = bf16::from_f32(v).to_bits();
             }
         }
     }
@@ -5481,7 +4741,7 @@ fn lin_prep(
 fn upload_affine_w4(b: &mut Builder, label: &str, parts: &W4Parts, n: usize, k: usize) -> DgAffine {
     let pack = |v: &[f32]| -> Vec<u32> {
         v.iter()
-            .map(|s| (half::bf16::from_f32(*s).to_bits()) as u32)
+            .map(|s| (bf16::from_f32(*s).to_bits()) as u32)
             .collect()
     };
     DgAffine {
@@ -5514,8 +4774,8 @@ fn push_gemv_w4(
     b: &mut Builder,
     label: &str,
     w: &DgAffine,
-    x: &wgpu::Buffer,
-    y_pairs: &wgpu::Buffer,
+    x: &Buffer,
+    y_pairs: &Buffer,
     out_f32: bool,
     msl_x16: bool,
 ) -> Result<()> {
@@ -5538,32 +4798,7 @@ fn push_gemv_w4(
         let bind = b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
             layout: &pls.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: w.w.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: w.scales.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: w.biases.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: x.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: p.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: y_pairs.as_entire_binding(),
-                },
-            ],
+            entries: &bind_entries![w.w, w.scales, w.biases, x, p, y_pairs],
         });
         b.push_prebuilt(
             decode_gemv_msl::MSL_GEMV_ENTRY,
@@ -5573,7 +4808,7 @@ fn push_gemv_w4(
         );
         return Ok(());
     }
-    anyhow::ensure!(
+    ensure!(
         w.n.is_multiple_of(2) && w.k.is_multiple_of(2 * W4_GROUP as usize),
         "{label}: dg_gemv_w4_pk reads whole weight vec4s inside gs-64 groups, got n {} k {}",
         w.n,
@@ -5615,11 +4850,11 @@ fn push_gemv_w4_gsilu(
     b: &mut Builder,
     label: &str,
     w: &DgAffine,
-    x: &wgpu::Buffer,
-    act_pairs: &wgpu::Buffer,
+    x: &Buffer,
+    act_pairs: &Buffer,
 ) -> Result<()> {
     let pls = decode_gemv_msl::msl_gemv_pipelines(b.ctx)?;
-    anyhow::ensure!(
+    ensure!(
         w.n.is_multiple_of(8),
         "{label}: dg_msl_w4_gemv_gsilu pairs four gate rows with their four up rows per \
          workgroup, got n {}",
@@ -5642,32 +4877,7 @@ fn push_gemv_w4_gsilu(
     let bind = b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
         layout: &pls.layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: w.w.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: w.scales.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: w.biases.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: x.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: p.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: act_pairs.as_entire_binding(),
-            },
-        ],
+        entries: &bind_entries![w.w, w.scales, w.biases, x, p, act_pairs],
     });
     b.push_prebuilt(
         decode_gemv_msl::MSL_GEMV_GSILU_ENTRY,
@@ -5681,9 +4891,9 @@ fn push_gemv_w4_gsilu(
 struct RmsFuseSite<'a> {
     rms_mode: u32,
     fold_res: bool,
-    nw: &'a wgpu::Buffer,
-    res: &'a wgpu::Buffer,
-    res_f32: &'a wgpu::Buffer,
+    nw: &'a Buffer,
+    res: &'a Buffer,
+    res_f32: &'a Buffer,
     eps: f32,
 }
 
@@ -5691,14 +4901,14 @@ fn push_gemv_w4_rms(
     b: &mut Builder,
     label: &str,
     w: &DgAffine,
-    x: &wgpu::Buffer,
-    y_pairs: &wgpu::Buffer,
+    x: &Buffer,
+    y_pairs: &Buffer,
     out_f32: bool,
     site: RmsFuseSite<'_>,
 ) -> Result<()> {
     let pls = decode_gemv_msl::msl_gemv_pipelines(b.ctx)?;
     let grid = b.grid1(w.n as u64, decode_gemv_msl::MSL_GEMV_ROWS);
-    anyhow::ensure!(
+    ensure!(
         site.rms_mode == 0 || !site.fold_res,
         "{label}: a fold kernel must not also norm -- its in-place res write would race the \
          prologue reads"
@@ -5723,43 +4933,16 @@ fn push_gemv_w4_rms(
     let bind = b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
         layout: &pls.rms_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: w.w.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: w.scales.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: w.biases.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: x.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: p.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: y_pairs.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: site.nw.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: site.res.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 8,
-                resource: site.res_f32.as_entire_binding(),
-            },
+        entries: &bind_entries![
+            w.w,
+            w.scales,
+            w.biases,
+            x,
+            p,
+            y_pairs,
+            site.nw,
+            site.res,
+            site.res_f32
         ],
     });
     b.push_prebuilt(
@@ -5771,7 +4954,7 @@ fn push_gemv_w4_rms(
     Ok(())
 }
 
-fn upload_f32_of_bf16(b: &mut Builder, label: &str, host: &[u16]) -> wgpu::Buffer {
+fn upload_f32_of_bf16(b: &mut Builder, label: &str, host: &[u16]) -> Buffer {
     let f: Vec<f32> = host
         .iter()
         .map(|v| f32::from_bits((*v as u32) << 16))
@@ -5787,7 +4970,7 @@ fn upload_lin(
     k: usize,
     quant: DotsGraphQuant,
 ) -> Result<Lin> {
-    anyhow::ensure!(
+    ensure!(
         host.len() == n * k,
         "{label}: {} values, want [{n}, {k}]",
         host.len()
@@ -5799,13 +4982,13 @@ fn upload_lin(
             k,
         }),
         DotsGraphQuant::Nvfp4 => {
-            anyhow::ensure!(
+            ensure!(
                 k.is_multiple_of(4 * NVFP4_BLOCK),
                 "{label}: nvfp4 needs k divisible by {} for the 4-block scale word, got {k}",
                 4 * NVFP4_BLOCK
             );
             let h = quantize_nvfp4_host(host, n, k);
-            anyhow::ensure!(
+            ensure!(
                 h.input_global == 1.0,
                 "{label}: host nvfp4 quantization must leave the activation global at 1.0 so one \
                  quantize pass can feed every projection reading the same activation"
@@ -5815,71 +4998,26 @@ fn upload_lin(
     }
 }
 
-fn alloc_act(b: &mut Builder, label: &str, k: usize, quant: DotsGraphQuant) -> Act {
-    let x = b.zeros(label, wbytes(k));
-    act_over(b, label, x, k, quant)
-}
-
-fn act_over(b: &mut Builder, label: &str, x: wgpu::Buffer, k: usize, quant: DotsGraphQuant) -> Act {
-    let (qb, sb) = match quant {
-        DotsGraphQuant::Bf16 | DotsGraphQuant::AffineW4 => (4u64, 4u64),
-        DotsGraphQuant::Nvfp4 => ((k / 2) as u64, (k / NVFP4_BLOCK).div_ceil(4) as u64 * 4),
-    };
+fn alloc_act(b: &mut Builder, label: &str, k: usize) -> Act {
     Act {
-        x,
+        x: b.zeros(label, wbytes(k)),
         k,
-        xq: b.zeros(&format!("{label}-xq"), qb),
-        xs: b.zeros(&format!("{label}-xs"), sb),
     }
 }
 
-fn push_quant(b: &mut Builder, s: &Sources, label: &str, a: &Act, sl: &SingleSlot) -> Result<()> {
-    let k_blocks = a.k / NVFP4_BLOCK;
-    anyhow::ensure!(
-        k_blocks.is_multiple_of(4),
-        "{label}: quantize rows needs k/{NVFP4_BLOCK} divisible by 4, got {k_blocks}"
-    );
-    let p = b.uni(
-        &format!("{label}-p"),
-        QuantRowsParams {
-            k_blocks: k_blocks as u32,
-            n_slots: 1,
-            use_sel: 0,
-            x_slot_stride_elems: 0,
-            ..Default::default()
-        },
-    );
-    let gx = (k_blocks as u32).div_ceil(256).max(1);
-    b.push(
-        label,
-        &s.quant,
-        "lgw_quant_rows",
-        &[
-            (10, &a.x),
-            (11, &p),
-            (12, &a.xq),
-            (13, &a.xs),
-            (14, &sl.sel0),
-            (15, &sl.global1),
-        ],
-        (gx, 1, 1),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn push_gemv(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Lin,
     x: &Act,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     out_f32: bool,
     y_off_words: usize,
 ) -> Result<()> {
     match w {
         Lin::Bf16 { w, n, k } => {
-            anyhow::ensure!(*k == x.k, "{label}: gemv k {k} != activation k {}", x.k);
+            ensure!(*k == x.k, "{label}: gemv k {k} != activation k {}", x.k);
             let rows = g4_rows_for(*n);
             let grid = b.grid1(n.div_ceil(rows as usize) as u64, 1);
             if k.is_multiple_of(8) {
@@ -5930,14 +5068,15 @@ fn push_gemv(
                 grid,
             )
         }
-        Lin::Nvfp4(w) if nvfp4_mrow4_enabled() => {
-            anyhow::ensure!(
+        Lin::Nvfp4(w) => {
+            let _ = NVFP4_MROW4_SHARES_ONE_ACTIVATION_DECODE_ACROSS_FOUR_ROWS;
+            ensure!(
                 w.k == x.k,
                 "{label}: gemv k {} != activation k {}",
                 w.k,
                 x.k
             );
-            anyhow::ensure!(
+            ensure!(
                 !out_f32,
                 "{label}: the nvfp4 gemv writes bf16 pairs, so an f32 sink needs the bf16 arm"
             );
@@ -5962,62 +5101,16 @@ fn push_gemv(
                 grid,
             )
         }
-        Lin::Nvfp4(w) => {
-            anyhow::ensure!(
-                w.k == x.k,
-                "{label}: gemv k {} != activation k {}",
-                w.k,
-                x.k
-            );
-            anyhow::ensure!(
-                !out_f32,
-                "{label}: the nvfp4 gemv writes bf16 pairs, so an f32 sink needs the bf16 arm"
-            );
-            let k_blocks = w.k / NVFP4_BLOCK;
-            let grid = b.grid1(w.n.div_ceil(NVFP4_GEMV_ROWS_PER_WORKGROUP) as u64, 1);
-            let _ = NVFP4_ACTIVATION_GLOBAL_IS_A_POWER_OF_TWO_SO_IT_ADDS_NO_ROUNDING;
-            let _ =
-                NVFP4_GEMV_SPENDS_32_LANES_ON_A_ROW_SO_A_1536_WIDE_K_STILL_AMORTIZES_THE_REDUCTION;
-            let _ =
-                NVFP4_GEMV_CALLS_ONE_DOT4I8PACKED_PER_STATEMENT_BECAUSE_THE_MSL_POLYFILL_COLLIDES;
-            let p = b.uni(
-                &format!("{label}-p"),
-                GemvNvfp4Params {
-                    alpha: w.alpha
-                        / NVFP4_ACTIVATION_GLOBAL_2POW7_LANDS_DECODE_BLOCK_SCALES_INSIDE_THE_E4M3_WINDOW,
-                    n_rows: w.n as u32,
-                    k_blocks: k_blocks as u32,
-                    k_tiles: k_blocks.div_ceil(4) as u32,
-                    groups_x: grid.0,
-                    ..Default::default()
-                },
-            );
-            b.push(
-                label,
-                &s.gemv_nvfp4,
-                "dg_gemv_nvfp4",
-                &[
-                    (10, &w.w),
-                    (11, &w.scales),
-                    (12, &x.xq),
-                    (13, &x.xs),
-                    (14, &p),
-                    (15, y),
-                ],
-                grid,
-            )
-        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_rmsnorm(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
     batch: usize,
@@ -6025,14 +5118,13 @@ fn push_rmsnorm(
     push_rmsnorm_fmt(b, s, label, x, w, y, hidden, eps, batch, false)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_rmsnorm_fmt(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
     batch: usize,
@@ -6066,15 +5158,14 @@ fn push_rmsnorm_fmt(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_rmsnorm_residual(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    delta: &wgpu::Buffer,
-    res: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    delta: &Buffer,
+    res: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
     batch: usize,
@@ -6082,15 +5173,14 @@ fn push_rmsnorm_residual(
     push_rmsnorm_residual_fmt(b, s, label, delta, res, w, y, hidden, eps, batch, false)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_rmsnorm_residual_fmt(
     b: &mut Builder,
     _s: &Sources,
     label: &str,
-    delta: &wgpu::Buffer,
-    res: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    delta: &Buffer,
+    res: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
     batch: usize,
@@ -6106,7 +5196,7 @@ fn push_rmsnorm_residual_fmt(
         },
     );
     let grid = b.grid1(batch as u64, 1);
-    anyhow::ensure!(
+    ensure!(
         hidden / 2 <= 4 * 256,
         "{label}: dg_rmsres stashes each lane's row words in four registers, hidden {hidden}"
     );
@@ -6119,14 +5209,13 @@ fn push_rmsnorm_residual_fmt(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 #[derive(Clone, Copy)]
 struct RopeSite<'a> {
-    src: &'a wgpu::Buffer,
-    bias: &'a wgpu::Buffer,
-    cos: &'a wgpu::Buffer,
-    sin: &'a wgpu::Buffer,
-    dst: &'a wgpu::Buffer,
+    src: &'a Buffer,
+    bias: &'a Buffer,
+    cos: &'a Buffer,
+    sin: &'a Buffer,
+    dst: &'a Buffer,
     n_rows: usize,
     rope_rows: usize,
     head_dim: usize,
@@ -6174,15 +5263,14 @@ fn push_bias_rope(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_kv_write(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    src: &wgpu::Buffer,
+    src: &Buffer,
     step: &StepBuffers,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     kv_rows: usize,
     k_off_rows: usize,
     v_off_rows: usize,
@@ -6213,15 +5301,14 @@ fn push_kv_write(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_bias_rope_kvw(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     site: RopeSite<'_>,
     step: &StepBuffers,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     kv_rows: usize,
     capacity: usize,
 ) -> Result<()> {
@@ -6267,13 +5354,12 @@ fn push_bias_rope_kvw(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_silu_mul(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    gate_up: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    gate_up: &Buffer,
+    out: &Buffer,
     inter: usize,
     slots: usize,
     src_slot_words: usize,
@@ -6293,13 +5379,12 @@ fn push_silu_mul(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_silu_mul_fmt(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    gate_up: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    gate_up: &Buffer,
+    out: &Buffer,
     inter: usize,
     slots: usize,
     src_slot_words: usize,
@@ -6327,16 +5412,15 @@ fn push_silu_mul_fmt(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_attn(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    q: &wgpu::Buffer,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    q: &Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     step: &StepBuffers,
-    out: &wgpu::Buffer,
+    out: &Buffer,
     cfg: &DotsDecoderConfig,
     capacity: usize,
     slots: usize,
@@ -6375,9 +5459,9 @@ fn push_attn(
 }
 
 struct RopeKvwSite<'a> {
-    kc: &'a wgpu::Buffer,
-    vc: &'a wgpu::Buffer,
-    bslot: &'a wgpu::Buffer,
+    kc: &'a Buffer,
+    vc: &'a Buffer,
+    bslot: &'a Buffer,
     kv_rows: usize,
     k_off_rows: usize,
     v_off_rows: usize,
@@ -6385,14 +5469,13 @@ struct RopeKvwSite<'a> {
     n_kv_heads: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn region_rope_pass(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     site: RopeSite<'_>,
     step: &StepBuffers,
-    bpos: &wgpu::Buffer,
+    bpos: &Buffer,
     kvw: Option<RopeKvwSite<'_>>,
 ) -> Result<Pass> {
     let p = b.uni(
@@ -6409,7 +5492,7 @@ fn region_rope_pass(
         },
     );
     let _ = step;
-    let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![
+    let mut binds: Vec<(u32, &Buffer)> = vec![
         (0, site.src),
         (1, site.bias),
         (2, site.cos),
@@ -6451,16 +5534,15 @@ fn region_rope_pass(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn region_kv_pass(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     entry: &str,
-    src: &wgpu::Buffer,
+    src: &Buffer,
     step: &StepBuffers,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     kv_rows: usize,
     k_off_rows: usize,
     v_off_rows: usize,
@@ -6468,7 +5550,7 @@ fn region_kv_pass(
     slots: usize,
     src_slot_words: usize,
     n_kv_heads: usize,
-    bslot: Option<&wgpu::Buffer>,
+    bslot: Option<&Buffer>,
 ) -> Result<Pass> {
     let kv_words = kv_rows / 2;
     let p = b.uni(
@@ -6483,7 +5565,7 @@ fn region_kv_pass(
             ..Default::default()
         },
     );
-    let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![(10, src), (12, &p), (13, kc), (14, vc)];
+    let mut binds: Vec<(u32, &Buffer)> = vec![(10, src), (12, &p), (13, kc), (14, vc)];
     if let Some(bs) = bslot {
         binds.push((15, bs));
     } else {
@@ -6498,23 +5580,22 @@ fn region_kv_pass(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn region_attn_pass(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     entry: &str,
-    q: &wgpu::Buffer,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    q: &Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     step: &StepBuffers,
-    out: &wgpu::Buffer,
+    out: &Buffer,
     cfg: &DotsDecoderConfig,
     capacity: usize,
     slots: usize,
     q_slot_words: usize,
     out_slot_words: usize,
-    brange: Option<&wgpu::Buffer>,
+    brange: Option<&Buffer>,
 ) -> Result<Pass> {
     let n_q = cfg.num_attention_heads;
     let p = b.uni(
@@ -6530,8 +5611,7 @@ fn region_attn_pass(
             scale: (cfg.head_dim() as f32).powf(-0.5),
         },
     );
-    let mut binds: Vec<(u32, &wgpu::Buffer)> =
-        vec![(30, q), (31, kc), (32, vc), (34, &p), (35, out)];
+    let mut binds: Vec<(u32, &Buffer)> = vec![(30, q), (31, kc), (32, vc), (34, &p), (35, out)];
     if let Some(br) = brange {
         binds.push((36, br));
     } else {
@@ -6540,17 +5620,16 @@ fn region_attn_pass(
     b.make_pass(label, &s.rope, entry, &binds, (n_q as u32, slots as u32, 1))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_attn_split(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    q: &wgpu::Buffer,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    q: &Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     step: &StepBuffers,
-    part: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    part: &Buffer,
+    out: &Buffer,
     cfg: &DotsDecoderConfig,
     capacity: usize,
     n_splits: usize,
@@ -6599,17 +5678,16 @@ fn push_attn_split(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_attn_tiled(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     entry: &str,
-    q: &wgpu::Buffer,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    q: &Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     step: &StepBuffers,
-    out: &wgpu::Buffer,
+    out: &Buffer,
     cfg: &DotsDecoderConfig,
     capacity: usize,
     chunk: usize,
@@ -6619,12 +5697,12 @@ fn push_attn_tiled(
     let n_q = cfg.num_attention_heads;
     let n_kv = cfg.num_key_value_heads;
     let hd = cfg.head_dim();
-    anyhow::ensure!(
+    ensure!(
         hd <= ATTN_TILE_MAX_HEAD_DIM,
         "{label}: the tiled attention stages {ATTN_TILE_MAX_HEAD_DIM} dims per row to fit the \
          workgroup budget, head_dim is {hd}"
     );
-    anyhow::ensure!(
+    ensure!(
         chunk.is_multiple_of(ATTN_TILE_QUERY_ROWS),
         "{label}: a {chunk}-row chunk is not a whole number of {ATTN_TILE_QUERY_ROWS}-row query \
          tiles"
@@ -6674,21 +5752,21 @@ fn push_attn_tiled(
 }
 
 struct FusedSlabs {
-    qa: wgpu::Buffer,
-    qb: wgpu::Buffer,
-    sa: wgpu::Buffer,
-    sb: wgpu::Buffer,
-    la: wgpu::Buffer,
-    lb: wgpu::Buffer,
-    oa: wgpu::Buffer,
-    ob: wgpu::Buffer,
+    qa: Buffer,
+    qb: Buffer,
+    sa: Buffer,
+    sb: Buffer,
+    la: Buffer,
+    lb: Buffer,
+    oa: Buffer,
+    ob: Buffer,
 }
 
 struct FusedMirrors {
-    kf0: wgpu::Buffer,
-    kf1: wgpu::Buffer,
-    vt0: wgpu::Buffer,
-    vt1: wgpu::Buffer,
+    kf0: Buffer,
+    kf1: Buffer,
+    vt0: Buffer,
+    vt1: Buffer,
 }
 
 pub const ATTN_FUSED_QK_PLAN: (u32, u32, u32, u32) = (4, 4, 4, 2);
@@ -6730,17 +5808,16 @@ fn attn_cap16(capacity: usize) -> usize {
     capacity.div_ceil(16) * 16
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_attn_fused(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    q: &wgpu::Buffer,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    q: &Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     step: &StepBuffers,
-    out: &wgpu::Buffer,
-    zero: &wgpu::Buffer,
+    out: &Buffer,
+    zero: &Buffer,
     fb: &FusedSlabs,
     mir: &FusedMirrors,
     cfg: &DotsDecoderConfig,
@@ -6753,12 +5830,12 @@ fn push_attn_fused(
     let n_kv = cfg.num_key_value_heads;
     let hd = cfg.head_dim();
     let gqa = n_q / n_kv;
-    anyhow::ensure!(
+    ensure!(
         hd == ATTN_FUSED_HEAD_DIM && n_kv == 2,
         "{label}: the GEMM attention arm bakes head_dim {ATTN_FUSED_HEAD_DIM} and two kv heads, \
          got {hd}/{n_kv}"
     );
-    anyhow::ensure!(
+    ensure!(
         chunk.is_multiple_of(ATTN_FUSED_QUERY_ROWS),
         "{label}: a {chunk}-row chunk is not a whole number of {ATTN_FUSED_QUERY_ROWS}-row rows"
     );
@@ -6810,7 +5887,7 @@ fn push_attn_fused(
     let plan = coop_plan();
     let (qtm, qtn, qsg, qku) = ATTN_FUSED_QK_PLAN;
     plan.check_shape(rows as u32, cap16 as u32, hd as u32)
-        .map_err(|e| anyhow::anyhow!("{label}: qk shape: {e}"))?;
+        .map_err(|e| anyhow!("{label}: qk shape: {e}"))?;
     let qk_src = attn_coop_source(qtm, qtn, qsg, qku);
     let qk_entry = plan.entry(qtm, qtn, qsg, qku);
     let (qbm, qbn) = plan.grid(rows as u32, cap16 as u32, qtm, qtn, qsg);
@@ -6858,7 +5935,7 @@ fn push_attn_fused(
     }
     let (ptm, ptn, psg, pku) = ATTN_FUSED_PV_PLAN_TM2_TN1_SG2_IS_THE_M768_N128_LADDER_KNEE;
     plan.check_shape(rows as u32, hd as u32, cap16 as u32)
-        .map_err(|e| anyhow::anyhow!("{label}: pv shape: {e}"))?;
+        .map_err(|e| anyhow!("{label}: pv shape: {e}"))?;
     let pv_src = attn_coop_source(ptm, ptn, psg, pku);
     let pv_entry = plan.entry(ptm, ptn, psg, pku);
     let (pbm, pbn) = plan.grid(rows as u32, hd as u32, ptm, ptn, psg);
@@ -6925,48 +6002,45 @@ struct DgScvtParams {
 }
 
 struct SteelBufs {
-    qh: wgpu::Buffer,
-    oh: wgpu::Buffer,
-    sp: Vec<wgpu::Buffer>,
-    pu: Vec<wgpu::Buffer>,
-    mp: wgpu::Buffer,
-    dummy: wgpu::Buffer,
-    pls: std::sync::Arc<super::prefill_attn_msl::CausalSteelPipelines>,
+    qh: Buffer,
+    oh: Buffer,
+    sp: Vec<Buffer>,
+    pu: Vec<Buffer>,
+    mp: Buffer,
+    dummy: Buffer,
+    pls: Arc<super::prefill_attn_msl::CausalSteelPipelines>,
 }
 
 fn steel_params_buffer(
     b: &mut Builder,
     label: &str,
     p: &super::vision_attn_msl::SteelAttnParams,
-) -> wgpu::Buffer {
+) -> Buffer {
     use wgpu::util::DeviceExt;
     let buf = b
         .ctx
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),
-            contents: bytemuck::bytes_of(p),
-            usage: wgpu::BufferUsages::UNIFORM
-                | wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST,
+            contents: bytes_of(p),
+            usage: BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
     b.core.store(label, buf)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_attn_steel(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    q: &wgpu::Buffer,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    q: &Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     step: &StepBuffers,
-    out: &wgpu::Buffer,
+    out: &Buffer,
     sb: &SteelBufs,
     pfi: usize,
-    kh: &wgpu::Buffer,
-    vh: &wgpu::Buffer,
+    kh: &Buffer,
+    vh: &Buffer,
     cfg: &DotsDecoderConfig,
     chunk: usize,
 ) -> Result<()> {
@@ -6989,20 +6063,19 @@ fn push_attn_steel(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_attn_steel_kv(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    q: &wgpu::Buffer,
-    kc: &wgpu::Buffer,
-    vc: &wgpu::Buffer,
+    q: &Buffer,
+    kc: &Buffer,
+    vc: &Buffer,
     step: &StepBuffers,
-    out: &wgpu::Buffer,
+    out: &Buffer,
     sb: &SteelBufs,
     pfi: usize,
-    kh: &wgpu::Buffer,
-    vh: &wgpu::Buffer,
+    kh: &Buffer,
+    vh: &Buffer,
     cfg: &DotsDecoderConfig,
     chunk: usize,
     kv_entry: &str,
@@ -7012,7 +6085,7 @@ fn push_attn_steel_kv(
     let q_words = n_q * hd / 2;
     let kv_words = cfg.num_key_value_heads * hd / 2;
     let bq = super::vision_attn_msl::STEEL_BQ as usize;
-    anyhow::ensure!(
+    ensure!(
         hd == ATTN_FUSED_HEAD_DIM && chunk.is_multiple_of(bq),
         "{label}: the causal steel arm bakes head_dim {ATTN_FUSED_HEAD_DIM} and {bq}-row query \
          blocks, got {hd}/{chunk}"
@@ -7042,40 +6115,7 @@ fn push_attn_steel_kv(
     let bind = b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
         layout: &sb.pls.layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: sb.qh.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: kh.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: vh.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: sb.oh.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: sb.sp[pfi].as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: sb.mp.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: sb.dummy.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: sb.dummy.as_entire_binding(),
-            },
-        ],
+        entries: &bind_entries![sb.qh, kh, vh, sb.oh, sb.sp[pfi], sb.mp, sb.dummy, sb.dummy],
     });
     b.push_prebuilt(
         super::prefill_attn_msl::CAUSAL_ENTRY,
@@ -7093,19 +6133,17 @@ fn push_attn_steel_kv(
 }
 
 struct SteelProjBufs {
-    xh: wgpu::Buffer,
-    skpart: Option<wgpu::Buffer>,
-    pls: std::sync::Arc<super::vision_attn_msl::SteelGemmPipelines>,
-    cvt: Option<std::sync::Arc<super::vision_attn_msl::SteelGemmCvtPipelines>>,
+    skpart: Option<Buffer>,
+    cvt: Arc<super::vision_attn_msl::SteelGemmCvtPipelines>,
 }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct DgSkRedParams {
-    n_elems: u32,
-    slices: u32,
-    pad0: u32,
-    pad1: u32,
+pod! {
+    struct DgSkRedParams {
+        n_elems: u32,
+        slices: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 }
 
 const DG_SK_RED_WGSL: &str = "
@@ -7128,8 +6166,7 @@ pub const TRUNK_BF16OUT_FOLDS_THE_SPLITK_REDUCE_STORE_BECAUSE_THE_F32_PARTIAL_SU
     dg_sk_red_bf16 keeps the identical ascending-slice f32 sum and only rounds the final store \
     through dg_cvt's exact bf16_encode chain (RNE incl the NaN map), so the fold is bitwise -- \
     rounding partials to bf16 BEFORE the reduce would change the sum and is the tolerance form \
-    this fold refuses. It rides NV_DOTS_TRUNK_BF16OUT (the output-fold env): =0 restores \
-    dg_sk_red plus the standalone dg_cvt byte-identically. qkv keeps the f32 reduce (rope \
+    this fold refuses. qkv keeps the f32 reduce (rope \
     consumes the f32 sink directly); gateup never splits.";
 
 const DG_SK_RED_BF16_WGSL: &str = "
@@ -7156,8 +6193,8 @@ fn dg_sk_red_bf16(@builtin(global_invocation_id) g: vec3<u32>) {
 }
 ";
 
-fn upload_f16_of_bf16(b: &mut Builder, label: &str, host: &[u16]) -> wgpu::Buffer {
-    let h16 = |bits: u16| half::f16::from_f32(half::bf16::from_bits(bits).to_f32()).to_bits();
+fn upload_f16_of_bf16(b: &mut Builder, label: &str, host: &[u16]) -> Buffer {
+    let h16 = |bits: u16| half::f16::from_f32(bf16::from_bits(bits).to_f32()).to_bits();
     let mut words = Vec::with_capacity(host.len().div_ceil(2));
     for pair in host.chunks(2) {
         let lo = h16(pair[0]) as u32;
@@ -7167,67 +6204,37 @@ fn upload_f16_of_bf16(b: &mut Builder, label: &str, host: &[u16]) -> wgpu::Buffe
     b.upload_u32(label, &words)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_proj_steel(
     b: &mut Builder,
-    s: &Sources,
     label: &str,
     fam: ProjFamily,
-    w_h: &wgpu::Buffer,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
-    sink16: Option<&wgpu::Buffer>,
+    w_h: &Buffer,
+    x: &Buffer,
+    y: &Buffer,
+    sink16: Option<&Buffer>,
     sb: &SteelProjBufs,
     m: usize,
     n: usize,
     k: usize,
-) -> Result<bool> {
+) -> Result<()> {
+    let _ = TRUNK_CVT_FUSIONS_DELETE_196_MIRROR_PASSES_PER_BSTEP_AND_STAY_IN_THE_BITWISE_CLASS;
     let cfg = pf_steel_proj_cfg_for(m);
-    anyhow::ensure!(
+    ensure!(
         k.is_multiple_of(2 * cfg.2 as usize),
         "{label}: k {k} is not a whole even number of {}-deep steel k-blocks",
         cfg.2
     );
-    anyhow::ensure!(
+    ensure!(
         n.is_multiple_of(2),
         "{label}: n {n} must be even so bf16 word stores never split a pair"
     );
-    let kw = k / 2;
-    let abf16 = trunk_abf16_enabled() && sb.cvt.is_some();
-    if !abf16 {
-        let p = b.uni(
-            &format!("{label}-cp"),
-            DgScvtParams {
-                m: m as u32,
-                qkv_words: kw as u32,
-                q_words: kw as u32,
-                kv_words: 0,
-                capacity: 0,
-                heads_words: 0,
-                row_off: 0,
-                pad1: 0,
-            },
-        );
-        b.push(
-            &format!("{label}-xcvt"),
-            &s.scvt,
-            "dg_scvt_q",
-            &[(1, x), (4, &p), (5, &sb.xh)],
-            ((kw as u32).div_ceil(64), m as u32, 1),
-        )?;
-    }
-    let a_buf = if abf16 { x } else { &sb.xh };
     let sk = trunk_splitk_s(fam, m, k, cfg.2);
     let sk_pipeline = if sk > 1 {
-        if abf16 {
-            anyhow::ensure!(
-                cfg == super::vision_attn_msl::STEEL_GEMM_CVT_SK_CFG_IS_THE_ONLY_TILE_SPLITK_ENGAGES,
-                "{label}: splitk engaged an uninstantiated abf16 tile {cfg:?}"
-            );
-            sb.cvt.as_ref().and_then(|c| c.pick("sk_abf16", cfg))
-        } else {
-            sb.pls.pick_splitk(cfg)
-        }
+        ensure!(
+            cfg == super::vision_attn_msl::STEEL_GEMM_CVT_SK_CFG_IS_THE_ONLY_TILE_SPLITK_ENGAGES,
+            "{label}: splitk engaged an uninstantiated abf16 tile {cfg:?}"
+        );
+        sb.cvt.pick("sk_abf16", cfg)
     } else {
         None
     };
@@ -7236,40 +6243,13 @@ fn push_proj_steel(
             &format!("{label}-skgp"),
             super::vision_attn_msl::steel_gemm_splitk_params(m, n, k, sk, cfg),
         );
-        let layout = if abf16 {
-            &sb.cvt.as_ref().unwrap().layout
-        } else {
-            &sb.pls.layout
-        };
         let bind = b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some(label),
-            layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: w_h.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: part.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: gp.as_entire_binding(),
-                },
-            ],
+            layout: &sb.cvt.layout,
+            entries: &bind_entries![x, w_h, part, gp],
         });
-        let entry = if abf16 {
-            super::vision_attn_msl::steel_gemm_cvt_entry("sk_abf16", cfg)
-        } else {
-            super::vision_attn_msl::steel_gemm_splitk_entry(cfg.0, cfg.1, cfg.2, cfg.3, cfg.4)
-        };
         b.push_prebuilt(
-            &entry,
+            &super::vision_attn_msl::steel_gemm_cvt_entry("sk_abf16", cfg),
             pipeline,
             bind,
             super::vision_attn_msl::steel_gemm_splitk_grid(m, n, sk, cfg),
@@ -7283,8 +6263,7 @@ fn push_proj_steel(
                 pad1: 0,
             },
         );
-        let red16 = sink16.filter(|_| trunk_bf16out_enabled());
-        match red16 {
+        match sink16 {
             Some(sink) => {
                 let _ = TRUNK_BF16OUT_FOLDS_THE_SPLITK_REDUCE_STORE_BECAUSE_THE_F32_PARTIAL_SUM_NEVER_MOVES;
                 b.push(
@@ -7307,86 +6286,42 @@ fn push_proj_steel(
             }
         }
         b.sk_families += 1;
-        if abf16 {
-            b.abf16_families += 1;
-        }
-        return Ok(red16.is_some());
+        b.abf16_families += 1;
+        return Ok(());
     }
-    let engage_out = sink16.is_some() && trunk_bf16out_enabled() && sb.cvt.is_some();
     let gp = b.uni(
         &format!("{label}-gp"),
         super::vision_attn_msl::steel_gemm_params(m, n, k, n, cfg),
     );
-    let kind = match (abf16, engage_out) {
-        (false, false) => None,
-        (true, false) => Some("abf16"),
-        (false, true) => Some("bf16o"),
-        (true, true) => Some("abf16o"),
-    };
-    let d_buf = if engage_out { sink16.unwrap() } else { y };
-    let (entry, pipeline, layout) = match kind {
-        None => (
-            super::vision_attn_msl::steel_gemm_entry(cfg.0, cfg.1, cfg.2, cfg.3, cfg.4),
-            sb.pls
-                .pick(cfg)
-                .ok_or_else(|| anyhow::anyhow!("{label}: steel gemm config {cfg:?} missing"))?,
-            &sb.pls.layout,
-        ),
-        Some(kind) => {
-            let cvt = sb.cvt.as_ref().unwrap();
-            (
-                super::vision_attn_msl::steel_gemm_cvt_entry(kind, cfg),
-                cvt.pick(kind, cfg).ok_or_else(|| {
-                    anyhow::anyhow!("{label}: steel cvt kernel {kind} at {cfg:?} missing")
-                })?,
-                &cvt.layout,
-            )
-        }
-    };
+    let kind = if sink16.is_some() { "abf16o" } else { "abf16" };
+    let pipeline = sb
+        .cvt
+        .pick(kind, cfg)
+        .ok_or_else(|| anyhow!("{label}: steel cvt kernel {kind} at {cfg:?} missing"))?;
     let bind = b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
-        layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: a_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: w_h.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: d_buf.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: gp.as_entire_binding(),
-            },
-        ],
+        layout: &sb.cvt.layout,
+        entries: &bind_entries![x, w_h, sink16.unwrap_or(y), gp],
     });
     b.push_prebuilt(
-        &entry,
+        &super::vision_attn_msl::steel_gemm_cvt_entry(kind, cfg),
         pipeline,
         bind,
         super::vision_attn_msl::steel_gemm_grid(m, n, cfg),
     );
-    if abf16 {
-        b.abf16_families += 1;
-    }
-    if engage_out {
+    b.abf16_families += 1;
+    if sink16.is_some() {
         b.bf16out_families += 1;
     }
-    Ok(engage_out)
+    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_cvt(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    src: &wgpu::Buffer,
-    dst: &wgpu::Buffer,
+    src: &Buffer,
+    dst: &Buffer,
     n_elems: usize,
     src_slot: usize,
     dst_slot: usize,
@@ -7420,7 +6355,7 @@ pub const COOP_F16_OPERANDS_MEASURED_A_LOSS_AT_DECODER_SHAPES_SO_F32_AND_ITS_BIT
      bytes are not what the projection GEMMs wait on, and the tower's f16 advantage does not \
      transfer down-shape. The arm is deleted rather than kept as a knob; f32 operands also \
      keep the chunk-vs-steps suite bitwise. The steel read this constant once pointed at is \
-     shipped: NV_DOTS_PF_STEEL_PROJ routes the four prefill projections through the vendored \
+     shipped: the four prefill projections route through the vendored \
      steel gemm by default, 1.59x over this coop plan on the projections at the 3412-row page \
      chunk, and the NV_DOTS_PF_STEEL_CFG ladder holds the vision crown tile as the decoder-shape \
      crown too -- bigger k-blocks lose here, so the coop plan below is the fallback arm, not the \
@@ -7439,21 +6374,20 @@ fn coop_plan() -> nv_kernels::wgpu_backend::kernels::gemm_coop_f16::CoopGemm {
     coop::CoopGemm::new(8, coop::Operand::F32)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_coop_gemm(
     b: &mut Builder,
     label: &str,
-    w_f32: &wgpu::Buffer,
-    x_f32: &wgpu::Buffer,
-    y_f32: &wgpu::Buffer,
-    zero: &wgpu::Buffer,
+    w_f32: &Buffer,
+    x_f32: &Buffer,
+    y_f32: &Buffer,
+    zero: &Buffer,
     m: usize,
     n: usize,
     k: usize,
 ) -> Result<()> {
     let plan = coop_plan();
     plan.check_shape(m as u32, n as u32, k as u32)
-        .map_err(|e| anyhow::anyhow!("{label}: coop shape: {e}"))?;
+        .map_err(|e| anyhow!("{label}: coop shape: {e}"))?;
     let (tm, tn, sg, ku) = COOP_PLAN_TM4_TN4_SG4_KU2_WON_EVERY_SHAPE_OF_THE_WIDTH_LADDER;
     let (blocks_m, blocks_n) = plan.grid(m as u32, n as u32, tm, tn, sg);
     let grid = b.grid1((blocks_m * blocks_n) as u64, 1);
@@ -7481,21 +6415,20 @@ fn push_coop_gemm(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemm_m8(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Lin,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     x_slot_words: usize,
     y_slot_words: usize,
     out_f32: bool,
     m: usize,
 ) -> Result<()> {
     let Lin::Bf16 { w, n, k } = w else {
-        anyhow::bail!("{label}: the m-row prefill GEMM is a bf16 kernel");
+        bail!("{label}: the m-row prefill GEMM is a bf16 kernel");
     };
     let want = gemm_slots();
     let slots = if m.is_multiple_of(want) {
@@ -7503,7 +6436,7 @@ fn push_gemm_m8(
     } else {
         PREFILL_GEMM_SLOTS_PER_DISPATCH_ARE_THE_TWO_VEC4_ACCUMULATORS_OF_DG_GEMM_M8
     };
-    anyhow::ensure!(
+    ensure!(
         m.is_multiple_of(slots),
         "{label}: a {m}-row chunk is not a whole number of {slots}-slot GEMM dispatches"
     );
@@ -7538,16 +6471,15 @@ fn push_gemm_m8(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gather_m(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     entry: &str,
-    src: &wgpu::Buffer,
-    tok: &wgpu::Buffer,
-    mask: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    src: &Buffer,
+    tok: &Buffer,
+    mask: &Buffer,
+    out: &Buffer,
     row_off: usize,
     n_rows: usize,
     hidden_words: usize,
@@ -7562,7 +6494,7 @@ fn push_gather_m(
             pad0: 0,
         },
     );
-    let binds: Vec<(u32, &wgpu::Buffer)> = if entry == "dg_splice_m" {
+    let binds: Vec<(u32, &Buffer)> = if entry == "dg_splice_m" {
         vec![(50, src), (52, mask), (53, &p), (54, out)]
     } else {
         vec![(50, src), (51, tok), (52, mask), (53, &p), (54, out)]
@@ -7584,7 +6516,6 @@ pub struct CoopProbe {
     pub m8_tflops: f64,
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn coop_gemm_probe(
     m: usize,
     n: usize,
@@ -7597,27 +6528,27 @@ pub fn coop_gemm_probe(
 ) -> Result<CoopProbe> {
     use nv_kernels::wgpu_backend::kernels::gemm_coop_f16 as coop;
 
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+    let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
     let plan = coop::CoopGemm::new(8, coop::Operand::F32);
     plan.check_shape(m as u32, n as u32, k as u32)
-        .map_err(|e| anyhow::anyhow!("coop shape: {e}"))?;
-    anyhow::ensure!(
+        .map_err(|e| anyhow!("coop shape: {e}"))?;
+    ensure!(
         plan.acc_fits_a_register_file(tm, tn),
         "tm{tm} tn{tn} needs {} accumulator dwords per lane, over the budget",
         plan.acc_lane_dwords(tm, tn)
     );
-    anyhow::ensure!(
+    ensure!(
         ctx.caps.coop_advertises(&plan.request()),
         "adapter does not advertise the tile-8 f32 cooperative matrix"
     );
 
-    let s = Sources::new(1, false, sg_tree_sites(ctx.subgroup_width()).attn);
+    let s = Sources::new(1, sg_tree_sites(ctx.subgroup_width()).attn);
     let mut b = Builder::new(ctx);
     let wbits: Vec<u16> = (0..n * k)
-        .map(|i| half::bf16::from_f32(((i % 97) as f32 - 48.0) / 512.0).to_bits())
+        .map(|i| bf16::from_f32(((i % 97) as f32 - 48.0) / 512.0).to_bits())
         .collect();
     let xbits: Vec<u16> = (0..m * k)
-        .map(|i| half::bf16::from_f32(((i % 89) as f32 - 44.0) / 256.0).to_bits())
+        .map(|i| bf16::from_f32(((i % 89) as f32 - 44.0) / 256.0).to_bits())
         .collect();
     let f32_of = |v: &[u16]| -> Vec<f32> {
         v.iter()
@@ -7668,24 +6599,24 @@ pub fn coop_gemm_probe(
 
     let run = |passes: Vec<&Pass>| -> Result<f64> {
         let list: Vec<&Pass> = (0..reps).flat_map(|_| passes.clone()).collect();
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let cb = dispatch::encode_pass_list_labeled(
             ctx,
             list.iter().map(|p| (&*p.pipeline, &p.bind, p.grid)),
             &[],
         );
         ctx.queue.submit([cb]);
-        let _: Vec<f32> = dispatch::read_back(ctx, &yf, 4)
-            .map_err(|e| anyhow::anyhow!("coop probe readback: {e}"))?;
+        let _: Vec<f32> =
+            dispatch::read_back(ctx, &yf, 4).map_err(|e| anyhow!("coop probe readback: {e}"))?;
         Ok(t.elapsed().as_secs_f64() * 1e3 / reps as f64)
     };
     let coop_ms = run(vec![&coop_pass])?;
     let m8_ms = run(m8_passes.iter().collect())?;
 
-    let a: Vec<f32> = dispatch::read_back(ctx, &yf, m * n)
-        .map_err(|e| anyhow::anyhow!("coop y readback: {e}"))?;
+    let a: Vec<f32> =
+        dispatch::read_back(ctx, &yf, m * n).map_err(|e| anyhow!("coop y readback: {e}"))?;
     let c: Vec<f32> =
-        dispatch::read_back(ctx, &y8, m * n).map_err(|e| anyhow::anyhow!("m8 y readback: {e}"))?;
+        dispatch::read_back(ctx, &y8, m * n).map_err(|e| anyhow!("m8 y readback: {e}"))?;
     let mut max_abs_diff = 0f32;
     for slot in 0..m {
         for row in 0..n {
@@ -7706,14 +6637,14 @@ pub fn coop_gemm_probe(
 }
 
 pub fn gemv_w4_probe(n: usize, k: usize, reps: usize) -> Result<(f64, f64, f32)> {
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
-    let s = Sources::new(1, false, sg_tree_sites(ctx.subgroup_width()).attn);
+    let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
+    let s = Sources::new(1, sg_tree_sites(ctx.subgroup_width()).attn);
     let mut b = Builder::new(ctx);
     let wf: Vec<f32> = (0..n * k)
         .map(|i| ((i % 97) as f32 - 48.0) / 512.0)
         .collect();
     let xb: Vec<u16> = (0..k)
-        .map(|i| half::bf16::from_f32(((i % 89) as f32 - 44.0) / 256.0).to_bits())
+        .map(|i| bf16::from_f32(((i % 89) as f32 - 44.0) / 256.0).to_bits())
         .collect();
     let xf: Vec<f32> = xb
         .iter()
@@ -7729,12 +6660,9 @@ pub fn gemv_w4_probe(n: usize, k: usize, reps: usize) -> Result<(f64, f64, f32)>
 
     let dq =
         nv_quant::mlx_affine::dequantize_mlx_affine_linear(&parts.0, &parts.1, &parts.2, n, k, gs);
-    let dqb: Vec<u16> = dq
-        .iter()
-        .map(|v| half::bf16::from_f32(*v).to_bits())
-        .collect();
+    let dqb: Vec<u16> = dq.iter().map(|v| bf16::from_f32(*v).to_bits()).collect();
     let wlin = upload_lin(&mut b, "dg-w4probe-bw", &dqb, n, k, DotsGraphQuant::Bf16)?;
-    let xa = act_over(&mut b, "dg-w4probe-xa", x.clone(), k, DotsGraphQuant::Bf16);
+    let xa = Act { x: x.clone(), k };
     let yb = b.zeros("dg-w4probe-yb", wbytes(n));
     push_gemv(&mut b, &s, "dg-w4probe-bf16", &wlin, &xa, &yb, false, 0)?;
     let bf_pass = b.passes.pop().expect("bf16 pass");
@@ -7742,22 +6670,22 @@ pub fn gemv_w4_probe(n: usize, k: usize, reps: usize) -> Result<(f64, f64, f32)>
 
     let run = |pass: &Pass| -> Result<f64> {
         let list: Vec<&Pass> = (0..reps).map(|_| pass).collect();
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let cb = dispatch::encode_pass_list_labeled(
             ctx,
             list.iter().map(|p| (&*p.pipeline, &p.bind, p.grid)),
             &[],
         );
         ctx.queue.submit([cb]);
-        let _: Vec<f32> = dispatch::read_back(ctx, &y, 1)
-            .map_err(|e| anyhow::anyhow!("w4 probe readback: {e}"))?;
+        let _: Vec<f32> =
+            dispatch::read_back(ctx, &y, 1).map_err(|e| anyhow!("w4 probe readback: {e}"))?;
         Ok(t.elapsed().as_secs_f64() * 1e3 / reps as f64)
     };
     let w4_ms = run(&w4_pass)?;
     let bf_ms = run(&bf_pass)?;
 
     let got_words: Vec<u32> =
-        dispatch::read_back(ctx, &y, n / 2).map_err(|e| anyhow::anyhow!("w4 y readback: {e}"))?;
+        dispatch::read_back(ctx, &y, n / 2).map_err(|e| anyhow!("w4 y readback: {e}"))?;
     let groups = k / gs;
     let mut max_rel = 0f32;
     for row in 0..n {
@@ -7781,55 +6709,11 @@ pub fn gemv_w4_probe(n: usize, k: usize, reps: usize) -> Result<(f64, f64, f32)>
             word >> 16
         };
         let got = f32::from_bits(bits << 16);
-        let want_b = half::bf16::from_f32(want as f32).to_f32();
+        let want_b = bf16::from_f32(want as f32).to_f32();
         let ulp = (want_b.abs().max(1e-3)) / 256.0;
         max_rel = max_rel.max((got - want_b).abs() / ulp);
     }
     Ok((w4_ms, bf_ms, max_rel))
-}
-
-pub fn nvfp4_gemv_once(w_bf16: &[u16], n: usize, k: usize, x_bf16: &[u16]) -> Result<Vec<f32>> {
-    anyhow::ensure!(
-        x_bf16.len() == k,
-        "nvfp4 gemv probe: activation has {} values, want {k}",
-        x_bf16.len()
-    );
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
-    let s = Sources::new(1, false, sg_tree_sites(ctx.subgroup_width()).attn);
-    let mut b = Builder::new(ctx);
-    let sl = SingleSlot {
-        sel0: b.upload_u32("dg-probe-sel", &[0u32]),
-        global1: b.upload_f32(
-            "dg-probe-global",
-            &[NVFP4_ACTIVATION_GLOBAL_2POW7_LANDS_DECODE_BLOCK_SCALES_INSIDE_THE_E4M3_WINDOW],
-        ),
-    };
-    let lin = upload_lin(&mut b, "dg-probe-w", w_bf16, n, k, DotsGraphQuant::Nvfp4)?;
-    let xb = b.upload_u32("dg-probe-x", &pack_pairs(x_bf16));
-    let act = act_over(&mut b, "dg-probe-act", xb, k, DotsGraphQuant::Nvfp4);
-    let y = b.zeros("dg-probe-y", wbytes(n));
-    push_quant(&mut b, &s, "dg-probe-quant", &act, &sl)?;
-    push_gemv(&mut b, &s, "dg-probe-gemv", &lin, &act, &y, false, 0)?;
-    b.flush_staging();
-    let cb = dispatch::encode_pass_list_labeled(
-        ctx,
-        b.passes.iter().map(|p| (&*p.pipeline, &p.bind, p.grid)),
-        &[],
-    );
-    ctx.queue.submit([cb]);
-    let words: Vec<u32> = dispatch::read_back(ctx, &y, n.div_ceil(2))
-        .map_err(|e| anyhow::anyhow!("nvfp4 gemv probe readback: {e}"))?;
-    Ok((0..n)
-        .map(|i| {
-            let w = words[i / 2];
-            let bits = if i.is_multiple_of(2) {
-                w & 0xffff
-            } else {
-                w >> 16
-            };
-            f32::from_bits(bits << 16)
-        })
-        .collect())
 }
 
 pub const REGION_SLOTS_32_IS_THE_PF_KNEE_WIDTH_THE_BATCHED_STEP_RIDES: usize = 32;
@@ -7848,8 +6732,6 @@ pub const BATCHED_REGION_DECODE_SERVES_B_CROPS_PER_TRUNK_PASS: &str =
      finished and truncated by the host instead, which plain-OCR crops already do at loop \
      onset.";
 
-pub const RPF_WIDE_ENV: &str = "NV_DOTS_RPF_WIDE";
-
 pub const RPF_CHUNK_COST_IS_NEAR_FLAT_IN_WIDTH_SO_FEWER_WIDER_CHUNKS_WIN: &str =
     "one trunk chunk prices at 40.5 ms for m=32, 35.5 for m=128 and 149 for m=1024 on the \
      serving span (weight-read-bound, not row-bound), so a region prompt wants the fewest \
@@ -7861,15 +6743,7 @@ pub const RPF_CHUNK_COST_IS_NEAR_FLAT_IN_WIDTH_SO_FEWER_WIDER_CHUNKS_WIN: &str =
      row's gemm k-loop, rmsnorm and causal steel key-block walk are chunk-width-independent, \
      so both arms produce byte-identical region kv rows and token streams, and the padded \
      rows write only inside the region's own stride (the stride's last row is the dead-row \
-     park slot, rewritten by every parked bstep before any read). NV_DOTS_RPF_WIDE=0 \
-     restores the narrow plan.";
-
-fn rpf_wide_enabled() -> bool {
-    let _ = RPF_CHUNK_COST_IS_NEAR_FLAT_IN_WIDTH_SO_FEWER_WIDER_CHUNKS_WIN;
-    !matches!(std::env::var(RPF_WIDE_ENV).ok().as_deref(), Some("0"))
-}
-
-pub const RPF_PACK_ENV: &str = "NV_DOTS_RPF_PACK";
+     park slot, rewritten by every parked bstep before any read).";
 
 pub const RPF_DEFER_ENV: &str = "NV_DOTS_RPF_DEFER";
 
@@ -7900,29 +6774,18 @@ pub const RPF_PACK_SHARES_ONE_TRUNK_READ_ACROSS_REGIONS_BECAUSE_ONLY_ATTENTION_H
      across packs. Packs engage only on the batched (>=24 regions) route, only when the \
      region stride is at least 1024 so lane-local pad rows stay inside their region's stride, \
      and only for groups of at least 2 regions worth at least 5 lanes (the measured 149 ms \
-     1024-chunk vs 34 ms 128-chunk break-even at ~4.4). NV_DOTS_RPF_PACK=0 restores the \
-     per-region plan. NV_DOTS_RPF_DEFER=K holds mid-loop slot refills until K slots are free \
+     1024-chunk vs 34 ms 128-chunk break-even at ~4.4). NV_DOTS_RPF_DEFER=K holds mid-loop slot refills until K slots are free \
      so retirements arrive in packable bursts, trading idle lanes for pack grouping -- the \
      gazette ladder read 12.27/12.34 at K=0, 12.09/12.11 at 4, 11.71/11.74 at 8 and 12.19 at \
-     12 against 12.99/13.05 unpacked, so K defaults to 8 while packing is on (=0 restores \
-     immediate refill).";
+     12 against 12.99/13.05 unpacked, so K defaults to 8 (=0 restores immediate refill).";
 
 pub const RPF_DEFER_DEFAULT_8_MATCHES_THE_PACK_LANES_AND_WON_ITS_GAZETTE_LADDER: usize = 8;
 
-fn rpf_pack_enabled() -> bool {
-    let _ = RPF_PACK_SHARES_ONE_TRUNK_READ_ACROSS_REGIONS_BECAUSE_ONLY_ATTENTION_HAS_AN_ORIGIN;
-    !matches!(std::env::var(RPF_PACK_ENV).ok().as_deref(), Some("0"))
-}
-
 pub fn rpf_defer_rows() -> usize {
-    std::env::var(RPF_DEFER_ENV)
+    env::var(RPF_DEFER_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(if rpf_pack_enabled() {
-            RPF_DEFER_DEFAULT_8_MATCHES_THE_PACK_LANES_AND_WON_ITS_GAZETTE_LADDER
-        } else {
-            0
-        })
+        .unwrap_or(RPF_DEFER_DEFAULT_8_MATCHES_THE_PACK_LANES_AND_WON_ITS_GAZETTE_LADDER)
 }
 
 pub const RANGED_STEEL_PREFILL_READS_THE_REGION_INTO_LOCAL_MIRROR_ROWS: &str =
@@ -7944,10 +6807,10 @@ struct SwapSite {
 
 struct PackMachinery {
     wi: usize,
-    bpos: wgpu::Buffer,
-    bslot: wgpu::Buffer,
-    brange: wgpu::Buffer,
-    lane_step: Vec<wgpu::Buffer>,
+    bpos: Buffer,
+    bslot: Buffer,
+    brange: Buffer,
+    lane_step: Vec<Buffer>,
     validated: bool,
 }
 
@@ -7958,16 +6821,14 @@ struct RegionMachinery {
     head_range: (usize, usize),
     gathers: Vec<Pass>,
     stashes: Vec<Pass>,
-    bpos: wgpu::Buffer,
-    bslot: wgpu::Buffer,
-    brange: wgpu::Buffer,
-    btoks: wgpu::Buffer,
+    bpos: Buffer,
+    bslot: Buffer,
+    brange: Buffer,
+    btoks: Buffer,
     bhead: Option<BheadMachinery>,
     validated: bool,
     bat_validated: bool,
 }
-
-pub const BHEAD_ENV: &str = "NV_DOTS_BHEAD";
 
 pub const BHEAD_X_SLAB_ROW_HALFS: usize = 1536;
 
@@ -7976,30 +6837,18 @@ pub const BHEAD_READS_THE_W4_HEAD_ONCE_PER_BSTEP_INSTEAD_OF_ONCE_PER_LIVE_ROW: &
      = 160 dispatches re-reading the 116 MB head from DRAM per live row (~8.3 ms of a 27 ms \
      step; the head fits no SLC, so replay order cannot delete the traffic). The batched head \
      is 4 dispatches: dg_bh_gather converts every live normed row to the act-f16 words the \
-     per-row gather produced (same pack2x16float on the same bf16 values), dg_msl_w4_gemv_b \
-     walks the batch rows around the shipped dot text so each weight word is read from DRAM \
-     once, and dg_bh_am1/dg_bh_am2 replay the shipped argmax comparisons per row into btoks \
-     directly. Every row's k-walk, simd_sum and argmax selection is the shipped text or a \
-     deterministic selection over identical bits, so per-row logits and tokens are gated \
-     bit-identical to the replay. NV_DOTS_BHEAD=0 restores the per-row replay.";
-
-fn bhead_enabled() -> bool {
-    let _ = BHEAD_READS_THE_W4_HEAD_ONCE_PER_BSTEP_INSTEAD_OF_ONCE_PER_LIVE_ROW;
-    !matches!(std::env::var(BHEAD_ENV).ok().as_deref(), Some("0"))
-}
-
-pub const BHEAD_MMA_ENV: &str = "NV_DOTS_BHEAD_MMA";
+     per-row gather produced (same pack2x16float on the same bf16 values), one steel f16 GEMM \
+     reads each head weight once for every row, and dg_bh_am1/dg_bh_am2 replay the shipped \
+     argmax comparisons per row into btoks directly. The per-row replay stays the fallback \
+     where the batched head cannot build (no act-f16 head, or hidden past the x slab).";
 
 pub const BHEAD_MMA_CFG_IS_32_32_16_BECAUSE_THE_HEAD_AT_M32_IS_B_READ_BOUND_AND_THE_BRACKET_CROWNED_IT:
     (u32, u32, u32, u32, u32) = (32, 32, 16, 2, 2);
 
-pub const BHEAD_MMA_IS_THE_DEFAULT_TOLERANCE_CLASS_WITH_ITS_CENSUS_AND_ZERO_RESTORES_THE_SCALAR_HEAD_BITWISE:
-    &str =
+pub const BHEAD_MMA_IS_THE_TOLERANCE_CLASS_DEFAULT_WITH_ITS_CENSUS: &str =
     "The batched-region lm head serves as one steel f16 GEMM (bm32bn32bk16) over a resident \
      f16 twin of the dequantized w4 head (the exact trunk-twin construction: dequant -> bf16 \
-     -> f16, +467 MB resident) instead of the scalar dg_msl_w4_gemv_b row loop; \
-     NV_DOTS_BHEAD_MMA=0 restores the scalar head byte-identically and frees the twin. The \
-     bracket priced the swap at the real shape (m=32 x 1536 x 151936): scalar chain 7.15 ms \
+     -> f16, +467 MB resident) instead of a scalar w4 row loop. The bracket priced the swap at the real shape (m=32 x 1536 x 151936): scalar chain 7.15 ms \
      at 2.1 T-op/s issue vs steel 0.98 ms at 478 GB/s of f16-B read -- the MMA head is \
      B-read-bound, not issue-bound, and the m=32 row tile starves nothing (4748 \
      workgroups). TOLERANCE CLASS, censused, arbitrated default-on: each weight is rounded \
@@ -8007,57 +6856,39 @@ pub const BHEAD_MMA_IS_THE_DEFAULT_TOLERANCE_CLASS_WITH_ITS_CENSUS_AND_ZERO_REST
      different reduction order than the lane-strided simd_sum, so logits move at the ulp \
      scale (max_abs 2.9e-2, rel_rms ~2e-3, 0/41 argmax moves censused) and a near-tie \
      argmax CAN flip -- batched-vs-serial byte identity is an empirical fact under this \
-     default, not a construction; gates that mean the scalar head pin =0. The corpus never \
+     default, not a construction. The corpus never \
      routes a bstep (trace md5 stamped identical both arms). At m=1 the f16-B read alone \
      (0.86 ms) exceeds the whole scalar head (0.55 ms), so the serial decode head keeps \
      the gemv on every arm. Pre-flip numbers: gazette 8.94-9.03 s, bstep 27.86 ms, \
      isolated 32-row head 8.20 ms.";
 
-fn bhead_mma_enabled() -> bool {
-    let _ = BHEAD_MMA_IS_THE_DEFAULT_TOLERANCE_CLASS_WITH_ITS_CENSUS_AND_ZERO_RESTORES_THE_SCALAR_HEAD_BITWISE;
-    !matches!(std::env::var(BHEAD_MMA_ENV).ok().as_deref(), Some("0"))
-}
-
 struct BheadMachinery {
     gather: Pass,
-    gemv: Pass,
+    mma: Pass,
     am1: Pass,
     am2: Pass,
-    gather_p: wgpu::Buffer,
-    gemv_p: wgpu::Buffer,
-    am_p: wgpu::Buffer,
+    gather_p: Buffer,
+    mma_p: Buffer,
+    am_p: Buffer,
     gather_params: BhGatherParams,
-    gemv_params: decode_gemv_msl::DgMslW4BParams,
+    mma_params: super::vision_attn_msl::SteelGemmParams,
     am_params: BhAmParams,
-    blogits: wgpu::Buffer,
-    mma: Option<(Pass, wgpu::Buffer, super::vision_attn_msl::SteelGemmParams)>,
 }
 
-impl BheadMachinery {
-    fn head_pass(&self) -> (&Pass, bool) {
-        match self.mma.as_ref().filter(|_| bhead_mma_enabled()) {
-            Some((p, _, _)) => (p, true),
-            None => (&self.gemv, false),
-        }
+pod! {
+    struct BhGatherParams {
+        words: u32,
+        src_slot_words: u32,
+        b_rows: u32,
+        pad0: u32,
     }
-}
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct BhGatherParams {
-    words: u32,
-    src_slot_words: u32,
-    b_rows: u32,
-    pad0: u32,
-}
-
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct BhAmParams {
-    n: u32,
-    groups: u32,
-    b_rows: u32,
-    pad0: u32,
+    struct BhAmParams {
+        n: u32,
+        groups: u32,
+        b_rows: u32,
+        pad0: u32,
+    }
 }
 
 const DG_BHEAD_WGSL: &str = r#"
@@ -8204,7 +7035,7 @@ pub const HANDOFF_SPLICE_WORDS_MATCH_BECAUSE_EVERY_HOST_HOP_ONLY_EVER_ROUNDED_ON
      are unreachable because dg_splice_m copies only mask==1 rows and dg_gather_m skips them.";
 
 pub struct VisionRowsGpu {
-    pub buf: wgpu::Buffer,
+    pub buf: Buffer,
     pub rows: usize,
     pub hidden: usize,
 }
@@ -8219,7 +7050,7 @@ fn unpack_bf16_pair_words(w: &[u32]) -> Vec<f32> {
 }
 
 pub async fn vision_rows_host_pumped(ctx: &WgpuContext, rows: &VisionRowsGpu) -> Result<Vec<f32>> {
-    anyhow::ensure!(
+    ensure!(
         rows.hidden.is_multiple_of(2),
         "bf16 pair packing needs an even hidden, got {}",
         rows.hidden
@@ -8233,12 +7064,12 @@ pub async fn vision_rows_host_pumped(ctx: &WgpuContext, rows: &VisionRowsGpu) ->
         dispatch::ReadbackArm::Pumped,
     )
     .await
-    .map_err(|e| anyhow::anyhow!("resident vision rows readback: {e}"))?;
+    .map_err(|e| anyhow!("resident vision rows readback: {e}"))?;
     Ok(unpack_bf16_pair_words(&w))
 }
 
 struct PfGpuVisionRows {
-    buf: wgpu::Buffer,
+    buf: Buffer,
     vs: usize,
     n_vis: usize,
 }
@@ -8273,7 +7104,7 @@ pub struct RegionPackJob<'a> {
 }
 
 struct RpfGpuCopy<'a> {
-    buf: &'a wgpu::Buffer,
+    buf: &'a Buffer,
     src_row: usize,
     dst_row: usize,
     rows: usize,
@@ -8300,23 +7131,22 @@ fn dvh_pack_rows(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation
 }
 ";
 
-static PACK_ROWS_PIPELINE: std::sync::OnceLock<std::sync::Arc<wgpu::ComputePipeline>> =
-    std::sync::OnceLock::new();
+static PACK_ROWS_PIPELINE: OnceLock<Arc<ComputePipeline>> = OnceLock::new();
 
 pub fn pack_f32_rows_to_bf16_words(
     ctx: &'static WgpuContext,
-    src: &wgpu::Buffer,
+    src: &Buffer,
     words: usize,
-) -> Result<wgpu::Buffer> {
+) -> Result<Buffer> {
     pack_f32_rows_to_bf16_words_at(ctx, src, 0, words)
 }
 
 pub fn pack_f32_rows_to_bf16_words_at(
     ctx: &'static WgpuContext,
-    src: &wgpu::Buffer,
+    src: &Buffer,
     src_word_off: usize,
     words: usize,
-) -> Result<wgpu::Buffer> {
+) -> Result<Buffer> {
     let _ = HANDOFF_SPLICE_WORDS_MATCH_BECAUSE_EVERY_HOST_HOP_ONLY_EVER_ROUNDED_ONCE;
     if PACK_ROWS_PIPELINE.get().is_none() {
         let p = dispatch::compute_pipeline_opts(
@@ -8326,19 +7156,19 @@ pub fn pack_f32_rows_to_bf16_words_at(
             "dvh_pack_rows",
             false,
         )
-        .map_err(|e| anyhow::anyhow!("handoff pack pipeline: {e}"))?;
-        let _ = PACK_ROWS_PIPELINE.set(std::sync::Arc::new(p));
+        .map_err(|e| anyhow!("handoff pack pipeline: {e}"))?;
+        let _ = PACK_ROWS_PIPELINE.set(Arc::new(p));
     }
     let pipeline = PACK_ROWS_PIPELINE
         .get()
         .expect("pack pipeline present")
         .clone();
     let groups = words.div_ceil(256);
-    anyhow::ensure!(
+    ensure!(
         groups <= 65535,
         "handoff pack of {words} words needs {groups} workgroups, over the 1d grid limit"
     );
-    anyhow::ensure!(
+    ensure!(
         src.size() >= ((src_word_off + words) * 8) as u64,
         "pack source holds {} bytes, want {} f32 pairs from pair offset {src_word_off}",
         src.size(),
@@ -8356,7 +7186,7 @@ pub fn pack_f32_rows_to_bf16_words_at(
         &[(0, src), (1, &out), (2, &p)],
         (groups as u32, 1, 1),
     )
-    .map_err(|e| anyhow::anyhow!("handoff pack dispatch: {e}"))?;
+    .map_err(|e| anyhow!("handoff pack dispatch: {e}"))?;
     Ok(out)
 }
 
@@ -8372,12 +7202,10 @@ pub struct DotsDecoderWgpuGraph {
     bstep_read_s: f64,
     bstep_count: u64,
     bstep_bhead: u64,
-    bstep_bhead_mma: u64,
     trunk_splitk_families: u64,
     trunk_bf16out_families: u64,
     trunk_abf16_families: u64,
     brope_kvw_fused_layers: u64,
-    battn_v2: bool,
     sg_tree: SgTreeSites,
     rpf_chunk_count: u64,
     step_submits: u32,
@@ -8393,13 +7221,13 @@ pub struct DotsDecoderWgpuGraph {
     pf_widths: Vec<usize>,
     embed_end: usize,
     head_start: usize,
-    res: wgpu::Buffer,
-    _buffers: Vec<wgpu::Buffer>,
+    res: Buffer,
+    _buffers: Vec<Buffer>,
     step: StepBuffers,
-    token_out: wgpu::Buffer,
-    spec_tok: Vec<(usize, wgpu::Buffer)>,
-    logits: wgpu::Buffer,
-    state_buffers: Vec<wgpu::Buffer>,
+    token_out: Buffer,
+    spec_tok: Vec<(usize, Buffer)>,
+    logits: Buffer,
+    state_buffers: Vec<Buffer>,
     vocab: usize,
     vram: VramReport,
     region: Option<RegionMachinery>,
@@ -8433,7 +7261,7 @@ impl DotsDecoderWgpuGraph {
 
     pub fn from_loader_mlx(
         cfg: DotsDecoderConfig,
-        loader: &nv_weights::WeightLoader,
+        loader: &WeightLoader,
         max_seq: usize,
     ) -> Result<Self> {
         let lora = DgLora::from_env(&cfg)?;
@@ -8442,7 +7270,7 @@ impl DotsDecoderWgpuGraph {
 
     pub fn from_loader_mlx_with_lora(
         cfg: DotsDecoderConfig,
-        loader: &nv_weights::WeightLoader,
+        loader: &WeightLoader,
         max_seq: usize,
         lora: Option<DgLora>,
     ) -> Result<Self> {
@@ -8465,7 +7293,7 @@ impl DotsDecoderWgpuGraph {
         quant: DotsGraphQuant,
         lora: Option<DgLora>,
     ) -> Result<Self> {
-        let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
         let hidden = cfg.hidden_size;
         let head_dim = cfg.head_dim();
         let n_q = cfg.num_attention_heads;
@@ -8478,40 +7306,33 @@ impl DotsDecoderWgpuGraph {
         let eps = cfg.rms_norm_eps as f32;
         let hidden_words = hidden / 2;
 
-        anyhow::ensure!(max_seq > 0, "max_seq must be positive");
-        anyhow::ensure!(
+        ensure!(max_seq > 0, "max_seq must be positive");
+        ensure!(
             hidden.is_multiple_of(2) && inter.is_multiple_of(2),
             "hidden {hidden} and intermediate {inter} must be even for bf16 word packing"
         );
-        anyhow::ensure!(
+        ensure!(
             head_dim.is_multiple_of(2)
                 && head_dim <= ROPE_WORKGROUP_STAGING_ARRAY_CAPS_HEAD_DIM_AT_256,
             "head_dim {head_dim} must be even and at most {}",
             ROPE_WORKGROUP_STAGING_ARRAY_CAPS_HEAD_DIM_AT_256
         );
-        anyhow::ensure!(
+        ensure!(
             n_kv > 0 && n_q.is_multiple_of(n_kv),
             "{n_q} query heads is not a multiple of {n_kv} key-value heads"
         );
 
         let fold = attn_fold_factor(&cfg);
         let sg_tree = sg_tree_sites(ctx.subgroup_width());
-        let s = Sources::new(fold, kv_transpose_enabled(), sg_tree.attn);
+        let s = Sources::new(fold, sg_tree.attn);
         let mut b = Builder::new(ctx);
         let step = StepBuffers::alloc(&mut b);
-        let sl = SingleSlot {
-            sel0: b.upload_u32("dg-sel0", &[0u32]),
-            global1: b.upload_f32(
-                "dg-global1",
-                &[NVFP4_ACTIVATION_GLOBAL_2POW7_LANDS_DECODE_BLOCK_SCALES_INSIDE_THE_E4M3_WINDOW],
-            ),
-        };
 
         let res = b.zeros("dg-res", wbytes(hidden));
-        let normed = alloc_act(&mut b, "dg-normed", hidden, quant);
-        let normed_post = alloc_act(&mut b, "dg-normed-post", hidden, quant);
-        let heads = alloc_act(&mut b, "dg-heads", q_rows, quant);
-        let act = alloc_act(&mut b, "dg-act", inter, quant);
+        let normed = alloc_act(&mut b, "dg-normed", hidden);
+        let normed_post = alloc_act(&mut b, "dg-normed-post", hidden);
+        let heads = alloc_act(&mut b, "dg-heads", q_rows);
+        let act = alloc_act(&mut b, "dg-act", inter);
         let pf_widths: Vec<usize> = if quant.bf16_like() {
             let mut w = prefill_widths();
             w.retain(|&m| m <= max_seq);
@@ -8563,9 +7384,8 @@ impl DotsDecoderWgpuGraph {
         });
         let mut rg_sites: Vec<Vec<SwapSite>> = pf.iter().map(|_| Vec::new()).collect();
         let n_splits = attn_split_count(max_seq);
-        let split_on = attn_split_enabled()
-            && max_seq
-                > ATTN_SPLIT_MIN_CONTEXT_IS_WHERE_ONE_WORKGROUP_PER_HEAD_STOPS_FILLING_THE_CORES;
+        let split_on =
+            max_seq > ATTN_SPLIT_MIN_CONTEXT_IS_WHERE_ONE_WORKGROUP_PER_HEAD_STOPS_FILLING_THE_CORES;
         let attn_part =
             split_on.then(|| b.zeros("dg-attn-part", (n_q * n_splits * (head_dim + 2) * 4) as u64));
         let attn_out = b.zeros("dg-attn-out", wbytes(hidden));
@@ -8593,7 +7413,7 @@ impl DotsDecoderWgpuGraph {
             Some(m) => m.dequant_bf16_host("model.embed_tokens.weight", vocab, hidden)?,
             None => load_bf16(weights, "model.embed_tokens.weight", &[vocab, hidden])?,
         };
-        let mut embed_chunks: Vec<wgpu::Buffer> = Vec::new();
+        let mut embed_chunks: Vec<Buffer> = Vec::new();
         for (off, rows) in splits.iter().copied() {
             let buf = b.upload_u32(
                 "dg-embed",
@@ -8644,7 +7464,6 @@ impl DotsDecoderWgpuGraph {
         let act_f16 = quant == DotsGraphQuant::AffineW4
             && !tied
             && splits.len() == 1
-            && msl_gemv_enabled()
             && decode_gemv_msl::msl_gemv_pipelines(ctx).is_ok();
 
         let dg_lora = lora;
@@ -8659,7 +7478,7 @@ impl DotsDecoderWgpuGraph {
             (false, false)
         };
         let gsilu_fuse =
-            act_f16 && dg_lora.is_none() && !fuse_qkv && !fuse_gu && dec_gsilu_enabled();
+            act_f16 && dg_lora.is_none() && !fuse_qkv && !fuse_gu;
         let res_f32 = b.zeros("dg-res-f32", (hidden * 4) as u64);
 
         let ln0 = load_bf16(
@@ -8732,15 +7551,13 @@ impl DotsDecoderWgpuGraph {
         } else {
             None
         };
-        let steel_prefill = pf_steel_enabled()
-            && head_dim == ATTN_FUSED_HEAD_DIM
+        let steel_prefill = head_dim == ATTN_FUSED_HEAD_DIM
             && !pf.is_empty()
             && pf.iter().all(|p| {
                 p.m.is_multiple_of(super::vision_attn_msl::STEEL_BQ as usize)
             })
             && super::prefill_attn_msl::causal_pipelines(ctx).is_ok();
-        let fused_prefill = attn_fused_enabled()
-            && !steel_prefill
+        let fused_prefill = !steel_prefill
             && head_dim == ATTN_FUSED_HEAD_DIM
             && n_kv == 2
             && !pf.is_empty()
@@ -8837,51 +7654,36 @@ impl DotsDecoderWgpuGraph {
             v.dedup();
             v
         };
-        let steel_proj_bufs = if pf_steel_proj_enabled()
-            && quant.bf16_like()
+        let steel_proj_bufs = if quant.bf16_like()
             && !pf.is_empty()
             && steel_proj_cfgs.iter().all(|c| {
                 hidden.is_multiple_of(2 * c.2 as usize) && inter.is_multiple_of(2 * c.2 as usize)
             }) {
             match super::vision_attn_msl::steel_gemm_pipelines(ctx) {
                 Ok(pls) if steel_proj_cfgs.iter().all(|c| pls.pick(*c).is_some()) => {
-                    let maxm = pf.iter().map(|p| p.m).max().unwrap_or(0);
-                    let kmax = hidden.max(inter);
                     let skm = pf
                         .iter()
                         .map(|p| p.m)
                         .filter(|&m| m <= TRUNK_SPLITK_MAX_WIDTH)
                         .max();
-                    let skpart = match (trunk_splitk_enabled(), skm) {
-                        (true, Some(skm)) => {
-                            let narrow_bk = pf_steel_proj_cfg_for(skm).2;
-                            let fams = [
-                                (ProjFamily::Qkv, q_rows + 2 * kv_rows, hidden),
-                                (ProjFamily::OProj, hidden, q_rows),
-                                (ProjFamily::GateUp, 2 * inter, hidden),
-                                (ProjFamily::Down, hidden, inter),
-                            ];
-                            let worst = fams
-                                .iter()
-                                .map(|(f, n, k)| {
-                                    trunk_splitk_s(*f, skm, *k, narrow_bk) * skm * n * 4
-                                })
-                                .max()
-                                .unwrap_or(0);
-                            (worst > 0).then(|| b.zeros("dg-steelproj-skpart", worst as u64))
-                        }
-                        _ => None,
-                    };
-                    let cvt = if trunk_bf16out_enabled() || trunk_abf16_enabled() {
-                        Some(super::vision_attn_msl::steel_gemm_cvt_pipelines(ctx)?)
-                    } else {
-                        None
-                    };
+                    let skpart = skm.and_then(|skm| {
+                        let narrow_bk = pf_steel_proj_cfg_for(skm).2;
+                        let fams = [
+                            (ProjFamily::Qkv, q_rows + 2 * kv_rows, hidden),
+                            (ProjFamily::OProj, hidden, q_rows),
+                            (ProjFamily::GateUp, 2 * inter, hidden),
+                            (ProjFamily::Down, hidden, inter),
+                        ];
+                        let worst = fams
+                            .iter()
+                            .map(|(f, n, k)| trunk_splitk_s(*f, skm, *k, narrow_bk) * skm * n * 4)
+                            .max()
+                            .unwrap_or(0);
+                        (worst > 0).then(|| b.zeros("dg-steelproj-skpart", worst as u64))
+                    });
                     Some(SteelProjBufs {
-                        xh: b.zeros("dg-steelproj-xh", (maxm * kmax / 2 * 4) as u64),
                         skpart,
-                        pls,
-                        cvt,
+                        cvt: super::vision_attn_msl::steel_gemm_cvt_pipelines(ctx)?,
                     })
                 }
                 _ => None,
@@ -8890,7 +7692,7 @@ impl DotsDecoderWgpuGraph {
             None
         };
         let steel_proj = steel_proj_bufs.is_some();
-        let coop_prefill = coop_prefill_enabled() && coop_prefill_supported(&ctx.caps);
+        let coop_prefill = coop_prefill_supported(&ctx.caps);
         let pack_wi = pf
             .iter()
             .position(|p| p.m == PREFILL_BIG_MID_1024_IS_THE_CHUNKED_LADDER_KNEE)
@@ -8912,10 +7714,10 @@ impl DotsDecoderWgpuGraph {
             let bpos = b.upload_u32("dg-pk-bpos", &vec![0u32; m]);
             let bslot = b.upload_u32("dg-pk-bslot", &vec![u32::MAX; m]);
             let brange = b.upload_u32("dg-pk-brange", &vec![0u32; 2 * m]);
-            let steps: Vec<wgpu::Buffer> = (0..lanes)
+            let steps: Vec<Buffer> = (0..lanes)
                 .map(|l| b.upload_u32(&format!("dg-pk-step{l}"), &[0u32; 4]))
                 .collect();
-            let pus: Vec<wgpu::Buffer> = (0..lanes)
+            let pus: Vec<Buffer> = (0..lanes)
                 .map(|l| {
                     b.uni(
                         &format!("dg-pk-pu{l}"),
@@ -8951,14 +7753,14 @@ impl DotsDecoderWgpuGraph {
         });
         let spec_layers = spec_probe_layers(layers);
         let spec_normw = (!spec_layers.is_empty())
-            .then(|| -> Result<wgpu::Buffer> {
+            .then(|| -> Result<Buffer> {
                 Ok(b.upload_u32(
                     "dg-spec-normw",
                     &pack_pairs(&load_bf16(weights, "model.norm.weight", &[hidden])?),
                 ))
             })
             .transpose()?;
-        let spec_x: Vec<(usize, wgpu::Buffer)> = spec_layers
+        let spec_x: Vec<(usize, Buffer)> = spec_layers
             .iter()
             .map(|&n| (n, b.zeros(&format!("dg-spec-x{n}"), wbytes(hidden))))
             .collect();
@@ -8966,9 +7768,6 @@ impl DotsDecoderWgpuGraph {
         let zero_bias = b.upload_u32("dg-zero-bias", &[0u32]);
         for li in 0..layers {
             let last = li + 1 == layers;
-            if quant == DotsGraphQuant::Nvfp4 && !nvfp4_mrow4_enabled() {
-                push_quant(&mut b, &s, &format!("dg-l{li}-qn"), &normed, &sl)?;
-            }
             let lora_layer = dg_lora
                 .as_ref()
                 .map(|l| upload_dg_lora_layer(&mut b, li, &l.layers[li], dg_lora_pf_m));
@@ -8994,7 +7793,7 @@ impl DotsDecoderWgpuGraph {
                 hidden,
                 quant,
             )?;
-            let proj_coop = coop_prefill && coop_proj_enabled() && quant.bf16_like();
+            let proj_coop = coop_prefill && quant.bf16_like();
             let qkvw_f32 = (proj_coop && !steel_proj)
                 .then(|| upload_f32_of_bf16(&mut b, &format!("dg-l{li}-qkvw-f32"), &qkv_host));
             let qkvw_h = steel_proj
@@ -9131,22 +7930,17 @@ impl DotsDecoderWgpuGraph {
                 src_slot_words: 0,
                 dst_slot_words: 0,
             };
-            let rope_kv_fused = rope_kv_fuse_enabled();
-            if rope_kv_fused {
-                push_bias_rope_kvw(
-                    &mut b,
-                    &s,
-                    &format!("dg-l{li}-qkvrope"),
-                    rope_site,
-                    &step,
-                    &kc,
-                    &vc,
-                    kv_rows,
-                    max_seq,
-                )?;
-            } else {
-                push_bias_rope(&mut b, &s, &format!("dg-l{li}-qkvrope"), rope_site, &step)?;
-            }
+            push_bias_rope_kvw(
+                &mut b,
+                &s,
+                &format!("dg-l{li}-qkvrope"),
+                rope_site,
+                &step,
+                &kc,
+                &vc,
+                kv_rows,
+                max_seq,
+            )?;
 
             let fused_mir = fused_prefill.then(|| {
                 let cap16 = attn_cap16(max_seq);
@@ -9163,25 +7957,6 @@ impl DotsDecoderWgpuGraph {
                     b.zeros(&format!("dg-l{li}-svh"), (max_seq * kv_rows / 2 * 4) as u64),
                 )
             });
-            if !rope_kv_fused {
-                push_kv_write(
-                    &mut b,
-                    &s,
-                    &format!("dg-l{li}-kvwrite"),
-                    &qkv_rot,
-                    &step,
-                    &kc,
-                    &vc,
-                    kv_rows,
-                    q_rows,
-                    q_rows + kv_rows,
-                    max_seq,
-                    1,
-                    0,
-                    n_kv,
-                )?;
-            }
-
             attn_idx.push(b.passes.len());
             push_attn(
                 &mut b,
@@ -9218,10 +7993,6 @@ impl DotsDecoderWgpuGraph {
                     act_f16,
                 )?;
                 b.split_mode = false;
-            }
-
-            if quant == DotsGraphQuant::Nvfp4 && !nvfp4_mrow4_enabled() {
-                push_quant(&mut b, &s, &format!("dg-l{li}-qh"), &heads, &sl)?;
             }
             match &o_aff {
                 Some(aff) if fuse_gu => push_gemv_w4_rms(
@@ -9296,10 +8067,6 @@ impl DotsDecoderWgpuGraph {
                     1,
                     act_f16,
                 )?;
-            }
-
-            if quant == DotsGraphQuant::Nvfp4 && !nvfp4_mrow4_enabled() {
-                push_quant(&mut b, &s, &format!("dg-l{li}-qp"), &normed_post, &sl)?;
             }
             let gu_names: Vec<(String, usize)> = ["mlp.gate_proj.weight", "mlp.up_proj.weight"]
                 .iter()
@@ -9419,9 +8186,6 @@ impl DotsDecoderWgpuGraph {
                     act_f16,
                 )?;
             }
-            if quant == DotsGraphQuant::Nvfp4 && !nvfp4_mrow4_enabled() {
-                push_quant(&mut b, &s, &format!("dg-l{li}-qa"), &act, &sl)?;
-            }
             match &down_aff {
                 Some(aff) if fuse_qkv && !last => push_gemv_w4_rms(
                     &mut b,
@@ -9490,7 +8254,6 @@ impl DotsDecoderWgpuGraph {
                 } else if let Some(sp) = &steel_proj_bufs {
                     push_proj_steel(
                         &mut b,
-                        &s,
                         &format!("dg-pf-l{li}-qkvsteel"),
                         ProjFamily::Qkv,
                         qkvw_h.as_ref().unwrap(),
@@ -9584,7 +8347,8 @@ impl DotsDecoderWgpuGraph {
                 if let Some((bpos, bslot, _, _)) =
                     rg_bufs.as_ref().filter(|_| Some(pfi) == region_wi)
                 {
-                    let kvw = rope_kv_fuse_b_enabled().then(|| RopeKvwSite {
+                    let _ = ROPE_KV_FUSE_B_PORTS_THE_SERIAL_FUSE_TO_THE_BATCHED_STEP;
+                    let kvw = Some(RopeKvwSite {
                         kc: &kc,
                         vc: &vc,
                         bslot,
@@ -9594,9 +8358,7 @@ impl DotsDecoderWgpuGraph {
                         capacity: max_seq,
                         n_kv_heads: n_kv,
                     });
-                    if kvw.is_some() {
-                        b.brope_kvw_layers += 1;
-                    }
+                    b.brope_kvw_layers += 1;
                     let bat = region_rope_pass(
                         &mut b,
                         &s,
@@ -9653,7 +8415,7 @@ impl DotsDecoderWgpuGraph {
                     qkv_words,
                     n_kv,
                 )?;
-                if let Some((_, bslot, _, _)) = &rg_bufs {
+                if rg_bufs.is_some() {
                     let rpf = region_kv_pass(
                         &mut b,
                         &s,
@@ -9672,32 +8434,7 @@ impl DotsDecoderWgpuGraph {
                         n_kv,
                         None,
                     )?;
-                    let bat: Option<Vec<Pass>> = if Some(pfi) == region_wi {
-                        if rope_kv_fuse_b_enabled() {
-                            Some(Vec::new())
-                        } else {
-                            Some(vec![region_kv_pass(
-                                &mut b,
-                                &s,
-                                &format!("dg-rg-l{li}-kvb"),
-                                "dg_kv_write_b",
-                                &pf.qkv_rot,
-                                &step,
-                                &kc,
-                                &vc,
-                                kv_rows,
-                                q_rows,
-                                q_rows + kv_rows,
-                                max_seq,
-                                pf.m,
-                                qkv_words,
-                                n_kv,
-                                Some(bslot),
-                            )?])
-                        }
-                    } else {
-                        None
-                    };
+                    let bat: Option<Vec<Pass>> = (Some(pfi) == region_wi).then(Vec::new);
                     let pack = if Some(pfi) == pack_wi {
                         let (_, pk_bslot, _, _, _) = pack_bufs.as_ref().unwrap();
                         Some(region_kv_pass(
@@ -9912,39 +8649,9 @@ impl DotsDecoderWgpuGraph {
                                     b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
                                         label: Some(&format!("dg-pk-l{li}-steel{l}")),
                                         layout: &sb.pls.layout,
-                                        entries: &[
-                                            wgpu::BindGroupEntry {
-                                                binding: 0,
-                                                resource: sb.qh.as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 1,
-                                                resource: kh.as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 2,
-                                                resource: vh.as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 3,
-                                                resource: sb.oh.as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 4,
-                                                resource: sb.sp[lwi].as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 5,
-                                                resource: sb.mp.as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 6,
-                                                resource: sb.dummy.as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 7,
-                                                resource: sb.dummy.as_entire_binding(),
-                                            },
+                                        entries: &bind_entries![
+                                            sb.qh, kh, vh, sb.oh, sb.sp[lwi], sb.mp, sb.dummy,
+                                            sb.dummy
                                         ],
                                     });
                                 v.push(Pass {
@@ -9996,9 +8703,8 @@ impl DotsDecoderWgpuGraph {
                 }
                 if pf_ablated("proj") {
                 } else if let Some(sp) = &steel_proj_bufs {
-                    let wrote16 = push_proj_steel(
+                    push_proj_steel(
                         &mut b,
-                        &s,
                         &format!("dg-pf-l{li}-osteel"),
                         ProjFamily::OProj,
                         ow_h.as_ref().unwrap(),
@@ -10010,20 +8716,6 @@ impl DotsDecoderWgpuGraph {
                         hidden,
                         q_rows,
                     )?;
-                    if !wrote16 {
-                        push_cvt(
-                            &mut b,
-                            &s,
-                            &format!("dg-pf-l{li}-ocvtout"),
-                            &pf.y_f32,
-                            &pf.attn_out,
-                            hidden,
-                            hidden,
-                            hidden_words,
-                            pf.m,
-                            false,
-                        )?;
-                    }
                 } else {
                     match ow_f32.as_ref().filter(|_| proj_wide(hidden, q_rows)) {
                         Some(wf) => {
@@ -10111,9 +8803,8 @@ impl DotsDecoderWgpuGraph {
                 });
                 if !pf_ablated("proj") {
                     if let Some(sp) = &steel_proj_bufs {
-                        let wrote16 = push_proj_steel(
+                        push_proj_steel(
                             &mut b,
-                            &s,
                             &format!("dg-pf-l{li}-gusteel"),
                             ProjFamily::GateUp,
                             gu_h.as_ref().unwrap(),
@@ -10125,20 +8816,6 @@ impl DotsDecoderWgpuGraph {
                             2 * inter,
                             hidden,
                         )?;
-                        if !wrote16 {
-                            push_cvt(
-                                &mut b,
-                                &s,
-                                &format!("dg-pf-l{li}-gucvtout"),
-                                &pf.y_f32,
-                                &pf.y_gu,
-                                2 * inter,
-                                2 * inter,
-                                inter,
-                                pf.m,
-                                false,
-                            )?;
-                        }
                     }
                 }
                 match coop_here {
@@ -10220,9 +8897,8 @@ impl DotsDecoderWgpuGraph {
                 )?;
                 if pf_ablated("proj") {
                 } else if let Some(sp) = &steel_proj_bufs {
-                    let wrote16 = push_proj_steel(
+                    push_proj_steel(
                         &mut b,
-                        &s,
                         &format!("dg-pf-l{li}-dsteel"),
                         ProjFamily::Down,
                         down_h.as_ref().unwrap(),
@@ -10234,20 +8910,6 @@ impl DotsDecoderWgpuGraph {
                         hidden,
                         inter,
                     )?;
-                    if !wrote16 {
-                        push_cvt(
-                            &mut b,
-                            &s,
-                            &format!("dg-pf-l{li}-dcvtout"),
-                            &pf.x_f32,
-                            &pf.ffn_out,
-                            hidden,
-                            hidden,
-                            hidden_words,
-                            pf.m,
-                            false,
-                        )?;
-                    }
                 } else {
                     match downw_f32.as_ref().filter(|_| proj_wide(hidden, inter)) {
                         Some(wf) => {
@@ -10387,11 +9049,11 @@ impl DotsDecoderWgpuGraph {
         let head_x = Act {
             x: final_x.clone(),
             k: hidden,
-            xq: sl.sel0.clone(),
-            xs: sl.sel0.clone(),
         };
         let lm_aff = lm_w4.map(|pw| upload_affine_w4(&mut b, "dg-lmhead", &pw, vocab, hidden));
-        let lm_mma_h = (bhead_mma_enabled() && lm_aff.is_some())
+        let _ = BHEAD_MMA_IS_THE_TOLERANCE_CLASS_DEFAULT_WITH_ITS_CENSUS;
+        let lm_mma_h = lm_aff
+            .is_some()
             .then(|| upload_f16_of_bf16(&mut b, "dg-lmhead-h", &head_host));
         match &lm_aff {
             Some(aff) => {
@@ -10485,10 +9147,9 @@ impl DotsDecoderWgpuGraph {
                         (1, 1, 1),
                     )?);
                 }
-                let bhead = match (&lm_aff, act_f16 && hidden <= BHEAD_X_SLAB_ROW_HALFS) {
-                    (Some(aff), true) => {
+                let bhead = match (&lm_mma_h, act_f16 && hidden <= BHEAD_X_SLAB_ROW_HALFS) {
+                    (Some(wh), true) => {
                         let _ = BHEAD_READS_THE_W4_HEAD_ONCE_PER_BSTEP_INSTEAD_OF_ONCE_PER_LIVE_ROW;
-                        let pls = decode_gemv_msl::msl_gemv_pipelines(ctx)?;
                         let bx = b.zeros("dg-bh-x", (slots * hidden * 2) as u64);
                         let blogits = b.zeros("dg-bh-logits", (slots * vocab * 4) as u64);
                         let bpv = b.zeros("dg-bh-pv", (slots * ARGMAX_GROUPS * 4) as u64);
@@ -10500,18 +9161,6 @@ impl DotsDecoderWgpuGraph {
                             pad0: 0,
                         };
                         let gather_p = b.uni("dg-bh-gp", gather_params);
-                        let grid = b.grid1(vocab as u64, decode_gemv_msl::MSL_GEMV_ROWS);
-                        let gemv_params = decode_gemv_msl::DgMslW4BParams {
-                            n_rows: vocab as u32,
-                            w_vec4: (hidden / 32) as u32,
-                            scale_stride: (hidden / W4_GROUP as usize) as u32,
-                            groups_x: grid.0,
-                            b_rows: slots as u32,
-                            x_stride: hidden as u32,
-                            y_stride: vocab as u32,
-                            pad0: 0,
-                        };
-                        let gemv_p = b.uni("dg-bh-p", gemv_params);
                         let am_params = BhAmParams {
                             n: vocab as u32,
                             groups: ARGMAX_GROUPS as u32,
@@ -10527,43 +9176,6 @@ impl DotsDecoderWgpuGraph {
                             &[(90, &pf[wi].normed), (91, &gather_p), (92, &bx)],
                             ((words as u32).div_ceil(64).max(1), slots as u32, 1),
                         )?;
-                        let gemv_bind =
-                            b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("dg-bh-gemv"),
-                                layout: &pls.layout,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: aff.w.as_entire_binding(),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: aff.scales.as_entire_binding(),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 2,
-                                        resource: aff.biases.as_entire_binding(),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 3,
-                                        resource: bx.as_entire_binding(),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 4,
-                                        resource: gemv_p.as_entire_binding(),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 5,
-                                        resource: blogits.as_entire_binding(),
-                                    },
-                                ],
-                            });
-                        let gemv = Pass {
-                            pipeline: pls.batch_pipeline.clone(),
-                            bind: gemv_bind,
-                            grid: (grid.0, grid.1, 1),
-                            entry: decode_gemv_msl::MSL_GEMV_BATCH_ENTRY.to_string(),
-                        };
                         let am1 = b.make_pass(
                             "dg-bh-am1",
                             &bh_src,
@@ -10578,67 +9190,38 @@ impl DotsDecoderWgpuGraph {
                             &[(41, &bpv), (42, &bpi), (43, &btoks), (44, &am_p)],
                             (slots as u32, 1, 1),
                         )?;
-                        let mma = match &lm_mma_h {
-                            Some(wh) => {
-                                let cfg = BHEAD_MMA_CFG_IS_32_32_16_BECAUSE_THE_HEAD_AT_M32_IS_B_READ_BOUND_AND_THE_BRACKET_CROWNED_IT;
-                                let spls = super::vision_attn_msl::steel_gemm_pipelines(ctx)?;
-                                let pipeline = spls.pick(cfg).ok_or_else(|| {
-                                    anyhow::anyhow!("bhead mma: steel cfg {cfg:?} missing")
-                                })?;
-                                let mma_params = super::vision_attn_msl::steel_gemm_params(
-                                    slots, vocab, hidden, vocab, cfg,
-                                );
-                                let mma_p = b.uni("dg-bh-mmap", mma_params);
-                                let bind =
-                                    b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                        label: Some("dg-bh-mma"),
-                                        layout: &spls.layout,
-                                        entries: &[
-                                            wgpu::BindGroupEntry {
-                                                binding: 0,
-                                                resource: bx.as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 1,
-                                                resource: wh.as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 2,
-                                                resource: blogits.as_entire_binding(),
-                                            },
-                                            wgpu::BindGroupEntry {
-                                                binding: 3,
-                                                resource: mma_p.as_entire_binding(),
-                                            },
-                                        ],
-                                    });
-                                let pass = Pass {
-                                    pipeline,
-                                    bind,
-                                    grid: super::vision_attn_msl::steel_gemm_grid(
-                                        slots, vocab, cfg,
-                                    ),
-                                    entry: super::vision_attn_msl::steel_gemm_entry(
-                                        cfg.0, cfg.1, cfg.2, cfg.3, cfg.4,
-                                    ),
-                                };
-                                Some((pass, mma_p, mma_params))
-                            }
-                            None => None,
+                        let cfg = BHEAD_MMA_CFG_IS_32_32_16_BECAUSE_THE_HEAD_AT_M32_IS_B_READ_BOUND_AND_THE_BRACKET_CROWNED_IT;
+                        let spls = super::vision_attn_msl::steel_gemm_pipelines(ctx)?;
+                        let pipeline = spls
+                            .pick(cfg)
+                            .ok_or_else(|| anyhow!("bhead mma: steel cfg {cfg:?} missing"))?;
+                        let mma_params =
+                            super::vision_attn_msl::steel_gemm_params(slots, vocab, hidden, vocab, cfg);
+                        let mma_p = b.uni("dg-bh-mmap", mma_params);
+                        let bind = b.ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("dg-bh-mma"),
+                            layout: &spls.layout,
+                            entries: &bind_entries![bx, wh, blogits, mma_p],
+                        });
+                        let mma = Pass {
+                            pipeline,
+                            bind,
+                            grid: super::vision_attn_msl::steel_gemm_grid(slots, vocab, cfg),
+                            entry: super::vision_attn_msl::steel_gemm_entry(
+                                cfg.0, cfg.1, cfg.2, cfg.3, cfg.4,
+                            ),
                         };
                         Some(BheadMachinery {
                             gather,
-                            gemv,
+                            mma,
                             am1,
                             am2,
                             gather_p,
-                            gemv_p,
+                            mma_p,
                             am_p,
                             gather_params,
-                            gemv_params,
+                            mma_params,
                             am_params,
-                            blogits,
-                            mma,
                         })
                     }
                     _ => None,
@@ -10673,7 +9256,7 @@ impl DotsDecoderWgpuGraph {
             _ => None,
         };
 
-        let mut spec_tok: Vec<(usize, wgpu::Buffer)> = Vec::new();
+        let mut spec_tok: Vec<(usize, Buffer)> = Vec::new();
         if let Some(aff) = lm_aff.as_ref().filter(|_| !spec_x.is_empty()) {
             let spec_logits = b.zeros("dg-spec-logits", (vocab * 4) as u64);
             for (n, sx) in &spec_x {
@@ -10735,12 +9318,10 @@ impl DotsDecoderWgpuGraph {
             bstep_read_s: 0.0,
             bstep_count: 0,
             bstep_bhead: 0,
-            bstep_bhead_mma: 0,
             trunk_splitk_families: sk_families,
             trunk_bf16out_families: bf16out_families,
             trunk_abf16_families: abf16_families,
             brope_kvw_fused_layers: brope_kvw_layers,
-            battn_v2: battn_v2_enabled(),
             sg_tree,
             rpf_chunk_count: 0,
             step_submits: 0,
@@ -10802,10 +9383,6 @@ impl DotsDecoderWgpuGraph {
         self.bstep_bhead
     }
 
-    pub fn bstep_bhead_mma_steps(&self) -> u64 {
-        self.bstep_bhead_mma
-    }
-
     pub fn pf_chunk_widths(&self) -> &[usize] {
         &self.pf_widths
     }
@@ -10826,10 +9403,6 @@ impl DotsDecoderWgpuGraph {
         self.trunk_splitk_families
     }
 
-    pub fn battn_v2(&self) -> bool {
-        self.battn_v2
-    }
-
     pub fn sg_tree(&self) -> SgTreeSites {
         self.sg_tree
     }
@@ -10838,138 +9411,27 @@ impl DotsDecoderWgpuGraph {
         self.ctx.queue.write_buffer(
             &bh.gather_p,
             0,
-            bytemuck::bytes_of(&BhGatherParams {
+            bytes_of(&BhGatherParams {
                 b_rows,
                 ..bh.gather_params
             }),
         );
         self.ctx.queue.write_buffer(
-            &bh.gemv_p,
-            0,
-            bytemuck::bytes_of(&decode_gemv_msl::DgMslW4BParams {
-                b_rows,
-                ..bh.gemv_params
-            }),
-        );
-        self.ctx.queue.write_buffer(
             &bh.am_p,
             0,
-            bytemuck::bytes_of(&BhAmParams {
+            bytes_of(&BhAmParams {
                 b_rows,
                 ..bh.am_params
             }),
         );
-        if let Some((_, mp, base)) = &bh.mma {
-            self.ctx.queue.write_buffer(
-                mp,
-                0,
-                bytemuck::bytes_of(&super::vision_attn_msl::SteelGemmParams {
-                    m: b_rows as i32,
-                    ..*base
-                }),
-            );
-        }
-    }
-
-    pub fn bstep_head_probe(
-        &mut self,
-        rows: &[RegionRow],
-        reps: usize,
-    ) -> Result<Option<(f64, f64)>> {
-        if self.region.as_ref().is_none_or(|rg| rg.bhead.is_none()) {
-            return Ok(None);
-        }
-        let rg = self.region.as_ref().expect("region machinery");
-        let (hs, he) = rg.head_range;
-        let med = |run: &[&Pass]| -> Result<f64> {
-            let mut ms: Vec<f64> = Vec::with_capacity(reps);
-            for _ in 0..reps {
-                let t = std::time::Instant::now();
-                let cb = dispatch::encode_pass_list_labeled(
-                    self.ctx,
-                    run.iter().map(|p| (&*p.pipeline, &p.bind, p.grid)),
-                    &[],
-                );
-                self.ctx.queue.submit([cb]);
-                let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
-                ms.push(t.elapsed().as_secs_f64() * 1e3);
-            }
-            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            Ok(ms[ms.len() / 2])
-        };
-        let mut replay_run: Vec<&Pass> = Vec::new();
-        for r in 0..rows.len() {
-            replay_run.push(&rg.gathers[r]);
-            for p in &self.passes[hs..he] {
-                replay_run.push(p);
-            }
-            replay_run.push(&rg.stashes[r]);
-        }
-        let replay_ms = med(&replay_run)?;
-        let bh = rg.bhead.as_ref().expect("bhead machinery");
-        self.write_bhead_uniforms(bh, rows.len() as u32);
-        let batched_run = [&bh.gather, bh.head_pass().0, &bh.am1, &bh.am2];
-        let batched_ms = med(&batched_run)?;
-        Ok(Some((replay_ms, batched_ms)))
-    }
-
-    pub fn bstep_head_census(
-        &mut self,
-        rows: &[RegionRow],
-    ) -> Result<Option<(Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<u32>, Vec<u32>)>> {
-        if self.region.as_ref().is_none_or(|rg| rg.bhead.is_none()) {
-            return Ok(None);
-        }
-        let replay_toks = {
-            let prev = std::env::var(BHEAD_ENV).ok();
-            std::env::set_var(BHEAD_ENV, "0");
-            let r = self.bstep_tokens(rows);
-            match prev {
-                Some(v) => std::env::set_var(BHEAD_ENV, v),
-                None => std::env::remove_var(BHEAD_ENV),
-            }
-            r?
-        };
-        let vocab = self.vocab;
-        let rg = self.region.as_ref().expect("region machinery");
-        let (hs, he) = rg.head_range;
-        let mut replay_logits: Vec<Vec<f32>> = Vec::with_capacity(rows.len());
-        for r in 0..rows.len() {
-            let mut run: Vec<&Pass> = vec![&rg.gathers[r]];
-            for p in &self.passes[hs..he] {
-                run.push(p);
-            }
-            let cb = dispatch::encode_pass_list_labeled(
-                self.ctx,
-                run.iter().map(|p| (&*p.pipeline, &p.bind, p.grid)),
-                &[],
-            );
-            self.ctx.queue.submit([cb]);
-            let l: Vec<f32> = dispatch::read_back(self.ctx, &self.logits, vocab)
-                .map_err(|e| anyhow::anyhow!("census replay logits: {e}"))?;
-            replay_logits.push(l);
-        }
-        let bh = rg.bhead.as_ref().expect("bhead machinery");
-        self.write_bhead_uniforms(bh, rows.len() as u32);
-        let run = [&bh.gather, bh.head_pass().0, &bh.am1, &bh.am2];
-        let cb = dispatch::encode_pass_list_labeled(
-            self.ctx,
-            run.iter().map(|p| (&*p.pipeline, &p.bind, p.grid)),
-            &[],
+        self.ctx.queue.write_buffer(
+            &bh.mma_p,
+            0,
+            bytes_of(&super::vision_attn_msl::SteelGemmParams {
+                m: b_rows as i32,
+                ..bh.mma_params
+            }),
         );
-        self.ctx.queue.submit([cb]);
-        let flat: Vec<f32> = dispatch::read_back(self.ctx, &bh.blogits, rows.len() * vocab)
-            .map_err(|e| anyhow::anyhow!("census batched logits: {e}"))?;
-        let batched_logits: Vec<Vec<f32>> = flat.chunks(vocab).map(|c| c.to_vec()).collect();
-        let m = self.pf_widths[rg.wi];
-        let bt: Vec<u32> = dispatch::read_back(self.ctx, &rg.btoks, m)
-            .map_err(|e| anyhow::anyhow!("census batched btoks: {e}"))?;
-        Ok(Some((
-            replay_logits,
-            batched_logits,
-            replay_toks,
-            bt[..rows.len()].to_vec(),
-        )))
     }
 
     pub fn handoff_gpu_copies(&self) -> u64 {
@@ -11076,7 +9538,7 @@ impl DotsDecoderWgpuGraph {
     }
 
     pub fn kv_cache_raw(&self) -> Result<Vec<(Vec<u32>, Vec<u32>)>> {
-        anyhow::ensure!(
+        ensure!(
             self.state_buffers.len() == 2 * self.cfg.num_hidden_layers,
             "the state buffers are exactly the per-layer kc/vc pairs; a new state buffer \
              class must teach this readback its layout before the kv census can trust it"
@@ -11085,9 +9547,9 @@ impl DotsDecoderWgpuGraph {
             .chunks(2)
             .map(|pair| {
                 let k = dispatch::read_back(self.ctx, &pair[0], (pair[0].size() / 4) as usize)
-                    .map_err(|e| anyhow::anyhow!("k cache readback: {e}"))?;
+                    .map_err(|e| anyhow!("k cache readback: {e}"))?;
                 let v = dispatch::read_back(self.ctx, &pair[1], (pair[1].size() / 4) as usize)
-                    .map_err(|e| anyhow::anyhow!("v cache readback: {e}"))?;
+                    .map_err(|e| anyhow!("v cache readback: {e}"))?;
                 Ok((k, v))
             })
             .collect()
@@ -11161,7 +9623,7 @@ impl DotsDecoderWgpuGraph {
     pub fn boundary_probe(&mut self, arm: &str, reps: usize) -> Result<Vec<BoundaryRep>> {
         let res_words = (self.res.size() / 4) as usize;
         let res_snap: Vec<u32> = dispatch::read_back(self.ctx, &self.res, res_words)
-            .map_err(|e| anyhow::anyhow!("res snapshot: {e}"))?;
+            .map_err(|e| anyhow!("res snapshot: {e}"))?;
         self.step
             .write(self.ctx, 100, self.pos as u32, (self.pos + 1) as u32);
         let full = self.step_pass_list(0, self.passes.len());
@@ -11170,14 +9632,14 @@ impl DotsDecoderWgpuGraph {
             .passes
             .iter()
             .find(|p| p.entry == "dg_rms" || p.entry == "rmsnorm_bf16")
-            .ok_or_else(|| anyhow::anyhow!("no rms pass anchors the same-pipeline arms"))?;
+            .ok_or_else(|| anyhow!("no rms pass anchors the same-pipeline arms"))?;
         let silu = self
             .passes
             .iter()
             .find(|p| p.entry == "dg_silu_mul")
-            .ok_or_else(|| anyhow::anyhow!("no silu pass anchors the wide-grid arm"))?;
+            .ok_or_else(|| anyhow!("no silu pass anchors the wide-grid arm"))?;
         let hidden = self.cfg.hidden_size;
-        let disjoint: Vec<wgpu::BindGroup> = if arm == "disjoint" {
+        let disjoint: Vec<BindGroup> = if arm == "disjoint" {
             let w = dispatch::storage_zeroed(self.ctx, "bp-disjoint-w", (hidden / 2) as u64 * 4);
             let p = dispatch::uniform_from(
                 self.ctx,
@@ -11201,7 +9663,7 @@ impl DotsDecoderWgpuGraph {
                         &format!("bp-disjoint-y{i}"),
                         (hidden / 2) as u64 * 4,
                     );
-                    let binds: Vec<(u32, &wgpu::Buffer)> = if rms.entry == "dg_rms" {
+                    let binds: Vec<(u32, &Buffer)> = if rms.entry == "dg_rms" {
                         vec![(0, &x), (2, &w), (3, &y), (4, &p)]
                     } else {
                         vec![(0, &x), (1, &w), (2, &y), (3, &p)]
@@ -11216,8 +9678,8 @@ impl DotsDecoderWgpuGraph {
         for _ in 0..reps {
             self.ctx
                 .queue
-                .write_buffer(&self.res, 0, bytemuck::cast_slice(&res_snap));
-            let list: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = match arm {
+                .write_buffer(&self.res, 0, cast_slice(&res_snap));
+            let list: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = match arm {
                 "samepipe" => (0..n)
                     .map(|_| (&*rms.pipeline, &rms.bind, rms.grid))
                     .collect(),
@@ -11232,7 +9694,7 @@ impl DotsDecoderWgpuGraph {
                         .passes
                         .iter()
                         .find(|p| p.entry.contains("gemv"))
-                        .ok_or_else(|| anyhow::anyhow!("no gemv pass for samepipe_gemv1"))?;
+                        .ok_or_else(|| anyhow!("no gemv pass for samepipe_gemv1"))?;
                     (0..n)
                         .map(|_| (&*g.pipeline, &g.bind, (1u32, 1u32, 1u32)))
                         .collect()
@@ -11242,7 +9704,7 @@ impl DotsDecoderWgpuGraph {
                     let a = self
                         .split_passes
                         .get(i)
-                        .ok_or_else(|| anyhow::anyhow!("no split pass for {arm}"))?;
+                        .ok_or_else(|| anyhow!("no split pass for {arm}"))?;
                     (0..n)
                         .map(|_| (&*a.pipeline, &a.bind, (1u32, 1u32, 1u32)))
                         .collect()
@@ -11272,12 +9734,12 @@ impl DotsDecoderWgpuGraph {
             };
             let per_submit = arm == "persubmit" || arm.starts_with("chunk");
             let one_pass_per_chunk = arm != "perpass";
-            let t0 = std::time::Instant::now();
+            let t0 = Instant::now();
             let mut encode_s = 0.0f64;
             let mut submit_s = 0.0f64;
-            let mut pending: Vec<wgpu::CommandBuffer> = Vec::new();
+            let mut pending: Vec<CommandBuffer> = Vec::new();
             for group in list.chunks(chunk.max(1)) {
-                let te = std::time::Instant::now();
+                let te = Instant::now();
                 let mut enc = self.ctx.device.create_command_encoder(&Default::default());
                 if one_pass_per_chunk {
                     let mut pass = enc.begin_compute_pass(&Default::default());
@@ -11301,7 +9763,7 @@ impl DotsDecoderWgpuGraph {
                     continue;
                 }
                 if per_submit {
-                    let ts = std::time::Instant::now();
+                    let ts = Instant::now();
                     self.ctx.queue.submit([cb]);
                     submit_s += ts.elapsed().as_secs_f64();
                 } else {
@@ -11309,18 +9771,18 @@ impl DotsDecoderWgpuGraph {
                 }
             }
             if arm == "nullsubmit" {
-                let te = std::time::Instant::now();
+                let te = Instant::now();
                 let enc = self.ctx.device.create_command_encoder(&Default::default());
                 let cb = enc.finish();
                 encode_s += te.elapsed().as_secs_f64();
                 pending.push(cb);
             }
             if !pending.is_empty() {
-                let ts = std::time::Instant::now();
+                let ts = Instant::now();
                 self.ctx.queue.submit(pending);
                 submit_s += ts.elapsed().as_secs_f64();
             }
-            let tw = std::time::Instant::now();
+            let tw = Instant::now();
             if arm != "encode_drop" {
                 let _ = self.ctx.device.poll(wgpu::PollType::wait_indefinitely());
             }
@@ -11337,7 +9799,7 @@ impl DotsDecoderWgpuGraph {
     }
 
     fn run(&mut self, token: u32, row: Option<&[f32]>, full: bool) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.pos < self.max_seq,
             "kv cache full at {} (max_seq {})",
             self.pos,
@@ -11345,23 +9807,20 @@ impl DotsDecoderWgpuGraph {
         );
         let start = match row {
             None => {
-                anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+                ensure!((token as usize) < self.vocab, "token {token} out of vocab");
                 0
             }
             Some(row) => {
-                anyhow::ensure!(
+                ensure!(
                     row.len() == self.cfg.hidden_size,
                     "supplied hidden row has {} values, want {}",
                     row.len(),
                     self.cfg.hidden_size
                 );
-                let bits: Vec<u16> = row
-                    .iter()
-                    .map(|v| half::bf16::from_f32(*v).to_bits())
-                    .collect();
+                let bits: Vec<u16> = row.iter().map(|v| bf16::from_f32(*v).to_bits()).collect();
                 self.ctx
                     .queue
-                    .write_buffer(&self.res, 0, bytemuck::cast_slice(&pack_pairs(&bits)));
+                    .write_buffer(&self.res, 0, cast_slice(&pack_pairs(&bits)));
                 self.embed_end
             }
         };
@@ -11373,11 +9832,7 @@ impl DotsDecoderWgpuGraph {
         } else {
             !self.validated && !self.prefix_validated
         };
-        let scope = need_scope.then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
+        let scope = need_scope.then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
         let end = if full {
             self.passes.len()
         } else {
@@ -11414,7 +9869,7 @@ impl DotsDecoderWgpuGraph {
         self.step_submits = submits;
         if let Some(scope) = scope {
             if let Some(e) = dispatch::pop_scope(scope) {
-                anyhow::bail!("dots decoder graph step validation: {e}");
+                bail!("dots decoder graph step validation: {e}");
             }
             if full {
                 self.validated = true;
@@ -11429,25 +9884,21 @@ impl DotsDecoderWgpuGraph {
         self.run(token, None, full)
     }
 
-    fn step_ahead(
-        &mut self,
-        token: Option<u32>,
-        stage: &wgpu::Buffer,
-    ) -> Result<wgpu::SubmissionIndex> {
+    fn step_ahead(&mut self, token: Option<u32>, stage: &Buffer) -> Result<wgpu::SubmissionIndex> {
         let _ = DEC_RUNAHEAD_IS_EXACT_BECAUSE_THE_BAN_LIST_IS_KNOWN_BEFORE_THE_TOKEN;
-        anyhow::ensure!(
+        ensure!(
             self.pos < self.max_seq,
             "kv cache full at {} (max_seq {})",
             self.pos,
             self.max_seq
         );
-        anyhow::ensure!(
+        ensure!(
             self.validated,
             "run-ahead needs the validated full-step graph"
         );
         match token {
             Some(t) => {
-                anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+                ensure!((t as usize) < self.vocab, "token {t} out of vocab");
                 self.step
                     .write(self.ctx, t, self.pos as u32, (self.pos + 1) as u32);
             }
@@ -11481,7 +9932,7 @@ impl DotsDecoderWgpuGraph {
         Ok(idx)
     }
 
-    fn await_token(&self, idx: wgpu::SubmissionIndex, stage: &wgpu::Buffer) -> Result<u32> {
+    fn await_token(&self, idx: wgpu::SubmissionIndex, stage: &Buffer) -> Result<u32> {
         let slice = stage.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -11493,14 +9944,14 @@ impl DotsDecoderWgpuGraph {
                 submission_index: Some(idx),
                 timeout: None,
             })
-            .map_err(|e| anyhow::anyhow!("run-ahead token poll: {e}"))?;
+            .map_err(|e| anyhow!("run-ahead token poll: {e}"))?;
         rx.recv()
-            .map_err(|e| anyhow::anyhow!("run-ahead map callback: {e}"))?
-            .map_err(|e| anyhow::anyhow!("run-ahead map: {e}"))?;
+            .map_err(|e| anyhow!("run-ahead map callback: {e}"))?
+            .map_err(|e| anyhow!("run-ahead map: {e}"))?;
         let t = {
             let view = slice
                 .get_mapped_range()
-                .map_err(|e| anyhow::anyhow!("run-ahead mapped range: {e}"))?;
+                .map_err(|e| anyhow!("run-ahead mapped range: {e}"))?;
             u32::from_le_bytes(view[0..4].try_into().expect("4-byte token stage"))
         };
         stage.unmap();
@@ -11514,7 +9965,7 @@ impl DotsDecoderWgpuGraph {
     async fn read_logits_arm(&self, arm: dispatch::ReadbackArm) -> Result<Vec<f32>> {
         dispatch::read_back_arm(self.ctx, &self.logits, self.vocab, arm)
             .await
-            .map_err(|e| anyhow::anyhow!("logit readback: {e}"))
+            .map_err(|e| anyhow!("logit readback: {e}"))
     }
 
     fn read_token_and_logits(&self) -> Result<(u32, Vec<f32>)> {
@@ -11527,7 +9978,7 @@ impl DotsDecoderWgpuGraph {
     ) -> Result<(u32, Vec<f32>)> {
         let t: Vec<u32> = dispatch::read_back_arm(self.ctx, &self.token_out, 1, arm)
             .await
-            .map_err(|e| anyhow::anyhow!("token readback: {e}"))?;
+            .map_err(|e| anyhow!("token readback: {e}"))?;
         let l = self.read_logits_arm(arm).await?;
         Ok((t[0], l))
     }
@@ -11535,7 +9986,7 @@ impl DotsDecoderWgpuGraph {
     async fn read_token_arm(&self, arm: dispatch::ReadbackArm) -> Result<u32> {
         let t: Vec<u32> = dispatch::read_back_arm(self.ctx, &self.token_out, 1, arm)
             .await
-            .map_err(|e| anyhow::anyhow!("token readback: {e}"))?;
+            .map_err(|e| anyhow!("token readback: {e}"))?;
         Ok(t[0])
     }
 
@@ -11548,7 +9999,7 @@ impl DotsDecoderWgpuGraph {
             .pf_gpu
             .as_ref()
             .expect("a gpu row fetch happens only under a gpu vision source");
-        anyhow::ensure!(
+        ensure!(
             local_row < g.n_vis,
             "gpu row {local_row} out of {} rows",
             g.n_vis
@@ -11557,7 +10008,7 @@ impl DotsDecoderWgpuGraph {
         let w: Vec<u32> =
             dispatch::read_back_at_arm(self.ctx, &g.buf, local_row * words, words, arm)
                 .await
-                .map_err(|e| anyhow::anyhow!("gpu vision row readback: {e}"))?;
+                .map_err(|e| anyhow!("gpu vision row readback: {e}"))?;
         Ok(unpack_bf16_pair_words(&w))
     }
 
@@ -11572,7 +10023,7 @@ impl DotsDecoderWgpuGraph {
         real: usize,
     ) -> Result<()> {
         let _ = PAD_ROWS_COST_NOTHING_BECAUSE_CAUSALITY_SHIELDS_THEM_AND_DECODE_OVERWRITES_THEM;
-        anyhow::ensure!(
+        ensure!(
             real >= 1 && real <= chunk.len(),
             "padded chunk advances {real} of {} rows",
             chunk.len()
@@ -11580,13 +10031,13 @@ impl DotsDecoderWgpuGraph {
         let m = *self
             .pf_widths
             .get(wi)
-            .ok_or_else(|| anyhow::anyhow!("prefill width {wi} not built"))?;
-        anyhow::ensure!(
+            .ok_or_else(|| anyhow!("prefill width {wi} not built"))?;
+        ensure!(
             chunk.len() == m,
             "prefill chunk is {} rows, want the {m}-row chunk graph",
             chunk.len()
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + m <= self.max_seq,
             "kv cache full at {} + {m} (max_seq {})",
             self.pos,
@@ -11600,7 +10051,7 @@ impl DotsDecoderWgpuGraph {
             let b = (self.pos + real).min(g.vs + g.n_vis);
             (a < b).then_some((a, b))
         });
-        let t_repack = std::time::Instant::now();
+        let t_repack = Instant::now();
         let mut toks = vec![0u32; m];
         let mut mask = vec![0u32; m];
         let mut splice = (!gpu_mode).then(|| vec![0u32; m * words]);
@@ -11608,7 +10059,7 @@ impl DotsDecoderWgpuGraph {
             if let Some((a, b)) = gspan {
                 let j = self.pos + i;
                 if j >= a && j < b {
-                    anyhow::ensure!(
+                    ensure!(
                         row.is_none(),
                         "gpu vision rows arrive by device copy, never as host slices"
                     );
@@ -11618,27 +10069,24 @@ impl DotsDecoderWgpuGraph {
             }
             match row {
                 Some(r) => {
-                    anyhow::ensure!(
+                    ensure!(
                         !gpu_mode,
                         "a host vision slice inside a gpu-handoff prefill would bypass the \
                          device copy this chunk rides"
                     );
-                    anyhow::ensure!(
+                    ensure!(
                         r.len() == hidden,
                         "supplied hidden row has {} values, want {hidden}",
                         r.len()
                     );
                     mask[i] = 1;
-                    let bits: Vec<u16> = r
-                        .iter()
-                        .map(|v| half::bf16::from_f32(*v).to_bits())
-                        .collect();
+                    let bits: Vec<u16> = r.iter().map(|v| bf16::from_f32(*v).to_bits()).collect();
                     splice.as_mut().expect("host splice staging present")
                         [i * words..(i + 1) * words]
                         .copy_from_slice(&pack_pairs(&bits));
                 }
                 None => {
-                    anyhow::ensure!((*tok as usize) < self.vocab, "token {tok} out of vocab");
+                    ensure!((*tok as usize) < self.vocab, "token {tok} out of vocab");
                     toks[i] = *tok;
                 }
             }
@@ -11646,16 +10094,12 @@ impl DotsDecoderWgpuGraph {
         self.repack_s += t_repack.elapsed().as_secs_f64();
         {
             let pf = &self.pf[wi];
-            self.ctx
-                .queue
-                .write_buffer(&pf.tok, 0, bytemuck::cast_slice(&toks));
-            self.ctx
-                .queue
-                .write_buffer(&pf.mask, 0, bytemuck::cast_slice(&mask));
+            self.ctx.queue.write_buffer(&pf.tok, 0, cast_slice(&toks));
+            self.ctx.queue.write_buffer(&pf.mask, 0, cast_slice(&mask));
             if let Some(splice) = &splice {
                 self.ctx
                     .queue
-                    .write_buffer(&pf.splice, 0, bytemuck::cast_slice(splice));
+                    .write_buffer(&pf.splice, 0, cast_slice(splice));
             }
         }
         if let Some((a, b)) = gspan {
@@ -11674,11 +10118,8 @@ impl DotsDecoderWgpuGraph {
         }
         self.step
             .write(self.ctx, 0, self.pos as u32, (self.pos + m) as u32);
-        let scope = (!self.pf_validated).then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
+        let scope =
+            (!self.pf_validated).then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
         let cb = dispatch::encode_pass_list_labeled(
             self.ctx,
             self.pf_passes[wi]
@@ -11689,7 +10130,7 @@ impl DotsDecoderWgpuGraph {
         self.ctx.queue.submit([cb]);
         if let Some(scope) = scope {
             if let Some(e) = dispatch::pop_scope(scope) {
-                anyhow::bail!("dots decoder prefill chunk validation: {e}");
+                bail!("dots decoder prefill chunk validation: {e}");
             }
             self.pf_validated = true;
         }
@@ -11786,7 +10227,7 @@ impl DotsDecoderWgpuGraph {
         gcopy: Option<RpfGpuCopy<'_>>,
     ) -> Result<()> {
         let m = self.pf_widths[wi];
-        anyhow::ensure!(
+        ensure!(
             chunk.len() == m,
             "rpf chunk is {} rows, want {m}",
             chunk.len()
@@ -11800,13 +10241,13 @@ impl DotsDecoderWgpuGraph {
                 .as_ref()
                 .is_some_and(|gc| i >= gc.dst_row && i < gc.dst_row + gc.rows)
         };
-        let t_repack = std::time::Instant::now();
+        let t_repack = Instant::now();
         let mut toks = vec![0u32; m];
         let mut mask = vec![0u32; m];
         let mut splice = (!gpu_mode).then(|| vec![0u32; m * words]);
         for (i, (tok, row)) in chunk.iter().enumerate() {
             if in_gspan(i) {
-                anyhow::ensure!(
+                ensure!(
                     row.is_none(),
                     "gpu vision rows arrive by device copy, never as host slices"
                 );
@@ -11815,27 +10256,24 @@ impl DotsDecoderWgpuGraph {
             }
             match row {
                 Some(r) => {
-                    anyhow::ensure!(
+                    ensure!(
                         !gpu_mode,
                         "a host vision slice inside a gpu-handoff region chunk would bypass \
                          the device copy this chunk rides"
                     );
-                    anyhow::ensure!(
+                    ensure!(
                         r.len() == hidden,
                         "supplied hidden row has {} values, want {hidden}",
                         r.len()
                     );
                     mask[i] = 1;
-                    let bits: Vec<u16> = r
-                        .iter()
-                        .map(|v| half::bf16::from_f32(*v).to_bits())
-                        .collect();
+                    let bits: Vec<u16> = r.iter().map(|v| bf16::from_f32(*v).to_bits()).collect();
                     splice.as_mut().expect("host splice staging present")
                         [i * words..(i + 1) * words]
                         .copy_from_slice(&pack_pairs(&bits));
                 }
                 None => {
-                    anyhow::ensure!((*tok as usize) < self.vocab, "token {tok} out of vocab");
+                    ensure!((*tok as usize) < self.vocab, "token {tok} out of vocab");
                     toks[i] = *tok;
                 }
             }
@@ -11843,16 +10281,12 @@ impl DotsDecoderWgpuGraph {
         self.rpf_repack_s += t_repack.elapsed().as_secs_f64();
         {
             let pf = &self.pf[wi];
-            self.ctx
-                .queue
-                .write_buffer(&pf.tok, 0, bytemuck::cast_slice(&toks));
-            self.ctx
-                .queue
-                .write_buffer(&pf.mask, 0, bytemuck::cast_slice(&mask));
+            self.ctx.queue.write_buffer(&pf.tok, 0, cast_slice(&toks));
+            self.ctx.queue.write_buffer(&pf.mask, 0, cast_slice(&mask));
             if let Some(splice) = &splice {
                 self.ctx
                     .queue
-                    .write_buffer(&pf.splice, 0, bytemuck::cast_slice(splice));
+                    .write_buffer(&pf.splice, 0, cast_slice(splice));
             }
         }
         if let Some(gc) = &gcopy {
@@ -11871,11 +10305,7 @@ impl DotsDecoderWgpuGraph {
         self.step
             .write_base(self.ctx, 0, lpos as u32, (lpos + m) as u32, base as u32);
         let need_scope = !self.region.as_ref().expect("region machinery").validated;
-        let scope = need_scope.then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
+        let scope = need_scope.then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
         {
             let run = self.swapped_run(wi, false);
             let cb = dispatch::encode_pass_list_labeled(
@@ -11887,7 +10317,7 @@ impl DotsDecoderWgpuGraph {
         }
         if let Some(scope) = scope {
             if let Some(e) = dispatch::pop_scope(scope) {
-                anyhow::bail!("dots region prefill chunk validation: {e}");
+                bail!("dots region prefill chunk validation: {e}");
             }
             self.region.as_mut().expect("region machinery").validated = true;
         }
@@ -11935,7 +10365,7 @@ impl DotsDecoderWgpuGraph {
         let serial = |g: &mut Self, j: &RegionPackJob<'_>| {
             g.region_prefill_src(j.slot, j.prompt_tokens, j.vision_start, j.src.reborrow())
         };
-        if self.pack.is_none() || !rpf_pack_enabled() || jobs.len() < 2 {
+        if self.pack.is_none() || jobs.len() < 2 {
             return jobs.iter().map(|j| serial(self, j)).collect();
         }
         let mut lens = vec![0usize; jobs.len()];
@@ -11995,22 +10425,22 @@ impl DotsDecoderWgpuGraph {
         let mut copies: Vec<(usize, usize, usize)> = Vec::new();
         let mut lane_writes: Vec<(usize, [u32; 4])> = Vec::new();
         let mut lc = 0usize;
-        let t_repack = std::time::Instant::now();
+        let t_repack = Instant::now();
         for &ji in idxs {
             let j = &jobs[ji];
-            anyhow::ensure!(j.slot < slots, "region slot {} out of {slots}", j.slot);
-            anyhow::ensure!(
+            ensure!(j.slot < slots, "region slot {} out of {slots}", j.slot);
+            ensure!(
                 j.prompt_tokens.len() > 1,
                 "region prompt needs at least two tokens"
             );
             let gend = j.prompt_tokens.len() - 1;
-            anyhow::ensure!(
+            ensure!(
                 gend < stride,
                 "region prompt of {gend} rows does not fit the {stride}-row stride minus its \
                  reserved pad row (lower NV_DOTS_CROP_MAX_PIXELS or raise NV_DOTS_MAX_SEQ)"
             );
             let lj = gend.div_ceil(lane).max(1);
-            anyhow::ensure!(
+            ensure!(
                 lc + lj <= RPF_PACK_LANES_8_FILL_THE_1024_TRUNK,
                 "pack lane overflow: {lc} + {lj} lanes"
             );
@@ -12019,13 +10449,13 @@ impl DotsDecoderWgpuGraph {
             let (n_vis, host, gpu): (usize, Option<&[f32]>, Option<&VisionRowsGpu>) = match &j.src {
                 RegionRowsSrc::None => (0, None, None),
                 RegionRowsSrc::Host(f) => {
-                    anyhow::ensure!(
+                    ensure!(
                         f.len().is_multiple_of(hidden),
                         "vision features hold {} values, not a multiple of hidden {hidden}",
                         f.len()
                     );
                     let n = f.len() / hidden;
-                    anyhow::ensure!(
+                    ensure!(
                         vs + n <= j.prompt_tokens.len(),
                         "vision span {vs}+{n} exceeds prompt {}",
                         j.prompt_tokens.len()
@@ -12033,18 +10463,18 @@ impl DotsDecoderWgpuGraph {
                     (n, Some(f), None)
                 }
                 RegionRowsSrc::Gpu(g) => {
-                    anyhow::ensure!(
+                    ensure!(
                         g.hidden == hidden,
                         "gpu vision rows are {} wide, decoder hidden is {hidden}",
                         g.hidden
                     );
-                    anyhow::ensure!(
+                    ensure!(
                         g.buf.size() >= (g.rows * hidden * 2) as u64,
                         "gpu vision row buffer holds {} bytes for {} rows",
                         g.buf.size(),
                         g.rows
                     );
-                    anyhow::ensure!(
+                    ensure!(
                         vs + g.rows <= j.prompt_tokens.len(),
                         "vision span {vs}+{} exceeds prompt {}",
                         g.rows,
@@ -12067,17 +10497,15 @@ impl DotsDecoderWgpuGraph {
                     mask[p] = 1;
                     if let Some(f) = host {
                         let r = &f[(local - vs) * hidden..(local - vs + 1) * hidden];
-                        let bits: Vec<u16> = r
-                            .iter()
-                            .map(|v| half::bf16::from_f32(*v).to_bits())
-                            .collect();
+                        let bits: Vec<u16> =
+                            r.iter().map(|v| bf16::from_f32(*v).to_bits()).collect();
                         splice.get_or_insert_with(|| vec![0u32; m * words])
                             [p * words..(p + 1) * words]
                             .copy_from_slice(&pack_pairs(&bits));
                     }
                 } else {
                     let tok = j.prompt_tokens[local];
-                    anyhow::ensure!((tok as usize) < self.vocab, "token {tok} out of vocab");
+                    ensure!((tok as usize) < self.vocab, "token {tok} out of vocab");
                     toks[p] = tok;
                 }
             }
@@ -12100,30 +10528,24 @@ impl DotsDecoderWgpuGraph {
         {
             let pf = &self.pf[pk_wi];
             let pk = self.pack.as_ref().expect("pack machinery present");
-            self.ctx
-                .queue
-                .write_buffer(&pf.tok, 0, bytemuck::cast_slice(&toks));
-            self.ctx
-                .queue
-                .write_buffer(&pf.mask, 0, bytemuck::cast_slice(&mask));
+            self.ctx.queue.write_buffer(&pf.tok, 0, cast_slice(&toks));
+            self.ctx.queue.write_buffer(&pf.mask, 0, cast_slice(&mask));
             if let Some(splice) = &splice {
                 self.ctx
                     .queue
-                    .write_buffer(&pf.splice, 0, bytemuck::cast_slice(splice));
+                    .write_buffer(&pf.splice, 0, cast_slice(splice));
             }
+            self.ctx.queue.write_buffer(&pk.bpos, 0, cast_slice(&bpos));
             self.ctx
                 .queue
-                .write_buffer(&pk.bpos, 0, bytemuck::cast_slice(&bpos));
+                .write_buffer(&pk.bslot, 0, cast_slice(&bslot));
             self.ctx
                 .queue
-                .write_buffer(&pk.bslot, 0, bytemuck::cast_slice(&bslot));
-            self.ctx
-                .queue
-                .write_buffer(&pk.brange, 0, bytemuck::cast_slice(&brange));
+                .write_buffer(&pk.brange, 0, cast_slice(&brange));
             for (l, st) in &lane_writes {
                 self.ctx
                     .queue
-                    .write_buffer(&pk.lane_step[*l], 0, bytemuck::cast_slice(st));
+                    .write_buffer(&pk.lane_step[*l], 0, cast_slice(st));
             }
         }
         if !copies.is_empty() {
@@ -12131,7 +10553,7 @@ impl DotsDecoderWgpuGraph {
             let mut enc = self.ctx.device.create_command_encoder(&Default::default());
             for (ji, dst_row, rows) in &copies {
                 let RegionRowsSrc::Gpu(g) = &jobs[*ji].src else {
-                    anyhow::bail!("pack copy source must be gpu rows");
+                    bail!("pack copy source must be gpu rows");
                 };
                 enc.copy_buffer_to_buffer(
                     &g.buf,
@@ -12149,11 +10571,7 @@ impl DotsDecoderWgpuGraph {
             .as_ref()
             .expect("pack machinery present")
             .validated;
-        let scope = need_scope.then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
+        let scope = need_scope.then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
         {
             let run = self.pack_run(lc);
             let cb = dispatch::encode_pass_list_labeled(
@@ -12165,7 +10583,7 @@ impl DotsDecoderWgpuGraph {
         }
         if let Some(scope) = scope {
             if let Some(e) = dispatch::pop_scope(scope) {
-                anyhow::bail!("dots region pack prefill validation: {e}");
+                bail!("dots region pack prefill validation: {e}");
             }
             self.pack
                 .as_mut()
@@ -12188,14 +10606,12 @@ impl DotsDecoderWgpuGraph {
         src: RegionRowsSrc<'_>,
     ) -> Result<usize> {
         let Some(rg) = self.region.as_ref() else {
-            anyhow::bail!(
-                "region machinery needs the 32-row prefill width and a span of at least 64"
-            );
+            bail!("region machinery needs the 32-row prefill width and a span of at least 64");
         };
         let stride = rg.stride;
         let slots = REGION_SLOTS_32_IS_THE_PF_KNEE_WIDTH_THE_BATCHED_STEP_RIDES;
-        anyhow::ensure!(slot < slots, "region slot {slot} out of {slots}");
-        anyhow::ensure!(
+        ensure!(slot < slots, "region slot {slot} out of {slots}");
+        ensure!(
             prompt_tokens.len() > 1,
             "region prompt needs at least two tokens"
         );
@@ -12212,13 +10628,13 @@ impl DotsDecoderWgpuGraph {
         let n_vis = match &src {
             RegionRowsSrc::None => 0,
             RegionRowsSrc::Host(f) => {
-                anyhow::ensure!(
+                ensure!(
                     f.len().is_multiple_of(hidden),
                     "vision features hold {} values, not a multiple of hidden {hidden}",
                     f.len()
                 );
                 let n = f.len() / hidden;
-                anyhow::ensure!(
+                ensure!(
                     vision_start + n <= prompt_tokens.len(),
                     "vision span {vision_start}+{n} exceeds prompt {}",
                     prompt_tokens.len()
@@ -12226,18 +10642,18 @@ impl DotsDecoderWgpuGraph {
                 n
             }
             RegionRowsSrc::Gpu(g) => {
-                anyhow::ensure!(
+                ensure!(
                     g.hidden == hidden,
                     "gpu vision rows are {} wide, decoder hidden is {hidden}",
                     g.hidden
                 );
-                anyhow::ensure!(
+                ensure!(
                     g.buf.size() >= (g.rows * hidden * 2) as u64,
                     "gpu vision row buffer holds {} bytes for {} rows",
                     g.buf.size(),
                     g.rows
                 );
-                anyhow::ensure!(
+                ensure!(
                     vision_start + g.rows <= prompt_tokens.len(),
                     "vision span {vision_start}+{} exceeds prompt {}",
                     g.rows,
@@ -12247,7 +10663,7 @@ impl DotsDecoderWgpuGraph {
             }
         };
         let gend = prompt_tokens.len() - 1;
-        anyhow::ensure!(
+        ensure!(
             gend < stride,
             "region prompt of {gend} rows does not fit the {stride}-row stride minus its \
              reserved pad row (lower NV_DOTS_CROP_MAX_PIXELS or raise NV_DOTS_MAX_SEQ)"
@@ -12277,23 +10693,19 @@ impl DotsDecoderWgpuGraph {
                 rows: b - a,
             })
         };
+        let _ = RPF_CHUNK_COST_IS_NEAR_FLAT_IN_WIDTH_SO_FEWER_WIDER_CHUNKS_WIN;
         let widths = self.pf_widths.clone();
-        let wide = rpf_wide_enabled();
-        if wide {
-            let one = widths
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(_, m)| {
-                    *m >= gend && *m <= stride && (*m <= PREFILL_M_WIDE || gend * 2 >= *m)
-                })
-                .min_by_key(|&(_, m)| m);
-            if let Some((wi, m)) = one {
-                let mut chunk: Vec<(u32, Option<&[f32]>)> = (0..gend).map(entry).collect();
-                chunk.resize(m, (0, None));
-                self.rpf_chunk(wi, &chunk, base, 0, gcopy_for(0, m))?;
-                return Ok(gend);
-            }
+        let one = widths
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, m)| *m >= gend && *m <= stride && (*m <= PREFILL_M_WIDE || gend * 2 >= *m))
+            .min_by_key(|&(_, m)| m);
+        if let Some((wi, m)) = one {
+            let mut chunk: Vec<(u32, Option<&[f32]>)> = (0..gend).map(entry).collect();
+            chunk.resize(m, (0, None));
+            self.rpf_chunk(wi, &chunk, base, 0, gcopy_for(0, m))?;
+            return Ok(gend);
         }
         let usable: Vec<(usize, usize)> = widths
             .iter()
@@ -12301,14 +10713,14 @@ impl DotsDecoderWgpuGraph {
             .enumerate()
             .filter(|(_, m)| *m < stride)
             .collect();
-        anyhow::ensure!(
+        ensure!(
             !usable.is_empty(),
             "no prefill width fits the region stride"
         );
         let mut lpos = 0usize;
         let mut i = 0usize;
         for (wi, m) in usable.iter().copied() {
-            if wide && m < PREFILL_M_WIDE {
+            if m < PREFILL_M_WIDE {
                 break;
             }
             while i + m <= gend && lpos + m < stride {
@@ -12318,7 +10730,7 @@ impl DotsDecoderWgpuGraph {
                 i += m;
             }
         }
-        if wide && gend > i {
+        if gend > i {
             let rem = gend - i;
             let wide_tail = usable
                 .iter()
@@ -12348,7 +10760,7 @@ impl DotsDecoderWgpuGraph {
                 .rev()
                 .find(|(_, m)| *m >= rem && lpos + m < stride);
             let Some((wi, m)) = tail else {
-                anyhow::bail!(
+                bail!(
                     "region prompt tail of {rem} rows does not fit the {stride}-row stride at \
                      local position {lpos}"
                 );
@@ -12363,12 +10775,12 @@ impl DotsDecoderWgpuGraph {
 
     pub fn bstep_tokens(&mut self, rows: &[RegionRow]) -> Result<Vec<u32>> {
         let Some(rg) = self.region.as_ref() else {
-            anyhow::bail!("region machinery absent");
+            bail!("region machinery absent");
         };
         let wi = rg.wi;
         let stride = rg.stride as u32;
         let m = self.pf_widths[wi];
-        anyhow::ensure!(
+        ensure!(
             !rows.is_empty() && rows.len() <= m,
             "bstep takes 1..={m} rows, got {}",
             rows.len()
@@ -12379,12 +10791,12 @@ impl DotsDecoderWgpuGraph {
         let mut bslot = vec![0u32; m];
         let mut brange = vec![0u32; 2 * m];
         for (r, row) in rows.iter().enumerate() {
-            anyhow::ensure!(
+            ensure!(
                 (row.token as usize) < self.vocab,
                 "token {} out of vocab",
                 row.token
             );
-            anyhow::ensure!(
+            ensure!(
                 row.len + 1 < stride && row.base.is_multiple_of(stride),
                 "region row {r}: len {} base {} outside the {stride}-row stride contract",
                 row.len,
@@ -12402,42 +10814,31 @@ impl DotsDecoderWgpuGraph {
             brange[2 * r] = park;
             brange[2 * r + 1] = 1;
         }
-        let t_cpu = std::time::Instant::now();
+        let t_cpu = Instant::now();
         {
             let pf = &self.pf[wi];
+            self.ctx.queue.write_buffer(&pf.tok, 0, cast_slice(&toks));
+            self.ctx.queue.write_buffer(&pf.mask, 0, cast_slice(&mask));
+            self.ctx.queue.write_buffer(&rg.bpos, 0, cast_slice(&bpos));
             self.ctx
                 .queue
-                .write_buffer(&pf.tok, 0, bytemuck::cast_slice(&toks));
+                .write_buffer(&rg.bslot, 0, cast_slice(&bslot));
             self.ctx
                 .queue
-                .write_buffer(&pf.mask, 0, bytemuck::cast_slice(&mask));
-            self.ctx
-                .queue
-                .write_buffer(&rg.bpos, 0, bytemuck::cast_slice(&bpos));
-            self.ctx
-                .queue
-                .write_buffer(&rg.bslot, 0, bytemuck::cast_slice(&bslot));
-            self.ctx
-                .queue
-                .write_buffer(&rg.brange, 0, bytemuck::cast_slice(&brange));
+                .write_buffer(&rg.brange, 0, cast_slice(&brange));
         }
         self.step.write_base(self.ctx, 0, 0, m as u32, 0);
-        let use_bhead = rg.bhead.is_some() && bhead_enabled();
+        let use_bhead = rg.bhead.is_some();
         let need_scope = !rg.bat_validated;
-        let scope = need_scope.then(|| {
-            self.ctx
-                .device
-                .push_error_scope(wgpu::ErrorFilter::Validation)
-        });
+        let scope = need_scope.then(|| self.ctx.device.push_error_scope(ErrorFilter::Validation));
         {
             let rg = self.region.as_ref().expect("region machinery");
             let mut run = self.swapped_run(wi, true);
             if use_bhead {
                 let bh = rg.bhead.as_ref().expect("bhead machinery");
                 self.write_bhead_uniforms(bh, rows.len() as u32);
-                let (head, _) = bh.head_pass();
                 run.push(&bh.gather);
-                run.push(head);
+                run.push(&bh.mma);
                 run.push(&bh.am1);
                 run.push(&bh.am2);
             } else {
@@ -12459,15 +10860,10 @@ impl DotsDecoderWgpuGraph {
         }
         if use_bhead {
             self.bstep_bhead += 1;
-            let rg = self.region.as_ref().expect("region machinery");
-            let bh = rg.bhead.as_ref().expect("bhead machinery");
-            if bh.head_pass().1 {
-                self.bstep_bhead_mma += 1;
-            }
         }
         if let Some(scope) = scope {
             if let Some(e) = dispatch::pop_scope(scope) {
-                anyhow::bail!("dots batched region step validation: {e}");
+                bail!("dots batched region step validation: {e}");
             }
             self.region
                 .as_mut()
@@ -12475,10 +10871,10 @@ impl DotsDecoderWgpuGraph {
                 .bat_validated = true;
         }
         self.bstep_cpu_s += t_cpu.elapsed().as_secs_f64();
-        let t_read = std::time::Instant::now();
+        let t_read = Instant::now();
         let rg = self.region.as_ref().expect("region machinery");
         let all: Vec<u32> = dispatch::read_back(self.ctx, &rg.btoks, m)
-            .map_err(|e| anyhow::anyhow!("btoks readback: {e}"))?;
+            .map_err(|e| anyhow!("btoks readback: {e}"))?;
         self.bstep_read_s += t_read.elapsed().as_secs_f64();
         self.bstep_count += 1;
         Ok(all[..rows.len()].to_vec())
@@ -12508,7 +10904,7 @@ impl DotsDecoderWgpuGraph {
     }
 
     pub fn prefill_prompt(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
-        anyhow::ensure!(!tokens.is_empty(), "prefill_prompt needs a token");
+        ensure!(!tokens.is_empty(), "prefill_prompt needs a token");
         let widths = self.pf_widths.clone();
         let end = tokens.len() - 1;
         let mut i = 0usize;
@@ -12644,8 +11040,8 @@ impl DotsDecoderWgpuGraph {
     ) -> Result<GenerateOutcome> {
         let hidden = self.cfg.hidden_size;
         let prompt_len = prompt_tokens.len();
-        anyhow::ensure!(prompt_len > 0, "generate needs a prompt");
-        anyhow::ensure!(
+        ensure!(prompt_len > 0, "generate needs a prompt");
+        ensure!(
             prompt_len < self.max_seq,
             "prompt of {prompt_len} tokens exceeds the graph kv span {} (raise NV_DOTS_MAX_SEQ \
              or lower NV_DOTS_MAX_PIXELS)",
@@ -12654,31 +11050,31 @@ impl DotsDecoderWgpuGraph {
         let n_vis = match &src {
             RowsSrc::None => 0,
             RowsSrc::Host(f) => {
-                anyhow::ensure!(
+                ensure!(
                     f.len().is_multiple_of(hidden),
                     "vision features hold {} values, not a multiple of hidden {hidden}",
                     f.len()
                 );
                 let n = f.len() / hidden;
-                anyhow::ensure!(
+                ensure!(
                     vision_start + n <= prompt_len,
                     "vision span {vision_start}+{n} exceeds prompt {prompt_len}"
                 );
                 n
             }
             RowsSrc::Gpu(g) => {
-                anyhow::ensure!(
+                ensure!(
                     g.hidden == hidden,
                     "gpu vision rows are {} wide, decoder hidden is {hidden}",
                     g.hidden
                 );
-                anyhow::ensure!(
+                ensure!(
                     g.buf.size() >= (g.rows * hidden * 2) as u64,
                     "gpu vision row buffer holds {} bytes for {} rows",
                     g.buf.size(),
                     g.rows
                 );
-                anyhow::ensure!(
+                ensure!(
                     vision_start + g.rows <= prompt_len,
                     "vision span {vision_start}+{} exceeds prompt {prompt_len}",
                     g.rows
@@ -12696,7 +11092,7 @@ impl DotsDecoderWgpuGraph {
         }
         self.handoff_copies = 0;
 
-        let t_gen = std::time::Instant::now();
+        let t_gen = Instant::now();
         self.repack_s = 0.0;
         let host_rows: Option<&[f32]> = match &src {
             RowsSrc::Host(f) => Some(f),
@@ -12778,7 +11174,7 @@ impl DotsDecoderWgpuGraph {
         };
         self.pf_gpu = None;
         let prefill_s = t_gen.elapsed().as_secs_f64();
-        let t_decode = std::time::Instant::now();
+        let t_decode = Instant::now();
 
         let mut generated: Vec<u32> = Vec::new();
         let mut hit_eos = false;
@@ -12789,12 +11185,11 @@ impl DotsDecoderWgpuGraph {
             self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: 4,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
         };
         let stages = (arm == dispatch::ReadbackArm::Blocking
-            && dec_runahead()
             && self.spec_tok.is_empty()
             && !dispatch::profile::enabled())
         .then(|| [mk_stage("dg-ra-stage0"), mk_stage("dg-ra-stage1")]);
@@ -12829,7 +11224,7 @@ impl DotsDecoderWgpuGraph {
             if !self.spec_tok.is_empty() {
                 for (si, (_, buf)) in self.spec_tok.iter().enumerate() {
                     let t: Vec<u32> = dispatch::read_back(self.ctx, buf, 1)
-                        .map_err(|e| anyhow::anyhow!("spec probe readback: {e}"))?;
+                        .map_err(|e| anyhow!("spec probe readback: {e}"))?;
                     if t[0] == next {
                         spec_agree[si] += 1;
                     }
@@ -12882,17 +11277,14 @@ impl DotsDecoderWgpuGraph {
                 .collect();
             eprintln!("[dots-spec] steps={spec_steps} {}", curve.join(" "));
         }
-        if let Some(path) = std::env::var(DEC_TOKEN_TRACE_ENV)
-            .ok()
-            .filter(|p| !p.is_empty())
-        {
+        if let Some(path) = env::var(DEC_TOKEN_TRACE_ENV).ok().filter(|p| !p.is_empty()) {
             use std::io::Write;
             let ids: Vec<String> = generated.iter().map(|t| t.to_string()).collect();
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
-                .map_err(|e| anyhow::anyhow!("token trace open {path}: {e}"))?;
+                .map_err(|e| anyhow!("token trace open {path}: {e}"))?;
             writeln!(
                 f,
                 "n={} eos={} ids={}",
@@ -12900,7 +11292,7 @@ impl DotsDecoderWgpuGraph {
                 hit_eos,
                 ids.join(",")
             )
-            .map_err(|e| anyhow::anyhow!("token trace write {path}: {e}"))?;
+            .map_err(|e| anyhow!("token trace write {path}: {e}"))?;
         }
         Ok(GenerateOutcome {
             tokens: generated.clone(),
@@ -12914,7 +11306,7 @@ impl DotsDecoderWgpuGraph {
     pub fn forward_tokens(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         let (last, rest) = tokens
             .split_last()
-            .ok_or_else(|| anyhow::anyhow!("forward_tokens needs at least one token"))?;
+            .ok_or_else(|| anyhow!("forward_tokens needs at least one token"))?;
         for t in rest {
             self.prefill_step(*t)?;
         }
@@ -12970,21 +11362,15 @@ mod workgroup_limit_gate {
 
     #[test]
     fn every_dots_decoder_entry_point_fits_the_metal_workgroup_memory_limit() {
-        for (fold, kt) in [
-            (1usize, false),
-            (1, true),
-            (ATTN_FOLD_MAX, false),
-            (ATTN_FOLD_MAX, true),
-        ] {
-            let s = Sources::new(fold, kt, false);
+        for fold in [1usize, ATTN_FOLD_MAX] {
+            let s = Sources::new(fold, false);
             assert_every_entry_point_fits(
-                &format!("rope_tree(fold={fold},kt={kt})"),
-                &Sources::new(fold, kt, true).rope,
+                &format!("rope_tree(fold={fold})"),
+                &Sources::new(fold, true).rope,
             );
             for (n, src) in [
                 ("gemv_bf16", &s.gemv_bf16),
                 ("gemv_nvfp4", &s.gemv_nvfp4),
-                ("quant", &s.quant),
                 ("common", &s.common),
                 ("rms", &s.rms),
                 ("rmsres", &s._rmsres),
@@ -12993,25 +11379,25 @@ mod workgroup_limit_gate {
                 ("fused", &s.fused),
                 ("scvt", &s.scvt),
             ] {
-                assert_every_entry_point_fits(&format!("{n}(fold={fold},kt={kt})"), src);
+                assert_every_entry_point_fits(&format!("{n}(fold={fold})"), src);
             }
             assert_every_entry_point_fits(
-                &format!("rope_sg(fold={fold},kt={kt})"),
+                &format!("rope_sg(fold={fold})"),
                 &s.rope
                     .replace("const DGX_SG: u32 = 0u;", "const DGX_SG: u32 = 1u;"),
             );
             assert_every_entry_point_fits(
-                &format!("rope_kv16(fold={fold},kt={kt})"),
+                &format!("rope_kv16(fold={fold})"),
                 &s.rope
                     .replace("const DGKV16: u32 = 0u;", "const DGKV16: u32 = 1u;"),
             );
             assert_every_entry_point_fits(
-                &format!("fused_kv16(fold={fold},kt={kt})"),
+                &format!("fused_kv16(fold={fold})"),
                 &s.fused
                     .replace("const DGF_KV16: u32 = 0u;", "const DGF_KV16: u32 = 1u;"),
             );
             assert_every_entry_point_fits(
-                &format!("scvt_kv16(fold={fold},kt={kt})"),
+                &format!("scvt_kv16(fold={fold})"),
                 &s.scvt
                     .replace("const DSC_KV16: u32 = 0u;", "const DSC_KV16: u32 = 1u;"),
             );
@@ -13074,14 +11460,14 @@ mod workgroup_limit_gate {
 
     #[test]
     fn tree_twin_modules_validate_without_the_subgroup_capability() {
-        for (fold, kt) in [(1usize, false), (ATTN_FOLD_MAX, true)] {
-            let st = Sources::new(fold, kt, true);
+        for fold in [1usize, ATTN_FOLD_MAX] {
+            let st = Sources::new(fold, true);
             assert_validates_without_the_subgroup_capability(
-                &format!("rope_tree(fold={fold},kt={kt})"),
+                &format!("rope_tree(fold={fold})"),
                 &st.rope,
             );
             assert_validates_without_the_subgroup_capability(
-                &format!("rope_act16_tree(fold={fold},kt={kt})"),
+                &format!("rope_act16_tree(fold={fold})"),
                 &st.rope_act16,
             );
         }
@@ -13098,7 +11484,7 @@ mod workgroup_limit_gate {
             );
         }
         for (name, src) in [
-            ("rope_sg", Sources::new(1, false, false).rope),
+            ("rope_sg", Sources::new(1, false).rope),
             ("rmsres_sg", drr_source(false, false)),
             ("gemv_w4_sg", w4g_source(8, false)),
         ] {

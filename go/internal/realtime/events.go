@@ -250,26 +250,6 @@ type responseAudioDoneEvent struct {
 	ContentIndex int             `json:"content_index"`
 }
 
-type responseTextDeltaEvent struct {
-	EventID      string          `json:"event_id"`
-	Type         ServerEventType `json:"type"`
-	ResponseID   string          `json:"response_id"`
-	ItemID       string          `json:"item_id"`
-	OutputIndex  int             `json:"output_index"`
-	ContentIndex int             `json:"content_index"`
-	Delta        string          `json:"delta"`
-}
-
-type responseTextDoneEvent struct {
-	EventID      string          `json:"event_id"`
-	Type         ServerEventType `json:"type"`
-	ResponseID   string          `json:"response_id"`
-	ItemID       string          `json:"item_id"`
-	OutputIndex  int             `json:"output_index"`
-	ContentIndex int             `json:"content_index"`
-	Text         string          `json:"text"`
-}
-
 type responseDoneEvent struct {
 	EventID  string               `json:"event_id"`
 	Type     ServerEventType      `json:"type"`
@@ -502,11 +482,6 @@ type responseCancelledEvent struct {
 	EventID    string          `json:"event_id"`
 	Type       ServerEventType `json:"type"`
 	ResponseID string          `json:"response_id"`
-}
-
-type outputAudioBufferClearedEvent struct {
-	EventID string          `json:"event_id"`
-	Type    ServerEventType `json:"type"`
 }
 
 type outputAudioBufferStartedEvent struct {

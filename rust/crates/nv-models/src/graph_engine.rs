@@ -1,52 +1,15 @@
-use anyhow::Result;
-use candle_core::{DType, Device, Tensor};
+use anyhow::{ensure, Result};
+use candle_core::{CudaDevice, DType, Device, Storage, Tensor};
 
 use crate::gemma4_batch_graph::graph_teardown::GraphTeardown;
-use crate::host_serving_util::{env_arm_opt_in_eq_some_1_reread_every_call, DeviceArgmaxTokenExit};
+use crate::host_serving_util::DeviceArgmaxTokenExit;
 use crate::qwen3_5_moe::{GroupedMoeDispatch, MoeDispatch, Qwen3Moe, Qwen3MoeKvCache};
 
+use candle_core::op::BackpropOp;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use nv_kernels::graph::CudaGraphRunner;
+use std::collections::BTreeMap;
 use std::sync::Arc;
-
-pub const NV_Q38_BOOT_WARM_PREFILL_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_COLD_FIRST_REQUEST:
-    &str = "NV_Q38_BOOT_WARM_PREFILL";
-
-fn boot_warm_prefill_default_on_user_sign_off_2026_09_12(raw: Option<&std::ffi::OsStr>) -> bool {
-    raw.is_none() || raw == Some(std::ffi::OsStr::new("1"))
-}
-
-pub fn boot_warm_prefill_selected_from_env() -> bool {
-    boot_warm_prefill_default_on_user_sign_off_2026_09_12(std::env::var_os(
-        NV_Q38_BOOT_WARM_PREFILL_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_COLD_FIRST_REQUEST,
-    )
-    .as_deref())
-}
-
-#[cfg(test)]
-mod boot_warm_prefill_default_tests {
-    use super::boot_warm_prefill_default_on_user_sign_off_2026_09_12 as selected;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn only_unset_changes_and_zero_restores_cold_prefill() {
-        assert!(selected(None));
-        assert!(selected(Some(OsStr::new("1"))));
-        for raw in ["0", "", " 1", "1 ", "true", "gate"] {
-            assert!(
-                !selected(Some(OsStr::new(raw))),
-                "explicit {raw:?} stays off"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_unicode_remains_explicit_off() {
-        use std::os::unix::ffi::OsStrExt;
-        assert!(!selected(Some(OsStr::from_bytes(&[0xff]))));
-    }
-}
 
 pub const THE_EAGER_ALL_NAN_WAS_THE_GROUPED_MULTI_TOKEN_DEFECT_NOW_FIXED_NOT_THIS_DISABLE: &str =
     "This engine allocates token_buf/pos_buf/logits_buf and nv_quant's 64 MiB nvfp4 workspace with \
@@ -58,10 +21,8 @@ pub const THE_EAGER_ALL_NAN_WAS_THE_GROUPED_MULTI_TOKEN_DEFECT_NOW_FIXED_NOT_THI
      reproduced it with event tracking ON, no capture taken and this disable never reached, and a \
      stream synchronize inside nv_layers::moe_grouped::forward_grouped_decode made it emit the \
      same token ids as the plain dispatch. That defect is gone -- the device-side route+gather \
-     consolidation left the m>1 chain bit-identical with the stall off (the suite covering it is \
-     qwen36_moecap_stall_bisect: rows 3/4/5/8, stall-forced vs default, eager m=24 grouped \
-     prefill, zero-env and the full record stack), the stall survives only as the opt-in \
-     diagnostic NV_MOE_MT_STALL=1, and the rows-keyed verify graphs capture through the grouped \
+     consolidation left the m>1 chain bit-identical with the stall off, the stall survives only \
+     as the opt-in diagnostic NV_MOE_MT_STALL=1, and the rows-keyed verify graphs capture through the grouped \
      dispatch. A placement change for this disable is therefore now measurable; the placement to \
      try is a SCOPED disable rather than a hoist, because cudarc's flag lives on the CudaContext \
      and only decides whether slices allocated WHILE IT IS OFF carry read/write CudaEvents -- \
@@ -194,16 +155,14 @@ impl GraphedQwen3Moe {
             prefill_graphs: None,
             _err_drain: CtxErrDrain(dev.cuda_stream().context().clone()),
         };
-        if boot_warm_prefill_selected_from_env() {
-            let warm_tokens = crate::qwen3_5_moe::q38_prefill_chunk_tokens_from_env()
-                .unwrap_or(
-                    crate::qwen3_5_moe::Q38_PREFILL_CHUNK_DEFAULT_TOKENS_MEASURED_LADDER_140K_AT_6_GIB_OVER_BOOT,
-                )
-                .min(max_seq_len.saturating_sub(1))
-                .max(1);
-            let _ = engine.prefill(&vec![0u32; warm_tokens])?;
-            engine.reset()?;
-        }
+        let warm_tokens = crate::qwen3_5_moe::q38_prefill_chunk_tokens_from_env()
+            .unwrap_or(
+                crate::qwen3_5_moe::Q38_PREFILL_CHUNK_DEFAULT_TOKENS_MEASURED_LADDER_140K_AT_6_GIB_OVER_BOOT,
+            )
+            .min(max_seq_len.saturating_sub(1))
+            .max(1);
+        let _ = engine.prefill(&vec![0u32; warm_tokens])?;
+        engine.reset()?;
         Ok(engine)
     }
 
@@ -245,34 +204,34 @@ impl GraphedQwen3Moe {
 
     pub fn captured_graph_node_type_census_type_ids_are_cugraphnodetype(
         &self,
-    ) -> std::collections::BTreeMap<u32, usize> {
+    ) -> BTreeMap<u32, usize> {
         self.runner
             .cached_node_type_census_type_ids_are_cugraphnodetype()
     }
 
     pub fn captured_graph_node_type_census_per_shape_token(
         &self,
-    ) -> std::collections::BTreeMap<u64, std::collections::BTreeMap<u32, usize>> {
+    ) -> BTreeMap<u64, BTreeMap<u32, usize>> {
         self.runner.cached_node_type_census_per_shape_token()
     }
 
     pub fn captured_graph_memset_census_key_is_element_size_and_bytes(
         &self,
-    ) -> std::collections::BTreeMap<(u32, u64), usize> {
+    ) -> BTreeMap<(u32, u64), usize> {
         self.runner
             .cached_memset_census_key_is_element_size_and_bytes()
     }
 
     pub fn captured_graph_memset_consumer_census_key_is_bytes_and_kernel_name(
         &self,
-    ) -> std::collections::BTreeMap<(u64, String), usize> {
+    ) -> BTreeMap<(u64, String), usize> {
         self.runner
             .cached_memset_consumer_census_key_is_bytes_and_kernel_name()
     }
 
     pub fn captured_graph_memcpy_consumer_census_key_is_bytes_and_kernel_name(
         &self,
-    ) -> std::collections::BTreeMap<(u64, String), usize> {
+    ) -> BTreeMap<(u64, String), usize> {
         self.runner
             .cached_memcpy_consumer_census_key_is_bytes_and_kernel_name()
     }
@@ -280,12 +239,12 @@ impl GraphedQwen3Moe {
     pub fn captured_graph_kernel_context_census_for_name_substring(
         &self,
         needle: &str,
-    ) -> std::collections::BTreeMap<(String, String), usize> {
+    ) -> BTreeMap<(String, String), usize> {
         self.runner
             .cached_kernel_context_census_for_name_substring(needle)
     }
 
-    pub fn captured_graph_kernel_name_census(&self) -> std::collections::BTreeMap<String, usize> {
+    pub fn captured_graph_kernel_name_census(&self) -> BTreeMap<String, usize> {
         self.runner.cached_kernel_name_census()
     }
 
@@ -380,9 +339,9 @@ impl GraphedQwen3Moe {
     }
 
     pub fn prefill(&mut self, prompt: &[u32]) -> Result<Vec<f32>> {
-        anyhow::ensure!(!prompt.is_empty(), "prefill: empty prompt");
+        ensure!(!prompt.is_empty(), "prefill: empty prompt");
         self.invalidate_graphs_synced()?;
-        anyhow::ensure!(
+        ensure!(
             self.current_pos + prompt.len() <= self.cache.max_seq_len(),
             "prefill: {} + {} tokens exceed cache max_seq_len {}",
             self.current_pos,
@@ -484,9 +443,9 @@ impl GraphedQwen3Moe {
     where
         F: FnMut(&Qwen3Moe, &[u32], &Tensor) -> Result<()>,
     {
-        anyhow::ensure!(!prompt.is_empty(), "prefill_hidden: empty prompt");
+        ensure!(!prompt.is_empty(), "prefill_hidden: empty prompt");
         self.invalidate_graphs_synced()?;
-        anyhow::ensure!(
+        ensure!(
             self.current_pos + prompt.len() <= self.cache.max_seq_len(),
             "prefill_hidden: {} + {} tokens exceed cache max_seq_len {}",
             self.current_pos,
@@ -549,14 +508,14 @@ impl GraphedQwen3Moe {
     }
 
     pub fn ensure_verify_lane(&mut self, rows: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             rows >= 2,
             "ensure_verify_lane: a {rows}-row verify is a plain decode; use forward_decode"
         );
-        anyhow::ensure!(
+        ensure!(
             self.cache.mk_verify_route_available(rows),
             "ensure_verify_lane: the mk verify attention route is unavailable for rows={rows} \
-             (NV_Q38_MK_VERIFY=0, rows outside 2..=24, or head_dim > 512); a captured verify \
+             (rows outside 2..=24, or head_dim > 512); a captured verify \
              would bake the \
              kv length of the capture-time dequant view and read stale kv on every deeper replay"
         );
@@ -639,16 +598,16 @@ impl GraphedQwen3Moe {
 
     pub fn forward_verify_chain(&mut self, chain: &[u32]) -> Result<()> {
         let rows = chain.len();
-        anyhow::ensure!(
+        ensure!(
             self.verify_lane_mut_for_shape(rows, false).is_some(),
             "forward_verify_chain: no lane for rows={rows}; call ensure_verify_lane({rows}) first"
         );
-        anyhow::ensure!(
+        ensure!(
             self.pending_verify_pos_rows_tree.is_none(),
             "forward_verify_chain called twice without commit_verify_consumed; the lin-attn \
              rollback checkpoints of the first call would be lost"
         );
-        anyhow::ensure!(
+        ensure!(
             self.current_pos + rows <= self.cache.max_seq_len(),
             "forward_verify_chain: {} + {rows} exceeds cache max_seq_len {}",
             self.current_pos,
@@ -672,7 +631,6 @@ impl GraphedQwen3Moe {
         (self.device_routing || self.force_capture_env)
             && !self.capture_failed
             && self.capture_supported
-            && !env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_OFF")
             && (self.moe_dispatch.is_some()
                 || self
                     .dense_trunk_needs_no_moe_dispatch_for_capture_because_every_ffn_is_a_plain_mlp(
@@ -681,7 +639,7 @@ impl GraphedQwen3Moe {
 
     pub fn ensure_verify_tree_lane_two_branch_m6(&mut self) -> Result<()> {
         let rows = crate::qwen3_5_moe::VERIFY_TREE_TWO_BRANCH_M6_ROWS;
-        anyhow::ensure!(
+        ensure!(
             self.cache.mk_verify_route_available(rows),
             "ensure_verify_tree_lane: the mk verify attention route is unavailable for \
              rows={rows}; tree rows have no lossless attention route without it"
@@ -750,21 +708,21 @@ impl GraphedQwen3Moe {
 
     pub fn forward_verify_tree_two_branch_m6(&mut self, rows_tokens: &[u32]) -> Result<()> {
         let rows = crate::qwen3_5_moe::VERIFY_TREE_TWO_BRANCH_M6_ROWS;
-        anyhow::ensure!(
+        ensure!(
             rows_tokens.len() == rows,
             "forward_verify_tree: the two-branch shape verifies {rows} rows, got {}",
             rows_tokens.len()
         );
-        anyhow::ensure!(
+        ensure!(
             self.verify_lane_mut_for_shape(rows, true).is_some(),
             "forward_verify_tree: no tree lane; call ensure_verify_tree_lane_two_branch_m6 first"
         );
-        anyhow::ensure!(
+        ensure!(
             self.pending_verify_pos_rows_tree.is_none(),
             "forward_verify_tree called twice without a commit; the lin-attn rollback \
              checkpoints of the first call would be lost"
         );
-        anyhow::ensure!(
+        ensure!(
             self.current_pos + rows <= self.cache.max_seq_len(),
             "forward_verify_tree: {} + {rows} exceeds cache max_seq_len {}",
             self.current_pos,
@@ -792,9 +750,8 @@ impl GraphedQwen3Moe {
     }
 
     fn forward_verify_uncaptured(&mut self, pos: usize, rows: usize, tree: bool) -> Result<()> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = dev.cuda_stream();
         let vocab = self.model.vocab_size();
@@ -820,9 +777,7 @@ impl GraphedQwen3Moe {
             .map_err(|e| anyhow::anyhow!("htod verify pos: {e:?}"))?;
         let tokens = wrap_slice_u32(&lane.token_buf, &dev, (1usize, rows))?;
         let positions = wrap_slice_i32(&lane.pos_buf, &dev, rows)?;
-        let _tc = nv_layers::linear::VerifyTcFp8LtGemmScopeGuard::enter_if(
-            nv_layers::linear_attn::verify_tc_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_tc_0_for_the_pre_champion_verify(),
-        );
+        let _tc = nv_layers::linear::VerifyTcFp8LtGemmScopeGuard::enter_if(true);
         let (logits, hid) = model.forward_with_cache_dispatched_hidden_rows(
             &tokens,
             &positions,
@@ -843,9 +798,8 @@ impl GraphedQwen3Moe {
     fn forward_verify_captured(&mut self, pos: usize, rows: usize, tree: bool) -> Result<()> {
         use anyhow::Context as _;
 
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         disable_event_tracking_no_earlier_than_the_first_capture(&dev);
         let key = if tree {
@@ -903,9 +857,7 @@ impl GraphedQwen3Moe {
                 .map_err(|e| anyhow::anyhow!("htod verify pos: {e:?}"))?;
             let tokens = wrap_slice_u32(token_buf, &dev, (1usize, rows))?;
             let positions = wrap_slice_i32(pos_buf, &dev, rows)?;
-            let _tc = nv_layers::linear::VerifyTcFp8LtGemmScopeGuard::enter_if(
-                nv_layers::linear_attn::verify_tc_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_tc_0_for_the_pre_champion_verify(),
-            );
+            let _tc = nv_layers::linear::VerifyTcFp8LtGemmScopeGuard::enter_if(true);
             let (logits, hid) = model.forward_with_cache_dispatched_hidden_rows(
                 &tokens, &positions, cache, hook, None,
             )?;
@@ -995,9 +947,8 @@ impl GraphedQwen3Moe {
 
     pub fn verify_hidden_rows_tensor_valid_until_next_forward(&self) -> Result<Tensor> {
         let lane = self.active_verify_lane()?;
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let hidden = self.model.config().hidden_size;
         let clone = lane
@@ -1006,9 +957,9 @@ impl GraphedQwen3Moe {
             .map_err(|e| anyhow::anyhow!("clone hidden buf: {e:?}"))?;
         let storage = candle_core::CudaStorage::wrap_cuda_slice(clone, dev);
         Ok(Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, lane.rows, hidden),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         ))
     }
@@ -1018,12 +969,12 @@ impl GraphedQwen3Moe {
             .pending_verify_pos_rows_tree
             .take()
             .ok_or_else(|| anyhow::anyhow!("commit_verify_consumed without a pending verify"))?;
-        anyhow::ensure!(
+        ensure!(
             !tree,
             "commit_verify_consumed on a tree verify; only commit_verify_tree knows the \
              checkpoint-row-vs-depth split"
         );
-        anyhow::ensure!(
+        ensure!(
             consumed >= 1 && consumed <= rows,
             "commit_verify_consumed: consumed {consumed} out of 1..={rows}"
         );
@@ -1043,8 +994,8 @@ impl GraphedQwen3Moe {
             .pending_verify_pos_rows_tree
             .take()
             .ok_or_else(|| anyhow::anyhow!("commit_verify_tree without a pending verify"))?;
-        anyhow::ensure!(tree, "commit_verify_tree on a chain verify");
-        anyhow::ensure!(
+        ensure!(tree, "commit_verify_tree on a chain verify");
+        ensure!(
             depth_consumed >= 1 && depth_consumed <= rows && bonus_row < rows,
             "commit_verify_tree: depth {depth_consumed} bonus_row {bonus_row} out of rows {rows}"
         );
@@ -1061,7 +1012,7 @@ impl GraphedQwen3Moe {
         &mut self,
         rows_shapes: &[usize],
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.pending_verify_pos_rows_tree.is_none(),
             "precapture_verify_graphs: a verify is pending commit; precapture only between rounds"
         );
@@ -1101,7 +1052,7 @@ impl GraphedQwen3Moe {
     pub fn precapture_verify_tree_graph_then_discard_state_so_no_mid_run_capture_pollutes_verify_ms(
         &mut self,
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.pending_verify_pos_rows_tree.is_none(),
             "precapture_verify_tree: a verify is pending commit; precapture only between rounds"
         );
@@ -1138,7 +1089,7 @@ impl GraphedQwen3Moe {
         v_chunk: &Tensor,
     ) -> Result<()> {
         let t = k_chunk.dims().get(1).copied().unwrap_or(0);
-        anyhow::ensure!(
+        ensure!(
             self.current_pos + t <= self.cache.max_seq_len(),
             "synthetic prime: {} + {} tokens exceed cache max_seq_len {}",
             self.current_pos,
@@ -1159,7 +1110,7 @@ impl GraphedQwen3Moe {
     }
 
     pub fn forward_decode(&mut self, token_id: u32) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.current_pos < self.cache.max_seq_len(),
             "forward_decode: cache full at {}",
             self.current_pos
@@ -1207,9 +1158,8 @@ impl GraphedQwen3Moe {
     }
 
     fn forward_decode_uncaptured(&mut self, token_id: u32) -> Result<()> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = dev.cuda_stream();
         self.host_tok[0] = token_id;
@@ -1240,9 +1190,8 @@ impl GraphedQwen3Moe {
     fn forward_decode_captured(&mut self, token_id: u32) -> Result<()> {
         use anyhow::Context as _;
 
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         if !self.capture_supported {
             self.capture_failed = true;
@@ -1268,28 +1217,7 @@ impl GraphedQwen3Moe {
             );
             return self.forward_decode_uncaptured(token_id);
         }
-        if !self.runner.has_cached()
-            && self.cache.has_lin_attn_layers()
-            && !self.cache.fused_lin_attn()
-        {
-            self.capture_failed = true;
-            self.capture_active = false;
-            eprintln!(
-                "[graph_engine] graph capture blocked: fused lin-attn decode is disabled \
-                 (NV_GDN_FUSED_DECODE=0); the non-fused recurrent path is not capture-safe. \
-                 Continuing with uncaptured decode."
-            );
-            return self.forward_decode_uncaptured(token_id);
-        }
 
-        if env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_OFF") {
-            self.capture_failed = true;
-            self.capture_active = false;
-            if env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_FORCE_DISABLE_ET") {
-                disable_event_tracking_no_earlier_than_the_first_capture(&dev);
-            }
-            return self.forward_decode_uncaptured(token_id);
-        }
         disable_event_tracking_no_earlier_than_the_first_capture(&dev);
         if !self.runner.has_cached() {
             if let Err(e) = self.runner.probe_capture() {
@@ -1427,12 +1355,7 @@ impl GraphedQwen3Moe {
     }
 }
 
-pub(crate) fn disable_event_tracking_no_earlier_than_the_first_capture(
-    dev: &candle_core::CudaDevice,
-) {
-    if env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_KEEP_EVENT_TRACKING") {
-        return;
-    }
+pub(crate) fn disable_event_tracking_no_earlier_than_the_first_capture(dev: &CudaDevice) {
     let stream = dev.cuda_stream();
     if !stream.context().is_event_tracking() {
         return;
@@ -1463,7 +1386,7 @@ impl Drop for GraphedQwen3Moe {
 
 fn wrap_slice_u32<S: Into<candle_core::Shape>>(
     buf: &CudaSlice<u32>,
-    dev: &candle_core::CudaDevice,
+    dev: &CudaDevice,
     shape: S,
 ) -> Result<Tensor> {
     let clone = buf
@@ -1471,16 +1394,16 @@ fn wrap_slice_u32<S: Into<candle_core::Shape>>(
         .map_err(|e| anyhow::anyhow!("clone u32 buf: {e:?}"))?;
     let storage = candle_core::CudaStorage::wrap_cuda_slice(clone, dev.clone());
     Ok(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         shape,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
 
 fn wrap_slice_i32<S: Into<candle_core::Shape>>(
     buf: &CudaSlice<i32>,
-    dev: &candle_core::CudaDevice,
+    dev: &CudaDevice,
     shape: S,
 ) -> Result<Tensor> {
     let clone = buf
@@ -1488,9 +1411,9 @@ fn wrap_slice_i32<S: Into<candle_core::Shape>>(
         .map_err(|e| anyhow::anyhow!("clone i32 buf: {e:?}"))?;
     let storage = candle_core::CudaStorage::wrap_cuda_slice(clone, dev.clone());
     Ok(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         shape,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
@@ -1499,17 +1422,17 @@ fn copy_last_row_bf16(
     logits: &Tensor,
     vocab: usize,
     dst: &mut CudaSlice<half::bf16>,
-    dev: &candle_core::CudaDevice,
+    dev: &CudaDevice,
 ) -> Result<()> {
     let contig = logits.contiguous()?;
     let (storage, _layout) = contig.storage_and_layout();
     let cuda = match &*storage {
-        candle_core::Storage::Cuda(s) => s,
+        Storage::Cuda(s) => s,
         _ => anyhow::bail!("logits must be on CUDA"),
     };
     let slice = cuda.as_cuda_slice::<half::bf16>()?;
     let n = slice.len();
-    anyhow::ensure!(n >= vocab, "logits len {} < vocab {}", n, vocab);
+    ensure!(n >= vocab, "logits len {} < vocab {}", n, vocab);
     let src = slice.slice(n - vocab..);
     let stream = nv_layers::cuda_stream::current_stream(dev);
     stream

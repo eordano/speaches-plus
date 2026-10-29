@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::dequant::bytes_to_words;
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::pack_u16_even_min_one_word as pack_bf16;
@@ -345,14 +343,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kv4_div_rn_matches_ieee_division_and_survives_huge_denominators() {
-        for i in 1..5000u32 {
-            let a = i as f32 * 0.73;
-            assert_eq!(kv4_div_rn(a, E2M1_MAX).to_bits(), (a / E2M1_MAX).to_bits());
+    fn kv4_div_rn_matches_ieee_division_and_k_channel_scales_walk_blocks_of_32() {
+        {
+            for i in 1..5000u32 {
+                let a = i as f32 * 0.73;
+                assert_eq!(kv4_div_rn(a, E2M1_MAX).to_bits(), (a / E2M1_MAX).to_bits());
+            }
+            let huge = 2.0e38f32;
+            assert!(kv4_div_rn(E2M1_MAX, huge).is_finite());
+            assert!(kv4_div_rn(E2M1_MAX, huge) > 0.0);
         }
-        let huge = 2.0e38f32;
-        assert!(kv4_div_rn(E2M1_MAX, huge).is_finite());
-        assert!(kv4_div_rn(E2M1_MAX, huge) > 0.0);
+        {
+            assert_eq!(k_channel_scale_index(0, 2, 0, 8, 3), 3);
+            assert_eq!(k_channel_scale_index(31, 2, 1, 8, 3), 11);
+            assert_eq!(k_channel_scale_index(32, 2, 0, 8, 0), 16);
+            assert_eq!(k_scale_blocks(1), 1);
+            assert_eq!(k_scale_blocks(32), 1);
+            assert_eq!(k_scale_blocks(33), 2);
+        }
     }
 
     #[test]
@@ -391,15 +399,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn k_channel_scale_indexing_walks_blocks_of_32() {
-        assert_eq!(k_channel_scale_index(0, 2, 0, 8, 3), 3);
-        assert_eq!(k_channel_scale_index(31, 2, 1, 8, 3), 11);
-        assert_eq!(k_channel_scale_index(32, 2, 0, 8, 0), 16);
-        assert_eq!(k_scale_blocks(1), 1);
-        assert_eq!(k_scale_blocks(32), 1);
-        assert_eq!(k_scale_blocks(33), 2);
     }
 }

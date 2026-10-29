@@ -105,7 +105,6 @@ export function startLivePoll(transport, onAttach, onForeign) {
   }, 2000);
 }
 
-// Read /v1/inspect/sessions and /sessions/history once.
 export async function fetchSessions() {
   const [live, hist] = await Promise.all([
     fetch('/v1/inspect/sessions').then(r => r.ok ? r.json() : []).catch(() => []),

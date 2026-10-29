@@ -371,7 +371,7 @@ fn cache() -> &'static Mutex<Vec<CacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+pub fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -384,7 +384,7 @@ pub(crate) fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLay
     }
 }
 
-pub(crate) fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+pub fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,

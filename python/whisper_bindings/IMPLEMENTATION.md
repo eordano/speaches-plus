@@ -56,7 +56,7 @@ wrapper does:
 1. Allocate `buf_size` bytes (start at 64 KiB, matching Go).
 2. Call into the C symbol with `*out_size = buf_size`.
 3. On `rc == 0`: success -- copy `buf[..size]` into the Python `dict`.
-4. On `rc == -2`: the C side wrote the *required* size into `*out_size`
+4. On `rc == -2`: the C side wrote the required size into `*out_size`
    without writing any payload -- bump `buf_size = size + 1` and retry.
 5. On any other `rc`: raise `RuntimeError`.
 

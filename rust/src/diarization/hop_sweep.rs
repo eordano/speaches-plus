@@ -291,7 +291,7 @@ fn run_once(
 #[test]
 #[ignore]
 fn diar_hop_ratio_sweep() -> Result<()> {
-    if std::env::var("DIAR_SWEEP").ok().as_deref() != Some("1") {
+    if !nv_config::env_arm_opt_in_eq_some_1_reread_every_call("DIAR_SWEEP") {
         eprintln!("skip: set DIAR_SWEEP=1");
         return Ok(());
     }
@@ -464,7 +464,7 @@ fn kokoro_handle() -> Result<crate::tts::KokoroHandle> {
 #[test]
 #[ignore]
 fn diar_build_multispeaker_fixture() -> Result<()> {
-    if std::env::var("DIAR_FIXTURE_BUILD").ok().as_deref() != Some("1") {
+    if !nv_config::env_arm_opt_in_eq_some_1_reread_every_call("DIAR_FIXTURE_BUILD") {
         eprintln!("skip: set DIAR_FIXTURE_BUILD=1");
         return Ok(());
     }

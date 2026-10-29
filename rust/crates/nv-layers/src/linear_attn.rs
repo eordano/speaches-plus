@@ -208,39 +208,6 @@ pub const MROW_VERIFY_ROWS_MAX_16_THE_GDN_CHUNK_KERNEL_T_CAP: usize = 16;
 const GDN_L2_EPS_1E6_MATCHES_L2_NORMALIZE_LAST: f32 = 1e-6;
 pub const MROW_VERIFY_CONV_KERNEL_MAX_8_THE_GDN_CONV_CHUNK_KERNEL_K_CAP: usize = 8;
 
-pub fn chunk_prefill_env_read_per_call_so_one_process_can_ab_both_scan_paths() -> bool {
-    const CHUNK_IS_THE_DEFAULT_SCAN_THE_PUBLISHED_PP512_5500_AND_WIKITEXT_PPL_7_0851_WERE_MEASURED_ON_IT_AND_ZERO_RESTORES_THE_TOKEN_SEQUENTIAL_CANDLE_SCAN_AT_ITS_6X_FORMATION_COST: &str =
-        "NV_Q38_GDN_CHUNK_PREFILL";
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        CHUNK_IS_THE_DEFAULT_SCAN_THE_PUBLISHED_PP512_5500_AND_WIKITEXT_PPL_7_0851_WERE_MEASURED_ON_IT_AND_ZERO_RESTORES_THE_TOKEN_SEQUENTIAL_CANDLE_SCAN_AT_ITS_6X_FORMATION_COST,
-    )
-}
-
-pub fn gdn_chunk_gemm_env_read_per_call_so_one_process_can_ab_both_scan_formulations() -> bool {
-    const CHUNK_GEMM_DEFAULT_ON_AGAIN_THE_NEG80_LOG_DECAY_FLOOR_FIXED_THE_FREEFORM_NONFINITE_AND_THE_REPRO_SUITE_GATES_IT_ROWS_Q38_GDNV3_TAILCHAMP_GDNFLIP:
-        &str = "NV_Q38_GDN_CHUNK_GEMM";
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        CHUNK_GEMM_DEFAULT_ON_AGAIN_THE_NEG80_LOG_DECAY_FLOOR_FIXED_THE_FREEFORM_NONFINITE_AND_THE_REPRO_SUITE_GATES_IT_ROWS_Q38_GDNV3_TAILCHAMP_GDNFLIP,
-    )
-}
-
-pub fn gdn_scan_v2_env_read_per_call_so_one_process_can_ab_both_scan_kernels() -> bool {
-    const V2_IS_THE_WARP_SYNCHRONOUS_SCAN_SAME_MATH_SAME_ORDER_BITWISE_VS_V1_AND_OFF_KEEPS_THE_SHIPPED_128_THREAD_BLOCK_KERNEL:
-        &str = "NV_Q38_GDN_SCAN_V2";
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
-        V2_IS_THE_WARP_SYNCHRONOUS_SCAN_SAME_MATH_SAME_ORDER_BITWISE_VS_V1_AND_OFF_KEEPS_THE_SHIPPED_128_THREAD_BLOCK_KERNEL,
-    )
-}
-
-pub fn mrow_verify_env_read_per_call_so_one_process_can_ab_both_verify_paths() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_MROW_VERIFY")
-}
-
-pub fn verify_tc_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_tc_0_for_the_pre_champion_verify(
-) -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q38_VERIFY_TC")
-}
-
 #[cfg(feature = "cuda")]
 pub mod gdn_step_prof {
     use std::collections::BTreeMap;
@@ -459,18 +426,6 @@ pub mod gdn_stage_hook {
 }
 
 #[cfg(feature = "cuda")]
-pub fn fused_decode_env() -> Option<bool> {
-    static V: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *V.get_or_init(
-        || match std::env::var("NV_GDN_FUSED_DECODE").ok().as_deref() {
-            Some("0") => Some(false),
-            Some("1") => Some(true),
-            _ => None,
-        },
-    )
-}
-
-#[cfg(feature = "cuda")]
 fn cuda_tensor_raw(t: &Tensor) -> Result<(candle_core::CudaDevice, u64, usize)> {
     let dev = match t.device() {
         Device::Cuda(d) => d.clone(),
@@ -521,15 +476,6 @@ fn copy_tensor_data(src: &Tensor, dst: &Tensor) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("state dtod: {e:?}"))?;
     }
     Ok(())
-}
-
-pub const GDN_ROLLBACK_BATCH_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ONE_BATCHED_STATE_COPY_KERNEL_REPLACES_THE_96_PER_SLOT_MEMCPY_DTOD_BITWISE_STATE_PARITY_GATED_SET_0_RESTORES_THE_PER_SLOT_PATH: &str =
-    "NV_Q38_GDN_ROLLBACK_BATCH";
-
-pub fn gdn_rollback_batch_default_on_unless_0() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        GDN_ROLLBACK_BATCH_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ONE_BATCHED_STATE_COPY_KERNEL_REPLACES_THE_96_PER_SLOT_MEMCPY_DTOD_BITWISE_STATE_PARITY_GATED_SET_0_RESTORES_THE_PER_SLOT_PATH,
-    )
 }
 
 #[cfg(feature = "cuda")]
@@ -693,11 +639,6 @@ pub fn gdn_nvfp4_cf_env_opt_in_1_quantizes_on_host_with_the_closed_form_ue4m3_sc
     nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_NVFP4_CF")
 }
 
-pub fn gdn_split_default_on_signed_off_2026_09_03_bit_identical_0_mismatches_over_786432_state_floats_and_6144_output_words_across_160_forced_decode_steps_and_minus_1_97_and_minus_2_07_ms_tok_at_256_and_8192_set_nv_q38_gdn_split_0_for_the_pre_split_step(
-) -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_Q38_GDN_SPLIT")
-}
-
 pub const GDN_SPLIT_STEP_TRADES_ONE_LANE_PRIVATE_KERNEL_FOR_THREE_THAT_SHARE_ONE_LANE_WIDE_PREP_SCRATCH_SO_A_LANE_GROUP_RUNNING_IT_CANNOT_FORK_ITS_PER_LANE_STREAMS: &str =
     "gdn_decode_step_split_bf16 writes qn/kn/g_exp/beta/core scratch sized for ONE lane, so \
      every lane in a group must serialize on the main stream to use it, while \
@@ -727,8 +668,7 @@ pub fn gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungate
 pub fn gdn_split_selected_for_lane_count(m: usize) -> bool {
     let _ = GDN_SPLIT_STEP_TRADES_ONE_LANE_PRIVATE_KERNEL_FOR_THREE_THAT_SHARE_ONE_LANE_WIDE_PREP_SCRATCH_SO_A_LANE_GROUP_RUNNING_IT_CANNOT_FORK_ITS_PER_LANE_STREAMS;
     let _ = GDN_SPLIT_STEP_WIDTH_LADDER_MEASURED_ON_QWEN38_27B_NVFP4_SO_THE_LANE_CAP_IS_NEVER_READ_AS_ARBITRARY;
-    gdn_split_default_on_signed_off_2026_09_03_bit_identical_0_mismatches_over_786432_state_floats_and_6144_output_words_across_160_forced_decode_steps_and_minus_1_97_and_minus_2_07_ms_tok_at_256_and_8192_set_nv_q38_gdn_split_0_for_the_pre_split_step()
-        && m <= gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungated_arm()
+    m <= gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungated_arm()
 }
 
 pub const THE_PER_LANE_GDN_STEP_LOOP_PAYS_ONE_CONV_LAUNCH_AND_ONE_STEP_LAUNCH_PER_LANE_PER_LAYER_WHILE_BOTH_KERNELS_GIVE_EVERY_BLOCK_A_LANE_PRIVATE_CHANNEL_OR_HEAD_SO_THE_LANES_ARE_ONE_MORE_GRID_DIMENSION: &str =
@@ -755,7 +695,7 @@ pub const GDN_GROUP_LANE_STATE_POINTERS_RIDE_KERNEL_PARAMS_NOT_A_DEVICE_ARRAY_BE
      launches' single state pointer already is";
 
 pub const GDN_LANES_GROUP_IS_IMPLIED_BY_THE_BATCH_LANE_POOL_BECAUSE_WITHOUT_IT_RAISING_THE_LANE_COUNT_REGRESSES_N8_AGGREGATE_117P4_VS_176P7_TOK_S_AND_THE_IDENTITY_SUITE_PROVES_IT_COSTS_NO_BITS: &str =
-    "the batch path batches only the qkv/z/ab projection GEMM and then runs PER-LANE conv+step      kernels, so the GDN conv and step are serial in the lane count (2m launches per layer).      Measured on a live N-parallel streaming ladder at 8 lanes: without this arm N=8 reads 117.4      tok/s aggregate, WORSE than the 4-lane pool's 142.8; with it N=8 reads 176.7 and 8 lanes      finally beats 4. gdn_lanes_group_identity proves lanes 1..16 bit-identical in mixed, gated,      conv_state and recurrent_state, so arming it with the pool costs no bits.      NV_Q38_GDN_LANES_GROUP=0 still forces the per-lane loop";
+    "the batch path batches only the qkv/z/ab projection GEMM and then runs PER-LANE conv+step      kernels, so the GDN conv and step are serial in the lane count (2m launches per layer).      Measured on a live N-parallel streaming ladder at 8 lanes: without this arm N=8 reads 117.4      tok/s aggregate, WORSE than the 4-lane pool's 142.8; with it N=8 reads 176.7 and 8 lanes      finally beats 4. gdn_lanes_group_identity proves lanes 1..16 bit-identical in mixed, gated,      conv_state and recurrent_state, so arming it with the pool costs no bits";
 
 pub fn gdn_lanes_group_env_opt_in_nv_q38_gdn_lanes_group_1_one_conv_and_one_step_launch_span_the_group(
 ) -> bool {
@@ -765,7 +705,6 @@ pub fn gdn_lanes_group_env_opt_in_nv_q38_gdn_lanes_group_1_one_conv_and_one_step
         .map(str::trim)
     {
         Some("1") => true,
-        Some("0") => false,
         _ => matches!(
             std::env::var("NV_Q38_BATCH").ok().as_deref().map(str::trim),
             Some("1")
@@ -790,7 +729,6 @@ pub fn gdn_lanes_group_selected_for_lane_count(m: usize) -> bool {
 pub fn gdn_lanes_group_takes_the_split_step_form_when_the_split_arm_is_set(m: usize) -> bool {
     let _ = THE_GROUP_FORM_REMOVES_THE_VERY_MECHANISM_THE_SPLIT_STEPS_SIX_LANE_CAP_EXISTS_FOR_SO_A_GROUP_SPANNING_SPLIT_IS_NOT_CAPPED_AT_SIX;
     gdn_lanes_group_selected_for_lane_count(m)
-        && gdn_split_default_on_signed_off_2026_09_03_bit_identical_0_mismatches_over_786432_state_floats_and_6144_output_words_across_160_forced_decode_steps_and_minus_1_97_and_minus_2_07_ms_tok_at_256_and_8192_set_nv_q38_gdn_split_0_for_the_pre_split_step()
 }
 
 pub const A_NULLED_GDN_SUBSTAGE_SERVES_MEANINGLESS_TOKENS_BY_CONSTRUCTION_BECAUSE_IT_WRITES_ZEROS_INSTEAD_OF_ITS_FUNCTION_AND_ONLY_THE_GRAPHED_STEP_DELTA_AGAINST_THE_SAME_SESSIONS_UNNULLED_CELL_IS_A_MEASUREMENT: &str =
@@ -844,9 +782,6 @@ pub fn gdn_qkvz_one_env_read_per_call_so_the_kill_switch_works_mid_process() -> 
 pub const GDN_QKVZ_ONE_UNDER_VERIFY_TC_KEEPS_THE_DUAL_E4M3_MK_GEMV_FOR_THE_VERIFY_ROWS_WHERE_THE_LT_GEMM_PAYS_61_PLUS_49_US_AGAINST_88_AT_M4_ON_THE_STAGE_BENCH:
     &str = "NV_Q38_GDN_QKVZ_ONE_UNDER_VERIFY_TC";
 
-pub const GDN_MROW_FP8MMA_ENV_1_ROUTES_THE_VERIFY_ROW_QKV_AND_Z_PROJECTIONS_TO_THE_E4M3_F16MMA_KERNEL_INSTEAD_OF_CUBLASLT:
-    &str = "NV_Q38_GDN_MROW_FP8MMA";
-
 pub fn q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11(
     raw: Option<&std::ffi::OsStr>,
 ) -> bool {
@@ -868,16 +803,6 @@ mod q38_projection_user_signed_default_tests {
     }
 }
 
-pub const GDN_MROW_FP8MMA_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_00232_TILED_PLUS_0_00056_FREEFORM_MINUS_0_00964_MEAN_MINUS_0_00225_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_42_LEDGER_16384_M4_24_3_TO_23_6_SET_0_TO_RESTORE_CUBLASLT:
-    &str = "temp/q38-coord/reports/host-runs/fusedtc-42-fp8mma-graphed-walk.log";
-
-pub fn gdn_mrow_fp8mma_env_opt_in_1_reread_every_call() -> bool {
-    let _ = GDN_MROW_FP8MMA_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_00232_TILED_PLUS_0_00056_FREEFORM_MINUS_0_00964_MEAN_MINUS_0_00225_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_42_LEDGER_16384_M4_24_3_TO_23_6_SET_0_TO_RESTORE_CUBLASLT;
-    q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11(
-        std::env::var_os(GDN_MROW_FP8MMA_ENV_1_ROUTES_THE_VERIFY_ROW_QKV_AND_Z_PROJECTIONS_TO_THE_E4M3_F16MMA_KERNEL_INSTEAD_OF_CUBLASLT).as_deref(),
-    )
-}
-
 #[cfg(feature = "cuda")]
 pub fn e4m3_mrows_f16mma_projection(
     lin: &Linear,
@@ -897,7 +822,13 @@ pub fn e4m3_mrows_f16mma_projection(
     };
     let k = lin.in_features();
     let n = lin.out_features();
-    if !k.is_multiple_of(128) || x_c.dtype() != DType::BF16 || x_c.elem_count() != m * k {
+    let k_multiple_the_kernel_accepts =
+        unsafe { nv_kernels::cuda::gemm_e4m3_mrows_f16mma_k_multiple() };
+    if k_multiple_the_kernel_accepts <= 0
+        || !k.is_multiple_of(k_multiple_the_kernel_accepts as usize)
+        || x_c.dtype() != DType::BF16
+        || x_c.elem_count() != m * k
+    {
         return Ok(None);
     }
     let stream = crate::cuda_stream::current_stream(dev);
@@ -937,32 +868,6 @@ pub fn e4m3_mrows_f16mma_projection(
         candle_core::op::BackpropOp::none(),
         false,
     )))
-}
-
-pub const GDN_MROW_FP8MMA_OUT_ENV_1_ROUTES_THE_VERIFY_ROW_OUT_PROJ_TO_THE_E4M3_F16MMA_KERNEL_INSTEAD_OF_CUBLASLT:
-    &str = "NV_Q38_GDN_MROW_FP8MMA_OUT";
-
-pub const GDN_MROW_FP8MMA_OUT_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_01521_TILED_MINUS_0_00250_FREEFORM_MINUS_0_00561_MEAN_PLUS_0_00237_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_46_LEDGER_16384_M4_23_50_23_80_TO_23_07_23_28_SET_0_TO_RESTORE_CUBLASLT:
-    &str = "temp/q38-coord/reports/host-runs/fusedtc-46-outab-graphed-walk.log";
-
-pub fn gdn_mrow_fp8mma_out_env_opt_in_1_reread_every_call() -> bool {
-    let _ = GDN_MROW_FP8MMA_OUT_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_NLL_DELTA_AGENTIC_PLUS_0_01521_TILED_MINUS_0_00250_FREEFORM_MINUS_0_00561_MEAN_PLUS_0_00237_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_46_LEDGER_16384_M4_23_50_23_80_TO_23_07_23_28_SET_0_TO_RESTORE_CUBLASLT;
-    q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11(
-        std::env::var_os(GDN_MROW_FP8MMA_OUT_ENV_1_ROUTES_THE_VERIFY_ROW_OUT_PROJ_TO_THE_E4M3_F16MMA_KERNEL_INSTEAD_OF_CUBLASLT).as_deref(),
-    )
-}
-
-pub const GDN_AB_ROWS_GEMV_ENV_1_RUNS_THE_VERIFY_ROW_A_AND_B_PROJECTIONS_AS_ONE_GEMV_BF16_ROWS_LAUNCH_BITWISE_THE_M1_GEMV_PER_ROW:
-    &str = "NV_Q38_GDN_AB_ROWS_GEMV";
-
-pub const GDN_AB_ROWS_GEMV_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_BITWISE_THE_M1_DECODE_ROW_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_OUTAB_VS_CTL_NLL_DELTA_AGENTIC_MINUS_0_01538_TILED_MINUS_0_00484_FREEFORM_PLUS_0_01241_MEAN_MINUS_0_00260_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_46_LEDGER_16384_M4_23_54_TO_23_22_SET_0_TO_RESTORE_THE_TWO_CUBLASLT_LAUNCHES:
-    &str = "temp/q38-coord/reports/host-runs/fusedtc-46-outab-graphed-walk.log";
-
-pub fn gdn_ab_rows_gemv_env_opt_in_1_reread_every_call() -> bool {
-    let _ = GDN_AB_ROWS_GEMV_DEFAULT_ON_USER_SIGN_OFF_2026_09_11_BITWISE_THE_M1_DECODE_ROW_ON_THE_GRAPHED_ENGINE_WALK_AT_172032_OUTAB_VS_CTL_NLL_DELTA_AGENTIC_MINUS_0_01538_TILED_MINUS_0_00484_FREEFORM_PLUS_0_01241_MEAN_MINUS_0_00260_ALL_INSIDE_BAND_LOG_HOST_RUNS_FUSEDTC_46_LEDGER_16384_M4_23_54_TO_23_22_SET_0_TO_RESTORE_THE_TWO_CUBLASLT_LAUNCHES;
-    q38_verify_projection_default_on_from_raw_user_sign_off_2026_09_11(
-        std::env::var_os(GDN_AB_ROWS_GEMV_ENV_1_RUNS_THE_VERIFY_ROW_A_AND_B_PROJECTIONS_AS_ONE_GEMV_BF16_ROWS_LAUNCH_BITWISE_THE_M1_GEMV_PER_ROW).as_deref(),
-    )
 }
 
 #[cfg(feature = "cuda")]
@@ -1029,10 +934,6 @@ pub fn gdn_qkvz_one_under_verify_tc_env_opt_in_1_reread_every_call() -> bool {
     nv_config::env_arm_opt_in_eq_some_1_reread_every_call(
         GDN_QKVZ_ONE_UNDER_VERIFY_TC_KEEPS_THE_DUAL_E4M3_MK_GEMV_FOR_THE_VERIFY_ROWS_WHERE_THE_LT_GEMM_PAYS_61_PLUS_49_US_AGAINST_88_AT_M4_ON_THE_STAGE_BENCH,
     )
-}
-
-pub fn gdn_ab_one_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_AB_ONE")
 }
 
 #[cfg(feature = "cuda")]
@@ -1297,9 +1198,6 @@ fn ab_rows_one_gemm_bf16_mk_launch_bit_identical_to_the_per_lane_gemv_loop(
     {
         return Ok(None);
     }
-    if std::env::var("NV_LINEAR_BF16_FORCE_CUBLAS").is_ok() {
-        return Ok(None);
-    }
     let Some(w) = ab.weight() else {
         return Ok(None);
     };
@@ -1355,19 +1253,6 @@ pub const GDN_AB_WIDE_ROWS_STOP_AT_THE_KMAXGEMMM_TEMPLATE_CAP_THE_KERNEL_REFUSES
 
 pub fn gdn_prenorm_fold_env_read_per_call_so_the_kill_switch_works_mid_process() -> bool {
     nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_GDN_PRENORM_FOLD")
-}
-
-pub fn gdn_chunk_split_default_on_inside_mrow_kill_switch_nv_q38_gdn_chunk_split_0() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_Q38_GDN_CHUNK_SPLIT",
-    )
-}
-
-pub fn verify_gdn_chunk_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_gdn_chunk_0_for_per_row_ckpt_copies(
-) -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_Q38_VERIFY_GDN_CHUNK",
-    )
 }
 
 #[cfg(feature = "cuda")]
@@ -1538,10 +1423,10 @@ pub struct LinearAttention {
     #[cfg(feature = "cuda")]
     ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency:
         Option<Linear>,
+    output_gate_sigmoid_because_qwen4_exp_declares_output_gate_type_sigmoid: bool,
 }
 
 impl LinearAttention {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: LinearAttentionConfig,
         in_proj_qkv: Linear,
@@ -1656,7 +1541,52 @@ impl LinearAttention {
             #[cfg(feature = "cuda")]
             ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency:
                 ab_concat,
+            output_gate_sigmoid_because_qwen4_exp_declares_output_gate_type_sigmoid: false,
         })
+    }
+
+    pub fn train_twin_parts_sharing_the_resident_projections(
+        &self,
+    ) -> (LinearAttentionConfig, [Linear; 5], [Tensor; 4]) {
+        (
+            self.cfg,
+            [
+                self.in_proj_qkv.view_sharing_the_resident_weights_without_a_hook(),
+                self.in_proj_z.view_sharing_the_resident_weights_without_a_hook(),
+                self.in_proj_a.view_sharing_the_resident_weights_without_a_hook(),
+                self.in_proj_b.view_sharing_the_resident_weights_without_a_hook(),
+                self.out_proj.view_sharing_the_resident_weights_without_a_hook(),
+            ],
+            [
+                self.conv1d_weight.clone(),
+                self.a_log.clone(),
+                self.dt_bias.clone(),
+                self.norm_weight.clone(),
+            ],
+        )
+    }
+
+    pub fn set_output_gate_sigmoid_process_wide_because_the_gdn_kernels_read_one_constant_flag(
+        &mut self,
+        on: bool,
+    ) -> Result<()> {
+        self.output_gate_sigmoid_because_qwen4_exp_declares_output_gate_type_sigmoid = on;
+        #[cfg(feature = "cuda")]
+        {
+            let rc = unsafe { nv_kernels::cuda::gdn_decode_output_gate_sigmoid_set(on as i32) };
+            anyhow::ensure!(rc == 0, "gdn_decode_output_gate_sigmoid_set rc={rc}");
+            let rc = unsafe { nv_kernels::cuda::gdn_prefill_output_gate_sigmoid_set(on as i32) };
+            anyhow::ensure!(rc == 0, "gdn_prefill_output_gate_sigmoid_set rc={rc}");
+        }
+        Ok(())
+    }
+
+    fn output_gate_candle(&self, z_f32: &Tensor) -> Result<Tensor> {
+        if self.output_gate_sigmoid_because_qwen4_exp_declares_output_gate_type_sigmoid {
+            Ok(candle_nn::ops::sigmoid(z_f32)?)
+        } else {
+            Ok(candle_nn::ops::silu(z_f32)?)
+        }
     }
 
     #[cfg(feature = "cuda")]
@@ -2092,8 +2022,9 @@ impl LinearAttention {
                 let core_bf = core.to_dtype(input_dtype)?;
                 let z_re = z.reshape((b, t, n_v, d_v))?;
                 let normed = rmsnorm_last(&core_bf, &self.norm_weight, self.cfg.rms_eps)?;
-                let gate =
-                    candle_nn::ops::silu(&z_re.to_dtype(DType::F32)?)?.to_dtype(input_dtype)?;
+                let gate = self
+                    .output_gate_candle(&z_re.to_dtype(DType::F32)?)?
+                    .to_dtype(input_dtype)?;
                 let gated = normed.mul(&gate)?;
                 let flat = gated.reshape((b, t, value_dim))?;
                 toc!("glue_post_rmsnorm_gate", t0);
@@ -2155,14 +2086,13 @@ impl LinearAttention {
         let pad_left = kernel - 1;
         let _ = (b, t, conv_dim, kernel, pad_left);
         #[cfg(feature = "cuda")]
-        if matches!(conv_in.device(), Device::Cuda(_))
+        if conv_in.device().is_cuda()
             && conv_in.dtype() == DType::BF16
             && self.conv1d_weight.dtype() == DType::BF16
         {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
-            let dev = match conv_in.device() {
-                Device::Cuda(d) => d.clone(),
-                _ => unreachable!(),
+            let Device::Cuda(dev) = conv_in.device().clone() else {
+                unreachable!()
             };
             let stream = crate::cuda_stream::current_stream(&dev);
             let t_in = conv_in.dim(2)?;
@@ -2228,18 +2158,14 @@ impl LinearAttention {
         use cudarc::driver::DevicePtrMut;
         use nv_kernels::cuda as nvk;
 
-        if !chunk_prefill_env_read_per_call_so_one_process_can_ab_both_scan_paths() {
-            return Ok(None);
-        }
         let conv_dim = self.cfg.conv_dim();
         let kernel = self.cfg.linear_conv_kernel_dim;
         let pad_left = kernel - 1;
         if !(2..=8).contains(&kernel) || b * t == 0 {
             return Ok(None);
         }
-        let dev = match qkv_bt.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = qkv_bt.device().clone() else {
+            return Ok(None);
         };
         if qkv_bt.dtype() != DType::BF16 || self.conv1d_weight.dtype() != DType::BF16 {
             return Ok(None);
@@ -2313,7 +2239,6 @@ impl LinearAttention {
     }
 
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn run_fused_chunk_prefill_scan_norm_gate_if_enabled(
         &self,
         mixed: &Tensor,
@@ -2327,9 +2252,6 @@ impl LinearAttention {
         use cudarc::driver::DevicePtrMut;
         use nv_kernels::cuda as nvk;
 
-        if !chunk_prefill_env_read_per_call_so_one_process_can_ab_both_scan_paths() {
-            return Ok(None);
-        }
         let c = &self.cfg;
         if c.linear_key_head_dim != 128
             || c.linear_value_head_dim != 128
@@ -2340,9 +2262,8 @@ impl LinearAttention {
         {
             return Ok(None);
         }
-        let dev = match mixed.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = mixed.device().clone() else {
+            return Ok(None);
         };
         if mixed.dtype() != DType::BF16
             || z.dtype() != DType::BF16
@@ -2428,9 +2349,7 @@ impl LinearAttention {
             };
             anyhow::ensure!(rc == 0, "gdn_prefill_qk_l2norm_from_mixed rc={rc}");
         }
-        let chunk_gemm_armed = b == 1
-            && gdn_chunk_gemm_env_read_per_call_so_one_process_can_ab_both_scan_formulations();
-        if chunk_gemm_armed {
+        if b == 1 {
             static WS_CACHED_PER_STREAM_BECAUSE_A_PER_CALL_GIGABYTE_ALLOC_COSTS_MORE_WALL_THAN_THE_SCAN_SAVES:
                 std::sync::OnceLock<
                     std::sync::Mutex<
@@ -2493,13 +2412,8 @@ impl LinearAttention {
             let (kp, _gk) = kn_dev.device_ptr_mut(&stream);
             let (sp, _gs) = state_dev.device_ptr_mut(&stream);
             let (cp, _gc) = core_dev.device_ptr_mut(&stream);
-            let scan = if gdn_scan_v2_env_read_per_call_so_one_process_can_ab_both_scan_kernels() {
-                nvk::gdn_recurrent_stateful_gqa_bf16out_shfl
-            } else {
-                nvk::gdn_recurrent_stateful_gqa_bf16out
-            };
             let rc = unsafe {
-                scan(
+                nvk::gdn_recurrent_stateful_gqa_bf16out_shfl(
                     stream.cu_stream() as *mut std::ffi::c_void,
                     qp as *const f32,
                     kp as *const f32,
@@ -2518,7 +2432,10 @@ impl LinearAttention {
                     (2 * key_dim) as i32,
                 )
             };
-            anyhow::ensure!(rc == 0, "gdn_recurrent_stateful_gqa_bf16out scan rc={rc}");
+            anyhow::ensure!(
+                rc == 0,
+                "gdn_recurrent_stateful_gqa_bf16out_shfl scan rc={rc}"
+            );
         }
         {
             let (cp, _gc) = core_dev.device_ptr_mut(&stream);
@@ -2560,9 +2477,6 @@ impl LinearAttention {
 
     #[cfg(feature = "cuda")]
     pub fn fused_decode_supported(&self) -> bool {
-        if fused_decode_env() == Some(false) {
-            return false;
-        }
         let c = &self.cfg;
         c.mamba_ssm_dtype == DType::F32
             && c.linear_conv_kernel_dim >= 2
@@ -2689,9 +2603,8 @@ impl LinearAttention {
         if dims != [1, 1, self.cfg.hidden_size] || x.dtype() != DType::BF16 {
             return Ok(None);
         }
-        let dev = match x.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = x.device().clone() else {
+            return Ok(None);
         };
 
         let n_v = self.cfg.linear_num_value_heads;
@@ -2752,7 +2665,6 @@ impl LinearAttention {
     }
 
     #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
     fn fused_decode_conv_step_out_shared_by_plain_and_prenorm_folded_arms(
         &self,
         state: &LinAttnState,
@@ -2868,7 +2780,7 @@ impl LinearAttention {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     eprintln!(
-                        "[linear_attn] NV_Q38_GDN_SPLIT step path active \
+                        "[linear_attn] gdn split step path active \
                          (prep+regstate-vsplit+gate, n_v={n_v} d_k={d_k} d_v={d_v})"
                     );
                 });
@@ -2918,17 +2830,6 @@ impl LinearAttention {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn forward_decode_fused_batch_lanes_projections_once_then_per_lane_step_kernels(
-        &self,
-        x: &Tensor,
-        states: &[&LinAttnState],
-    ) -> Result<Option<Tensor>> {
-        self.forward_decode_fused_batch_lanes_projections_once_then_per_lane_step_kernels_prof(
-            x, states, None, None,
-        )
-    }
-
-    #[cfg(feature = "cuda")]
     pub fn forward_decode_fused_batch_lanes_projections_once_then_per_lane_step_kernels_prof(
         &self,
         x: &Tensor,
@@ -2952,9 +2853,8 @@ impl LinearAttention {
         {
             return Ok(None);
         }
-        let dev = match x.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = x.device().clone() else {
+            return Ok(None);
         };
         let stream = crate::cuda_stream::current_stream(&dev);
         let conv_dim = self.cfg.conv_dim();
@@ -3129,8 +3029,7 @@ impl LinearAttention {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 eprintln!(
-                    "[linear_attn] gdn split lane gate: env={} m={m} cap={} -> split={split_env}",
-                    gdn_split_default_on_signed_off_2026_09_03_bit_identical_0_mismatches_over_786432_state_floats_and_6144_output_words_across_160_forced_decode_steps_and_minus_1_97_and_minus_2_07_ms_tok_at_256_and_8192_set_nv_q38_gdn_split_0_for_the_pre_split_step(),
+                    "[linear_attn] gdn split lane gate: m={m} cap={} -> split={split_env}",
                     gdn_split_max_lanes_env_nv_q38_gdn_split_max_lanes_16_restores_the_ungated_arm()
                 );
             });
@@ -3430,9 +3329,8 @@ impl LinearAttention {
         {
             return Ok(None);
         }
-        let dev = match x_raw.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = x_raw.device().clone() else {
+            return Ok(None);
         };
         let Some((qkv_wq, qkv_scales)) = self
             .in_proj_qkv
@@ -3671,9 +3569,8 @@ impl LinearAttention {
         if !(2..=MROW_VERIFY_CONV_KERNEL_MAX_8_THE_GDN_CONV_CHUNK_KERNEL_K_CAP).contains(&kernel) {
             return Ok(None);
         }
-        let dev = match x.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = x.device().clone() else {
+            return Ok(None);
         };
         let stream = crate::cuda_stream::current_stream(&dev);
 
@@ -3742,13 +3639,12 @@ impl LinearAttention {
                     pair
                 }
                 None => {
-                    let fp8mma = gdn_mrow_fp8mma_env_opt_in_1_reread_every_call();
                     let qkv = match e4m3_mrows_f16mma_projection(
                         &self.in_proj_qkv,
                         &x_c,
                         m,
                         &dev,
-                        fp8mma,
+                        true,
                     )? {
                         Some(t) => t,
                         None => self.in_proj_qkv.forward(&x_c)?.contiguous()?,
@@ -3757,7 +3653,7 @@ impl LinearAttention {
                         p.lap("mrow_in_qkv");
                     }
                     let z =
-                        match e4m3_mrows_f16mma_projection(&self.in_proj_z, &x_c, m, &dev, fp8mma)?
+                        match e4m3_mrows_f16mma_projection(&self.in_proj_z, &x_c, m, &dev, true)?
                         {
                             Some(t) => t,
                             None => self.in_proj_z.forward(&x_c)?.contiguous()?,
@@ -3769,13 +3665,8 @@ impl LinearAttention {
         let ab_one_holder = match &self
             .ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency
         {
-            Some(ab) if gdn_ab_rows_gemv_env_opt_in_1_reread_every_call() => {
-                bf16_rows_gemv_one_launch(ab, &x_c, m, &dev)?
-            }
-            Some(ab) if gdn_ab_one_env_read_per_call_so_the_kill_switch_works_mid_process() => {
-                Some(ab.forward(&x_c)?.contiguous()?)
-            }
-            _ => None,
+            Some(ab) => bf16_rows_gemv_one_launch(ab, &x_c, m, &dev)?,
+            None => None,
         };
         let ab_separate_holder = match &ab_one_holder {
             Some(_) => None,
@@ -3807,18 +3698,6 @@ impl LinearAttention {
                 );
             });
         }
-        if verify_gdn_chunk_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_gdn_chunk_0_for_per_row_ckpt_copies()
-        {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                eprintln!(
-                    "[linear_attn] verify gdn-chunk in-place ckpt arm requested \
-                     (NV_Q38_VERIFY_GDN_CHUNK=1): chunk kernels target the ckpt slab and the \
-                     per-row dtod fan-out is gone when the slab rows are stride-contiguous"
-                );
-            });
-        }
-
         let (_d1, qkv_ptr, _l1) = cuda_tensor_raw(&qkv)?;
         let (_d2, z_ptr, _l2) = cuda_tensor_raw(&z)?;
         let (a_ptr, b_ptr, ab_row_stride) = match (&ab_one_holder, &ab_separate_holder) {
@@ -3827,7 +3706,7 @@ impl LinearAttention {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     eprintln!(
-                        "[linear_attn] NV_Q38_GDN_AB_ONE mrow arm active (ab concat one GEMM, \
+                        "[linear_attn] mrow ab rows gemv active (ab concat one launch, \
                          chunk kernels read stride {})",
                         2 * n_v
                     );
@@ -3864,12 +3743,8 @@ impl LinearAttention {
         let (_d10, rec_state_ptr, _l10) = cuda_tensor_raw(&state.recurrent_state)?;
 
         let key_dim = n_k * d_k;
-        let ckpt_in_place_bases = if verify_gdn_chunk_default_on_champion_stack_signed_off_2026_09_02_set_nv_q38_verify_gdn_chunk_0_for_per_row_ckpt_copies()
-        {
-            ckpt_rows_contiguous_base(&ckpts[..m], conv_row_elems, rec_row_elems)?
-        } else {
-            None
-        };
+        let ckpt_in_place_bases =
+            ckpt_rows_contiguous_base(&ckpts[..m], conv_row_elems, rec_row_elems)?;
         let mut scratch_lease = match ckpt_in_place_bases {
             Some(_) => Some(mrow_verify_scratch_take_or_build(
                 &stream, m, conv_dim, key_dim, value_dim, n_v,
@@ -3994,14 +3869,8 @@ impl LinearAttention {
             p.lap("mrow_conv_chunk");
         }
         gdn_stage_hook::mark(1);
-        anyhow::ensure!(
-            tree_parents_ptr.is_none()
-                || gdn_chunk_split_default_on_inside_mrow_kill_switch_nv_q38_gdn_chunk_split_0(),
-            "m-row verify tree: only the chunk-split state kernel has a parent-forking twin; \
-             unset NV_Q38_GDN_CHUNK_SPLIT=0 for tree rounds"
-        );
         let mut chunk_split_wrote_live_state = false;
-        if gdn_chunk_split_default_on_inside_mrow_kill_switch_nv_q38_gdn_chunk_split_0() {
+        {
             let mut owned_split: Option<(
                 cudarc::driver::CudaSlice<f32>,
                 cudarc::driver::CudaSlice<f32>,
@@ -4221,7 +4090,7 @@ impl LinearAttention {
             &flat,
             m,
             &dev,
-            gdn_mrow_fp8mma_out_env_opt_in_1_reread_every_call(),
+            true,
         )? {
             Some(t) => t,
             None => self.out_proj.forward(&flat)?,
@@ -4309,7 +4178,7 @@ impl LinearAttention {
         let use_fused_conv = {
             #[cfg(feature = "cuda")]
             {
-                matches!(qkv_btc.device(), Device::Cuda(_))
+                qkv_btc.device().is_cuda()
                     && qkv_btc.dtype() == DType::BF16
                     && self.conv1d_weight.dtype() == DType::BF16
                     && pad_left == kernel - 1
@@ -4324,9 +4193,8 @@ impl LinearAttention {
             #[cfg(feature = "cuda")]
             {
                 use cudarc::driver::{DevicePtr, DevicePtrMut};
-                let dev = match qkv_btc.device() {
-                    Device::Cuda(d) => d.clone(),
-                    _ => unreachable!(),
+                let Device::Cuda(dev) = qkv_btc.device().clone() else {
+                    unreachable!()
                 };
                 let stream = crate::cuda_stream::current_stream(&dev);
                 let mut y_dev: cudarc::driver::CudaSlice<half::bf16> =
@@ -4443,7 +4311,9 @@ impl LinearAttention {
         let z_re = z.reshape((b, t, n_v, d_v))?;
 
         let normed = rmsnorm_last(&core_bf, &self.norm_weight, self.cfg.rms_eps)?;
-        let gate = candle_nn::ops::silu(&z_re.to_dtype(DType::F32)?)?.to_dtype(input_dtype)?;
+        let gate = self
+            .output_gate_candle(&z_re.to_dtype(DType::F32)?)?
+            .to_dtype(input_dtype)?;
         let gated = normed.mul(&gate)?;
 
         let flat = gated.reshape((b, t, value_dim))?;
@@ -4474,7 +4344,6 @@ impl LinearAttention {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_gdn_scan(
     q: &Tensor,
     k: &Tensor,
@@ -4499,7 +4368,6 @@ fn run_gdn_scan(
     run_gdn_scan_candle(q, k, v, g_exp, beta, b, t, n_v, d_k, d_v, acc_dtype)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_gdn_scan_candle(
     q: &Tensor,
     k: &Tensor,
@@ -4519,7 +4387,6 @@ fn run_gdn_scan_candle(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_gdn_scan_candle_stateful(
     q: &Tensor,
     k: &Tensor,
@@ -4591,9 +4458,8 @@ fn run_gdn_scan_cuda_f32(
     let g_c = g_exp.to_dtype(DType::F32)?.contiguous()?;
     let beta_c = beta.to_dtype(DType::F32)?.contiguous()?;
 
-    let dev = match q_c.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => unreachable!(),
+    let Device::Cuda(dev) = q_c.device().clone() else {
+        unreachable!()
     };
     let stream = crate::cuda_stream::current_stream(&dev);
 
@@ -4739,9 +4605,8 @@ fn compute_gdn_gating_cuda_bf16(
         return Ok((g.exp()?, beta));
     }
 
-    let dev = match a_c.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => unreachable!(),
+    let Device::Cuda(dev) = a_c.device().clone() else {
+        unreachable!()
     };
     let stream = crate::cuda_stream::current_stream(&dev);
 
@@ -4888,7 +4753,6 @@ fn load_linear_else_fp8_rowscale_dequant_because_q38_mixed_checkpoints_store_gdn
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 fn load_linear_else_fp8_rowscale_resident_because_gdn_decode_bandwidth_wants_1_byte_per_param(
     weights: &WeightLoader,
     module: &str,
@@ -5035,11 +4899,9 @@ fn host_closed_form_nvfp4_linear_same_ue4m3_grid_as_the_dev_kernel_but_error_opt
         _ => anyhow::bail!("NVFP4 Linear requires a CUDA device"),
     };
     let stream = crate::cuda_stream::current_stream(&dev);
-    #[allow(deprecated)]
     let packed_dev = stream
         .clone_htod(&packed)
         .map_err(|e| anyhow::anyhow!("htod closed-form packed: {e:?}"))?;
-    #[allow(deprecated)]
     let scales_dev = stream
         .clone_htod(&scales_sw)
         .map_err(|e| anyhow::anyhow!("htod closed-form scales: {e:?}"))?;
@@ -5102,7 +4964,6 @@ fn load_linear_fp8_resident_quantizing_bf16_checkpoint_modules_because_qwen36_sh
         _ => anyhow::bail!("fp8 resident linear requires a CUDA device"),
     };
     let stream = crate::cuda_stream::current_stream(&dev);
-    #[allow(deprecated)]
     let weight_u8 = stream
         .clone_htod(&weight_bytes)
         .map_err(|e| anyhow::anyhow!(e))?;

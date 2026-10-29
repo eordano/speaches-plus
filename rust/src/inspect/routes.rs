@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path as FsPath, PathBuf};
@@ -18,8 +17,8 @@ use tracing::warn;
 
 use super::audio_store::{wav_header, Channel};
 use super::registry;
+use super::session_dir;
 use super::types::{SessionHistoryEntry, SessionMeta};
-use super::{retention_bytes, retention_count, retention_days, session_dir};
 
 const STREAM_CHUNK: usize = 64 * 1024;
 
@@ -365,12 +364,6 @@ async fn send_line(socket: &mut WebSocket, line: &[u8]) -> bool {
         .is_ok()
 }
 
-pub fn _unused_force_link() {
-    let _ = retention_count();
-    let _ = retention_bytes();
-    let _ = retention_days();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,41 +382,38 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_sid_rejects_traversal_and_overlong() {
+    fn sanitize_sid_rejects_traversal_and_byte_range_matches_pcm16_math() {
         assert_eq!(sanitize_sid("sess_abc-1"), Some("sess_abc-1"));
         assert_eq!(sanitize_sid(""), None);
         assert_eq!(sanitize_sid("../etc/passwd"), None);
         assert_eq!(sanitize_sid(&"a".repeat(65)), None);
+        {
+            assert_eq!(byte_range(0, 0, 16_000), (0, None));
+            assert_eq!(byte_range(100, 200, 16_000), (3200, Some(6400)));
+            assert_eq!(byte_range(1000, 0, 24_000), (48_000, None));
+            let (s, e) = byte_range(u64::MAX, u64::MAX, 24_000);
+            assert!(s > 0 && e.is_some());
+        }
     }
 
     #[test]
-    fn byte_range_matches_pcm16_math() {
-        assert_eq!(byte_range(0, 0, 16_000), (0, None));
-        assert_eq!(byte_range(100, 200, 16_000), (3200, Some(6400)));
-        assert_eq!(byte_range(1000, 0, 24_000), (48_000, None));
-        let (s, e) = byte_range(u64::MAX, u64::MAX, 24_000);
-        assert!(s > 0 && e.is_some());
-    }
-
-    #[test]
-    fn read_range_open_ended_reads_to_eof() {
+    fn read_range_reads_to_eof_open_ended_and_truncates_bounded_reads() {
         let data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
         let (path, mut fh) = temp_file(&data);
         let got = read_range(&mut fh, 50, None).unwrap();
         assert_eq!(got, data[50..]);
         let _ = std::fs::remove_file(&path);
+        {
+            let data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+            let (path, mut fh) = temp_file(&data);
+            let got = read_range(&mut fh, 100, Some(150)).unwrap();
+            assert_eq!(got, data[100..150]);
+            let past = read_range(&mut fh, 190, Some(400)).unwrap();
+            assert_eq!(past, data[190..]);
+            let beyond = read_range(&mut fh, 500, Some(600)).unwrap();
+            assert!(beyond.is_empty());
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
-    #[test]
-    fn read_range_bounded_truncates_at_eof() {
-        let data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
-        let (path, mut fh) = temp_file(&data);
-        let got = read_range(&mut fh, 100, Some(150)).unwrap();
-        assert_eq!(got, data[100..150]);
-        let past = read_range(&mut fh, 190, Some(400)).unwrap();
-        assert_eq!(past, data[190..]);
-        let beyond = read_range(&mut fh, 500, Some(600)).unwrap();
-        assert!(beyond.is_empty());
-        let _ = std::fs::remove_file(&path);
-    }
 }

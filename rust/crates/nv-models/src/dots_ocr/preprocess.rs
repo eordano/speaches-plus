@@ -236,43 +236,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smart_resize_rounds_to_factor() {
+    fn smart_resize_rounds_to_factor_within_the_budget_and_rejects_extreme_aspect() {
         let (h, w) = smart_resize(2200, 1700, PixelBudget::default()).unwrap();
-        assert_eq!(h % FACTOR, 0);
-        assert_eq!(w % FACTOR, 0);
         assert_eq!((h, w), (2212, 1708));
-    }
-
-    #[test]
-    fn smart_resize_shrinks_over_max_pixels() {
-        let budget = PixelBudget {
+        let shrink = PixelBudget {
             min_pixels: 3136,
             max_pixels: 100_000,
         };
-        let (h, w) = smart_resize(2000, 1000, budget).unwrap();
-        assert!(h * w <= budget.max_pixels, "{h}x{w}");
-        assert_eq!(h % FACTOR, 0);
-        assert_eq!(w % FACTOR, 0);
-        let ar = h as f64 / w as f64;
-        assert!((ar - 2.0).abs() < 0.15, "aspect drifted: {ar}");
-    }
-
-    #[test]
-    fn smart_resize_grows_under_min_pixels() {
-        let budget = PixelBudget::default();
-        let (h, w) = smart_resize(10, 10, budget).unwrap();
-        assert!(h * w >= budget.min_pixels, "{h}x{w}");
-        assert_eq!(h % FACTOR, 0);
-        assert_eq!(w % FACTOR, 0);
-    }
-
-    #[test]
-    fn smart_resize_rejects_extreme_aspect() {
+        for (ih, iw, budget) in [
+            (2200usize, 1700usize, PixelBudget::default()),
+            (2000, 1000, shrink),
+            (10, 10, PixelBudget::default()),
+        ] {
+            let (h, w) = smart_resize(ih, iw, budget).unwrap();
+            assert_eq!(h % FACTOR, 0, "{ih}x{iw}");
+            assert_eq!(w % FACTOR, 0, "{ih}x{iw}");
+            assert!(h * w <= budget.max_pixels, "{ih}x{iw} -> {h}x{w}");
+            assert!(h * w >= budget.min_pixels, "{ih}x{iw} -> {h}x{w}");
+            let ar = h as f64 / w as f64;
+            let want = ih as f64 / iw as f64;
+            assert!((ar - want).abs() < 0.15, "aspect drifted: {ar} vs {want}");
+        }
         assert!(smart_resize(1, 500, PixelBudget::default()).is_err());
     }
 
     #[test]
-    fn patchify_is_merge_block_major() {
+    fn patchify_is_merge_block_major_and_prepared_scales_bboxes_back_to_the_original() {
+        let tall = RgbImage::filled(100, 200, [128, 128, 128]);
+        let prep = prepare(&tall, PixelBudget::default()).unwrap();
+        let full = prep.scale_to_orig([0.0, 0.0, prep.resized_w as f32, prep.resized_h as f32]);
+        assert!((full[2] - 100.0).abs() < 1e-3);
+        assert!((full[3] - 200.0).abs() < 1e-3);
         let img = RgbImage::from_fn(FACTOR * 2, FACTOR * 2, |x, y| {
             let px = (x / PATCH_SIZE) as u8;
             let py = (y / PATCH_SIZE) as u8;
@@ -300,14 +294,5 @@ mod tests {
         for (row, (py, px)) in ids.iter().enumerate() {
             assert_eq!(decode(row), (*px as u8, *py as u8), "row {row}");
         }
-    }
-
-    #[test]
-    fn prepared_scales_bbox_back_to_original() {
-        let img = RgbImage::filled(100, 200, [128, 128, 128]);
-        let prep = prepare(&img, PixelBudget::default()).unwrap();
-        let full = prep.scale_to_orig([0.0, 0.0, prep.resized_w as f32, prep.resized_h as f32]);
-        assert!((full[2] - 100.0).abs() < 1e-3);
-        assert!((full[3] - 200.0).abs() < 1e-3);
     }
 }

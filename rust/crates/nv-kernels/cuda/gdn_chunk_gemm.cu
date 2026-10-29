@@ -23,8 +23,7 @@ constexpr size_t LT_WORKSPACE_BYTES_32M_MATCHES_THE_NV_QUANT_DET_HANDLE = 32u * 
 
 struct WsLayout {
     int n;
-    size_t cg, kr, qr, kk, qk, amat, tinv, attn, rhs, wu, kc, stack_a, stack_c, stack_d, sbeta,
-        sstate, ltws, aw_fp8, ak_fp8, aw_scale, ak_scale;
+    size_t cg, kr, qr, attn, rhs, wu, kc, stack_a, aw_fp8, ak_fp8, aw_scale, ak_scale;
     size_t total;
 };
 
@@ -48,20 +47,11 @@ WsLayout layout(int T, int H, int HK) {
     l.cg = take_f32(P * H);
     l.kr = take_bf16(P * HK * 128);
     l.qr = take_bf16(P * HK * 128);
-    l.kk = take_f32((size_t)l.n * HK * C * C);
-    l.qk = take_f32((size_t)l.n * HK * C * C);
-    l.amat = take_f32((size_t)l.n * H * C * C);
-    l.tinv = take_bf16((size_t)l.n * H * C * C);
     l.attn = take_bf16((size_t)l.n * H * C * C);
     l.rhs = take_bf16((size_t)l.n * H * C * 256);
     l.wu = take_bf16((size_t)l.n * H * C * 256);
     l.kc = take_bf16(P * H * 128);
     l.stack_a = take_f32((size_t)l.n * H * R * 128);
-    l.stack_c = take_f32((size_t)l.n * H * R * 128);
-    l.stack_d = take_f32((size_t)l.n * H * R * 128);
-    l.sbeta = take_f32(P * H);
-    l.sstate = take_f32((size_t)H * 128 * 128);
-    l.ltws = take_f32(LT_WORKSPACE_BYTES_32M_MATCHES_THE_NV_QUANT_DET_HANDLE / sizeof(float));
     auto take_fp8 = [&off](size_t elems) {
         off = (off + 3) & ~(size_t)3;
         size_t at = off;
@@ -120,25 +110,6 @@ static cublasLtHandle_t g_handle = nullptr;
 static std::mutex g_mu;
 static std::map<PlanKey, Plan> g_plans;
 
-static bool v3_env_read_per_call_so_one_process_can_ab_split_ladder_vs_inline_out_tails() {
-    const char*
-        V3_DEFAULT_ON_THE_CHAMPION_TAIL_ROWS_Q38_TAILCHAMP_10_OF_10_P_0_002_OVER_MMA_AND_ZERO_RESTORES_THE_OPT_IN_MMA_FWDH_GRAPH_SCALAR_SELECTION =
-            "NV_Q38_GDN_CHUNK_GEMM_V3";
-    const char* v = getenv(
-        V3_DEFAULT_ON_THE_CHAMPION_TAIL_ROWS_Q38_TAILCHAMP_10_OF_10_P_0_002_OVER_MMA_AND_ZERO_RESTORES_THE_OPT_IN_MMA_FWDH_GRAPH_SCALAR_SELECTION);
-    return !(v && strcmp(v, "0") == 0);
-}
-
-static int ckpt_lowp_env_read_per_call_opt_in_fp8_operands_and_16bit_state_in_the_checkpoint_scan() {
-    const char* v = getenv("NV_Q38_GDN_V3_CKPT_LOWP");
-    if (v == nullptr) return 0;
-    if (strcmp(v, "1") == 0) return 1;
-    if (strcmp(v, "f16") == 0 || strcmp(v, "2") == 0) return 2;
-    if (strcmp(v, "3") == 0) return 3;
-    if (strcmp(v, "4") == 0) return 4;
-    return 0;
-}
-
 static bool ckpt_lowp_mma_env_read_per_call_opt_in_the_fp8_mma_two_blocks_per_sm_perf_kernel() {
     const char* v = getenv("NV_Q38_GDN_V3_CKPT_LOWP_MMA");
     return v && strcmp(v, "1") == 0;
@@ -149,40 +120,9 @@ static bool ckpt_fp8_env_read_per_call_opt_in_native_e4m3_mma_fp8_state_and_oper
     return v && strcmp(v, "1") == 0;
 }
 
-static bool ckpt_bf16_default_on_user_signoff_20260912_native_bf16_checkpoint_unset_is_on_0_restores_the_f32_state_kernel() {
-    const char* v = getenv("NV_Q38_GDN_V3_CKPT_BF16");
-    return !(v && strcmp(v, "0") == 0);
-}
-
 static bool ckpt_kstream_env_read_per_call_opt_in_bf16_two_blocks_per_sm_one_reused_operand_buffer() {
     const char* v = getenv("NV_Q38_GDN_V3_CKPT_KSTREAM");
     return v && strcmp(v, "1") == 0;
-}
-
-static bool fold_rearrange_env_read_per_call_default_on_unless_0() {
-    const char* v = getenv("NV_Q38_GDN_PREFILL_FOLD_REARRANGE");
-    return !(v != nullptr && v[0] == '0' && v[1] == '\0');
-}
-
-static constexpr bool tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(const char* v) {
-    return v == nullptr || (v[0] == '1' && v[1] == '\0');
-}
-
-static_assert(tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(nullptr));
-static_assert(tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a("1"));
-static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a("0"));
-static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(""));
-static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a("gate"));
-static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(" 1"));
-static_assert(!tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a("1 "));
-
-static bool tc_env_read_per_call_so_one_process_can_ab_fused_wmma_head_vs_the_cublas_head() {
-    const char*
-        TC_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_XPPL_FAMILY_CERT_PR_20260912_033755_292843_ZERO_RESTORES_CUBLAS_HEAD =
-            "NV_Q38_GDN_PREFILL_TC";
-    const char* v = getenv(
-        TC_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_XPPL_FAMILY_CERT_PR_20260912_033755_292843_ZERO_RESTORES_CUBLAS_HEAD);
-    return tc_default_on_user_sign_off_2026_09_12_xppl_qwen38_family_cert_73131bb1a(v);
 }
 
 static int run_tc_head(
@@ -202,38 +142,6 @@ static int run_tc_head(
     if (prof) prof->lap("tc_fused_head");
     return 0;
 }
-
-static bool graph_env_read_per_call_so_one_process_can_ab_replay_vs_uncaptured() {
-    const char*
-        GRAPH_REPLAYS_THE_TAIL_IN_ONE_LAUNCH_BECAUSE_THE_78_LAUNCH_CHAIN_IS_SUBMISSION_BOUND =
-            "NV_Q38_GDN_CHUNK_GEMM_GRAPH";
-    const char* v = getenv(
-        GRAPH_REPLAYS_THE_TAIL_IN_ONE_LAUNCH_BECAUSE_THE_78_LAUNCH_CHAIN_IS_SUBMISSION_BOUND);
-    return v && strcmp(v, "1") == 0;
-}
-
-enum GraphState {
-    WARMUP_RAN_UNCAPTURED_SO_LT_PLANS_AND_MODULES_EXIST_BEFORE_CAPTURE = 0,
-    GRAPH_READY = 1,
-    CAPTURE_FAILED_STAY_UNCAPTURED = 2,
-};
-
-struct GraphKey {
-    std::array<int64_t, 4> v;
-    bool operator<(const GraphKey& o) const { return v < o.v; }
-};
-
-struct GraphEntry {
-    GraphState state;
-    cudaGraphExec_t exec;
-};
-
-static std::mutex g_graph_mu;
-static std::map<GraphKey, GraphEntry> g_graphs;
-static cudaStream_t
-    g_capture_stream_side_allocated_because_the_callers_legacy_stream_cannot_begin_capture =
-        nullptr;
-static std::atomic<long long> g_graph_replays{0};
 
 static cublasStatus_t plan_for(
     int m, int n, int k, bool trans_a_rm, bool trans_b_rm, GemmMode mode,
@@ -344,37 +252,14 @@ __global__ void cumsum_log_decay_kernel(
     cg[((size_t)s * H + h) * C + c] = buf[c];
 }
 
-__global__ void rearrange_qk_padded_kernel(
-    const float* __restrict__ qn, const float* __restrict__ kn,
-    __nv_bfloat16* __restrict__ qr, __nv_bfloat16* __restrict__ kr, int T, int HK
-) {
-    const int C = 64;
-    int kh = blockIdx.x % HK;
-    int row = blockIdx.x / HK;
-    int s = row / C;
-    int c = row % C;
-    int i = threadIdx.x;
-    int t = s * C + c;
-    size_t dst = (((size_t)s * HK + kh) * C + c) * 128 + i;
-    if (t < T) {
-        size_t src = ((size_t)t * HK + kh) * 128 + i;
-        qr[dst] = __float2bfloat16(qn[src]);
-        kr[dst] = __float2bfloat16(kn[src]);
-    } else {
-        qr[dst] = __float2bfloat16(0.f);
-        kr[dst] = __float2bfloat16(0.f);
-    }
-}
-
 __global__ void materialize_rhs_qb_kc_kernel(
     const float* __restrict__ qn, const float* __restrict__ kn,
     const __nv_bfloat16* __restrict__ mixed, const float* __restrict__ beta,
-    const float* __restrict__ cg, __nv_bfloat16* __restrict__ rhs, float* __restrict__ stack_a,
+    const float* __restrict__ cg, __nv_bfloat16* __restrict__ rhs,
     __nv_bfloat16* __restrict__ kc, int T, int H, int HK, int conv_dim, int v_channel_offset,
     __nv_bfloat16* __restrict__ qr, __nv_bfloat16* __restrict__ kr
 ) {
     const int C = 64;
-    const int R = 192;
     int h = blockIdx.x % H;
     int row = blockIdx.x / H;
     int s = row / C;
@@ -383,7 +268,6 @@ __global__ void materialize_rhs_qb_kc_kernel(
     int t = s * C + c;
     size_t sh = (size_t)s * H + h;
     size_t rhs_at = (sh * C + c) * 256;
-    size_t qb_at = sh * R * 128 + (size_t)(128 + c) * 128;
     size_t kc_at = (sh * C + c) * 128;
     int kh = h / (H / HK);
     const bool kv_group_leader_writes_the_rearranged_qk_once_per_kh = (qr != nullptr) && (h % (H / HK) == 0);
@@ -391,7 +275,6 @@ __global__ void materialize_rhs_qb_kc_kernel(
     if (t >= T) {
         rhs[rhs_at + i] = __float2bfloat16(0.f);
         rhs[rhs_at + 128 + i] = __float2bfloat16(0.f);
-        if (stack_a != nullptr) stack_a[qb_at + i] = 0.f;
         kc[kc_at + i] = __float2bfloat16(0.f);
         if (kv_group_leader_writes_the_rearranged_qk_once_per_kh) {
             qr[qr_dst] = __float2bfloat16(0.f);
@@ -407,94 +290,11 @@ __global__ void materialize_rhs_qb_kc_kernel(
     float vv = __bfloat162float(mixed[(size_t)t * conv_dim + v_channel_offset + (size_t)h * 128 + i]);
     rhs[rhs_at + i] = __float2bfloat16(bt * expf(cg_c) * kv);
     rhs[rhs_at + 128 + i] = __float2bfloat16(bt * vv);
-    if (stack_a != nullptr) stack_a[qb_at + i] = expf(cg_c) * qv;
     kc[kc_at + i] = __float2bfloat16(expf(cg_last - cg_c) * kv);
     if (kv_group_leader_writes_the_rearranged_qk_once_per_kh) {
         qr[qr_dst] = __float2bfloat16(qv);
         kr[qr_dst] = __float2bfloat16(kv);
     }
-}
-
-__global__ void mask_scale_a_attn_kernel(
-    const float* __restrict__ kk, const float* __restrict__ qk,
-    const float* __restrict__ beta, const float* __restrict__ cg,
-    float* __restrict__ amat, __nv_bfloat16* __restrict__ attn, int T, int H, int HK
-) {
-    const int C = 64;
-    int i = blockIdx.x % C;
-    int h = (blockIdx.x / C) % H;
-    int s = blockIdx.x / (C * H);
-    int j = threadIdx.x;
-    int kh = h / (H / HK);
-    size_t sh = (size_t)s * H + h;
-    int t_i = s * C + i;
-    int t_j = s * C + j;
-    size_t src = (((size_t)s * HK + kh) * C + i) * C + j;
-    size_t dst = (sh * C + i) * C + j;
-    float a_v = 0.f;
-    float o_v = 0.f;
-    if (t_i < T && t_j < T) {
-        float ratio = expf(cg[sh * C + i] - cg[sh * C + j]);
-        if (j < i) {
-            a_v = beta[(size_t)t_i * H + h] * ratio * kk[src];
-        }
-        if (j <= i) {
-            o_v = ratio * qk[src];
-        }
-    }
-    amat[dst] = a_v;
-    attn[dst] = __float2bfloat16(o_v);
-}
-
-__global__ void unit_lower_triangular_inverse_bf16out_kernel(
-    const float* __restrict__ amat, __nv_bfloat16* __restrict__ tinv
-) {
-    const int C = 64;
-    int c = threadIdx.x;
-    const float* a = amat + (size_t)blockIdx.x * C * C;
-    __nv_bfloat16* t = tinv + (size_t)blockIdx.x * C * C;
-    __shared__ float a_sh[C][C];
-    __shared__ float t_sh[C][C];
-    for (int i = 0; i < C; ++i) {
-        a_sh[i][c] = a[i * C + c];
-    }
-    __syncthreads();
-    for (int i = 0; i < C; ++i) {
-        float v = (i == c) ? 1.f : 0.f;
-        for (int j = 0; j < i; ++j) {
-            v -= a_sh[i][j] * t_sh[j][c];
-        }
-        t_sh[i][c] = v;
-        __syncthreads();
-    }
-    for (int i = 0; i < C; ++i) {
-        t[i * C + c] = __float2bfloat16(t_sh[i][c]);
-    }
-}
-
-__global__ void add_carry_decay_to_diagonal_kernel(
-    const float* __restrict__ cg, float* __restrict__ stack_a, int H
-) {
-    const int C = 64;
-    const int R = 192;
-    int d = threadIdx.x;
-    size_t sh = (size_t)blockIdx.x;
-    float b_last = expf(cg[sh * C + (C - 1)]);
-    stack_a[sh * R * 128 + (size_t)d * 128 + d] += b_last;
-}
-
-__global__ void writeback_out_bf16_kernel(
-    const float* __restrict__ stack_d, __nv_bfloat16* __restrict__ out, int T, int H
-) {
-    const int C = 64;
-    const int R = 192;
-    int h = blockIdx.x % H;
-    int t = blockIdx.x / H;
-    int i = threadIdx.x;
-    int s = t / C;
-    int c = t % C;
-    size_t src = ((size_t)s * H + h) * R * 128 + (size_t)(128 + c) * 128 + i;
-    out[((size_t)t * H + h) * 128 + i] = __float2bfloat16(stack_d[src]);
 }
 
 constexpr int MMA_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID = 32;
@@ -564,177 +364,6 @@ __global__ void gdn_lowp_quantize_operands_kernel(
         ak_fp8[(sh * C + c) * D + col] = (__nv_fp8_e4m3)fmaxf(-448.f, fminf(448.f, ka));
     }
 }
-
-__global__ void v3_ladder_state_checkpoint_kernel(
-    const __nv_bfloat16* __restrict__ wu, const __nv_bfloat16* __restrict__ kc,
-    const float* __restrict__ cg, float* __restrict__ state_inout,
-    __nv_bfloat16* __restrict__ schk, __nv_bfloat16* __restrict__ vchk, int H, int n, int lowp
-) {
-    using namespace nvcuda;
-    const int C = 64;
-    const int D = 128;
-    const int TC = MMA_TILE_COLS_32_BY_H48_HEADS_MAKES_192_BLOCKS_ONE_WAVE_ON_THE_188_SM_GRID;
-    const int SLD = MMA_STATE_LD_40_PADS_THE_32_COL_TILE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
-    const int ALD = MMA_OPERAND_LD_136_PADS_THE_128_COL_STAGE_SO_FRAGMENT_LOADS_SPREAD_BANKS;
-    const int tile = blockIdx.x;
-    const int h = blockIdx.y;
-    const int j0 = tile * TC;
-    const int tid = threadIdx.x;
-    const int wid = tid >> 5;
-    extern __shared__ unsigned char smem_raw[];
-    float* S = (float*)smem_raw;
-    float* scr = S + D * SLD;
-    float* ecl = scr + C * SLD;
-    __nv_bfloat16* Sb = (__nv_bfloat16*)(ecl + 4);
-    __nv_bfloat16* Aw = Sb + D * SLD;
-    __nv_bfloat16* Ak = Aw + C * ALD;
-    __nv_bfloat16* Us0 = Ak + C * ALD;
-    __nv_bfloat16* Us1 = Us0 + C * SLD;
-    __nv_bfloat16* Vn = Us1 + C * SLD;
-
-    auto stage_wide = [&](__nv_bfloat16* dst, const __nv_bfloat16* src_row0, int src_ld) {
-        for (int i = tid; i < C * 16; i += (int)blockDim.x) {
-            int c = i >> 4;
-            int seg = i & 15;
-            mma_cp_async16(dst + c * ALD + seg * 8, src_row0 + (size_t)c * src_ld + seg * 8);
-        }
-    };
-    auto stage_u = [&](__nv_bfloat16* dst, const __nv_bfloat16* wrow) {
-        for (int i = tid; i < C * 4; i += (int)blockDim.x) {
-            int c = i >> 2;
-            int seg = i & 3;
-            mma_cp_async16(dst + c * SLD + seg * 8, wrow + (size_t)c * 256 + D + j0 + seg * 8);
-        }
-    };
-
-    const int lane_for_fp8 = tid & 31;
-    auto round_operand_fp8_e4m3_perrow_scale_simulates_the_staged_fp8_operand_precision = [&](__nv_bfloat16* buf) {
-        if (!(lowp == 1 || lowp == 2 || lowp == 3)) return;
-        for (int r = wid; r < C; r += 8) {
-            float mx = 0.f;
-            for (int c = lane_for_fp8; c < D; c += 32)
-                mx = fmaxf(mx, fabsf(__bfloat162float(buf[r * ALD + c])));
-            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-            if (lane_for_fp8 == 0) scr[r] = (mx > 1e-12f) ? 448.f / mx : 1.f;
-        }
-        __syncthreads();
-        for (int i = tid; i < C * D; i += (int)blockDim.x) {
-            int r = i / D, c = i % D;
-            float s = scr[r];
-            float f = __bfloat162float(buf[r * ALD + c]);
-            float sc = fmaxf(-448.f, fminf(448.f, f * s));
-            __nv_fp8_e4m3 q = (__nv_fp8_e4m3)sc;
-            buf[r * ALD + c] = __float2bfloat16((float)q / s);
-        }
-        __syncthreads();
-    };
-
-    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
-        int k = idx / TC;
-        int j = idx % TC;
-        float v = state_inout[((size_t)h * D + k) * D + j0 + j];
-        __nv_bfloat16 vb = __float2bfloat16(v);
-        S[k * SLD + j] = (lowp == 1 || lowp == 4) ? __bfloat162float(vb)
-                         : (lowp == 2 ? __half2float(__float2half(v)) : v);
-        Sb[k * SLD + j] = vb;
-        schk[((size_t)h * D + k) * D + j0 + j] = vb;
-    }
-    {
-        const __nv_bfloat16* wrow = wu + (size_t)h * C * 256;
-        stage_wide(Aw, wrow, 256);
-        stage_u(Us0, wrow);
-        mma_cp_async_commit();
-        stage_wide(Ak, kc + (size_t)h * C * D, D);
-        mma_cp_async_commit();
-    }
-
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> fa;
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::col_major> fat;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> fb;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> facc;
-
-    const int m0 = (wid >> 1) * 16;
-    const int n0 = (wid & 1) * 16;
-    const int sm0 = wid * 16;
-
-    for (int sc = 0; sc < n; ++sc) {
-        size_t sh = (size_t)sc * H + h;
-        __nv_bfloat16* Us = (sc & 1) ? Us1 : Us0;
-        if (tid == 0) ecl[0] = expf(cg[sh * C + (C - 1)]);
-        mma_cp_async_wait<1>();
-        __syncthreads();
-        round_operand_fp8_e4m3_perrow_scale_simulates_the_staged_fp8_operand_precision(Aw);
-
-        wmma::fill_fragment(facc, 0.f);
-        for (int kt = 0; kt < D / 16; ++kt) {
-            wmma::load_matrix_sync(fa, Aw + m0 * ALD + kt * 16, ALD);
-            wmma::load_matrix_sync(fb, Sb + kt * 16 * SLD + n0, SLD);
-            wmma::mma_sync(facc, fa, fb, facc);
-        }
-        wmma::store_matrix_sync(scr + m0 * SLD + n0, facc, SLD, wmma::mem_row_major);
-        __syncthreads();
-
-        for (int idx = tid; idx < C * TC; idx += blockDim.x) {
-            int c = idx / TC;
-            int j = idx % TC;
-            __nv_bfloat16 v =
-                __float2bfloat16(__bfloat162float(Us[c * SLD + j]) - scr[c * SLD + j]);
-            Vn[c * SLD + j] = v;
-            vchk[(sh * C + c) * D + j0 + j] = v;
-        }
-        if (sc + 1 < n) {
-            size_t sh1 = (size_t)(sc + 1) * H + h;
-            const __nv_bfloat16* wrow = wu + sh1 * C * 256;
-            stage_wide(Aw, wrow, 256);
-            stage_u((sc & 1) ? Us0 : Us1, wrow);
-            mma_cp_async_commit();
-            mma_cp_async_wait<1>();
-        } else {
-            mma_cp_async_wait<0>();
-        }
-        __syncthreads();
-        round_operand_fp8_e4m3_perrow_scale_simulates_the_staged_fp8_operand_precision(Ak);
-
-        float b_last = ecl[0];
-        for (int nt = 0; nt < TC / 16; ++nt) {
-            wmma::load_matrix_sync(facc, S + sm0 * SLD + nt * 16, SLD, wmma::mem_row_major);
-            for (int i = 0; i < facc.num_elements; ++i) facc.x[i] *= b_last;
-            for (int kt = 0; kt < C / 16; ++kt) {
-                wmma::load_matrix_sync(fat, Ak + kt * 16 * ALD + sm0, ALD);
-                wmma::load_matrix_sync(fb, Vn + kt * 16 * SLD + nt * 16, SLD);
-                wmma::mma_sync(facc, fat, fb, facc);
-            }
-            wmma::store_matrix_sync(S + sm0 * SLD + nt * 16, facc, SLD, wmma::mem_row_major);
-        }
-        __syncwarp();
-        for (int idx = tid & 31; idx < 16 * TC; idx += 32) {
-            int r = idx / TC;
-            int j = idx % TC;
-            float sval = S[(sm0 + r) * SLD + j];
-            __nv_bfloat16 vb = __float2bfloat16(sval);
-            Sb[(sm0 + r) * SLD + j] = vb;
-            if (lowp == 1 || lowp == 4) S[(sm0 + r) * SLD + j] = __bfloat162float(vb);
-            else if (lowp == 2) S[(sm0 + r) * SLD + j] = __half2float(__float2half(sval));
-            if (sc + 1 < n) {
-                schk[(((size_t)(sc + 1) * H + h) * D + sm0 + r) * D + j0 + j] = vb;
-            }
-        }
-        __syncthreads();
-        if (sc + 1 < n) {
-            stage_wide(Ak, kc + ((size_t)(sc + 1) * H + h) * C * D, D);
-            mma_cp_async_commit();
-        }
-    }
-    for (int idx = tid; idx < D * TC; idx += blockDim.x) {
-        int k = idx / TC;
-        int j = idx % TC;
-        state_inout[((size_t)h * D + k) * D + j0 + j] = S[k * SLD + j];
-    }
-}
-
-constexpr size_t V3_LADDER_SMEM_BYTES_91K_TWO_PRODUCT_CHAIN_FITS_UNDER_THE_MMA_TAILS_93K =
-    (size_t)(128 * 40 + 64 * 40 + 4) * sizeof(float) +
-    (size_t)(128 * 40 + 2 * 64 * 136 + 2 * 64 * 40 + 64 * 40) * sizeof(__nv_bfloat16);
 
 constexpr int V3_LOWP_OPERAND_LD_128_FP8_UNPADDED_KEEPS_16B_CP_ASYNC_ALIGNMENT = 128;
 
@@ -1659,51 +1288,6 @@ constexpr size_t V3_OUT_SMEM_BYTES_87K_ONE_SHOT_STAGE_NO_PIPELINE_BLOCKS_OVERLAP
     (size_t)(64 + 8 * 16 * 20) * sizeof(float) +
     (size_t)(128 * 136 + 2 * 64 * 136 + 64 * 72) * sizeof(__nv_bfloat16);
 
-static int run_head(
-    cudaStream_t s, const WsLayout& l, float* workspace, const float* beta,
-    int T, int H, int HK, StageProf* prof
-) {
-    const int C = SUBCHUNK_64_MATCHES_FLA_CHUNK_SIZE_AND_KEEPS_DECAY_RATIOS_ABOVE_F32_UNDERFLOW;
-    const int n = l.n;
-    float* cg = workspace + l.cg;
-    __nv_bfloat16* kr = (__nv_bfloat16*)(workspace + l.kr);
-    __nv_bfloat16* qr = (__nv_bfloat16*)(workspace + l.qr);
-    float* kk = workspace + l.kk;
-    float* qk = workspace + l.qk;
-    float* amat = workspace + l.amat;
-    __nv_bfloat16* tinv = (__nv_bfloat16*)(workspace + l.tinv);
-    __nv_bfloat16* attn = (__nv_bfloat16*)(workspace + l.attn);
-    __nv_bfloat16* rhs = (__nv_bfloat16*)(workspace + l.rhs);
-    __nv_bfloat16* wu = (__nv_bfloat16*)(workspace + l.wu);
-    float* ltws = workspace + l.ltws;
-    const GemmMode bf_in = GEMM_BF16_IN_F32_OUT_TENSOR_CORES_WITH_F32_ACCUM;
-    const GemmMode bf_all = GEMM_BF16_ALL_TENSOR_CORES_WITH_F32_ACCUM;
-
-    cublasStatus_t st;
-    st = gemm_rm(s, ltws, C, C, 128, false, true, bf_in, 1.f, kr, 128, (long long)C * 128, kr,
-                 128, (long long)C * 128, 0.f, kk, kk, C, (long long)C * C, n * HK);
-    if (st != CUBLAS_STATUS_SUCCESS) return -6;
-    st = gemm_rm(s, ltws, C, C, 128, false, true, bf_in, 1.f, qr, 128, (long long)C * 128, kr,
-                 128, (long long)C * 128, 0.f, qk, qk, C, (long long)C * C, n * HK);
-    if (st != CUBLAS_STATUS_SUCCESS) return -6;
-    if (prof) prof->lap("kk_qk_gemms");
-
-    mask_scale_a_attn_kernel<<<n * H * C, C, 0, s>>>(kk, qk, beta, cg, amat, attn, T, H, HK);
-    cudaError_t ce = cudaGetLastError();
-    if (ce != cudaSuccess) return (int)ce;
-    if (prof) prof->lap("mask_scale");
-    unit_lower_triangular_inverse_bf16out_kernel<<<n * H, C, 0, s>>>(amat, tinv);
-    ce = cudaGetLastError();
-    if (ce != cudaSuccess) return (int)ce;
-    if (prof) prof->lap("tri_inv");
-
-    st = gemm_rm(s, ltws, C, 256, C, false, false, bf_all, 1.f, tinv, C, (long long)C * C, rhs,
-                 256, (long long)C * 256, 0.f, wu, wu, 256, (long long)C * 256, n * H);
-    if (st != CUBLAS_STATUS_SUCCESS) return -6;
-    if (prof) prof->lap("wu_gemm");
-    return 0;
-}
-
 static int run_v3_tail(
     cudaStream_t s, const WsLayout& l, float* workspace, float* state_inout, __nv_bfloat16* out,
     int T, int H, int HK, StageProf* prof
@@ -1712,10 +1296,6 @@ static int run_v3_tail(
     static std::once_flag smem_once;
     static cudaError_t smem_rc = cudaSuccess;
     std::call_once(smem_once, []() {
-        smem_rc = cudaFuncSetAttribute(
-            v3_ladder_state_checkpoint_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)V3_LADDER_SMEM_BYTES_91K_TWO_PRODUCT_CHAIN_FITS_UNDER_THE_MMA_TAILS_93K);
-        if (smem_rc != cudaSuccess) return;
         smem_rc = cudaFuncSetAttribute(
             v3_output_from_checkpoints_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
             (int)V3_OUT_SMEM_BYTES_87K_ONE_SHOT_STAGE_NO_PIPELINE_BLOCKS_OVERLAP_EACH_OTHER);
@@ -1746,17 +1326,12 @@ static int run_v3_tail(
     __nv_bfloat16* vchk =
         schk + (size_t)l.n * H * V3_CHECKPOINTS_ALIAS_THE_STACK_A_RESERVATION_STATE_16384_PLUS_VNEW_8192_BF16_IS_HALF_ITS_F32_ROWS;
     dim3 lgrid(128 / TC, H);
-    const int lowp =
-        ckpt_lowp_env_read_per_call_opt_in_fp8_operands_and_16bit_state_in_the_checkpoint_scan();
     cudaError_t ce;
     if (getenv("NV_Q38_GDN_V3_CKPT_LOWP_MMA_OCC")) {
-        int occ_lowp = 0, occ_def = 0;
+        int occ_lowp = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &occ_lowp, v3_ladder_state_checkpoint_lowp_kernel, 256,
             (int)V3_LOWP_SMEM_BYTES_45K_FP8_OPERANDS_PLUS_BF16_STATE_LET_TWO_BLOCKS_CORESIDE_WITH_THE_CP_ASYNC_DOUBLE_BUFFER_AND_SLD40_KEPT);
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &occ_def, v3_ladder_state_checkpoint_kernel, 256,
-            (int)V3_LADDER_SMEM_BYTES_91K_TWO_PRODUCT_CHAIN_FITS_UNDER_THE_MMA_TAILS_93K);
         int occ_bf16 = 0, occ_ks = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &occ_bf16, v3_ladder_state_checkpoint_bf16_kernel, 256,
@@ -1764,8 +1339,8 @@ static int run_v3_tail(
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &occ_ks, v3_ladder_state_checkpoint_kstream_kernel, 256,
             (int)V3_KSTREAM_SMEM_BYTES_37K_BF16_STATE_ONE_REUSED_OPERAND_BUFFER_TIME_MULTIPLEXED_AW_THEN_AK_LETS_TWO_BLOCKS_CORESIDE_AND_BANK_THE_STRAGGLER_WAVE);
-        fprintf(stderr, "[v3-lowp-occ] lowp_mma=%d/SM default=%d/SM bf16=%d/SM kstream=%d/SM smem_bf16=%zu smem_ks=%zu\n",
-                occ_lowp, occ_def, occ_bf16, occ_ks,
+        fprintf(stderr, "[v3-lowp-occ] lowp_mma=%d/SM bf16=%d/SM kstream=%d/SM smem_bf16=%zu smem_ks=%zu\n",
+                occ_lowp, occ_bf16, occ_ks,
                 V3_BF16_SMEM_BYTES_54K_FULL_BF16_OPERANDS_NATIVE_MMA_NO_CONVERT_NO_PREPASS_ONE_BLOCK_PER_SM_ISOLATES_THE_M16N8K16_HALF_WIDTH_PER_STEP_COST,
                 V3_KSTREAM_SMEM_BYTES_37K_BF16_STATE_ONE_REUSED_OPERAND_BUFFER_TIME_MULTIPLEXED_AW_THEN_AK_LETS_TWO_BLOCKS_CORESIDE_AND_BANK_THE_STRAGGLER_WAVE);
     }
@@ -1798,16 +1373,11 @@ static int run_v3_tail(
                 V3_LOWP_SMEM_BYTES_45K_FP8_OPERANDS_PLUS_BF16_STATE_LET_TWO_BLOCKS_CORESIDE_WITH_THE_CP_ASYNC_DOUBLE_BUFFER_AND_SLD40_KEPT,
                 s>>>(aw8, ak8, awsc, aksc, wu, cg, state_inout, schk, vchk, H, l.n);
         }
-    } else if (ckpt_bf16_default_on_user_signoff_20260912_native_bf16_checkpoint_unset_is_on_0_restores_the_f32_state_kernel()) {
+    } else {
         v3_ladder_state_checkpoint_bf16_kernel<<<
             lgrid, MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP,
             V3_BF16_SMEM_BYTES_54K_FULL_BF16_OPERANDS_NATIVE_MMA_NO_CONVERT_NO_PREPASS_ONE_BLOCK_PER_SM_ISOLATES_THE_M16N8K16_HALF_WIDTH_PER_STEP_COST,
             s>>>(wu, kc, cg, state_inout, schk, vchk, H, l.n);
-    } else {
-        v3_ladder_state_checkpoint_kernel<<<
-            lgrid, MMA_THREADS_256_EIGHT_WARPS_ONE_16X16_WMMA_OUTPUT_TILE_PER_WARP,
-            V3_LADDER_SMEM_BYTES_91K_TWO_PRODUCT_CHAIN_FITS_UNDER_THE_MMA_TAILS_93K, s>>>(
-            wu, kc, cg, state_inout, schk, vchk, H, l.n, lowp);
     }
     ce = cudaGetLastError();
     if (ce != cudaSuccess) return (int)ce;
@@ -1823,142 +1393,11 @@ static int run_v3_tail(
     return 0;
 }
 
-static int run_stack_tail(
-    cudaStream_t s, const WsLayout& l, float* workspace, const float* state0,
-    int T, int H, int HK, StageProf* prof
-) {
-    const int C = SUBCHUNK_64_MATCHES_FLA_CHUNK_SIZE_AND_KEEPS_DECAY_RATIOS_ABOVE_F32_UNDERFLOW;
-    const int R = STACK_ROWS_192_IS_STATE_128_PLUS_OUT_64_SO_THE_CARRY_IS_ONE_GEMM_PER_SUBCHUNK;
-    const int n = l.n;
-    float* cg = workspace + l.cg;
-    __nv_bfloat16* attn = (__nv_bfloat16*)(workspace + l.attn);
-    __nv_bfloat16* wu = (__nv_bfloat16*)(workspace + l.wu);
-    __nv_bfloat16* kc = (__nv_bfloat16*)(workspace + l.kc);
-    float* stack_a = workspace + l.stack_a;
-    float* stack_c = workspace + l.stack_c;
-    float* stack_d = workspace + l.stack_d;
-    float* ltws = workspace + l.ltws;
-    const GemmMode bf_in = GEMM_BF16_IN_F32_OUT_TENSOR_CORES_WITH_F32_ACCUM;
-
-    cublasStatus_t st;
-    st = gemm_rm(s, ltws, C, 128, C, false, false, bf_in, 1.f, attn, C, (long long)C * C,
-                 wu + 128, 256, (long long)C * 256, 0.f, stack_c + (size_t)128 * 128,
-                 stack_c + (size_t)128 * 128, 128, (long long)R * 128, n * H);
-    if (st != CUBLAS_STATUS_SUCCESS) return -6;
-    st = gemm_rm(s, ltws, C, 128, C, false, false, bf_in, -1.f, attn, C, (long long)C * C, wu,
-                 256, (long long)C * 256, 1.f, stack_a + (size_t)128 * 128,
-                 stack_a + (size_t)128 * 128, 128, (long long)R * 128, n * H);
-    if (st != CUBLAS_STATUS_SUCCESS) return -6;
-    if (prof) prof->lap("oloc_qeff_gemms");
-    st = gemm_rm(s, ltws, 128, 128, C, true, false, bf_in, -1.f, kc, 128, (long long)C * 128, wu,
-                 256, (long long)C * 256, 0.f, stack_a, stack_a, 128, (long long)R * 128, n * H);
-    if (st != CUBLAS_STATUS_SUCCESS) return -6;
-    st = gemm_rm(s, ltws, 128, 128, C, true, false, bf_in, 1.f, kc, 128, (long long)C * 128,
-                 wu + 128, 256, (long long)C * 256, 0.f, stack_c, stack_c, 128,
-                 (long long)R * 128, n * H);
-    if (st != CUBLAS_STATUS_SUCCESS) return -6;
-
-    add_carry_decay_to_diagonal_kernel<<<n * H, 128, 0, s>>>(cg, stack_a, H);
-    cudaError_t ce = cudaGetLastError();
-    if (ce != cudaSuccess) return (int)ce;
-    if (prof) prof->lap("p_g_gemms_diag");
-
-    for (int sc = 0; sc < n; ++sc) {
-        size_t at = (size_t)sc * H * R * 128;
-        const float* s_prev = sc == 0 ? state0 : stack_d + (size_t)(sc - 1) * H * R * 128;
-        long long s_stride = sc == 0 ? (long long)128 * 128 : (long long)R * 128;
-        st = gemm_rm(s, ltws, R, 128, 128, false, false, GEMM_F32_ALL, 1.f, stack_a + at, 128,
-                     (long long)R * 128, s_prev, 128, s_stride, 1.f, stack_c + at, stack_d + at,
-                     128, (long long)R * 128, H);
-        if (st != CUBLAS_STATUS_SUCCESS) return -6;
-    }
-    if (prof) prof->lap("sequential_carry_gemms");
-    return 0;
-}
-
-static int run_tail(
-    cudaStream_t s, const WsLayout& l, float* workspace, const float* beta, const float* state0,
-    int T, int H, int HK, StageProf* prof
-) {
-    int rc = run_head(s, l, workspace, beta, T, H, HK, prof);
-    if (rc != 0) return rc;
-    return run_stack_tail(s, l, workspace, state0, T, H, HK, prof);
-}
-
-static int run_graph_tail(
-    cudaStream_t s, const WsLayout& l, float* workspace, const float* sbeta, const float* sstate,
-    int T, int H, int HK
-) {
-    std::lock_guard<std::mutex> lock(g_graph_mu);
-    GraphKey key{{T, H, HK, (int64_t)(uintptr_t)workspace}};
-    auto it = g_graphs.find(key);
-    if (it == g_graphs.end()) {
-        int rc = run_tail(s, l, workspace, sbeta, sstate, T, H, HK, nullptr);
-        if (rc == 0) {
-            g_graphs.emplace(
-                key,
-                GraphEntry{WARMUP_RAN_UNCAPTURED_SO_LT_PLANS_AND_MODULES_EXIST_BEFORE_CAPTURE,
-                           nullptr});
-        }
-        return rc;
-    }
-    GraphEntry& e = it->second;
-    if (e.state == WARMUP_RAN_UNCAPTURED_SO_LT_PLANS_AND_MODULES_EXIST_BEFORE_CAPTURE) {
-        cudaStream_t& cs =
-            g_capture_stream_side_allocated_because_the_callers_legacy_stream_cannot_begin_capture;
-        if (cs == nullptr && cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking) != cudaSuccess) {
-            cs = nullptr;
-            e.state = CAPTURE_FAILED_STAY_UNCAPTURED;
-            fprintf(stderr, "[gdn-chunk-gemm-graph] side stream create failed; staying uncaptured\n");
-        } else if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeRelaxed) != cudaSuccess) {
-            e.state = CAPTURE_FAILED_STAY_UNCAPTURED;
-            fprintf(stderr, "[gdn-chunk-gemm-graph] begin capture failed; staying uncaptured\n");
-        } else {
-            int rc = run_tail(cs, l, workspace, sbeta, sstate, T, H, HK, nullptr);
-            cudaGraph_t graph = nullptr;
-            cudaError_t ce = cudaStreamEndCapture(cs, &graph);
-            if (rc != 0 || ce != cudaSuccess || graph == nullptr) {
-                if (graph != nullptr) cudaGraphDestroy(graph);
-                e.state = CAPTURE_FAILED_STAY_UNCAPTURED;
-                fprintf(stderr, "[gdn-chunk-gemm-graph] capture failed rc=%d ce=%d; staying uncaptured\n",
-                        rc, (int)ce);
-            } else {
-                size_t n_nodes = 0;
-                cudaGraphGetNodes(graph, nullptr, &n_nodes);
-                cudaGraphExec_t exec = nullptr;
-                ce = cudaGraphInstantiate(&exec, graph, 0);
-                cudaGraphDestroy(graph);
-                if (ce != cudaSuccess || exec == nullptr) {
-                    e.state = CAPTURE_FAILED_STAY_UNCAPTURED;
-                    fprintf(stderr, "[gdn-chunk-gemm-graph] instantiate failed ce=%d; staying uncaptured\n",
-                            (int)ce);
-                } else {
-                    fprintf(stderr, "[gdn-chunk-gemm-graph] captured T=%d H=%d HK=%d nodes=%zu\n",
-                            T, H, HK, n_nodes);
-                    e.exec = exec;
-                    e.state = GRAPH_READY;
-                }
-            }
-        }
-    }
-    if (e.state != GRAPH_READY) {
-        return run_tail(s, l, workspace, sbeta, sstate, T, H, HK, nullptr);
-    }
-    cudaError_t ce = cudaGraphLaunch(e.exec, s);
-    if (ce != cudaSuccess) return (int)ce;
-    g_graph_replays.fetch_add(1, std::memory_order_relaxed);
-    return 0;
-}
-
 }
 
 extern "C" long long nv_kernels_gdn_chunk_gemm_scan_workspace_elems(int T, int H, int HK) {
     if (T <= 0 || H <= 0 || HK <= 0) return 0;
     return (long long)gdn_chunk_gemm::layout(T, H, HK).total;
-}
-
-extern "C" long long nv_kernels_gdn_chunk_gemm_graph_replays_total() {
-    return gdn_chunk_gemm::g_graph_replays.load(std::memory_order_relaxed);
 }
 
 constexpr long long TREE_MAT_ELEMS_128X128_ONE_CHUNK_CARRY_TRANSITION_IS_A_FULL_STATE_SQUARE_MATRIX =
@@ -2055,69 +1494,19 @@ extern "C" int nv_kernels_gdn_chunk_gemm_scan_f32(
     __nv_bfloat16* qr = (__nv_bfloat16*)(workspace + l.qr);
     __nv_bfloat16* rhs = (__nv_bfloat16*)(workspace + l.rhs);
     __nv_bfloat16* kc = (__nv_bfloat16*)(workspace + l.kc);
-    float* stack_a = workspace + l.stack_a;
-    float* stack_d = workspace + l.stack_d;
 
     StageProf prof{prof_armed_nv_gdn_chunk_gemm_prof_1_syncs_every_stage_so_never_in_timed_runs(),
                    s, std::chrono::steady_clock::now()};
-    const bool v3_armed =
-        v3_env_read_per_call_so_one_process_can_ab_split_ladder_vs_inline_out_tails();
-    const bool tc_armed =
-        tc_env_read_per_call_so_one_process_can_ab_fused_wmma_head_vs_the_cublas_head();
-    const bool fold_rearrange_into_materialize_default_on_bitwise_the_group_leader_head_writes_qr_kr_from_the_qn_kn_it_already_loads =
-        fold_rearrange_env_read_per_call_default_on_unless_0();
     cumsum_log_decay_kernel<<<n * H, C, 0, s>>>(g_exp, cg, T, H);
-    if (!fold_rearrange_into_materialize_default_on_bitwise_the_group_leader_head_writes_qr_kr_from_the_qn_kn_it_already_loads) {
-        rearrange_qk_padded_kernel<<<n * C * HK, 128, 0, s>>>(qn, kn, qr, kr, T, HK);
-    }
     materialize_rhs_qb_kc_kernel<<<n * C * H, 128, 0, s>>>(
-        qn, kn, (const __nv_bfloat16*)mixed, beta, cg, rhs,
-        v3_armed ? nullptr : stack_a, kc, T, H, HK,
-        conv_dim, v_channel_offset,
-        fold_rearrange_into_materialize_default_on_bitwise_the_group_leader_head_writes_qr_kr_from_the_qn_kn_it_already_loads ? qr : nullptr,
-        fold_rearrange_into_materialize_default_on_bitwise_the_group_leader_head_writes_qr_kr_from_the_qn_kn_it_already_loads ? kr : nullptr);
+        qn, kn, (const __nv_bfloat16*)mixed, beta, cg, rhs, kc, T, H, HK,
+        conv_dim, v_channel_offset, qr, kr);
     cudaError_t ce = cudaGetLastError();
     if (ce != cudaSuccess) return (int)ce;
     prof.lap("materialize");
 
-    if (v3_armed) {
-        int rc = tc_armed
-            ? run_tc_head(s, l, workspace, beta, T, H, HK, prof.on ? &prof : nullptr)
-            : run_head(s, l, workspace, beta, T, H, HK, prof.on ? &prof : nullptr);
-        if (rc != 0) return rc;
-        rc = run_v3_tail(s, l, workspace, state_inout, (__nv_bfloat16*)out, T, H, HK,
-                         prof.on ? &prof : nullptr);
-        if (rc != 0) return rc;
-        return 0;
-    }
-
-    const bool graph_armed =
-        !prof.on && graph_env_read_per_call_so_one_process_can_ab_replay_vs_uncaptured();
-    int rc;
-    if (graph_armed) {
-        float* sbeta = workspace + l.sbeta;
-        float* sstate = workspace + l.sstate;
-        ce = cudaMemcpyAsync(sbeta, beta, (size_t)T * H * sizeof(float),
-                             cudaMemcpyDeviceToDevice, s);
-        if (ce != cudaSuccess) return (int)ce;
-        ce = cudaMemcpyAsync(sstate, state_inout, (size_t)H * 128 * 128 * sizeof(float),
-                             cudaMemcpyDeviceToDevice, s);
-        if (ce != cudaSuccess) return (int)ce;
-        rc = run_graph_tail(s, l, workspace, sbeta, sstate, T, H, HK);
-    } else {
-        rc = run_tail(s, l, workspace, beta, state_inout, T, H, HK, &prof);
-    }
+    int rc = run_tc_head(s, l, workspace, beta, T, H, HK, prof.on ? &prof : nullptr);
     if (rc != 0) return rc;
-
-    writeback_out_bf16_kernel<<<T * H, 128, 0, s>>>(stack_d, (__nv_bfloat16*)out, T, H);
-    ce = cudaGetLastError();
-    if (ce != cudaSuccess) return (int)ce;
-    const int R = STACK_ROWS_192_IS_STATE_128_PLUS_OUT_64_SO_THE_CARRY_IS_ONE_GEMM_PER_SUBCHUNK;
-    ce = cudaMemcpy2DAsync(state_inout, (size_t)128 * 128 * sizeof(float),
-                           stack_d + (size_t)(n - 1) * H * R * 128,
-                           (size_t)R * 128 * sizeof(float), (size_t)128 * 128 * sizeof(float), H,
-                           cudaMemcpyDeviceToDevice, s);
-    if (ce != cudaSuccess) return (int)ce;
-    prof.lap("writeback_and_state_copy");
-    return 0;
+    return run_v3_tail(s, l, workspace, state_inout, (__nv_bfloat16*)out, T, H, HK,
+                       prof.on ? &prof : nullptr);
 }

@@ -34,6 +34,7 @@ fn lin_butterfly(acc: f32) -> f32 {
 }
 
 fn lin_acc(w_vec_base: u32, ws_base: u32, blocks: u32, kb0: u32) -> f32 {
+    #def b3
     var acc = 0.0;
     for (var kb = kb0; kb < blocks; kb = kb + LIN_STRIDE) {
         let si = ws_base + kb;
@@ -43,6 +44,7 @@ fn lin_acc(w_vec_base: u32, ws_base: u32, blocks: u32, kb0: u32) -> f32 {
         let wv = gemv_w_packed[w_vec_base + kb];
         let xv = gemv_x_packed[kb];
         var dot = 0.0;
+    #end
         dot = gemv_dot8(wv.x, xv.x, dot);
         dot = gemv_dot8(wv.y, xv.y, dot);
         acc = fma(block_scale, dot, acc);
@@ -93,15 +95,7 @@ fn xpre_dot8(ww: u32, xw: u32, dot_in: f32) -> f32 {
 }
 
 fn nodec_acc(w_vec_base: u32, ws_base: u32, blocks: u32, kb0: u32) -> f32 {
-    var acc = 0.0;
-    for (var kb = kb0; kb < blocks; kb = kb + LIN_STRIDE) {
-        let si = ws_base + kb;
-        let ws = byte_at(gemv_w_scales_lin[si >> 2u], si);
-        let xs = byte_at(gemv_x_scales[kb >> 2u], kb);
-        let block_scale = gemv_ue4m3_decode(ws) * gemv_ue4m3_decode(xs);
-        let wv = gemv_w_packed[w_vec_base + kb];
-        let xv = gemv_x_packed[kb];
-        var dot = 0.0;
+    #use b3
         dot = nodec_dot8(wv.x, xv.x, dot);
         dot = nodec_dot8(wv.y, xv.y, dot);
         acc = fma(block_scale, dot, acc);
@@ -110,15 +104,7 @@ fn nodec_acc(w_vec_base: u32, ws_base: u32, blocks: u32, kb0: u32) -> f32 {
 }
 
 fn xpre_acc(w_vec_base: u32, ws_base: u32, blocks: u32, kb0: u32) -> f32 {
-    var acc = 0.0;
-    for (var kb = kb0; kb < blocks; kb = kb + LIN_STRIDE) {
-        let si = ws_base + kb;
-        let ws = byte_at(gemv_w_scales_lin[si >> 2u], si);
-        let xs = byte_at(gemv_x_scales[kb >> 2u], kb);
-        let block_scale = gemv_ue4m3_decode(ws) * gemv_ue4m3_decode(xs);
-        let wv = gemv_w_packed[w_vec_base + kb];
-        let xv = gemv_x_packed[kb];
-        var dot = 0.0;
+    #use b3
         dot = xpre_dot8(wv.x, xv.x, dot);
         dot = xpre_dot8(wv.y, xv.y, dot);
         acc = fma(block_scale, dot, acc);
@@ -133,6 +119,8 @@ fn v3_dot8(ww: u32, x_lo: u32, x_hi: u32, dot_in: f32) -> f32 {
 
 @compute @workgroup_size(128)
 fn gemv_nvfp4_v3(
+    #def b2
+    #def b4
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
@@ -142,6 +130,7 @@ fn gemv_nvfp4_v3(
     let pairs = select(0u, gemv_params.k_blocks >> 1u, row_live);
     let w4_base = select(0u, row * (gemv_params.w_row_words >> 2u), row_live);
     let ws_base = select(0u, row * gemv_params.ws_row_stride, row_live);
+    #end
 
     var acc = 0.0;
     for (var v = lane; v < pairs; v = v + 32u) {
@@ -155,6 +144,7 @@ fn gemv_nvfp4_v3(
         let s0 = gemv_ue4m3_decode(byte_at(wsw, si)) * gemv_ue4m3_decode(byte_at(xsw, kb));
         let s1 = gemv_ue4m3_decode(byte_at(wsw, si + 1u)) * gemv_ue4m3_decode(byte_at(xsw, kb + 1u));
         var d0 = 0.0;
+    #end
         d0 = v3_dot8(wv.x, xa.x, xa.y, d0);
         d0 = v3_dot8(wv.y, xa.z, xa.w, d0);
         acc = fma(s0, d0, acc);
@@ -177,28 +167,7 @@ fn v3_dot8_nodec(ww: u32, x_lo: u32, x_hi: u32, dot_in: f32) -> f32 {
 
 @compute @workgroup_size(128)
 fn gemv_nvfp4_v3_nodec(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row = (wid.x + wid.y * gemv_params.groups_x) * V3_ROWS_PER_WG + sgid;
-    let row_live = row < gemv_params.n_rows;
-    let pairs = select(0u, gemv_params.k_blocks >> 1u, row_live);
-    let w4_base = select(0u, row * (gemv_params.w_row_words >> 2u), row_live);
-    let ws_base = select(0u, row * gemv_params.ws_row_stride, row_live);
-
-    var acc = 0.0;
-    for (var v = lane; v < pairs; v = v + 32u) {
-        let kb = v << 1u;
-        let wv = gemv_w4[w4_base + v];
-        let xa = gemv_x_i8[v << 1u];
-        let xb = gemv_x_i8[(v << 1u) + 1u];
-        let si = ws_base + kb;
-        let wsw = gemv_w_scales_lin[si >> 2u];
-        let xsw = gemv_x_scales[kb >> 2u];
-        let s0 = gemv_ue4m3_decode(byte_at(wsw, si)) * gemv_ue4m3_decode(byte_at(xsw, kb));
-        let s1 = gemv_ue4m3_decode(byte_at(wsw, si + 1u)) * gemv_ue4m3_decode(byte_at(xsw, kb + 1u));
-        var d0 = 0.0;
+    #use b2
         d0 = v3_dot8_nodec(wv.x, xa.x, xa.y, d0);
         d0 = v3_dot8_nodec(wv.y, xa.z, xa.w, d0);
         acc = fma(s0, d0, acc);
@@ -216,15 +185,7 @@ fn gemv_nvfp4_v3_nodec(
 
 @compute @workgroup_size(128)
 fn gemv_nvfp4_v3_stream(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row = (wid.x + wid.y * gemv_params.groups_x) * V3_ROWS_PER_WG + sgid;
-    let row_live = row < gemv_params.n_rows;
-    let pairs = select(0u, gemv_params.k_blocks >> 1u, row_live);
-    let w4_base = select(0u, row * (gemv_params.w_row_words >> 2u), row_live);
-    let ws_base = select(0u, row * gemv_params.ws_row_stride, row_live);
+    #use b4
 
     var bits = 0u;
     for (var v = lane; v < pairs; v = v + 32u) {
@@ -246,6 +207,7 @@ fn gemv_nvfp4_v3_stream(
 
 @compute @workgroup_size(128)
 fn gemv_nvfp4_nodec_sg(
+    #def b1
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
@@ -254,6 +216,7 @@ fn gemv_nvfp4_nodec_sg(
     let row_live = row < gemv_params.n_rows;
     let blocks = select(0u, gemv_params.k_blocks, row_live);
     let w_vec_base = select(0u, row * (gemv_params.w_row_words >> 1u), row_live);
+    #end
     let ws_base = select(0u, row * gemv_params.ws_row_stride, row_live);
 
     let s0 = lin_butterfly(nodec_acc(w_vec_base, ws_base, blocks, 0u * 32u + lane));
@@ -273,14 +236,7 @@ fn gemv_nvfp4_nodec_sg(
 
 @compute @workgroup_size(128)
 fn gemv_nvfp4_xpre_sg(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row = (wid.x + wid.y * gemv_params.groups_x) * LIN_ROWS_PER_WG + sgid;
-    let row_live = row < gemv_params.n_rows;
-    let blocks = select(0u, gemv_params.k_blocks, row_live);
-    let w_vec_base = select(0u, row * (gemv_params.w_row_words >> 1u), row_live);
+    #use b1
     let ws_base = select(0u, row * gemv_params.ws_row_stride, row_live);
 
     let s0 = lin_butterfly(xpre_acc(w_vec_base, ws_base, blocks, 0u * 32u + lane));
@@ -300,14 +256,7 @@ fn gemv_nvfp4_xpre_sg(
 
 @compute @workgroup_size(128)
 fn gemv_nvfp4_lin_sg(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row = (wid.x + wid.y * gemv_params.groups_x) * LIN_ROWS_PER_WG + sgid;
-    let row_live = row < gemv_params.n_rows;
-    let blocks = select(0u, gemv_params.k_blocks, row_live);
-    let w_vec_base = select(0u, row * (gemv_params.w_row_words >> 1u), row_live);
+    #use b1
     let ws_base = select(0u, row * gemv_params.ws_row_stride, row_live);
 
     let s0 = lin_butterfly(lin_acc(w_vec_base, ws_base, blocks, 0u * 32u + lane));
@@ -327,14 +276,7 @@ fn gemv_nvfp4_lin_sg(
 
 @compute @workgroup_size(128)
 fn gemv_nvfp4_swz_sg(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row = (wid.x + wid.y * gemv_params.groups_x) * LIN_ROWS_PER_WG + sgid;
-    let row_live = row < gemv_params.n_rows;
-    let blocks = select(0u, gemv_params.k_blocks, row_live);
-    let w_vec_base = select(0u, row * (gemv_params.w_row_words >> 1u), row_live);
+    #use b1
     let scale_row = select(0u, row, row_live);
 
     let s0 = lin_butterfly(swz_acc(w_vec_base, scale_row, blocks, 0u * 32u + lane));
@@ -354,14 +296,7 @@ fn gemv_nvfp4_swz_sg(
 
 @compute @workgroup_size(128)
 fn gemv_nvfp4_noscale_sg(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row = (wid.x + wid.y * gemv_params.groups_x) * LIN_ROWS_PER_WG + sgid;
-    let row_live = row < gemv_params.n_rows;
-    let blocks = select(0u, gemv_params.k_blocks, row_live);
-    let w_vec_base = select(0u, row * (gemv_params.w_row_words >> 1u), row_live);
+    #use b1
 
     let s0 = lin_butterfly(noscale_acc(w_vec_base, blocks, 0u * 32u + lane));
     let s1 = lin_butterfly(noscale_acc(w_vec_base, blocks, 1u * 32u + lane));

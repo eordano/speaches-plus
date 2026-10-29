@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
@@ -128,29 +126,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_module_stays_inside_the_measured_browser_caps() {
-        assert!(
-            !WGSL.contains("subgroup"),
-            "no subgroup ops, no directive split needed"
-        );
-        assert!(!WGSL.contains("enable "), "no enable directives");
-        assert!(!WGSL.contains("f16"), "f32 only");
-        assert_eq!(WGSL.matches("@workgroup_size(256)").count(), 2);
-        assert_eq!(WGSL.matches("var<storage").count(), 5);
-        assert_eq!(WGSL.matches("var<workgroup>").count(), 1);
-        assert_eq!(SCRATCH_BYTES, 1024);
-        const { assert!(SCRATCH_BYTES <= 32768) };
-    }
-
-    #[test]
-    fn params_keep_the_sixteen_byte_uniform_layout() {
-        assert_eq!(std::mem::size_of::<ConvSiluBwdParams>(), 16);
-    }
-
-    #[test]
-    fn both_entries_are_declared() {
-        let s = compose(WGSL);
-        assert!(s.contains("fn q38_conv_silu_bwd_dx("));
-        assert!(s.contains("fn q38_conv_silu_bwd_dw("));
+    fn the_module_stays_inside_the_measured_browser_caps_with_both_entries_and_its_uniform_layout()
+    {
+        {
+            assert!(
+                !WGSL.contains("subgroup"),
+                "no subgroup ops, no directive split needed"
+            );
+            assert!(!WGSL.contains("enable "), "no enable directives");
+            assert!(!WGSL.contains("f16"), "f32 only");
+            assert_eq!(WGSL.matches("@workgroup_size(256)").count(), 2);
+            assert_eq!(WGSL.matches("var<storage").count(), 5);
+            assert_eq!(WGSL.matches("var<workgroup>").count(), 1);
+            assert_eq!(SCRATCH_BYTES, 1024);
+            const { assert!(SCRATCH_BYTES <= 32768) };
+        }
+        {
+            assert_eq!(std::mem::size_of::<ConvSiluBwdParams>(), 16);
+        }
+        {
+            let s = compose(WGSL);
+            assert!(s.contains("fn q38_conv_silu_bwd_dx("));
+            assert!(s.contains("fn q38_conv_silu_bwd_dw("));
+        }
     }
 }

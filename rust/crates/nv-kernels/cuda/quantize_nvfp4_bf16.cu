@@ -145,10 +145,12 @@ __global__ void quantize_nvfp4_bf16_per_expert_kernel(
     int m_per_expert,
     int m_total,
     int K,
-    int row_mul
+    int row_mul,
+    const int32_t* __restrict__ padding_rows_skipped_where_negative
 ) {
     int row = blockIdx.x * row_mul;
     if (row >= m_total) return;
+    if (padding_rows_skipped_where_negative && padding_rows_skipped_where_negative[row] < 0) return;
     int expert_idx = row / m_per_expert;
     float stored = stored_globals[expert_idx];
     if (stored == 0.f || !isfinite(stored)) stored = 1.f;
@@ -196,10 +198,12 @@ __global__ void silu_mul_quantize_nvfp4_bf16_per_expert_kernel(
     int m_per_expert,
     int m_total,
     int K,
-    int row_mul
+    int row_mul,
+    const int32_t* __restrict__ padding_rows_skipped_where_negative
 ) {
     int row = blockIdx.x * row_mul;
     if (row >= m_total) return;
+    if (padding_rows_skipped_where_negative && padding_rows_skipped_where_negative[row] < 0) return;
     int expert_idx = row / m_per_expert;
     float stored = stored_globals[expert_idx];
     if (stored == 0.f || !isfinite(stored)) stored = 1.f;
@@ -260,7 +264,7 @@ extern "C" int nv_kernels_silu_mul_quantize_nvfp4_bf16_per_expert(
         reinterpret_cast<const __nv_bfloat16*>(y_gate_bf16),
         reinterpret_cast<const __nv_bfloat16*>(y_up_bf16),
         packed_out, scales_out_swizzled,
-        stored_globals, m_per_expert, m_total, K, 1
+        stored_globals, m_per_expert, m_total, K, 1, nullptr
     );
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : (int)e;
@@ -286,7 +290,7 @@ extern "C" int nv_kernels_silu_mul_quantize_nvfp4_bf16_per_expert_strided(
         reinterpret_cast<const __nv_bfloat16*>(y_gate_bf16),
         reinterpret_cast<const __nv_bfloat16*>(y_up_bf16),
         packed_out, scales_out_swizzled,
-        stored_globals, m_per_expert, m_total, K, m_per_expert
+        stored_globals, m_per_expert, m_total, K, m_per_expert, nullptr
     );
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : (int)e;
@@ -310,7 +314,7 @@ extern "C" int nv_kernels_quantize_nvfp4_bf16_per_expert(
         packed_out,
         scales_out_swizzled,
         stored_globals,
-        m_per_expert, m_total, K, 1
+        m_per_expert, m_total, K, 1, nullptr
     );
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : (int)e;
@@ -336,7 +340,7 @@ extern "C" int nv_kernels_quantize_nvfp4_bf16_per_expert_strided(
         packed_out,
         scales_out_swizzled,
         stored_globals,
-        m_per_expert, m_total, K, m_per_expert
+        m_per_expert, m_total, K, m_per_expert, nullptr
     );
     cudaError_t e = cudaGetLastError();
     return (e == cudaSuccess) ? 0 : (int)e;
@@ -446,4 +450,54 @@ extern "C" int nv_kernels_quantize_nvfp4_silu_candle_bf16(
         reinterpret_cast<const __nv_bfloat16*>(up),
         packed_out, scales_out, stored_global, m_padded, m_logical, K, sf_blk_rows);
     return (int)cudaGetLastError();
+}
+
+extern "C" int nv_kernels_quantize_nvfp4_bf16_per_expert_real_rows(
+    void* stream,
+    const uint16_t* x_bf16,
+    uint8_t* packed_out,
+    uint8_t* scales_out_swizzled,
+    const float* stored_globals,
+    int m_per_expert,
+    int m_total,
+    int K,
+    const int32_t* row_src
+) {
+    if (m_total <= 0 || K <= 0 || m_per_expert <= 0) return 0;
+    if ((K % 16) != 0) return -1;
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    quantize_nvfp4_bf16_per_expert_kernel<<<m_total, 256, 0, s>>>(
+        reinterpret_cast<const __nv_bfloat16*>(x_bf16),
+        packed_out,
+        scales_out_swizzled,
+        stored_globals,
+        m_per_expert, m_total, K, 1, row_src
+    );
+    cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : (int)e;
+}
+
+extern "C" int nv_kernels_silu_mul_quantize_nvfp4_bf16_per_expert_real_rows(
+    void* stream,
+    const uint16_t* y_gate_bf16,
+    const uint16_t* y_up_bf16,
+    uint8_t* packed_out,
+    uint8_t* scales_out_swizzled,
+    const float* stored_globals,
+    int m_per_expert,
+    int m_total,
+    int K,
+    const int32_t* row_src
+) {
+    if (m_total <= 0 || K <= 0 || m_per_expert <= 0) return 0;
+    if ((K % 16) != 0) return -1;
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    silu_mul_quantize_nvfp4_bf16_per_expert_kernel<<<m_total, 256, 0, s>>>(
+        reinterpret_cast<const __nv_bfloat16*>(y_gate_bf16),
+        reinterpret_cast<const __nv_bfloat16*>(y_up_bf16),
+        packed_out, scales_out_swizzled,
+        stored_globals, m_per_expert, m_total, K, 1, row_src
+    );
+    cudaError_t e = cudaGetLastError();
+    return (e == cudaSuccess) ? 0 : (int)e;
 }

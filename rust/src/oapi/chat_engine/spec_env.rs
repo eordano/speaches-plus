@@ -91,11 +91,6 @@ pub(crate) fn chat_gate() -> &'static ChatGate {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn chat_semaphore() -> Arc<tokio::sync::Semaphore> {
-    chat_gate().sem.clone()
-}
-
-#[cfg(feature = "cuda")]
 pub(crate) async fn acquire_chat_permit() -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
     let g = chat_gate();
     acquire_permit_bounded(g.sem.clone(), g.permits, g.queue).await
@@ -232,29 +227,12 @@ pub(crate) fn env_flag_enabled(raw: Option<&str>) -> bool {
     raw.is_some_and(|v| v != "0")
 }
 
-pub(crate) fn spec_defer_drafter_from(raw: Option<&str>) -> bool {
-    raw != Some("0")
-}
-
-pub(crate) fn eagle3_graph_chain_from(raw: Option<&str>) -> bool {
-    raw != Some("0")
-}
-
 pub(crate) fn spec_requested(no_spec: bool, use_eagle3_set: bool, draft_dir_set: bool) -> bool {
     !no_spec && (use_eagle3_set || draft_dir_set)
 }
 
 pub(crate) fn spec_gate_for_request(no_spec: bool, use_eagle3_set: bool, greedy: bool) -> bool {
     !no_spec && (use_eagle3_set || greedy)
-}
-
-#[cfg(feature = "cuda")]
-pub(crate) fn spec_gate_for_request_env(greedy: bool) -> bool {
-    spec_gate_for_request(
-        nv_no_spec(std::env::var("NV_NO_SPEC").ok().as_deref()),
-        env_flag_enabled(std::env::var("NV_USE_EAGLE3").ok().as_deref()),
-        greedy,
-    )
 }
 
 #[cfg(feature = "cuda")]
@@ -298,24 +276,6 @@ pub(crate) const SPEC_VERIFY_HEADROOM: usize = 16;
 pub(crate) const SPEC_PREFILL_CHUNK_MIN: usize = 16;
 pub(crate) const SPEC_PREFILL_CHUNK_MAX: usize = 65535;
 pub(crate) const SPEC_PREFILL_CHUNK_DEFAULT: usize = 1024;
-
-pub(crate) fn resolve_cond_mode(raw: Option<&str>, use_drafter_kv: bool) -> (String, bool, bool) {
-    let requested = raw.unwrap_or("shift");
-    let (mode, forced) = match requested {
-        "shift-force" => ("shift", true),
-        m => (m, false),
-    };
-    if use_drafter_kv || forced {
-        return (mode.to_string(), forced, false);
-    }
-
-    let needs_downgrade = matches!(mode, "shift" | "bonus");
-    if needs_downgrade {
-        (String::new(), false, true)
-    } else {
-        (mode.to_string(), false, false)
-    }
-}
 
 pub(crate) fn spec_prefill_chunk(raw: Option<&str>) -> usize {
     let requested = match raw {
@@ -428,33 +388,24 @@ pub(crate) fn adaptive_k_graph(raw_max: Option<&str>, k_env: usize) -> usize {
     m.clamp(EAGLE3_K_MIN, EAGLE3_K_MAX).max(k_env)
 }
 #[cfg(feature = "cuda")]
+#[cfg(test)]
 pub(crate) const SPEC_SNAPSHOT_KEYS: &[&str] = &[
     "NV_ADAPTIVE_K",
     "NV_ADAPTIVE_K_MAX",
     "NV_DEBUG_DETERMINISM",
     "NV_DEBUG_GRAPH",
-    "NV_DFLASH_GRAPH_EAGER",
     "NV_DFLASH_K",
     "NV_DFLASH_K_PROSE",
-    "NV_DFLASH_NO_GRAPH",
     "NV_DRAFTER",
     "NV_DRAFTER_AUTO_SWITCH_TOKENS",
-    "NV_EAGLE3_COND",
-    "NV_EAGLE3_GRAPH_CHAIN",
     "NV_EAGLE3_K",
-    "NV_EAGLE3_NO_DEVICE_CHAIN",
-    "NV_EAGLE3_NO_DRAFTER_KV",
-    "NV_EAGLE3_NO_GRAPH_CACHE",
     "NV_EAGLE3_TREE",
     "NV_EAGLE3_UNGRAPHED",
-    "NV_MK_VERIFY_HD512",
     "NV_NO_SPEC",
     "NV_PROF_CHAT",
     "NV_PROF_PREFILL",
     "NV_ROUTE_CTX_GATE",
     "NV_SPEC_CTX_DISABLE",
-    "NV_SPEC_DEFER_DRAFTER",
-    "NV_SPEC_NO_GPU_ACCEPT",
     "NV_SPEC_PREFILL_CHUNK",
     "NV_SUFFIX_DRAFTER",
     "NV_SUFFIX_MIN_MATCH",
@@ -467,28 +418,18 @@ pub(crate) struct SpecEnvSnapshot {
     pub(crate) adaptive_k_max: Option<String>,
     pub(crate) debug_determinism: bool,
     pub(crate) debug_graph: bool,
-    pub(crate) dflash_graph_eager: bool,
     pub(crate) dflash_k: Option<String>,
     pub(crate) dflash_k_prose: Option<String>,
-    pub(crate) dflash_no_graph: bool,
     pub(crate) drafter: Option<String>,
     pub(crate) drafter_auto_switch_tokens: Option<String>,
-    pub(crate) eagle3_cond: Option<String>,
-    pub(crate) eagle3_graph_chain: Option<String>,
     pub(crate) eagle3_k: Option<String>,
-    pub(crate) eagle3_no_device_chain: bool,
-    pub(crate) eagle3_no_drafter_kv: bool,
-    pub(crate) eagle3_no_graph_cache: bool,
     pub(crate) eagle3_tree: bool,
     pub(crate) eagle3_ungraphed: Option<String>,
-    pub(crate) mk_verify_hd512: Option<String>,
     pub(crate) no_spec: Option<String>,
     pub(crate) prof_chat: Option<String>,
     pub(crate) prof_prefill: bool,
     pub(crate) route_ctx_gate: Option<String>,
     pub(crate) spec_ctx_disable: Option<String>,
-    pub(crate) spec_defer_drafter: Option<String>,
-    pub(crate) spec_no_gpu_accept: bool,
     pub(crate) spec_prefill_chunk: Option<String>,
     pub(crate) suffix_drafter: Option<String>,
     pub(crate) suffix_min_match: Option<String>,
@@ -509,28 +450,18 @@ impl SpecEnvSnapshot {
             adaptive_k_max: get("NV_ADAPTIVE_K_MAX"),
             debug_determinism: has("NV_DEBUG_DETERMINISM"),
             debug_graph: has("NV_DEBUG_GRAPH"),
-            dflash_graph_eager: has("NV_DFLASH_GRAPH_EAGER"),
             dflash_k: get("NV_DFLASH_K"),
             dflash_k_prose: get("NV_DFLASH_K_PROSE"),
-            dflash_no_graph: has("NV_DFLASH_NO_GRAPH"),
             drafter: get("NV_DRAFTER"),
             drafter_auto_switch_tokens: get("NV_DRAFTER_AUTO_SWITCH_TOKENS"),
-            eagle3_cond: get("NV_EAGLE3_COND"),
-            eagle3_graph_chain: get("NV_EAGLE3_GRAPH_CHAIN"),
             eagle3_k: get("NV_EAGLE3_K"),
-            eagle3_no_device_chain: has("NV_EAGLE3_NO_DEVICE_CHAIN"),
-            eagle3_no_drafter_kv: has("NV_EAGLE3_NO_DRAFTER_KV"),
-            eagle3_no_graph_cache: has("NV_EAGLE3_NO_GRAPH_CACHE"),
             eagle3_tree: get("NV_EAGLE3_TREE").is_some(),
             eagle3_ungraphed: get("NV_EAGLE3_UNGRAPHED"),
-            mk_verify_hd512: get("NV_MK_VERIFY_HD512"),
             no_spec: get("NV_NO_SPEC"),
             prof_chat: get("NV_PROF_CHAT"),
             prof_prefill: has("NV_PROF_PREFILL"),
             route_ctx_gate: get("NV_ROUTE_CTX_GATE"),
             spec_ctx_disable: get("NV_SPEC_CTX_DISABLE"),
-            spec_defer_drafter: get("NV_SPEC_DEFER_DRAFTER"),
-            spec_no_gpu_accept: has("NV_SPEC_NO_GPU_ACCEPT"),
             spec_prefill_chunk: get("NV_SPEC_PREFILL_CHUNK"),
             suffix_drafter: get("NV_SUFFIX_DRAFTER"),
             suffix_min_match: get("NV_SUFFIX_MIN_MATCH"),
@@ -544,10 +475,9 @@ impl SpecEnvSnapshot {
         }
         format!(
             "drafter={} no_spec={} use_eagle3={} eagle3_k={} dflash_k={} dflash_k_prose={} \
-             adaptive_k={} adaptive_k_max={} cond={} graph_chain={} prefill_chunk={} \
-             ctx_disable={} route_ctx_gate={} auto_switch_tokens={} defer_drafter={} suffix={} suffix_min={} ungraphed={} tree={} hd512={} \
-             no_drafter_kv={} no_graph_cache={} no_device_chain={} no_gpu_accept={} \
-             dflash_no_graph={} dflash_graph_eager={} prof_prefill={} debug_det={} debug_graph={}",
+             adaptive_k={} adaptive_k_max={} prefill_chunk={} ctx_disable={} route_ctx_gate={} \
+             auto_switch_tokens={} suffix={} suffix_min={} ungraphed={} tree={} prof_prefill={} \
+             debug_det={} debug_graph={}",
             s(&self.drafter),
             s(&self.no_spec),
             s(&self.use_eagle3),
@@ -556,24 +486,14 @@ impl SpecEnvSnapshot {
             s(&self.dflash_k_prose),
             s(&self.adaptive_k),
             s(&self.adaptive_k_max),
-            s(&self.eagle3_cond),
-            s(&self.eagle3_graph_chain),
             s(&self.spec_prefill_chunk),
             s(&self.spec_ctx_disable),
             s(&self.route_ctx_gate),
             s(&self.drafter_auto_switch_tokens),
-            s(&self.spec_defer_drafter),
             s(&self.suffix_drafter),
             s(&self.suffix_min_match),
             s(&self.eagle3_ungraphed),
             self.eagle3_tree,
-            s(&self.mk_verify_hd512),
-            self.eagle3_no_drafter_kv,
-            self.eagle3_no_graph_cache,
-            self.eagle3_no_device_chain,
-            self.spec_no_gpu_accept,
-            self.dflash_no_graph,
-            self.dflash_graph_eager,
             self.prof_prefill,
             self.debug_determinism,
             self.debug_graph,
@@ -594,7 +514,7 @@ mod chat_queue_tests {
 
     #[test]
     #[allow(clippy::assertions_on_constants)]
-    fn concurrency_default_is_a_backstop_above_what_vram_admission_allows() {
+    fn concurrency_default_is_a_backstop_and_the_env_overrides_in_both_directions() {
         assert_eq!(
             NV_CHAT_CONCURRENCY_DEFAULT, 16,
             "the semaphore is a safety backstop, not the throughput limiter; VRAM admission \
@@ -607,33 +527,29 @@ mod chat_queue_tests {
             "backstop must sit strictly above the measured VRAM-admission fit"
         );
         assert_eq!(chat_permits(None), NV_CHAT_CONCURRENCY_DEFAULT);
+        {
+            assert_eq!(chat_permits(Some("1")), 1);
+            assert_eq!(chat_permits(Some("3")), 3);
+            assert_eq!(chat_permits(Some(" 32 ")), 32);
+            assert_eq!(chat_permits(Some("999")), NV_CHAT_CONCURRENCY_MAX);
+            assert_eq!(chat_permits(Some("0")), NV_CHAT_CONCURRENCY_DEFAULT);
+            assert_eq!(chat_permits(Some("")), NV_CHAT_CONCURRENCY_DEFAULT);
+            assert_eq!(chat_permits(Some("lots")), NV_CHAT_CONCURRENCY_DEFAULT);
+        }
     }
 
     #[test]
-    fn concurrency_env_still_overrides_in_both_directions() {
-        assert_eq!(chat_permits(Some("1")), 1);
-        assert_eq!(chat_permits(Some("3")), 3);
-        assert_eq!(chat_permits(Some(" 32 ")), 32);
-        assert_eq!(chat_permits(Some("999")), NV_CHAT_CONCURRENCY_MAX);
-        assert_eq!(chat_permits(Some("0")), NV_CHAT_CONCURRENCY_DEFAULT);
-        assert_eq!(chat_permits(Some("")), NV_CHAT_CONCURRENCY_DEFAULT);
-        assert_eq!(chat_permits(Some("lots")), NV_CHAT_CONCURRENCY_DEFAULT);
-    }
-
-    #[test]
-    fn queue_ms_defaults_when_unset_or_garbage() {
+    fn queue_ms_defaults_when_unset_or_garbage_and_parses_with_zero_meaning_no_wait() {
         assert_eq!(chat_queue_ms(None), NV_CHAT_QUEUE_MS_DEFAULT);
         assert_eq!(chat_queue_ms(Some("")), NV_CHAT_QUEUE_MS_DEFAULT);
         assert_eq!(chat_queue_ms(Some("soon")), NV_CHAT_QUEUE_MS_DEFAULT);
         assert_eq!(chat_queue_ms(Some("-1")), NV_CHAT_QUEUE_MS_DEFAULT);
         assert_eq!(NV_CHAT_QUEUE_MS_DEFAULT, 3000);
-    }
-
-    #[test]
-    fn queue_ms_parses_and_zero_means_no_wait() {
-        assert_eq!(chat_queue_ms(Some("500")), 500);
-        assert_eq!(chat_queue_ms(Some(" 12000 ")), 12000);
-        assert_eq!(chat_queue_ms(Some("0")), 0);
+        {
+            assert_eq!(chat_queue_ms(Some("500")), 500);
+            assert_eq!(chat_queue_ms(Some(" 12000 ")), 12000);
+            assert_eq!(chat_queue_ms(Some("0")), 0);
+        }
     }
 
     #[tokio::test]
@@ -714,36 +630,34 @@ mod drafter_dim_tests {
     }
 
     #[test]
-    fn the_shipped_pair_is_accepted() {
+    fn the_shipped_pair_is_accepted_and_the_31b_speculator_is_rejected_against_e4b() {
         assert_eq!(
             drafter_target_mismatch(&gemma4_31b(), &speculator_31b()),
             Vec::<String>::new()
         );
+        {
+            let problems = drafter_target_mismatch(&gemma4_e4b(), &speculator_31b());
+            assert_eq!(
+                problems.len(),
+                2,
+                "expected exactly the hidden-size and aux-layer-range disagreements, got {problems:?}"
+            );
+            assert!(problems[0].contains("hidden_size"), "{problems:?}");
+            assert!(problems[0].contains("16128"), "{problems:?}");
+            assert!(problems[0].contains("5376"), "{problems:?}");
+            assert!(problems[0].contains("2560"), "{problems:?}");
+            assert!(problems[0].contains("7680"), "{problems:?}");
+            assert!(
+                problems[1].contains("aux_hidden_state_layer_ids"),
+                "{problems:?}"
+            );
+            assert!(problems[1].contains("57"), "{problems:?}");
+            assert!(problems[1].contains("42"), "{problems:?}");
+        }
     }
 
     #[test]
-    fn the_31b_speculator_is_rejected_against_e4b() {
-        let problems = drafter_target_mismatch(&gemma4_e4b(), &speculator_31b());
-        assert_eq!(
-            problems.len(),
-            2,
-            "expected exactly the hidden-size and aux-layer-range disagreements, got {problems:?}"
-        );
-        assert!(problems[0].contains("hidden_size"), "{problems:?}");
-        assert!(problems[0].contains("16128"), "{problems:?}");
-        assert!(problems[0].contains("5376"), "{problems:?}");
-        assert!(problems[0].contains("2560"), "{problems:?}");
-        assert!(problems[0].contains("7680"), "{problems:?}");
-        assert!(
-            problems[1].contains("aux_hidden_state_layer_ids"),
-            "{problems:?}"
-        );
-        assert!(problems[1].contains("57"), "{problems:?}");
-        assert!(problems[1].contains("42"), "{problems:?}");
-    }
-
-    #[test]
-    fn hidden_size_check_mirrors_the_runtime_ensure() {
+    fn hidden_size_and_aux_count_checks_mirror_the_runtime_ensure() {
         for (n_aux, hidden) in [(3usize, 5376usize), (2, 2560), (5, 4096)] {
             let d = DrafterDims {
                 fc_in_dim: n_aux * hidden,
@@ -761,34 +675,30 @@ mod drafter_dim_tests {
             off_by_one.hidden_size = hidden + 1;
             assert_eq!(drafter_target_mismatch(&off_by_one, &d).len(), 1);
         }
+        {
+            let d = DrafterDims {
+                fc_in_dim: 3 * 5376,
+                target_vocab_size: 262144,
+                aux_layer_ids: vec![2, 30],
+            };
+            let problems = drafter_target_mismatch(&gemma4_31b(), &d);
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(problems[0].contains("hidden_size"), "{problems:?}");
+        }
+        {
+            let d = DrafterDims {
+                fc_in_dim: 16128,
+                target_vocab_size: 262144,
+                aux_layer_ids: vec![],
+            };
+            let problems = drafter_target_mismatch(&gemma4_31b(), &d);
+            assert_eq!(problems.len(), 1, "{problems:?}");
+            assert!(problems[0].contains("declares none"), "{problems:?}");
+        }
     }
 
     #[test]
-    fn a_right_sized_drafter_with_the_wrong_aux_count_is_rejected() {
-        let d = DrafterDims {
-            fc_in_dim: 3 * 5376,
-            target_vocab_size: 262144,
-            aux_layer_ids: vec![2, 30],
-        };
-        let problems = drafter_target_mismatch(&gemma4_31b(), &d);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("hidden_size"), "{problems:?}");
-    }
-
-    #[test]
-    fn zero_aux_layers_is_rejected_without_dividing_by_zero() {
-        let d = DrafterDims {
-            fc_in_dim: 16128,
-            target_vocab_size: 262144,
-            aux_layer_ids: vec![],
-        };
-        let problems = drafter_target_mismatch(&gemma4_31b(), &d);
-        assert_eq!(problems.len(), 1, "{problems:?}");
-        assert!(problems[0].contains("declares none"), "{problems:?}");
-    }
-
-    #[test]
-    fn the_last_layer_id_is_in_range_and_one_past_it_is_not() {
+    fn layer_range_and_vocab_disagreements_are_reported() {
         let ok = DrafterDims {
             fc_in_dim: 3 * 5376,
             target_vocab_size: 262144,
@@ -800,20 +710,18 @@ mod drafter_dim_tests {
             ..ok
         };
         assert_eq!(drafter_target_mismatch(&gemma4_31b(), &bad).len(), 1);
-    }
-
-    #[test]
-    fn vocab_disagreement_is_reported_in_both_directions() {
-        for v in [32000usize, 262145] {
-            let t = TargetDims {
-                vocab_size: v,
-                ..gemma4_31b()
-            };
-            let problems = drafter_target_mismatch(&t, &speculator_31b());
-            assert_eq!(problems.len(), 1, "{problems:?}");
-            assert!(problems[0].contains("vocab_size"), "{problems:?}");
-            assert!(problems[0].contains("262144"), "{problems:?}");
-            assert!(problems[0].contains(&v.to_string()), "{problems:?}");
+        {
+            for v in [32000usize, 262145] {
+                let t = TargetDims {
+                    vocab_size: v,
+                    ..gemma4_31b()
+                };
+                let problems = drafter_target_mismatch(&t, &speculator_31b());
+                assert_eq!(problems.len(), 1, "{problems:?}");
+                assert!(problems[0].contains("vocab_size"), "{problems:?}");
+                assert!(problems[0].contains("262144"), "{problems:?}");
+                assert!(problems[0].contains(&v.to_string()), "{problems:?}");
+            }
         }
     }
 
@@ -838,18 +746,17 @@ mod ctx_disable_tests {
     use super::{spec_ctx_disable, SPEC_CTX_DISABLE_OFF};
 
     #[test]
-    fn ctx_disable_default_and_zero_are_off() {
+    fn ctx_disable_default_and_zero_are_off_and_a_threshold_parses() {
         assert_eq!(spec_ctx_disable(None), SPEC_CTX_DISABLE_OFF);
         assert_eq!(spec_ctx_disable(Some("")), SPEC_CTX_DISABLE_OFF);
         assert_eq!(spec_ctx_disable(Some("0")), SPEC_CTX_DISABLE_OFF);
         assert_eq!(spec_ctx_disable(Some("nope")), SPEC_CTX_DISABLE_OFF);
+        {
+            assert_eq!(spec_ctx_disable(Some("8192")), 8192);
+            assert_eq!(spec_ctx_disable(Some(" 12000 ")), 12000);
+        }
     }
 
-    #[test]
-    fn ctx_disable_parses_threshold() {
-        assert_eq!(spec_ctx_disable(Some("8192")), 8192);
-        assert_eq!(spec_ctx_disable(Some(" 12000 ")), 12000);
-    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
@@ -858,7 +765,7 @@ mod snapshot_tests {
     use std::cell::RefCell;
 
     #[test]
-    fn spec_env_knobs_sorted_and_deduped() {
+    fn spec_env_knobs_are_sorted_and_capture_reads_exactly_the_registered_set() {
         for w in SPEC_SNAPSHOT_KEYS.windows(2) {
             assert!(
                 w[0] < w[1],
@@ -867,25 +774,24 @@ mod snapshot_tests {
                 w[1]
             );
         }
+        {
+            let seen = RefCell::new(Vec::<String>::new());
+            let get = |k: &str| {
+                seen.borrow_mut().push(k.to_string());
+                None::<String>
+            };
+            let has = |k: &str| {
+                seen.borrow_mut().push(k.to_string());
+                false
+            };
+            let _ = SpecEnvSnapshot::capture_with(&get, &has);
+            let mut seen = seen.into_inner();
+            seen.sort();
+            seen.dedup();
+            let mut reg: Vec<String> = SPEC_SNAPSHOT_KEYS.iter().map(|s| s.to_string()).collect();
+            reg.sort();
+            assert_eq!(seen, reg);
+        }
     }
 
-    #[test]
-    fn capture_reads_exactly_the_registered_knobs() {
-        let seen = RefCell::new(Vec::<String>::new());
-        let get = |k: &str| {
-            seen.borrow_mut().push(k.to_string());
-            None::<String>
-        };
-        let has = |k: &str| {
-            seen.borrow_mut().push(k.to_string());
-            false
-        };
-        let _ = SpecEnvSnapshot::capture_with(&get, &has);
-        let mut seen = seen.into_inner();
-        seen.sort();
-        seen.dedup();
-        let mut reg: Vec<String> = SPEC_SNAPSHOT_KEYS.iter().map(|s| s.to_string()).collect();
-        reg.sort();
-        assert_eq!(seen, reg);
-    }
 }

@@ -78,6 +78,7 @@ fn gow_gemv_mx_sg_xv4(
     @builtin(subgroup_invocation_id) lane: u32
 ) {
     let slot = wid.z;
+    #def b5
     var e = slot;
     if (gow_mx_p.use_sel == 1u) {
         e = gow_mx_sel[slot];
@@ -87,6 +88,7 @@ fn gow_gemv_mx_sg_xv4(
     let blocks = select(0u, gow_mx_p.k_blocks, live);
     let wbase = e * gow_mx_p.w_e_stride_v4 + select(0u, row * gow_mx_p.k_blocks, live);
     let sfbase = e * gow_mx_p.sf_e_stride_bytes + select(0u, row * gow_mx_p.k_blocks, live);
+    #end
     let xqbase = slot * (gow_mx_p.x_slot_stride_words >> 2u);
 
     var acc = 0.0;
@@ -131,101 +133,9 @@ fn gow_mx_lut_dot8(word: u32, x0: u32, x1: u32, x2: u32, x3: u32) -> f32 {
     return a;
 }
 
-@compute @workgroup_size(256)
-fn gow_gemv_mx_sg_xv4_lut(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    gow_mx_xv4_byte_lut_every_e2m1_value_is_exact_in_f16[lid.x] =
-        pack2x16float(vec2<f32>(gow_mx_e2m1(lid.x, 0u), gow_mx_e2m1(lid.x, 1u)));
-    workgroupBarrier();
-
-    let slot = wid.z;
-    var e = slot;
-    if (gow_mx_p.use_sel == 1u) {
-        e = gow_mx_sel[slot];
-    }
-    let row = (wid.x + wid.y * gow_mx_p.groups_x) * GOW_MX_SG_ROWS + sgid;
-    let live = row < gow_mx_p.n_rows;
-    let blocks = select(0u, gow_mx_p.k_blocks, live);
-    let wbase = e * gow_mx_p.w_e_stride_v4 + select(0u, row * gow_mx_p.k_blocks, live);
-    let sfbase = e * gow_mx_p.sf_e_stride_bytes + select(0u, row * gow_mx_p.k_blocks, live);
-    let xqbase = slot * (gow_mx_p.x_slot_stride_words >> 2u);
-
-    var acc = 0.0;
-    for (var kb = lane; kb < blocks; kb = kb + GOW_MX_SG_LANES) {
-        let xq = xqbase + kb * 4u;
-        let xa = gow_mx_xv4[xq];
-        let xb = gow_mx_xv4[xq + 1u];
-        let xc = gow_mx_xv4[xq + 2u];
-        let xd = gow_mx_xv4[xq + 3u];
-        let wv = gow_mx_w[wbase + kb];
-        var d = gow_mx_lut_dot8(wv.x, xa.x, xa.y, xa.z, xa.w);
-        d = d + gow_mx_lut_dot8(wv.y, xb.x, xb.y, xb.z, xb.w);
-        d = d + gow_mx_lut_dot8(wv.z, xc.x, xc.y, xc.z, xc.w);
-        d = d + gow_mx_lut_dot8(wv.w, xd.x, xd.y, xd.z, xd.w);
-        let si = sfbase + kb;
-        acc = fma(gow_e8m0(byte_at(gow_mx_sf[si >> 2u], si)), d, acc);
-    }
-    let total = gow_mx_sg_butterfly32(acc);
-    if (lane == 0u && live) {
-        gow_mx_out_row(slot, e, row, total);
-    }
-}
-
 const GOW_MX_XS_VEC4_CAP_COVERS_K_UP_TO_4096: u32 = 512u;
 
 var<workgroup> gow_mx_xsh: array<vec4<u32>, 512>;
-
-@compute @workgroup_size(256)
-fn gow_gemv_mx_sg_xv4_lut_xs(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    gow_mx_xv4_byte_lut_every_e2m1_value_is_exact_in_f16[lid.x] =
-        pack2x16float(vec2<f32>(gow_mx_e2m1(lid.x, 0u), gow_mx_e2m1(lid.x, 1u)));
-    let slot = wid.z;
-    let xqbase = slot * (gow_mx_p.x_slot_stride_words >> 2u);
-    let xwords4 = gow_mx_p.k_blocks * 4u;
-    for (var i = lid.x; i < xwords4; i = i + 256u) {
-        gow_mx_xsh[i] = gow_mx_xv4[xqbase + i];
-    }
-    workgroupBarrier();
-
-    var e = slot;
-    if (gow_mx_p.use_sel == 1u) {
-        e = gow_mx_sel[slot];
-    }
-    let row = (wid.x + wid.y * gow_mx_p.groups_x) * GOW_MX_SG_ROWS + sgid;
-    let live = row < gow_mx_p.n_rows;
-    let blocks = select(0u, gow_mx_p.k_blocks, live);
-    let wbase = e * gow_mx_p.w_e_stride_v4 + select(0u, row * gow_mx_p.k_blocks, live);
-    let sfbase = e * gow_mx_p.sf_e_stride_bytes + select(0u, row * gow_mx_p.k_blocks, live);
-
-    var acc = 0.0;
-    for (var kb = lane; kb < blocks; kb = kb + GOW_MX_SG_LANES) {
-        let xq = kb * 4u;
-        let xa = gow_mx_xsh[xq];
-        let xb = gow_mx_xsh[xq + 1u];
-        let xc = gow_mx_xsh[xq + 2u];
-        let xd = gow_mx_xsh[xq + 3u];
-        let wv = gow_mx_w[wbase + kb];
-        var d = gow_mx_lut_dot8(wv.x, xa.x, xa.y, xa.z, xa.w);
-        d = d + gow_mx_lut_dot8(wv.y, xb.x, xb.y, xb.z, xb.w);
-        d = d + gow_mx_lut_dot8(wv.z, xc.x, xc.y, xc.z, xc.w);
-        d = d + gow_mx_lut_dot8(wv.w, xd.x, xd.y, xd.z, xd.w);
-        let si = sfbase + kb;
-        acc = fma(gow_e8m0(byte_at(gow_mx_sf[si >> 2u], si)), d, acc);
-    }
-    let total = gow_mx_sg_butterfly32(acc);
-    if (lane == 0u && live) {
-        gow_mx_out_row(slot, e, row, total);
-    }
-}
 
 const GOW_MX_SG_R4SW_ROWS_PER_WG: u32 = 32u;
 
@@ -246,6 +156,7 @@ fn gow_mx_r4sw_row_dot(wbase: u32, sfbase: u32, blocks: u32, lane: u32) -> f32 {
         let xb = gow_mx_xsh[xq + 1u];
         let xc = gow_mx_xsh[xq + 2u];
         let xd = gow_mx_xsh[xq + 3u];
+        #def b6
         let wv = gow_mx_w[wbase + kb];
         var d = gow_mx_lut_dot8(wv.x, xa.x, xa.y, xa.z, xa.w);
         d = d + gow_mx_lut_dot8(wv.y, xb.x, xb.y, xb.z, xb.w);
@@ -254,6 +165,7 @@ fn gow_mx_r4sw_row_dot(wbase: u32, sfbase: u32, blocks: u32, lane: u32) -> f32 {
         let si = sfbase + kb;
         acc = fma(gow_e8m0(byte_at(gow_mx_sf[si >> 2u], si)), d, acc);
     }
+        #end
     return acc;
 }
 
@@ -268,6 +180,7 @@ fn gow_mx_biased_row(e: u32, row: u32, total: f32) -> f32 {
 
 @compute @workgroup_size(256)
 fn gow_gemv_mx_sg_xv4_r4_lut_xs_swiglu(
+    #def b4
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
@@ -282,6 +195,7 @@ fn gow_gemv_mx_sg_xv4_r4_lut_xs_swiglu(
         gow_mx_xsh[i] = gow_mx_xv4[xqbase + i];
     }
     workgroupBarrier();
+    #end
 
     var e = slot;
     if (gow_mx_p.use_sel == 1u) {
@@ -312,21 +226,9 @@ fn gow_gemv_mx_sg_xv4_r4_lut_xs_swiglu(
 
 @compute @workgroup_size(256)
 fn gow_gemv_mx_sg_xv4_r2_lut_xs(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    gow_mx_xv4_byte_lut_every_e2m1_value_is_exact_in_f16[lid.x] =
-        pack2x16float(vec2<f32>(gow_mx_e2m1(lid.x, 0u), gow_mx_e2m1(lid.x, 1u)));
-    let slot = wid.z;
-    let xqbase = slot * (gow_mx_p.x_slot_stride_words >> 2u);
-    let xwords4 = gow_mx_p.k_blocks * 4u;
-    for (var i = lid.x; i < xwords4; i = i + 256u) {
-        gow_mx_xsh[i] = gow_mx_xv4[xqbase + i];
-    }
-    workgroupBarrier();
+    #use b4
 
+    #def b3
     var e = slot;
     if (gow_mx_p.use_sel == 1u) {
         e = gow_mx_sel[slot];
@@ -340,6 +242,7 @@ fn gow_gemv_mx_sg_xv4_r2_lut_xs(
     let wbase1 = e * gow_mx_p.w_e_stride_v4 + select(0u, row1 * gow_mx_p.k_blocks, live1);
     let sfbase0 = e * gow_mx_p.sf_e_stride_bytes + select(0u, row0 * gow_mx_p.k_blocks, live0);
     let sfbase1 = e * gow_mx_p.sf_e_stride_bytes + select(0u, row1 * gow_mx_p.k_blocks, live1);
+    #end
 
     var acc0 = 0.0;
     var acc1 = 0.0;
@@ -349,6 +252,7 @@ fn gow_gemv_mx_sg_xv4_r2_lut_xs(
         let xb = gow_mx_xsh[xq + 1u];
         let xc = gow_mx_xsh[xq + 2u];
         let xd = gow_mx_xsh[xq + 3u];
+        #def b2
         let wv0 = gow_mx_w[wbase0 + kb];
         var d0 = gow_mx_lut_dot8(wv0.x, xa.x, xa.y, xa.z, xa.w);
         d0 = d0 + gow_mx_lut_dot8(wv0.y, xb.x, xb.y, xb.z, xb.w);
@@ -368,6 +272,7 @@ fn gow_gemv_mx_sg_xv4_r2_lut_xs(
     }
     let total0 = gow_mx_sg_butterfly32(acc0);
     let total1 = gow_mx_sg_butterfly32(acc1);
+        #end
     if (lane == 0u && live0) {
         gow_mx_out_row(slot, e, row0, total0);
     }
@@ -423,25 +328,7 @@ fn gow_gemv_mx_sg_xv4_r2_lut_dncomb_sgslot(
         let xb = gow_mx_xv4[xq + 1u];
         let xc = gow_mx_xv4[xq + 2u];
         let xd = gow_mx_xv4[xq + 3u];
-        let wv0 = gow_mx_w[wbase0 + kb];
-        var d0 = gow_mx_lut_dot8(wv0.x, xa.x, xa.y, xa.z, xa.w);
-        d0 = d0 + gow_mx_lut_dot8(wv0.y, xb.x, xb.y, xb.z, xb.w);
-        d0 = d0 + gow_mx_lut_dot8(wv0.z, xc.x, xc.y, xc.z, xc.w);
-        d0 = d0 + gow_mx_lut_dot8(wv0.w, xd.x, xd.y, xd.z, xd.w);
-        let si0 = sfbase0 + kb;
-        acc0 = fma(gow_e8m0(byte_at(gow_mx_sf[si0 >> 2u], si0)), d0, acc0);
-        if (live1) {
-            let wv1 = gow_mx_w[wbase1 + kb];
-            var d1 = gow_mx_lut_dot8(wv1.x, xa.x, xa.y, xa.z, xa.w);
-            d1 = d1 + gow_mx_lut_dot8(wv1.y, xb.x, xb.y, xb.z, xb.w);
-            d1 = d1 + gow_mx_lut_dot8(wv1.z, xc.x, xc.y, xc.z, xc.w);
-            d1 = d1 + gow_mx_lut_dot8(wv1.w, xd.x, xd.y, xd.z, xd.w);
-            let si1 = sfbase1 + kb;
-            acc1 = fma(gow_e8m0(byte_at(gow_mx_sf[si1 >> 2u], si1)), d1, acc1);
-        }
-    }
-    let total0 = gow_mx_sg_butterfly32(acc0);
-    let total1 = gow_mx_sg_butterfly32(acc1);
+        #use b2
     if (lane == 0u) {
         let fb = (pair * 4u + slot) * 2u;
         gow_mx_dncomb_fold_two_row_pairs_by_four_expert_slots_by_two_rows[fb] =
@@ -491,6 +378,7 @@ fn gow_gemv_mx_sg_xv4_r2_lut_xs_dncomb_wg64(
     let xwords4 = gow_mx_p.k_blocks * 4u;
     let row0 = (wid.x + wid.y * gow_mx_p.groups_x) * GOW_MX_SG_DNCOMB_WG64_ROWS_PER_WG
         + sgid * 2u;
+    #def b7
     let row1 = row0 + 1u;
     let live0 = row0 < gow_mx_p.n_rows;
     let live1 = row1 < gow_mx_p.n_rows;
@@ -502,8 +390,10 @@ fn gow_gemv_mx_sg_xv4_r2_lut_xs_dncomb_wg64(
     for (var slot = 0u; slot < slots; slot = slot + 1u) {
         workgroupBarrier();
         let xqbase = slot * (gow_mx_p.x_slot_stride_words >> 2u);
+    #end
         for (var i = lid.x; i < xwords4;
              i = i + GOW_MX_SG_DNCOMB_WG64_THREADS_KEEP_ONE_WORKGROUP_PER_EXPERT_SLOT_OF_RESIDENCY) {
+            #def b1
             gow_mx_xsh[i] = gow_mx_xv4[xqbase + i];
         }
         workgroupBarrier();
@@ -552,6 +442,7 @@ fn gow_gemv_mx_sg_xv4_r2_lut_xs_dncomb_wg64(
         gow_mx_dncomb_out[row0 >> 1u] = bf16_pack(a0, a1);
     }
 }
+            #end
 
 @compute @workgroup_size(256)
 fn gow_gemv_mx_sg_xv4_r2_lut_xs_dncomb(
@@ -564,69 +455,13 @@ fn gow_gemv_mx_sg_xv4_r2_lut_xs_dncomb(
         pack2x16float(vec2<f32>(gow_mx_e2m1(lid.x, 0u), gow_mx_e2m1(lid.x, 1u)));
     let xwords4 = gow_mx_p.k_blocks * 4u;
     let row0 = (wid.x + wid.y * gow_mx_p.groups_x) * GOW_MX_SG_R2_ROWS_PER_WG + sgid * 2u;
-    let row1 = row0 + 1u;
-    let live0 = row0 < gow_mx_p.n_rows;
-    let live1 = row1 < gow_mx_p.n_rows;
-    let blocks = select(0u, gow_mx_p.k_blocks, live0);
-
-    var a0 = 0.0;
-    var a1 = 0.0;
-    let slots = gow_mx_dncomb_slots_ride_pad0_because_the_down_gemv_carries_no_swiglu_limit();
-    for (var slot = 0u; slot < slots; slot = slot + 1u) {
-        workgroupBarrier();
-        let xqbase = slot * (gow_mx_p.x_slot_stride_words >> 2u);
+    #use b7
         for (var i = lid.x; i < xwords4; i = i + 256u) {
-            gow_mx_xsh[i] = gow_mx_xv4[xqbase + i];
-        }
-        workgroupBarrier();
-
-        var e = slot;
-        if (gow_mx_p.use_sel == 1u) {
-            e = gow_mx_sel[slot];
-        }
-        let wbase0 = e * gow_mx_p.w_e_stride_v4 + select(0u, row0 * gow_mx_p.k_blocks, live0);
-        let wbase1 = e * gow_mx_p.w_e_stride_v4 + select(0u, row1 * gow_mx_p.k_blocks, live1);
-        let sfbase0 = e * gow_mx_p.sf_e_stride_bytes + select(0u, row0 * gow_mx_p.k_blocks, live0);
-        let sfbase1 = e * gow_mx_p.sf_e_stride_bytes + select(0u, row1 * gow_mx_p.k_blocks, live1);
-
-        var acc0 = 0.0;
-        var acc1 = 0.0;
-        for (var kb = lane; kb < blocks; kb = kb + GOW_MX_SG_LANES) {
-            let xq = kb * 4u;
-            let xa = gow_mx_xsh[xq];
-            let xb = gow_mx_xsh[xq + 1u];
-            let xc = gow_mx_xsh[xq + 2u];
-            let xd = gow_mx_xsh[xq + 3u];
-            let wv0 = gow_mx_w[wbase0 + kb];
-            var d0 = gow_mx_lut_dot8(wv0.x, xa.x, xa.y, xa.z, xa.w);
-            d0 = d0 + gow_mx_lut_dot8(wv0.y, xb.x, xb.y, xb.z, xb.w);
-            d0 = d0 + gow_mx_lut_dot8(wv0.z, xc.x, xc.y, xc.z, xc.w);
-            d0 = d0 + gow_mx_lut_dot8(wv0.w, xd.x, xd.y, xd.z, xd.w);
-            let si0 = sfbase0 + kb;
-            acc0 = fma(gow_e8m0(byte_at(gow_mx_sf[si0 >> 2u], si0)), d0, acc0);
-            if (live1) {
-                let wv1 = gow_mx_w[wbase1 + kb];
-                var d1 = gow_mx_lut_dot8(wv1.x, xa.x, xa.y, xa.z, xa.w);
-                d1 = d1 + gow_mx_lut_dot8(wv1.y, xb.x, xb.y, xb.z, xb.w);
-                d1 = d1 + gow_mx_lut_dot8(wv1.z, xc.x, xc.y, xc.z, xc.w);
-                d1 = d1 + gow_mx_lut_dot8(wv1.w, xd.x, xd.y, xd.z, xd.w);
-                let si1 = sfbase1 + kb;
-                acc1 = fma(gow_e8m0(byte_at(gow_mx_sf[si1 >> 2u], si1)), d1, acc1);
-            }
-        }
-        let total0 = gow_mx_sg_butterfly32(acc0);
-        let total1 = gow_mx_sg_butterfly32(acc1);
-        let wt = gow_mx_dncomb_wts[slot];
-        a0 = fma(gow_mx_biased_row(e, row0, total0), wt, a0);
-        a1 = fma(gow_mx_biased_row(e, row1, total1), wt, a1);
-    }
-    if (lane == 0u && live0) {
-        gow_mx_dncomb_out[row0 >> 1u] = bf16_pack(a0, a1);
-    }
-}
+            #use b1
 
 @compute @workgroup_size(256)
 fn gow_gemv_mx_sg_xv4_r2_lut(
+    #def b9
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
@@ -635,21 +470,11 @@ fn gow_gemv_mx_sg_xv4_r2_lut(
     gow_mx_xv4_byte_lut_every_e2m1_value_is_exact_in_f16[lid.x] =
         pack2x16float(vec2<f32>(gow_mx_e2m1(lid.x, 0u), gow_mx_e2m1(lid.x, 1u)));
     workgroupBarrier();
+    #end
 
+    #def b8
     let slot = wid.z;
-    var e = slot;
-    if (gow_mx_p.use_sel == 1u) {
-        e = gow_mx_sel[slot];
-    }
-    let row0 = (wid.x + wid.y * gow_mx_p.groups_x) * GOW_MX_SG_R2_ROWS_PER_WG + sgid * 2u;
-    let row1 = row0 + 1u;
-    let live0 = row0 < gow_mx_p.n_rows;
-    let live1 = row1 < gow_mx_p.n_rows;
-    let blocks = select(0u, gow_mx_p.k_blocks, live0);
-    let wbase0 = e * gow_mx_p.w_e_stride_v4 + select(0u, row0 * gow_mx_p.k_blocks, live0);
-    let wbase1 = e * gow_mx_p.w_e_stride_v4 + select(0u, row1 * gow_mx_p.k_blocks, live1);
-    let sfbase0 = e * gow_mx_p.sf_e_stride_bytes + select(0u, row0 * gow_mx_p.k_blocks, live0);
-    let sfbase1 = e * gow_mx_p.sf_e_stride_bytes + select(0u, row1 * gow_mx_p.k_blocks, live1);
+    #use b3
     let xqbase = slot * (gow_mx_p.x_slot_stride_words >> 2u);
 
     var acc0 = 0.0;
@@ -660,25 +485,8 @@ fn gow_gemv_mx_sg_xv4_r2_lut(
         let xb = gow_mx_xv4[xq + 1u];
         let xc = gow_mx_xv4[xq + 2u];
         let xd = gow_mx_xv4[xq + 3u];
-        let wv0 = gow_mx_w[wbase0 + kb];
-        var d0 = gow_mx_lut_dot8(wv0.x, xa.x, xa.y, xa.z, xa.w);
-        d0 = d0 + gow_mx_lut_dot8(wv0.y, xb.x, xb.y, xb.z, xb.w);
-        d0 = d0 + gow_mx_lut_dot8(wv0.z, xc.x, xc.y, xc.z, xc.w);
-        d0 = d0 + gow_mx_lut_dot8(wv0.w, xd.x, xd.y, xd.z, xd.w);
-        let si0 = sfbase0 + kb;
-        acc0 = fma(gow_e8m0(byte_at(gow_mx_sf[si0 >> 2u], si0)), d0, acc0);
-        if (live1) {
-            let wv1 = gow_mx_w[wbase1 + kb];
-            var d1 = gow_mx_lut_dot8(wv1.x, xa.x, xa.y, xa.z, xa.w);
-            d1 = d1 + gow_mx_lut_dot8(wv1.y, xb.x, xb.y, xb.z, xb.w);
-            d1 = d1 + gow_mx_lut_dot8(wv1.z, xc.x, xc.y, xc.z, xc.w);
-            d1 = d1 + gow_mx_lut_dot8(wv1.w, xd.x, xd.y, xd.z, xd.w);
-            let si1 = sfbase1 + kb;
-            acc1 = fma(gow_e8m0(byte_at(gow_mx_sf[si1 >> 2u], si1)), d1, acc1);
-        }
-    }
-    let total0 = gow_mx_sg_butterfly32(acc0);
-    let total1 = gow_mx_sg_butterfly32(acc1);
+    #end
+        #use b2
     if (lane == 0u && live0) {
         gow_mx_out_row(slot, e, row0, total0);
     }
@@ -694,62 +502,4 @@ fn gow_mx_out_row(slot: u32, e: u32, row: u32, total: f32) {
         v = v + bf16_decode(u16_at(gow_mx_b[bi >> 1u], bi));
     }
     gow_mx_y[slot * gow_mx_p.y_slot_stride + row] = v;
-}
-
-@compute @workgroup_size(256)
-fn gow_gemv_mx_sg_xv4_r2(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let slot = wid.z;
-    var e = slot;
-    if (gow_mx_p.use_sel == 1u) {
-        e = gow_mx_sel[slot];
-    }
-    let row0 = (wid.x + wid.y * gow_mx_p.groups_x) * GOW_MX_SG_R2_ROWS_PER_WG + sgid * 2u;
-    let row1 = row0 + 1u;
-    let live0 = row0 < gow_mx_p.n_rows;
-    let live1 = row1 < gow_mx_p.n_rows;
-    let blocks = select(0u, gow_mx_p.k_blocks, live0);
-    let wbase0 = e * gow_mx_p.w_e_stride_v4 + select(0u, row0 * gow_mx_p.k_blocks, live0);
-    let wbase1 = e * gow_mx_p.w_e_stride_v4 + select(0u, row1 * gow_mx_p.k_blocks, live1);
-    let sfbase0 = e * gow_mx_p.sf_e_stride_bytes + select(0u, row0 * gow_mx_p.k_blocks, live0);
-    let sfbase1 = e * gow_mx_p.sf_e_stride_bytes + select(0u, row1 * gow_mx_p.k_blocks, live1);
-    let xqbase = slot * (gow_mx_p.x_slot_stride_words >> 2u);
-
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    for (var kb = lane; kb < blocks; kb = kb + GOW_MX_SG_LANES) {
-        let xq = xqbase + kb * 4u;
-        let xa = gow_mx_xv4[xq];
-        let xb = gow_mx_xv4[xq + 1u];
-        let xc = gow_mx_xv4[xq + 2u];
-        let xd = gow_mx_xv4[xq + 3u];
-        let wv0 = gow_mx_w[wbase0 + kb];
-        var d0 = gow_mx_dot8(wv0.x, xa.x, xa.y, xa.z, xa.w);
-        d0 = d0 + gow_mx_dot8(wv0.y, xb.x, xb.y, xb.z, xb.w);
-        d0 = d0 + gow_mx_dot8(wv0.z, xc.x, xc.y, xc.z, xc.w);
-        d0 = d0 + gow_mx_dot8(wv0.w, xd.x, xd.y, xd.z, xd.w);
-        let si0 = sfbase0 + kb;
-        acc0 = fma(gow_e8m0(byte_at(gow_mx_sf[si0 >> 2u], si0)), d0, acc0);
-        if (live1) {
-            let wv1 = gow_mx_w[wbase1 + kb];
-            var d1 = gow_mx_dot8(wv1.x, xa.x, xa.y, xa.z, xa.w);
-            d1 = d1 + gow_mx_dot8(wv1.y, xb.x, xb.y, xb.z, xb.w);
-            d1 = d1 + gow_mx_dot8(wv1.z, xc.x, xc.y, xc.z, xc.w);
-            d1 = d1 + gow_mx_dot8(wv1.w, xd.x, xd.y, xd.z, xd.w);
-            let si1 = sfbase1 + kb;
-            acc1 = fma(gow_e8m0(byte_at(gow_mx_sf[si1 >> 2u], si1)), d1, acc1);
-        }
-    }
-    let total0 = gow_mx_sg_butterfly32(acc0);
-    let total1 = gow_mx_sg_butterfly32(acc1);
-
-    if (lane == 0u && live0) {
-        gow_mx_out_row(slot, e, row0, total0);
-    }
-    if (lane == 0u && live1) {
-        gow_mx_out_row(slot, e, row1, total1);
-    }
 }

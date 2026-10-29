@@ -2,32 +2,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::Result;
 use nv_kernels::wgpu_backend::{na, WgpuContext};
+use na::{storage_entry};
 
 pub const MSL_GEMV_ENTRY: &str = "dg_msl_w4_gemv";
 pub const MSL_GEMV_RMS_ENTRY: &str = "dg_msl_w4_gemv_rms";
 pub const MSL_GEMV_GSILU_ENTRY: &str = "dg_msl_w4_gemv_gsilu";
-pub const MSL_GEMV_BATCH_ENTRY: &str = "dg_msl_w4_gemv_b";
 pub const MSL_GEMV_ROWS: u32 = 8;
-
-pub const BHEAD_WINS_ONLY_THE_DISPATCH_CRUMBS_BECAUSE_THE_W4_HEAD_IS_ISSUE_BOUND_NOT_READ_BOUND:
-    &str = "dg_msl_w4_gemv_b serves the batched-region lm head as one dispatch looping the batch \
-     rows around the shipped dg_msl_w4_gemv dot text -- the i-loop, its simd_sum and the \
-     out_f32 identity store unchanged, only the per-row x base, the y row offset and a \
-     second rows8 barrier outside the dot (the gsilu class of recompile, not the rms round's \
-     branched-dot class; gated to 0/151936 per row against the shipped replay on real \
-     weights, tolerance returns for arbitration). What batching CANNOT buy here: the head at \
-     m=32 is issue-bound on the mandated scalar chain, not weight-read-bound -- the ~513 \
-     GB/s apparent of one replay is the byte rate that falls out of ~2.6 T ops/s of \
-     load+convert+extract+fma issue, not a DRAM wall -- so deleting the 31 redundant 116 MB \
-     head reads moves nothing. Four reuse geometries measured on real weights, isolated \
-     head at 32 rows vs the replay's 8.2 ms: 8-row register blocks around each weight vec4 \
-     8.2-8.4 (ALU-invariant), a 24 KB threadgroup x slab 10.8 (occupancy collapse, the \
-     W4_GEMV_BOUND slab verdict again), hoisted nibble extracts with u32 pair loads and 32 \
-     live accumulators 19.4 (register spill); every geometry held the per-row bits. The \
-     shipped row loop wins what is winnable -- 160 dispatches (32 x gather/gemv/argmax \
-     pair/stash) become 4, deleting ~0.9 ms of pass-boundary crumbs per bstep, bitwise. A \
-     cheaper head needs an arithmetic-class change (a w4-read steel GEMM), which is \
-     tolerance-class and returns for arbitration if ever sized.";
 
 pub const GSILU_FUSE_KEEPS_EVERY_REDUCTION_IN_ITS_KERNEL_AND_REPLAYS_THE_SILU_PASS_VERBATIM: &str =
     "dg_msl_w4_gemv_gsilu deletes the standalone dg_silu_mul pass -- one serial-drain pass \
@@ -359,71 +339,6 @@ kernel void dg_msl_w4_gemv_gsilu(
         (ghi / (1.0f + exp(-ghi))) * uhi)));
     }
 }
-
-struct DgMslW4BP {
-    uint n_rows;
-    uint w_vec4;
-    uint scale_stride;
-    uint groups_x;
-    uint b_rows;
-    uint x_stride;
-    uint y_stride;
-    uint pad0;
-};
-
-kernel void dg_msl_w4_gemv_b(
-    device const uint4* wq [[buffer(0)]],
-    device const uint* sc [[buffer(1)]],
-    device const uint* bs [[buffer(2)]],
-    device const half* xb [[buffer(3)]],
-    constant DgMslW4BP& p [[buffer(4)]],
-    device uint* y [[buffer(5)]],
-    uint3 tg [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]])
-{
-    const uint rh = tid >> 5;
-    const uint lane = tid & 31;
-    const uint wg8 = tg.x + tg.y * p.groups_x;
-    const uint row0 = wg8 * 8u;
-    const uint row = min(row0 + rh, p.n_rows - 1u);
-    const bool live = row0 + rh < p.n_rows;
-    const uint kw4 = live ? p.w_vec4 : 0u;
-    device const uint4* wrow = wq + row * p.w_vec4;
-    const uint sbase = row * p.scale_stride;
-    threadgroup float rows8[8];
-
-    for (uint r = 0; r < p.b_rows; ++r) {
-        device const half* x = xb + r * p.x_stride;
-        float acc = 0.0f;
-        for (uint i = lane; i < kw4; i += 32u) {
-            uint4 wv = wrow[i];
-            device const half* xp = x + i * 32u;
-            float qdot = 0.0f;
-            float xsum = 0.0f;
-            for (uint w = 0; w < 4; ++w) {
-                uint ww = wv[w];
-                device const half* xw = xp + w * 8u;
-                for (uint j = 0; j < 4; ++j) {
-                    uint bb = (ww >> (8u * j)) & 0xFFu;
-                    float lo = float(xw[2u * j]);
-                    float hi = float(xw[2u * j + 1u]);
-                    xsum += lo + hi;
-                    qdot = fma(float(bb & 0xFu), lo, qdot);
-                    qdot = fma(float(bb >> 4u), hi, qdot);
-                }
-            }
-            uint g = i >> 1;
-            acc = fma(bf16f(sc[sbase + g]), qdot, fma(bf16f(bs[sbase + g]), xsum, acc));
-        }
-        acc = simd_sum(acc);
-        if (lane == 0) rows8[rh] = acc;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < 8u && row0 + tid < p.n_rows) {
-            y[r * p.y_stride + row0 + tid] = as_type<uint>(rows8[tid]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-}
 ";
 
 #[repr(C)]
@@ -437,19 +352,6 @@ pub struct DgMslW4Params {
     pub y_off: u32,
     pub pad0: u32,
     pub pad1: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct DgMslW4BParams {
-    pub n_rows: u32,
-    pub w_vec4: u32,
-    pub scale_stride: u32,
-    pub groups_x: u32,
-    pub b_rows: u32,
-    pub x_stride: u32,
-    pub y_stride: u32,
-    pub pad0: u32,
 }
 
 #[repr(C)]
@@ -469,26 +371,12 @@ pub struct DgMslW4RmsParams {
     pub pad2: u32,
 }
 
-fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
 pub struct MslGemvPipelines {
     pub pipeline: Arc<wgpu::ComputePipeline>,
     pub layout: wgpu::BindGroupLayout,
     pub rms_pipeline: Arc<wgpu::ComputePipeline>,
     pub rms_layout: wgpu::BindGroupLayout,
     pub gsilu_pipeline: Arc<wgpu::ComputePipeline>,
-    pub batch_pipeline: Arc<wgpu::ComputePipeline>,
 }
 
 type CacheRow = (
@@ -505,7 +393,6 @@ fn build(ctx: &WgpuContext) -> Result<Arc<MslGemvPipelines>> {
     let _ = MSL_GEMV_EXISTS_BECAUSE_THE_FIVE_ISSUE_SLOT_BOUND_WAS_NAGAS_NOT_THE_MACHINES;
     let _ = RMS_FUSE_IS_TOLERANCE_CLASS_BECAUSE_SIMD_SUM_COMPILES_TO_A_PER_KERNEL_ORDER;
     let _ = GSILU_FUSE_KEEPS_EVERY_REDUCTION_IN_ITS_KERNEL_AND_REPLAYS_THE_SILU_PASS_VERBATIM;
-    let _ = BHEAD_WINS_ONLY_THE_DISPATCH_CRUMBS_BECAUSE_THE_W4_HEAD_IS_ISSUE_BOUND_NOT_READ_BOUND;
     let module = na::msl_module(
         ctx,
         "dg-msl-w4",
@@ -513,7 +400,6 @@ fn build(ctx: &WgpuContext) -> Result<Arc<MslGemvPipelines>> {
             (MSL_GEMV_ENTRY, (256, 1, 1)),
             (MSL_GEMV_RMS_ENTRY, (256, 1, 1)),
             (MSL_GEMV_GSILU_ENTRY, (256, 1, 1)),
-            (MSL_GEMV_BATCH_ENTRY, (256, 1, 1)),
         ],
         MSL_SRC,
     )
@@ -571,16 +457,6 @@ fn build(ctx: &WgpuContext) -> Result<Arc<MslGemvPipelines>> {
             cache: None,
         },
     ));
-    let batch_pipeline = Arc::new(ctx.device.create_compute_pipeline(
-        &wgpu::ComputePipelineDescriptor {
-            label: Some(MSL_GEMV_BATCH_ENTRY),
-            layout: Some(&layout),
-            module: &module,
-            entry_point: Some(MSL_GEMV_BATCH_ENTRY),
-            compilation_options: Default::default(),
-            cache: None,
-        },
-    ));
     let rms_entries = [
         storage_entry(0, true),
         storage_entry(1, true),
@@ -624,7 +500,6 @@ fn build(ctx: &WgpuContext) -> Result<Arc<MslGemvPipelines>> {
         rms_pipeline,
         rms_layout: rms_bgl,
         gsilu_pipeline,
-        batch_pipeline,
     }))
 }
 

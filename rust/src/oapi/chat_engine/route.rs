@@ -108,6 +108,7 @@ pub(crate) fn drafter_auto_switch_tokens(raw: Option<&str>) -> usize {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) fn drafter_arm_name(arm: DrafterArm) -> &'static str {
     match arm {
         DrafterArm::Eagle3 => "eagle3",
@@ -115,9 +116,11 @@ pub(crate) fn drafter_arm_name(arm: DrafterArm) -> &'static str {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) static LAST_ROUTED_DRAFTER_ARM_RECORDED_SO_SERVE_TESTS_CAN_ASSERT_AUTO_ROUTING:
     std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+#[cfg(feature = "cuda")]
 pub(crate) fn record_last_routed_drafter_arm(arm: DrafterArm) {
     let code = match arm {
         DrafterArm::Eagle3 => 1u8,
@@ -125,16 +128,6 @@ pub(crate) fn record_last_routed_drafter_arm(arm: DrafterArm) {
     };
     LAST_ROUTED_DRAFTER_ARM_RECORDED_SO_SERVE_TESTS_CAN_ASSERT_AUTO_ROUTING
         .store(code, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub(crate) fn last_routed_drafter_arm_name() -> Option<&'static str> {
-    match LAST_ROUTED_DRAFTER_ARM_RECORDED_SO_SERVE_TESTS_CAN_ASSERT_AUTO_ROUTING
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        1 => Some("eagle3"),
-        2 => Some("dflash"),
-        _ => None,
-    }
 }
 
 pub(crate) fn route_arm_for_ctx(prompt_tokens: usize, ctx_gate: usize) -> DrafterArm {
@@ -208,9 +201,9 @@ pub(crate) fn arm_ema_observe(arm: DrafterArm, accepted_per_round: f64) {
     if !accepted_per_round.is_finite() {
         return;
     }
-    let _ = arm_ema_cell(arm).fetch_update(
+    arm_ema_cell(arm).update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
-        |bits| Some(arm_ema_step(bits, accepted_per_round)),
+        |bits| arm_ema_step(bits, accepted_per_round),
     );
 }

@@ -341,7 +341,6 @@ fn relative_timing_signal(past: usize, future: usize, channels: usize) -> Vec<f3
 }
 
 impl Gemma4AudioAttention {
-    #[allow(clippy::too_many_arguments)]
     fn build(
         cfg: &Gemma4AudioConfig,
         q_proj: ClippedLinear,

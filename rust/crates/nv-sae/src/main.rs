@@ -17,7 +17,7 @@ pub const HOLDOUT_SESSION_SHARE: u64 = 15;
 #[derive(Parser)]
 #[command(
     name = "nv-sae",
-    about = "Sparse autoencoders over Laguna middle-layer states of agent logs"
+    about = "Sparse autoencoders over middle-layer residual states of agent logs, one dictionary per capture model and layer"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,6 +45,8 @@ enum Cmd {
         records: PathBuf,
         #[arg(long, default_value = "http://127.0.0.1:1327")]
         url: String,
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long, default_value_t = 19)]
         layer: usize,
         #[arg(long)]
@@ -94,6 +96,10 @@ enum Cmd {
         seed: u64,
         #[arg(long)]
         dense_baseline: bool,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        layer: Option<usize>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -235,6 +241,25 @@ fn write_records(path: &PathBuf, records: &[Record]) -> Result<()> {
     Ok(())
 }
 
+fn identity(
+    states: &std::path::Path,
+    model: Option<String>,
+    layer: Option<usize>,
+) -> Result<(String, usize)> {
+    let manifest = states.parent().and_then(|d| capture::read_manifest(d).ok());
+    let model = model
+        .or_else(|| manifest.as_ref().map(|m| m.model.clone()))
+        .filter(|m| !m.is_empty());
+    let layer = layer.or_else(|| manifest.as_ref().map(|m| m.layer));
+    match (model, layer) {
+        (Some(m), Some(l)) => Ok((m, l)),
+        _ => anyhow::bail!(
+            "{}: no capture.json beside the states and no --model/--layer; a dictionary must name the capture model and layer it belongs to",
+            states.display()
+        ),
+    }
+}
+
 fn holdout_mask(records: &[Record]) -> Vec<bool> {
     use sha2::Digest;
     records
@@ -284,6 +309,7 @@ fn main() -> Result<()> {
         Cmd::Capture {
             records,
             url,
+            model,
             layer,
             tokenizer,
             tokens,
@@ -314,13 +340,20 @@ fn main() -> Result<()> {
                 ),
                 None => None,
             };
-            let client = capture::Client::new(&url)?;
+            let client = capture::Client::new(&url, model.as_deref())?;
             let pace = capture::Pace {
-                batch: if tokens { batch.min(capture::CAPTURE_BATCH_RECORDS_WITH_TOKENS) } else { batch },
+                batch: if tokens {
+                    batch.min(capture::CAPTURE_BATCH_RECORDS_WITH_TOKENS)
+                } else {
+                    batch
+                },
                 pause: std::time::Duration::from_millis(pause_ms),
-                deadline: (max_seconds > 0).then(|| std::time::Instant::now() + std::time::Duration::from_secs(max_seconds)),
+                deadline: (max_seconds > 0).then(|| {
+                    std::time::Instant::now() + std::time::Duration::from_secs(max_seconds)
+                }),
             };
-            let m = capture::capture_records(&client, &recs, layer, &out, tok.as_ref(), tokens, &pace)?;
+            let m =
+                capture::capture_records(&client, &recs, layer, &out, tok.as_ref(), tokens, &pace)?;
             println!("{}", serde_json::to_string(&m)?);
         }
         Cmd::Merge { out, since, dirs } => {
@@ -340,11 +373,14 @@ fn main() -> Result<()> {
             l1,
             seed,
             dense_baseline,
+            model,
+            layer,
             out,
         } => {
             std::fs::create_dir_all(&out)?;
             let dev = train::device();
             let x = score::load_matrix(&states, &key)?;
+            let identity = identity(&states, model, layer)?;
             let recs = read_records(&records)?;
             let record_mask = holdout_mask(&recs);
             let mask = match spans {
@@ -391,6 +427,9 @@ fn main() -> Result<()> {
             report.progress.clear();
             result["encoder_sha256"] =
                 serde_json::json!(name::sha256_file(&out.join("sae.safetensors"))?);
+            result["model"] = serde_json::json!(identity.0);
+            result["layer"] = serde_json::json!(identity.1);
+            result["hidden_size"] = serde_json::json!(x.dims()[1]);
             std::fs::write(
                 out.join("result.json"),
                 serde_json::to_string_pretty(&result)?,
@@ -411,6 +450,13 @@ fn main() -> Result<()> {
             let dev = train::device();
             let sae = train::Sae::load(&sae, &dev)?;
             let x = score::load_matrix(&states, &key)?;
+            anyhow::ensure!(
+                x.dims()[1] == sae.mu.dims()[0],
+                "dictionary expects hidden size {} but {} holds {}; score only with the dictionary of the capture model and layer",
+                sae.mu.dims()[0],
+                states.display(),
+                x.dims()[1]
+            );
             let scored = score::score(&sae, &x, 1024)?;
             score::save_scored(&out, &scored)?;
             println!(
@@ -499,7 +545,7 @@ fn main() -> Result<()> {
             };
             let cap = out.join("capture");
             if stream && tokens {
-                let client = capture::Client::new(&url)?;
+                let client = capture::Client::new(&url, Some(&model))?;
                 let dev = train::device();
                 let cfg = train::TrainConfig {
                     width,
@@ -517,8 +563,8 @@ fn main() -> Result<()> {
                     .filter(|(_, t)| *t)
                     .map(|(r, _)| r.clone())
                     .collect();
-                let mut mean = vec![0f64; 2048];
-                let mut m2 = vec![0f64; 2048];
+                let mut mean: Vec<f64> = Vec::new();
+                let mut m2: Vec<f64> = Vec::new();
                 let mut n = 0f64;
                 let moments_records: Vec<Record> = train_recs.iter().take(400).cloned().collect();
                 capture::stream_batches(
@@ -528,6 +574,8 @@ fn main() -> Result<()> {
                     tok.as_ref(),
                     pass_batch,
                     |_, resp| {
+                        mean.resize(resp.hidden_size, 0.0);
+                        m2.resize(resp.hidden_size, 0.0);
                         for r in resp.records {
                             train::running_moments(
                                 r.token_states.as_deref().unwrap_or(&[]),
@@ -596,7 +644,7 @@ fn main() -> Result<()> {
                         for (r, c) in chunk.iter().zip(resp.records) {
                             let states = c.token_states.unwrap_or_default();
                             let x = candle_core::Tensor::new(states.concat().as_slice(), &dev)?
-                                .reshape((states.len(), 2048))?;
+                                .reshape((states.len(), mu.len()))?;
                             let s = score::score(&sae, &x, 1024)?;
                             spans.push(capture::Span {
                                 record: kept.len(),
@@ -635,7 +683,7 @@ fn main() -> Result<()> {
                 std::fs::write(
                     out.join("result.json"),
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"config": cfg, "layer": layer, "mode": "stream-tokens", "tokens": total, "records": kept.len(), "steps": steps_done, "losses": losses, "encoder_sha256": name::sha256_file(&out.join("sae.safetensors"))?}),
+                        &serde_json::json!({"config": cfg, "model": model, "layer": layer, "hidden_size": mu.len(), "mode": "stream-tokens", "tokens": total, "records": kept.len(), "steps": steps_done, "losses": losses, "encoder_sha256": name::sha256_file(&out.join("sae.safetensors"))?}),
                     )?,
                 )?;
                 let mut names = None;
@@ -670,7 +718,7 @@ fn main() -> Result<()> {
             }
             if !cap.join("states.safetensors").exists() {
                 let m = capture::capture_records(
-                    &capture::Client::new(&url)?,
+                    &capture::Client::new(&url, Some(&model))?,
                     &recs,
                     layer,
                     &cap,
@@ -726,6 +774,8 @@ fn main() -> Result<()> {
             result["encoder_sha256"] =
                 serde_json::json!(name::sha256_file(&out.join("sae.safetensors"))?);
             result["layer"] = serde_json::json!(layer);
+            result["model"] = serde_json::json!(model);
+            result["hidden_size"] = serde_json::json!(x.dims()[1]);
             std::fs::write(
                 out.join("result.json"),
                 serde_json::to_string_pretty(&result)?,

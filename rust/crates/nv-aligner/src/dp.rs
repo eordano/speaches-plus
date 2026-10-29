@@ -223,41 +223,59 @@ mod tests {
     }
 
     #[test]
-    fn toy_3frame_2token_vocab3() {
-        let (lps, t, v) = lp(&[
-            &[0.98, 0.01, 0.01],
-            &[0.01, 0.98, 0.01],
-            &[0.98, 0.01, 0.01],
-            &[0.01, 0.01, 0.98],
-            &[0.98, 0.01, 0.01],
-        ]);
-        let out = viterbi_align(&lps, t, v, &[1, 2], 0).unwrap();
-        assert_eq!(out, vec![(1, 2), (3, 4)]);
+    fn alignments_match_the_hand_worked_spans_and_frame_to_time_is_hop_over_rate() {
+        let cases: [(&[&[f32]], &[u32], Vec<(usize, usize)>); 5] = [
+            (
+                &[
+                    &[0.98, 0.01, 0.01],
+                    &[0.01, 0.98, 0.01],
+                    &[0.98, 0.01, 0.01],
+                    &[0.01, 0.01, 0.98],
+                    &[0.98, 0.01, 0.01],
+                ],
+                &[1, 2],
+                vec![(1, 2), (3, 4)],
+            ),
+            (
+                &[
+                    &[0.98, 0.01, 0.01],
+                    &[0.98, 0.01, 0.01],
+                    &[0.01, 0.98, 0.01],
+                    &[0.01, 0.98, 0.01],
+                    &[0.98, 0.01, 0.01],
+                    &[0.98, 0.01, 0.01],
+                ],
+                &[1],
+                vec![(2, 4)],
+            ),
+            (&[&[0.5, 0.5], &[0.5, 0.5]], &[], vec![]),
+            (
+                &[&[0.7, 0.3], &[0.1, 0.9], &[0.7, 0.3], &[0.1, 0.9], &[0.7, 0.3]],
+                &[1, 1],
+                vec![(1, 2), (3, 4)],
+            ),
+            (
+                &[&[0.99, 0.01], &[0.99, 0.01], &[0.01, 0.99], &[0.99, 0.01]],
+                &[1],
+                vec![(2, 3)],
+            ),
+        ];
+        for (i, (rows, targets, want)) in cases.iter().enumerate() {
+            let (mut lps, t, v) = lp(rows);
+            if i == 4 {
+                lps[1] = f32::NEG_INFINITY;
+            }
+            let out = viterbi_align(&lps, t, v, targets, 0).unwrap();
+            assert_eq!(out, *want, "case {i}");
+            assert!(out.iter().all(|&(s, e)| s < e));
+        }
+        assert!((frame_to_time_ms(0, 320, 16_000) - 0.0).abs() < 1e-6);
+        assert!((frame_to_time_ms(1, 320, 16_000) - 20.0).abs() < 1e-6);
+        assert!((frame_to_time_ms(50, 320, 16_000) - 1000.0).abs() < 1e-6);
     }
 
     #[test]
-    fn blanks_absorb_padding_at_start_and_end() {
-        let (lps, t, v) = lp(&[
-            &[0.98, 0.01, 0.01],
-            &[0.98, 0.01, 0.01],
-            &[0.01, 0.98, 0.01],
-            &[0.01, 0.98, 0.01],
-            &[0.98, 0.01, 0.01],
-            &[0.98, 0.01, 0.01],
-        ]);
-        let out = viterbi_align(&lps, t, v, &[1], 0).unwrap();
-        assert_eq!(out, vec![(2, 4)]);
-    }
-
-    #[test]
-    fn empty_targets_returns_empty() {
-        let (lps, t, v) = lp(&[&[0.5, 0.5], &[0.5, 0.5]]);
-        let out = viterbi_align(&lps, t, v, &[], 0).unwrap();
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn too_few_frames_errors() {
+    fn too_few_frames_shape_mismatch_and_invalid_ids_are_typed_errors() {
         let (lps, t, v) = lp(&[
             &[0.5, 0.3, 0.2],
             &[0.3, 0.5, 0.2],
@@ -275,23 +293,31 @@ mod tests {
 
         let msg = format!("{err}");
         assert!(msg.contains('4') && msg.contains('5'), "got: {msg}");
-    }
 
-    #[test]
-    fn shape_mismatch_errors() {
+        let (lps, t, v) = lp(&[
+            &[0.98, 0.01, 0.01],
+            &[0.01, 0.98, 0.01],
+            &[0.01, 0.01, 0.98],
+            &[0.98, 0.01, 0.01],
+        ]);
+        assert!(
+            matches!(
+                viterbi_align(&lps, t, v, &[1, 2], 0).unwrap_err(),
+                AlignError::TooFewFrames {
+                    frames: 4,
+                    required: 5
+                }
+            ),
+            "distinct tokens still need the blank frame budget"
+        );
         let lps = vec![0.0f32; 7];
-        let err = viterbi_align(&lps, 3, 3, &[1], 0).unwrap_err();
         assert!(matches!(
-            err,
+            viterbi_align(&lps, 3, 3, &[1], 0).unwrap_err(),
             AlignError::ShapeMismatch {
                 expected: 9,
                 got: 7
             }
         ));
-    }
-
-    #[test]
-    fn invalid_blank_and_token_errors() {
         let lps = vec![0.0f32; 6];
         assert!(matches!(
             viterbi_align(&lps, 2, 3, &[1], 99),
@@ -310,63 +336,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn repeated_token_requires_blank_between() {
-        let (lps, t, v) = lp(&[
-            &[0.7, 0.3],
-            &[0.1, 0.9],
-            &[0.7, 0.3],
-            &[0.1, 0.9],
-            &[0.7, 0.3],
-        ]);
-        let out = viterbi_align(&lps, t, v, &[1, 1], 0).unwrap();
-        assert_eq!(out, vec![(1, 2), (3, 4)]);
-    }
-
-    #[test]
-    fn distinct_tokens_can_skip_blank_between() {
-        let (lps, t, v) = lp(&[
-            &[0.98, 0.01, 0.01],
-            &[0.01, 0.98, 0.01],
-            &[0.01, 0.01, 0.98],
-            &[0.98, 0.01, 0.01],
-        ]);
-
-        let err = viterbi_align(&lps, t, v, &[1, 2], 0).unwrap_err();
-        assert!(matches!(
-            err,
-            AlignError::TooFewFrames {
-                frames: 4,
-                required: 5
-            }
-        ));
-    }
-
-    #[test]
-    fn handles_neg_infinity_emissions_gracefully() {
-        let neg = f32::NEG_INFINITY;
-        let mut lps = vec![
-            (0.99_f32).ln(),
-            (0.01_f32).ln(),
-            (0.99_f32).ln(),
-            (0.01_f32).ln(),
-            (0.01_f32).ln(),
-            (0.99_f32).ln(),
-            (0.99_f32).ln(),
-            (0.01_f32).ln(),
-        ];
-
-        lps[1] = neg;
-        let out = viterbi_align(&lps, 4, 2, &[1], 0).unwrap();
-        assert_eq!(out, vec![(2, 3)]);
-
-        assert!(out.iter().all(|&(s, e)| s < e));
-    }
-
-    #[test]
-    fn frame_to_time_ms_defaults() {
-        assert!((frame_to_time_ms(0, 320, 16_000) - 0.0).abs() < 1e-6);
-        assert!((frame_to_time_ms(1, 320, 16_000) - 20.0).abs() < 1e-6);
-        assert!((frame_to_time_ms(50, 320, 16_000) - 1000.0).abs() < 1e-6);
-    }
 }

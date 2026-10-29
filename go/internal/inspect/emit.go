@@ -48,10 +48,8 @@ func Emit(r *Relay, ctx context.Context, lane LaneID, kind string, corr *Corr, p
 	r.Publish(ev)
 }
 
-func SetTurnID(r *Relay, v string)     { r.SetCorr(&v, nil, nil, nil) }
-func SetItemID(r *Relay, v string)     { r.SetCorr(nil, &v, nil, nil) }
-func SetResponseID(r *Relay, v string) { r.SetCorr(nil, nil, &v, nil) }
-func SetPhraseID(r *Relay, v string)   { r.SetCorr(nil, nil, nil, &v) }
+func SetTurnID(r *Relay, v string) { r.SetCorr(&v, nil, nil, nil) }
+func SetItemID(r *Relay, v string) { r.SetCorr(nil, &v, nil, nil) }
 
 type EOUFields struct {
 	EouKind       string

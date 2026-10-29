@@ -29,9 +29,8 @@ fn dropping_the_first_model_after_an_m1_use_must_pull_its_persist_row_out_of_the
         "this is the marlin drop-side use-after-free gate and must not report success without \
          the CUDA card",
     );
-    let dev = match &device {
-        Device::Cuda(d) => d.clone(),
-        _ => unreachable!(),
+    let Device::Cuda(dev) = device.clone() else {
+        unreachable!()
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let (out, inp, ngroups) = SYNTHETIC_OUT_256_IN_256_GROUPS_2_IS_THE_SMALLEST_LN_SUPPORTED_SHAPE;
@@ -41,7 +40,7 @@ fn dropping_the_first_model_after_an_m1_use_must_pull_its_persist_row_out_of_the
     let _y = model_a.forward(&x)?;
     marlin_zero_upload(&stream)?;
     marlin_zero_launch(&stream)?;
-    stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+    stream.synchronize()?;
 
     let (entries, dev_list, count) =
         marlin_zero_snapshot_host_entries_uploaded_device_list_and_count(&stream)?;
@@ -80,8 +79,7 @@ fn dropping_the_first_model_after_an_m1_use_must_pull_its_persist_row_out_of_the
     let mut reused: Option<(CudaSlice<bf16>, usize, usize)> = None;
     'attempts: for _ in 0..SAME_SIZE_ALLOC_ATTEMPTS_BEFORE_DECLARING_THE_REUSE_ARM_VACUOUS {
         for elems in [out, 512, 65536] {
-            let mut b: CudaSlice<bf16> =
-                unsafe { stream.alloc::<bf16>(elems) }.map_err(|e| anyhow::anyhow!(e))?;
+            let mut b: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(elems) }?;
             let p = {
                 let (p, _g) = b.device_ptr_mut(&stream);
                 p
@@ -100,15 +98,11 @@ fn dropping_the_first_model_after_an_m1_use_must_pull_its_persist_row_out_of_the
         Some((mut model_b_tensor, w_lo, w_hi)) => {
             let elems = model_b_tensor.len();
             let pattern = vec![bf16::from_f32(1.0); elems];
-            stream
-                .memcpy_htod(&pattern, &mut model_b_tensor)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            stream.memcpy_htod(&pattern, &mut model_b_tensor)?;
             marlin_zero_upload(&stream)?;
             marlin_zero_launch(&stream)?;
-            stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
-            let back: Vec<bf16> = stream
-                .clone_dtoh(&model_b_tensor)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            stream.synchronize()?;
+            let back: Vec<bf16> = stream.clone_dtoh(&model_b_tensor)?;
             let zeroed = back[w_lo..w_hi].iter().filter(|v| v.to_bits() == 0).count();
             assert_eq!(
                 zeroed,

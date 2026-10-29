@@ -1,4 +1,5 @@
-use anyhow::Result;
+use anyhow::{ensure, Result};
+use wgpu::Buffer;
 
 use super::config::{LagunaShapes, LayerShape};
 use super::gpu::{
@@ -21,26 +22,26 @@ pub struct DenseGpu {
 fn check_shapes(shapes: &LagunaShapes, layer: &LayerShape, w: &HostDenseMlp) -> Result<usize> {
     let hidden = shapes.hidden_size;
     let inter = layer.ffn_intermediate;
-    anyhow::ensure!(
+    ensure!(
         inter > 0 && inter.is_multiple_of(2),
         "layer {} dense intermediate {inter} must be positive and even",
         layer.idx
     );
-    anyhow::ensure!(
+    ensure!(
         w.gate.n() == inter && w.gate.k() == hidden,
         "layer {} gate_proj [{}, {}] != [{inter}, {hidden}]",
         layer.idx,
         w.gate.n(),
         w.gate.k()
     );
-    anyhow::ensure!(
+    ensure!(
         w.up.n() == inter && w.up.k() == hidden,
         "layer {} up_proj [{}, {}] != [{inter}, {hidden}]",
         layer.idx,
         w.up.n(),
         w.up.k()
     );
-    anyhow::ensure!(
+    ensure!(
         w.down.n() == hidden && w.down.k() == inter,
         "layer {} down_proj [{}, {}] != [{hidden}, {inter}]",
         layer.idx,
@@ -50,15 +51,14 @@ fn check_shapes(shapes: &LagunaShapes, layer: &LayerShape, w: &HostDenseMlp) -> 
     Ok(inter)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_dense_mlp(
     b: &mut Builder,
     s: &Sources,
     shapes: &LagunaShapes,
     layer: &LayerShape,
     w: &HostDenseMlp,
-    x_normed_packed: &wgpu::Buffer,
-    out_packed: &wgpu::Buffer,
+    x_normed_packed: &Buffer,
+    out_packed: &Buffer,
     lora: Option<&LoraSiteCtx>,
 ) -> Result<DenseGpu> {
     let inter = check_shapes(shapes, layer, w)?;
@@ -121,8 +121,8 @@ pub fn build_dense_mlp_rows(
     s: &Sources,
     layer: &LayerShape,
     g: &DenseGpu,
-    x_rows_packed: &wgpu::Buffer,
-    out_rows_packed: &wgpu::Buffer,
+    x_rows_packed: &Buffer,
+    out_rows_packed: &Buffer,
     mp: &MRows,
 ) -> Result<()> {
     let inter = layer.ffn_intermediate;
@@ -184,7 +184,7 @@ pub fn ref_dense_mlp(
     x_normed: &[f32],
 ) -> Result<Vec<f32>> {
     let inter = check_shapes(shapes, layer, w)?;
-    anyhow::ensure!(
+    ensure!(
         x_normed.len() == shapes.hidden_size,
         "dense mlp input {} != hidden {}",
         x_normed.len(),

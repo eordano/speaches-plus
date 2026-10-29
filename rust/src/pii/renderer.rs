@@ -172,17 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rect_entirely_left_of_the_image_redacts_nothing() {
-        assert_eq!(clamp_rect(&rect(-100, -100, -50, -50), 900, 340), None);
-    }
-
-    #[test]
-    fn a_rect_entirely_right_of_the_image_redacts_nothing() {
-        assert_eq!(clamp_rect(&rect(1200, 400, 1300, 500), 900, 340), None);
-    }
-
-    #[test]
-    fn a_straddling_rect_is_clamped_to_the_image() {
+    fn clamp_rect_clamps_straddling_rects_and_drops_off_image_or_inverted_ones() {
         assert_eq!(
             clamp_rect(&rect(-20, -10, 200, 60), 900, 340),
             Some((0, 0, 200, 60))
@@ -191,11 +181,15 @@ mod tests {
             clamp_rect(&rect(800, 300, 5000, 9000), 900, 340),
             Some((800, 300, 900, 340))
         );
-    }
-
-    #[test]
-    fn an_inverted_rect_redacts_nothing() {
-        assert_eq!(clamp_rect(&rect(600, 200, 100, 50), 900, 340), None);
+        {
+            assert_eq!(clamp_rect(&rect(-100, -100, -50, -50), 900, 340), None);
+        }
+        {
+            assert_eq!(clamp_rect(&rect(1200, 400, 1300, 500), 900, 340), None);
+        }
+        {
+            assert_eq!(clamp_rect(&rect(600, 200, 100, 50), 900, 340), None);
+        }
     }
 
     #[test]

@@ -518,9 +518,7 @@ impl Backend {
             }
             #[cfg(feature = "cuda")]
             Self::Cuda(cu) => {
-                #[allow(deprecated)]
                 let dx: CudaSlice<f32> = cu.stream.clone_htod(x).map_err(cuda_err_rms)?;
-                #[allow(deprecated)]
                 let dw: CudaSlice<f32> = cu.stream.clone_htod(weight).map_err(cuda_err_rms)?;
                 let mut dy: CudaSlice<f32> = cu
                     .stream
@@ -544,8 +542,7 @@ impl Backend {
                 };
                 cuda_rc(KernelId::Rmsnorm, rc)?;
                 cu.stream.synchronize().map_err(cuda_err_rms)?;
-                #[allow(deprecated)]
-                let out = cu.stream.memcpy_dtov(&dy).map_err(cuda_err_rms)?;
+                let out = cu.stream.clone_dtoh(&dy).map_err(cuda_err_rms)?;
                 Ok(out)
             }
         }
@@ -567,9 +564,7 @@ impl Backend {
             }
             #[cfg(feature = "cuda")]
             Self::Cuda(cu) => {
-                #[allow(deprecated)]
                 let dx: CudaSlice<f32> = cu.stream.clone_htod(x).map_err(cuda_err_silu)?;
-                #[allow(deprecated)]
                 let dg: CudaSlice<f32> = cu.stream.clone_htod(gate).map_err(cuda_err_silu)?;
                 let mut dy: CudaSlice<f32> =
                     cu.stream.alloc_zeros::<f32>(n).map_err(cuda_err_silu)?;
@@ -589,8 +584,7 @@ impl Backend {
                 };
                 cuda_rc(KernelId::Silu, rc)?;
                 cu.stream.synchronize().map_err(cuda_err_silu)?;
-                #[allow(deprecated)]
-                let out = cu.stream.memcpy_dtov(&dy).map_err(cuda_err_silu)?;
+                let out = cu.stream.clone_dtoh(&dy).map_err(cuda_err_silu)?;
                 Ok(out)
             }
         }
@@ -617,9 +611,7 @@ impl Backend {
             }
             #[cfg(feature = "cuda")]
             Self::Cuda(cu) => {
-                #[allow(deprecated)]
                 let dw: CudaSlice<u16> = cu.stream.clone_htod(w).map_err(cuda_err_gemv)?;
-                #[allow(deprecated)]
                 let dx: CudaSlice<u16> = cu.stream.clone_htod(x).map_err(cuda_err_gemv)?;
                 let mut dy: CudaSlice<u16> =
                     cu.stream.alloc_zeros::<u16>(n).map_err(cuda_err_gemv)?;
@@ -640,14 +632,12 @@ impl Backend {
                 };
                 cuda_rc(KernelId::GemvBf16, rc)?;
                 cu.stream.synchronize().map_err(cuda_err_gemv)?;
-                #[allow(deprecated)]
-                let out = cu.stream.memcpy_dtov(&dy).map_err(cuda_err_gemv)?;
+                let out = cu.stream.clone_dtoh(&dy).map_err(cuda_err_gemv)?;
                 Ok(out)
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(any(feature = "wgpu", feature = "cuda")), allow(unused_variables))]
     pub fn attn_decode_f32(
         &self,
@@ -676,11 +666,8 @@ impl Backend {
             }
             #[cfg(feature = "cuda")]
             Self::Cuda(cu) => {
-                #[allow(deprecated)]
                 let dq: CudaSlice<f32> = cu.stream.clone_htod(q).map_err(cuda_err_attn)?;
-                #[allow(deprecated)]
                 let dk: CudaSlice<f32> = cu.stream.clone_htod(k).map_err(cuda_err_attn)?;
-                #[allow(deprecated)]
                 let dv: CudaSlice<f32> = cu.stream.clone_htod(v).map_err(cuda_err_attn)?;
                 let mut dout: CudaSlice<f32> = cu
                     .stream
@@ -708,8 +695,7 @@ impl Backend {
                 };
                 cuda_rc(KernelId::AttnDecode, rc)?;
                 cu.stream.synchronize().map_err(cuda_err_attn)?;
-                #[allow(deprecated)]
-                let out = cu.stream.memcpy_dtov(&dout).map_err(cuda_err_attn)?;
+                let out = cu.stream.clone_dtoh(&dout).map_err(cuda_err_attn)?;
                 Ok(out)
             }
             #[allow(unreachable_patterns)]

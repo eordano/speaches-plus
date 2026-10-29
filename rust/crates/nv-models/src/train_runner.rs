@@ -1,13 +1,9 @@
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor, Var, D};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use nv_layers::linear::{Linear, LoraDeltaHook};
 use nv_layers::norm::RmsNorm;
 use nv_layers::rope::Rope;
-use nv_train::qwen38::{
-    quant_resident_arm_opted_in,
-    NV_TRAIN_QUANT_RESIDENT_DEFAULT_ON_USER_SIGNOFF_2026_09_13_QLORA_QUANTIZED_ALWAYS_0_IS_THE_HOST_DEQUANT_ORACLE_KEEPS_NVFP4_AND_FP8_MODULES_RESIDENT_SO_TRAINING_RUNS_THE_SERVING_QUANT_GEMM as NV_TRAIN_QUANT_RESIDENT,
-};
 use nv_train::{
     ce_mean_over_unmasked_positions,
     eval_loss_scalar_is_the_sum_of_the_per_row_ce_means_in_dataset_row_order,
@@ -304,16 +300,6 @@ pub struct SpeculatorSpec {
     pub drafter_dir: PathBuf,
     pub rank: usize,
     pub lr_ratio: f64,
-}
-
-impl SpeculatorSpec {
-    pub fn eagle3_medusa2_defaults_rank_32_lr_ratio_4(drafter_dir: PathBuf) -> Self {
-        Self {
-            drafter_dir,
-            rank: 32,
-            lr_ratio: 4.0,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -781,13 +767,7 @@ pub fn load_base(path: &Path, device: &Device) -> Result<(BaseModel, DType)> {
 }
 
 fn load_base_resident_aware(path: &Path, device: &Device) -> Result<(BaseModel, DType, bool)> {
-    let resident = quant_resident_arm_opted_in();
     if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-        ensure!(
-            !resident,
-            "{NV_TRAIN_QUANT_RESIDENT}=1 on a gguf base: the gguf loader dequantizes to bf16 \
-             and has no resident-Linear plumbing"
-        );
         let model = Gemma4Moe::from_gguf(path, device, DType::BF16)
             .with_context(|| format!("load gguf base {}", path.display()))?;
         return Ok((BaseModel::Moe(model), DType::BF16, false));
@@ -807,13 +787,6 @@ fn load_base_resident_aware(path: &Path, device: &Device) -> Result<(BaseModel, 
         let packed = is_packed_nvfp4(&weights) || is_packed_w4a16(&weights);
 
         if base_cfg.enable_moe_block {
-            ensure!(
-                !resident,
-                "{NV_TRAIN_QUANT_RESIDENT}=1 on a MoE base: Gemma4Moe loads through a generic \
-                 TensorSource with per-expert fused tensors and has no resident-Linear \
-                 plumbing; only the dense gemma arm and the qwen38 windowed trainer carry the \
-                 resident arm"
-            );
             let cfg = Gemma4MoeConfig::from_hf_json_file(&cfg_path)
                 .with_context(|| format!("read moe config {}", cfg_path.display()))?;
             let model = if packed {
@@ -835,14 +808,7 @@ fn load_base_resident_aware(path: &Path, device: &Device) -> Result<(BaseModel, 
             DType::F32
         };
 
-        if resident {
-            ensure!(
-                is_packed_nvfp4(&weights),
-                "{NV_TRAIN_QUANT_RESIDENT}=1 but {} holds no modelopt-style nvfp4-packed linear \
-                 ({}); w4a16-packed and fp8 gemma bases have no dense-trainer resident path",
-                path.display(),
-                nv_train::qwen38::QUANT_RESIDENT_REFUSES_AN_ALL_BF16_CHECKPOINT_BECAUSE_A_SILENT_FALLTHROUGH_WOULD_FAKE_THE_ARM
-            );
+        if is_packed_nvfp4(&weights) && device.is_cuda() {
             let model = load_dense_resident(base_cfg, &weights, device, base_dtype, path)?;
             return Ok((BaseModel::Dense(model), base_dtype, true));
         }
@@ -890,12 +856,8 @@ fn load_dense_resident(
     path: &Path,
 ) -> Result<DenseTrainModel> {
     let _ = DENSE_RESIDENT_NVFP4_REQUANTIZES_THE_FUSED_MATRIX_BECAUSE_PER_MODULE_GLOBAL_SCALES_CANNOT_SHARE_ONE_WEIGHT_ALPHA;
-    let cuda = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => bail!(
-            "{NV_TRAIN_QUANT_RESIDENT}=1 needs a CUDA device: quantized-resident storages do \
-             not exist on CPU"
-        ),
+    let Device::Cuda(cuda) = device.clone() else {
+        bail!("quantized-resident storages need a CUDA device")
     };
     let runner = Arc::new(std::sync::Mutex::new(
         nv_quant::nvfp4::Nvfp4GemmRunner::new(cuda.cuda_stream())?,
@@ -914,15 +876,14 @@ fn load_dense_resident(
         let quantized: Vec<bool> = names.iter().map(|n| module_is_nvfp4(n)).collect();
         if quantized.iter().all(|q| !q) {
             for n in names {
-                ensure!(
+                anyhow::ensure!(
                     !weights.has(&format!("{n}.weight_packed")),
-                    "{n}: w4a16-packed storage has no resident-Linear path; unset \
-                     {NV_TRAIN_QUANT_RESIDENT} for this base"
+                    "{n}: w4a16-packed storage has no resident-Linear path"
                 );
             }
             return Linear::new_no_pretranspose(w, None);
         }
-        ensure!(
+        anyhow::ensure!(
             quantized.iter().all(|q| *q),
             "fused target {names:?} mixes nvfp4-packed and non-packed modules; a half-resident \
              fused GEMM would misreport the arm"
@@ -940,9 +901,9 @@ fn load_dense_resident(
         Some(&ingest),
     )
     .with_context(|| format!("load quant-resident dense base {}", path.display()))?;
-    ensure!(
+    anyhow::ensure!(
         resident_count.get() > 0,
-        "{NV_TRAIN_QUANT_RESIDENT}=1 built zero resident modules for {}; {}",
+        "the quantized-resident dense base built zero resident modules for {}; {}",
         path.display(),
         nv_train::qwen38::QUANT_RESIDENT_REFUSES_AN_ALL_BF16_CHECKPOINT_BECAUSE_A_SILENT_FALLTHROUGH_WOULD_FAKE_THE_ARM
     );
@@ -961,10 +922,7 @@ fn load_dense_resident(
     _base_dtype: DType,
     _path: &Path,
 ) -> Result<DenseTrainModel> {
-    bail!(
-        "{NV_TRAIN_QUANT_RESIDENT}=1 but this build has no cuda feature; quantized-resident \
-         storages only exist under cuda"
-    )
+    bail!("quantized-resident storages only exist under the cuda feature")
 }
 
 struct FusedTarget<'a> {
@@ -1143,9 +1101,7 @@ fn per_row_ce_means_in_dataset_row_order(
     batch: &[TokenRow],
 ) -> Result<Vec<Tensor>> {
     let dev = model.device();
-    let solo =
-        !model.is_dense() || nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_TRAIN_SOLO");
-    if solo {
+    if !model.is_dense() {
         return batch
             .iter()
             .map(|row| solo_example_loss(model, row, &dev))

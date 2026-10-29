@@ -139,7 +139,7 @@ ONE_SIDED_VERDICTS: dict[str, tuple[str, str]] = {
     "gdn_decode": (
         A_WGPU_PATH_CANNOT_EXPRESS_THIS_TODAY,
         "and the interesting half is the other direction: `gdn_gating.wgsl` / `gdn_recurrent.wgsl` "
-        "are gated A by `parity_gdn.rs` and no wgpu model wires them -- `nv-layers/src/linear_attn.rs` "
+        "exist and no wgpu model wires them -- `nv-layers/src/linear_attn.rs` "
         "dispatches CUDA or falls back to candle on the host",
     ),
     "gqa_verify_hd512": (
@@ -368,10 +368,6 @@ ONE_SIDED_VERDICTS: dict[str, tuple[str, str]] = {
         THE_FUNCTION_IS_PRESENT_UNDER_OTHER_ENTRY_NAMES,
         "the same bf16 gemv; legacy is the no-subgroup reduction spelling",
     ),
-    "g4m_gemv_i8": (
-        THE_FUNCTION_IS_PRESENT_UNDER_OTHER_ENTRY_NAMES,
-        "`gemv_bf16.cu`'s `gemv_i8_normed_kernel` is the same int8 gemv",
-    ),
     "g4m_gemv_i8_v4": (
         THE_FUNCTION_IS_PRESENT_UNDER_OTHER_ENTRY_NAMES,
         "the same int8 gemv, vec4 spelling",
@@ -456,18 +452,7 @@ ENTRY_POINT_VERDICTS: dict[str, tuple[str, str]] = {
     ),
 }
 
-DELETED_BY_9c74aedd2_THE_PARITY_CULL = "deleted by `9c74aedd2` (cull 157 -> 87 files); its numbers are quarantined in the historical table"
-DELETED_BY_0b11ba5f5_SUITE_CONSOLIDATION = "deleted by `0b11ba5f5`, which merged its assertions into a survivor named in the same row"
-DELETED_BY_c7277262d_STRAY_ARTIFACT = "deleted by `c7277262d` as a stray committed artifact"
-MOVED_INTO_THE_BOOK_BY_48de116aa = "the pre-`48de116aa` path of a page that now lives under `docs/book/`; named so a reader following an old link learns where it went"
-THE_DOC_ASSERTS_THIS_RESOLVES_NOWHERE = "the matrix claims this symbol is absent from the tree; if it comes back the claim is false and this gate says so"
-A_SYMBOL_THAT_LIVED_ONLY_IN_A_DELETED_SUITE = "a test fn or constant that lived in a suite the parity cull deleted"
-PRINTED_OUTPUT_OF_A_DELETED_SUITE = "a token from the console output of a deleted suite, quoted in the historical table"
-A_SUITE_FAMILY_THE_CULL_REMOVED_ENTIRELY = "a whole naming family the cull removed; nothing in the tree ends with it any more"
-
-DEAD_CITATIONS: dict[str, str] = {
-    "parity_gemm_nvfp4": DELETED_BY_9c74aedd2_THE_PARITY_CULL,
-}
+DEAD_CITATIONS: dict[str, str] = {}
 
 WGPU_BACKEND_MODULES_THAT_ARE_KERNELS = {"na", "na_attn", "na_bf16", "dequant"}
 WGPU_BACKEND_MODULES_THAT_ARE_INFRASTRUCTURE = {"buffer", "device", "dispatch", "qualify", "mod", "pack"}
@@ -608,7 +593,7 @@ def render(t: Tree, failures: list[str]) -> str:
         v, why = verdict_of(n, "CUDA-only", failures)
         L.append(
             f"| `{n}.cu` | {len(eps)} | {cell(eps, 7)} | {cell(t.tests_naming(eps + hosts))} | "
-            f"{cell(t.crates_calling(hosts), 4)} | **{v}** -- {why} |"
+            f"{cell(t.crates_calling(hosts), 4)} | {v} -- {why} |"
         )
     for n, files, eps in (
         ("marlin", t.marlin, marlin_eps),
@@ -617,7 +602,7 @@ def render(t: Tree, failures: list[str]) -> str:
         v, why = verdict_of(n, "CUDA-only", failures)
         names = cell([p.name for p in files], 4)
         needles = [n] + [p.stem for p in files if len(p.stem) >= A_VENDORED_FILE_STEM_SHORTER_THAN_THIS_MATCHES_EVERY_TEST]
-        L.append(f"| `{n}/` | {eps} | {names} | {cell(t.tests_naming(needles, as_prefix=True))} | -- | **{v}** -- {why} |")
+        L.append(f"| `{n}/` | {eps} | {names} | {cell(t.tests_naming(needles, as_prefix=True))} | -- | {v} -- {why} |")
     L.append("")
     L.append("### wgpu-only: a `.wgsl` or a wgpu module with no `.cu`")
     L.append("")
@@ -627,7 +612,7 @@ def render(t: Tree, failures: list[str]) -> str:
         eps = t.wgsl_eps.get(n, [])
         v, why = verdict_of(n, "wgpu-only", failures)
         shader = f"{len(eps)}" if n in t.wgsl else "generated in Rust"
-        L.append(f"| `{n}` | {shader} | {cell(t.tests_naming([n] + eps), 3)} | **{v}** -- {why} |")
+        L.append(f"| `{n}` | {shader} | {cell(t.tests_naming([n] + eps), 3)} | {v} -- {why} |")
     L.append("")
     L.append("### CUDA host entry fns no test in `rust/crates/*/tests/` names")
     L.append("")
@@ -652,7 +637,7 @@ def render(t: Tree, failures: list[str]) -> str:
     L.append("|---|---|")
     for key in sorted(ENTRY_POINT_VERDICTS):
         v, why = ENTRY_POINT_VERDICTS[key]
-        L.append(f"| `{key}` | **{v}** -- {why} |")
+        L.append(f"| `{key}` | {v} -- {why} |")
     L.append("")
     L.append("### Citations this file makes that must NOT resolve")
     L.append("")

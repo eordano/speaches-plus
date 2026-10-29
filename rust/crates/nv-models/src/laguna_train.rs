@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use nv_layers::linear::{Linear, LoraDeltaHook};
@@ -9,8 +9,8 @@ use nv_train::{
     ce_mean_over_unmasked_positions,
     eval_loss_scalar_is_the_sum_of_the_per_row_ce_means_in_dataset_row_order,
     grad_is_finite_by_one_scalar_readback_because_nan_and_inf_survive_a_sum,
-    load_jsonl_token_dataset, save_peft_raw, LoraConfig, LoraTrainable, RawLora, TokenRow,
-    TrainingLoraHook,
+    load_jsonl_token_dataset_strict as load_jsonl_token_dataset, save_peft_raw, LoraConfig,
+    LoraTrainable, RawLora, TokenRow, TrainingLoraHook,
     JSONL_MAX_SEQ_IS_512_SHARED_BY_BOTH_ENDPOINT_ARMS_BECAUSE_THE_DEFAULT_QWEN_WINDOWS_GDN_GRAPH_AT_512_IS_ABOUT_14_GB as JSONL_MAX_SEQ,
 };
 use nv_weights::WeightLoader;
@@ -21,17 +21,20 @@ use crate::gemma4::LayerType;
 use crate::laguna::{softplus_f32, yarn_inv_freq, LagunaConfig, LagunaGating, LagunaMoe};
 use crate::train_runner::select_device;
 use nv_layers::mlp::Mlp;
-use nv_layers::train_attn::gqa_sdpa_recompute;
+use nv_layers::train_attn::gqa_sdpa_recompute_with_group_serialization;
 
 #[path = "laguna_train_routing.rs"]
 mod routing;
+
+#[path = "laguna_train_checkpoint.rs"]
+mod checkpoint;
 
 pub const LAGUNA_TRAINS_FULL_DEPTH_WITHOUT_WINDOWING_BECAUSE_THE_TRUNK_IS_2048_HIDDEN_BY_40_LAYERS:
     &str =
     "Laguna-XS-2.1 is hidden 2048 x 40 layers, against the 5120 x 64 qwen3.8 27B whose GDN \
      activation memory forced that family's grad_layers window; laguna's full-graph activations \
      at JSONL_MAX_SEQ 512 are an order of magnitude smaller per layer and the MoE expert bulk is \
-     frozen, so this trainer takes the whole depth in one graph and exposes no window knob";
+     frozen, so this trainer takes the whole depth in one graph and exposes no depth-window knob";
 
 pub const LAGUNA_LORA_SITES_ARE_THE_ATTENTION_PROJECTIONS_BECAUSE_MLP_MEANS_PACKED_EXPERTS: &str =
     "laguna LoRA targets are q, k, v, o and g, the per-layer attention projections that stay \
@@ -39,8 +42,21 @@ pub const LAGUNA_LORA_SITES_ARE_THE_ATTENTION_PROJECTIONS_BECAUSE_MLP_MEANS_PACK
      layers route through 256 nvfp4-packed experts, so an mlp adapter would train only layer 0's \
      lone dense mlp while the job record claims mlp coverage";
 
+pub const DEFAULT_TRAIN_SEQUENCE_LENGTH: usize = JSONL_MAX_SEQ;
+pub const MAX_TRAIN_SEQUENCE_LENGTH: usize = 32768;
+
+pub fn validate_sequence_length(sequence_length: usize) -> Result<()> {
+    ensure!(
+        (2..=MAX_TRAIN_SEQUENCE_LENGTH).contains(&sequence_length),
+        "Laguna max_sequence_length must be between 2 and {}",
+        MAX_TRAIN_SEQUENCE_LENGTH
+    );
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct LagunaTrainArgs {
+    pub input_adapter: Option<PathBuf>,
     pub base: PathBuf,
     pub data: PathBuf,
     pub eval_data: Option<PathBuf>,
@@ -64,6 +80,7 @@ impl LagunaTrainArgs {
 
 #[derive(Clone, Debug)]
 pub struct LagunaTrainSummary {
+    pub max_sequence_length: usize,
     pub losses: Vec<f32>,
     pub eval_loss_adapter: Option<f32>,
     pub eval_loss_base: Option<f32>,
@@ -142,7 +159,7 @@ fn load_dense_linear(
     dtype: DType,
 ) -> Result<Linear> {
     let module = name.strip_suffix(".weight").unwrap_or(name);
-    anyhow::ensure!(
+    ensure!(
         !["weight_scale", "weight_scale_2", "weight_global_scale"]
             .iter().any(|suffix| weights.has(&format!("{module}.{suffix}"))),
         "Laguna training cannot load scaled {module} as dense; supported quantized weights use native NVFP4 weight_packed"
@@ -159,12 +176,21 @@ fn load_dense_linear(
 
 impl LagunaTrainModel {
     pub fn load(base: &Path, device: &Device) -> Result<Self> {
+        Self::load_with_sequence_length(base, device, DEFAULT_TRAIN_SEQUENCE_LENGTH)
+    }
+
+    pub fn load_with_sequence_length(
+        base: &Path,
+        device: &Device,
+        sequence_length: usize,
+    ) -> Result<Self> {
         let dtype = if device.is_cuda() {
             DType::BF16
         } else {
             DType::F32
         };
-        let mut model = Self::load_with_dtype(base, device, dtype)?;
+        let mut model =
+            Self::load_with_dtype_and_sequence_length(base, device, dtype, sequence_length)?;
         model.build_grouped_expert_stacks_and_free_the_per_expert_copies();
         Ok(model)
     }
@@ -195,6 +221,21 @@ impl LagunaTrainModel {
     }
 
     pub fn load_with_dtype(base: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        Self::load_with_dtype_and_sequence_length(
+            base,
+            device,
+            dtype,
+            DEFAULT_TRAIN_SEQUENCE_LENGTH,
+        )
+    }
+
+    fn load_with_dtype_and_sequence_length(
+        base: &Path,
+        device: &Device,
+        dtype: DType,
+        sequence_length: usize,
+    ) -> Result<Self> {
+        validate_sequence_length(sequence_length)?;
         let cfg_path = base.join("config.json");
         let config = LagunaConfig::from_hf_json_file(&cfg_path)
             .with_context(|| format!("read laguna config {}", cfg_path.display()))?;
@@ -204,16 +245,12 @@ impl LagunaTrainModel {
             .iter()
             .any(|n| n.ends_with(".weight_packed"));
         if has_packed {
-            anyhow::ensure!(
+            ensure!(
                 device.is_cuda() && cfg!(feature = "cuda") && dtype == DType::BF16,
                 "Laguna nvfp4 weight_packed training requires the CUDA backend with BF16 activations; the frozen base stays packed"
             );
-            anyhow::ensure!(
-                std::env::var("NV_ALLOW_LEAF_GRADIENT_LOSS").as_deref() != Ok("1"),
-                "Laguna NVFP4 training requires input gradients through frozen experts; unset NV_ALLOW_LEAF_GRADIENT_LOSS"
-            );
             let quant = nv_weights::QuantizationConfig::from_hf_json_file(&cfg_path)?;
-            anyhow::ensure!(
+            ensure!(
                 quant.scheme == nv_weights::QuantScheme::Nvfp4,
                 "Laguna weight_packed training requires an NVFP4 quantization_config"
             );
@@ -239,7 +276,7 @@ impl LagunaTrainModel {
             if let Some(runner) = &nvfp4_runner {
                 let module = name.strip_suffix(".weight").unwrap_or(name);
                 if weights.has(&format!("{module}.weight_packed")) {
-                    anyhow::ensure!(
+                    ensure!(
                         in_features > 0 && out_features > 0 && in_features.is_multiple_of(16)
                             && weights.shape_of(&format!("{module}.weight_scale"))
                                 == Some(vec![out_features, in_features / 16]),
@@ -487,7 +524,7 @@ impl LagunaTrainModel {
         };
         let lm_head = Linear::new_no_pretranspose(lm_head_weight, None)?;
 
-        let rope_len = config.max_position_embeddings.min(JSONL_MAX_SEQ * 2);
+        let rope_len = config.max_position_embeddings.min(sequence_length * 2);
         let full_dim = config.rotary_dim_full();
         let full_rope = Rope::from_inv_freq(
             RopeConfig {
@@ -582,60 +619,78 @@ impl LagunaTrainModel {
         })
     }
 
-    pub fn forward_logits(&self, tokens: &Tensor, positions: &Tensor) -> Result<Tensor> {
+    fn embed_tokens(&self, tokens: &Tensor) -> Result<Tensor> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
             bail!("LagunaTrainModel.forward_logits: tokens must be [1, seq], got {dims:?}");
         }
         let seq = dims[1];
         let tokens_flat = tokens.flatten_all()?.to_dtype(DType::U32)?;
-        let mut hidden = self
+        let hidden = self
             .embed_weight
             .detach()
             .index_select(&tokens_flat, 0)?
             .reshape((1usize, seq, self.config.hidden_size))?
             .to_dtype(self.dtype)?;
+        Ok(hidden)
+    }
+
+    fn forward_layer(
+        &self,
+        layer: &TrainLayer,
+        hidden: &Tensor,
+        positions: &Tensor,
+        seq: usize,
+    ) -> Result<Tensor> {
         let dev = hidden.device().clone();
-        for layer in &self.layers {
-            let after_attn = nv_train::train_prof::phase(&dev, "fwd_attention_layer", || {
-                let normed = layer.input_layernorm.forward_candle(&hidden)?;
-                let attn_out = self.attention_forward(layer, &normed, positions, seq)?;
-                Ok(hidden.add(&attn_out.to_dtype(hidden.dtype())?)?)
-            })?;
-            let ffn_phase = match &layer.ffn {
-                TrainFfn::Dense { .. } => "fwd_dense_mlp_layer",
-                TrainFfn::Moe(_) => "fwd_moe_layer",
+        let after_attn = nv_train::train_prof::phase(&dev, "fwd_attention_layer", || {
+            let normed = layer.input_layernorm.forward_candle(&hidden)?;
+            let attn_out = self.attention_forward(layer, &normed, positions, seq)?;
+            Ok(hidden.add(&attn_out.to_dtype(hidden.dtype())?)?)
+        })?;
+        let ffn_phase = match &layer.ffn {
+            TrainFfn::Dense { .. } => "fwd_dense_mlp_layer",
+            TrainFfn::Moe(_) => "fwd_moe_layer",
+        };
+        let out = nv_train::train_prof::phase(&dev, ffn_phase, || {
+            let normed_mlp = layer.post_attention_layernorm.forward_candle(&after_attn)?;
+            let ffn_out = match &layer.ffn {
+                TrainFfn::Dense {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                } => {
+                    let gate = gate_proj.forward(&normed_mlp)?;
+                    let up = up_proj.forward(&normed_mlp)?;
+                    down_proj.forward(&candle_nn::ops::silu(&gate)?.mul(&up)?)?
+                }
+                TrainFfn::Moe(moe) => {
+                    let flat = normed_mlp
+                        .reshape((seq, self.config.hidden_size))?
+                        .contiguous()?;
+                    routing::forward(moe, &flat)?.reshape((1usize, seq, self.config.hidden_size))?
+                }
             };
-            hidden = nv_train::train_prof::phase(&dev, ffn_phase, || {
-                let normed_mlp = layer.post_attention_layernorm.forward_candle(&after_attn)?;
-                let ffn_out = match &layer.ffn {
-                    TrainFfn::Dense {
-                        gate_proj,
-                        up_proj,
-                        down_proj,
-                    } => {
-                        let gate = gate_proj.forward(&normed_mlp)?;
-                        let up = up_proj.forward(&normed_mlp)?;
-                        down_proj.forward(&candle_nn::ops::silu(&gate)?.mul(&up)?)?
-                    }
-                    TrainFfn::Moe(moe) => {
-                        let flat = normed_mlp
-                            .reshape((seq, self.config.hidden_size))?
-                            .contiguous()?;
-                        routing::forward(moe, &flat)?.reshape((
-                            1usize,
-                            seq,
-                            self.config.hidden_size,
-                        ))?
-                    }
-                };
-                Ok(after_attn.add(&ffn_out.to_dtype(after_attn.dtype())?)?)
-            })?;
-        }
+            Ok(after_attn.add(&ffn_out.to_dtype(after_attn.dtype())?)?)
+        })?;
+        Ok(out)
+    }
+
+    fn final_logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        let dev = hidden.device().clone();
         nv_train::train_prof::phase(&dev, "fwd_final_norm_and_lm_head", || {
             let normed = self.final_norm.forward_candle(&hidden)?;
             Ok(self.lm_head.forward(&normed)?.to_dtype(DType::F32)?)
         })
+    }
+
+    pub fn forward_logits(&self, tokens: &Tensor, positions: &Tensor) -> Result<Tensor> {
+        let mut hidden = self.embed_tokens(tokens)?;
+        let seq = tokens.dim(1)?;
+        for layer in &self.layers {
+            hidden = self.forward_layer(layer, &hidden, positions, seq)?;
+        }
+        self.final_logits(&hidden)
     }
 
     fn attention_forward(
@@ -648,6 +703,7 @@ impl LagunaTrainModel {
         let head_dim = self.config.head_dim;
         let n_q = layer.num_heads;
         let n_kv = self.config.num_key_value_heads;
+        #[cfg(feature = "cuda")]
         let proj_span = fwd_span(x, "fwd_attn_qkv_projections_with_lora");
 
         let q = layer
@@ -664,7 +720,9 @@ impl LagunaTrainModel {
             .v_proj
             .forward(x)?
             .reshape((1usize, seq, n_kv, head_dim))?;
+        #[cfg(feature = "cuda")]
         drop(proj_span);
+        #[cfg(feature = "cuda")]
         let rope_span = fwd_span(x, "fwd_attn_norms_rope_casts");
 
         let (rope, rotary_dim, rot_scale) = match layer.kind {
@@ -684,23 +742,32 @@ impl LagunaTrainModel {
         let k_rot = k_rot.to_dtype(self.dtype)?.contiguous()?;
         let v = v.contiguous()?;
 
+        #[cfg(feature = "cuda")]
         drop(rope_span);
         let window = match layer.kind {
             LayerType::SlidingAttention => Some(self.config.sliding_window),
             LayerType::FullAttention => None,
         };
         let _ = nv_layers::train_attn::GQA_SDPA_RECOMPUTE_KEEPS_ONLY_Q_K_V_AND_O_ON_THE_GRAPH_AND_REBUILDS_THE_PROBABILITIES_IN_THE_BACKWARD;
-        let attn_out = if std::env::var("NV_TRAIN_ATTN_PROBE").as_deref() == Ok("naive") {
-            crate::dense_train::naive_sdpa(&q_rot, &k_rot, &v, 1, n_q, n_kv, head_dim, seq, window)?
+        let q_rot = if attention_output_stays_f32_like_the_expanded_head_path_did() {
+            q_rot.to_dtype(DType::F32)?
         } else {
-            let q_rot = if attention_output_stays_f32_like_the_expanded_head_path_did() {
-                q_rot.to_dtype(DType::F32)?
-            } else {
-                q_rot
-            };
-            gqa_sdpa_recompute(&q_rot, &k_rot, &v, 1, n_q, n_kv, head_dim, seq, window)?
+            q_rot
         };
+        let attn_out = gqa_sdpa_recompute_with_group_serialization(
+            &q_rot,
+            &k_rot,
+            &v,
+            1,
+            n_q,
+            n_kv,
+            head_dim,
+            seq,
+            window,
+            checkpoint::enabled(),
+        )?;
 
+        #[cfg(feature = "cuda")]
         let gate_span = fwd_span(x, "fwd_attn_gate_softplus_and_o_proj");
         let gated = match (&layer.g_proj, self.config.gating) {
             (Some(g_proj), LagunaGating::PerHead) => {
@@ -724,12 +791,12 @@ impl LagunaTrainModel {
             .reshape((1usize, seq, n_q * head_dim))?
             .to_dtype(self.dtype)?;
         let out = layer.o_proj.forward(&attn_flat);
+        #[cfg(feature = "cuda")]
         drop(gate_span);
         out
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn partial_rope_scaled_matching_serving_apply_partial_rope_scaled(
     q: &Tensor,
     k: &Tensor,
@@ -741,8 +808,20 @@ pub fn partial_rope_scaled_matching_serving_apply_partial_rope_scaled(
 ) -> Result<(Tensor, Tensor)> {
     #[cfg(feature = "cuda")]
     if nv_layers::rope::train_rope_op_serves(q) && q.dtype() == k.dtype() {
-        let q_out = rope.apply_train_partial_scaled(q, positions, rotary_dim.min(head_dim), head_dim, rot_scale)?;
-        let k_out = rope.apply_train_partial_scaled(k, positions, rotary_dim.min(head_dim), head_dim, rot_scale)?;
+        let q_out = rope.apply_train_partial_scaled(
+            q,
+            positions,
+            rotary_dim.min(head_dim),
+            head_dim,
+            rot_scale,
+        )?;
+        let k_out = rope.apply_train_partial_scaled(
+            k,
+            positions,
+            rotary_dim.min(head_dim),
+            head_dim,
+            rot_scale,
+        )?;
         return Ok((q_out, k_out));
     }
     let scale_rot = |t: Tensor| -> Result<Tensor> {
@@ -853,7 +932,13 @@ fn solo_row_ce(model: &LagunaTrainModel, row: &TokenRow) -> Result<Tensor> {
     let seq = row.ids.len();
     let tokens = Tensor::from_vec(row.ids.clone(), (1usize, seq), dev)?;
     let positions = Tensor::from_vec((0..seq as u32).collect::<Vec<_>>(), seq, dev)?;
-    let logits = model.forward_logits(&tokens, &positions)?.squeeze(0)?;
+    row_loss_from_logits(&model.forward_logits(&tokens, &positions)?, row)
+}
+
+fn row_loss_from_logits(logits: &Tensor, row: &TokenRow) -> Result<Tensor> {
+    let dev = logits.device();
+    let seq = row.ids.len();
+    let logits = logits.squeeze(0)?;
     let inp = logits.narrow(0, 0, seq - 1)?.contiguous()?;
     let tgt = Tensor::from_vec(row.ids[1..].to_vec(), seq - 1, dev)?;
     ce_mean_over_unmasked_positions(
@@ -865,7 +950,13 @@ fn solo_row_ce(model: &LagunaTrainModel, row: &TokenRow) -> Result<Tensor> {
 
 fn per_row_eval_ce(model: &LagunaTrainModel, rows: &[TokenRow]) -> Result<Vec<f32>> {
     rows.iter()
-        .map(|row| Ok(solo_row_ce(model, row)?.to_scalar::<f32>()?))
+        .map(|row| {
+            if checkpoint::enabled() {
+                checkpoint::eval_row_ce(model, row)
+            } else {
+                Ok(solo_row_ce(model, row)?.to_scalar::<f32>()?)
+            }
+        })
         .collect()
 }
 
@@ -878,7 +969,15 @@ fn attention_output_stays_f32_like_the_expanded_head_path_did() -> bool {
 pub const ONE_ROW_ON_THE_GRAPH_AT_A_TIME_BECAUSE_SUMMING_EVERY_ROW_LOSS_BEFORE_ONE_BACKWARD_HELD_EVERY_ROW_GRAPH_AT_ONCE: usize = 1;
 
 pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
-    let device = if std::env::var_os("NV_TRAIN_DEVICE").is_none()
+    run_with_sequence_length(args, DEFAULT_TRAIN_SEQUENCE_LENGTH)
+}
+
+pub fn run_with_sequence_length(
+    args: &LagunaTrainArgs,
+    sequence_length: usize,
+) -> Result<LagunaTrainSummary> {
+    validate_sequence_length(sequence_length)?;
+    let device = if !nv_config::env_arm_present_at_all_reread_every_call("NV_TRAIN_DEVICE")
         && open_base_weights(&args.base, &Device::Cpu)?
             .names()
             .iter()
@@ -894,7 +993,18 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
         select_device()?
     };
     let device_label = if device.is_cuda() { "cuda" } else { "cpu" };
-    let model = LagunaTrainModel::load(&args.base, &device)?;
+    let input = match &args.input_adapter {
+        Some(path) => {
+            validate_input_adapter(args, path)?;
+            Some(WeightLoader::open_file(
+                path.join("adapter_model.safetensors"),
+                &device,
+            )?)
+        }
+        None => None,
+    };
+    let model = LagunaTrainModel::load_with_sequence_length(&args.base, &device, sequence_length)?;
+    let sequence_length = sequence_length.min(model.config.max_position_embeddings);
     let (moe_layers, dense_mlp_layers) = model.moe_and_dense_mlp_layer_counts();
     eprintln!(
         "LAGUNA_BASE 1  layers {}  hidden {}  vocab {}  moe_layers {moe_layers}  device \
@@ -907,6 +1017,25 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
     );
 
     let sites = build_sites(&model, &args.targets, args.seed)?;
+    if let Some(weights) = &input {
+        let expected: std::collections::BTreeSet<String> = sites
+            .iter()
+            .flat_map(|s| {
+                [
+                    format!("base_model.model.{}.lora_A.weight", s.module),
+                    format!("base_model.model.{}.lora_B.weight", s.module),
+                ]
+            })
+            .collect();
+        ensure!(
+            weights
+                .names()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                == expected,
+            "input adapter target modules differ from training targets"
+        );
+    }
     let cfg = LoraConfig {
         r: args.rank,
         alpha: args.alpha,
@@ -922,6 +1051,25 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
             s.seed,
             &device,
         )?);
+        if let Some(weights) = &input {
+            for (var, suffix) in lora.trainable_vars().iter().zip(["A", "B"]) {
+                let value = weights.get(
+                    &format!("base_model.model.{}.lora_{suffix}.weight", s.module),
+                    DType::F32,
+                )?;
+                ensure!(
+                    value.dims() == var.dims(),
+                    "input adapter tensor shape mismatch"
+                );
+                ensure!(
+                    grad_is_finite_by_one_scalar_readback_because_nan_and_inf_survive_a_sum(
+                        &value
+                    )?,
+                    "input adapter has non-finite weights"
+                );
+                var.set(&value)?;
+            }
+        }
         vars.extend(lora.trainable_vars());
         let hook: Arc<dyn LoraDeltaHook> = Arc::new(TrainingLoraHook::new(lora.clone(), true));
         s.lin.attach_lora(hook)?;
@@ -932,7 +1080,7 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
         &args.data,
         &args.base,
         model.config.vocab_size,
-        JSONL_MAX_SEQ,
+        sequence_length,
     )?;
 
     let mut losses = Vec::with_capacity(args.steps);
@@ -951,14 +1099,21 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
             let _ = ONE_ROW_ON_THE_GRAPH_AT_A_TIME_BECAUSE_SUMMING_EVERY_ROW_LOSS_BEFORE_ONE_BACKWARD_HELD_EVERY_ROW_GRAPH_AT_ONCE;
             let mut lv = 0f32;
             let mut grads: Option<candle_core::backprop::GradStore> = None;
-            anyhow::ensure!(!dataset.is_empty(), "empty laguna training batch");
+            ensure!(!dataset.is_empty(), "empty laguna training batch");
             for row in &dataset {
-                let loss =
-                    nv_train::train_prof::phase(&dev, "forward_row", || solo_row_ce(&model, row))?;
-                lv += loss.to_scalar::<f32>()?;
-                let row_grads = nv_train::train_prof::phase(&dev, "backward_row", || {
-                    loss.backward().map_err(Into::into)
-                })?;
+                let (row_loss, row_grads) = if checkpoint::enabled() {
+                    checkpoint::row_gradients(&model, row, &vars)?
+                } else {
+                    let loss = nv_train::train_prof::phase(&dev, "forward_row", || {
+                        solo_row_ce(&model, row)
+                    })?;
+                    let value = loss.to_scalar::<f32>()?;
+                    let gradients = nv_train::train_prof::phase(&dev, "backward_row", || {
+                        loss.backward().map_err(Into::into)
+                    })?;
+                    (value, gradients)
+                };
+                lv += row_loss;
                 grads = Some(match grads {
                     None => row_grads,
                     Some(mut acc) => {
@@ -975,7 +1130,7 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
                     }
                 });
             }
-            anyhow::ensure!(
+            ensure!(
                 lv.is_finite(),
                 "Laguna training step {step}: non-finite loss"
             );
@@ -985,7 +1140,7 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
                     let g = grads.get(v).with_context(|| {
                         format!("Laguna training step {step}: missing gradient for adapter variable {index}")
                     })?;
-                    anyhow::ensure!(
+                    ensure!(
                         grad_is_finite_by_one_scalar_readback_because_nan_and_inf_survive_a_sum(g)?,
                         "Laguna training step {step}: non-finite gradient for adapter variable {index}"
                     );
@@ -1004,8 +1159,12 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
 
     let (eval_ce_adapter, eval_ce_base) = match &args.eval_data {
         Some(path) => {
-            let eval_set =
-                load_jsonl_token_dataset(path, &args.base, model.config.vocab_size, JSONL_MAX_SEQ)?;
+            let eval_set = load_jsonl_token_dataset(
+                path,
+                &args.base,
+                model.config.vocab_size,
+                sequence_length,
+            )?;
             let with_adapter = per_row_eval_ce(&model, &eval_set)?;
             for s in &sites {
                 s.lin.detach_lora();
@@ -1052,6 +1211,7 @@ pub fn run(args: &LagunaTrainArgs) -> Result<LagunaTrainSummary> {
     let modules: Vec<String> = entries.iter().map(|e| e.module.clone()).collect();
     let num_eval_examples = eval_ce_base.len();
     Ok(LagunaTrainSummary {
+        max_sequence_length: sequence_length,
         losses,
         eval_loss_adapter,
         eval_loss_base,
@@ -1271,7 +1431,49 @@ fn fwd_span(x: &Tensor, name: &'static str) -> Option<nv_layers::prof_events::Sp
     }
 }
 
-#[cfg(not(feature = "cuda"))]
-fn fwd_span(_x: &Tensor, _name: &'static str) -> Option<()> {
-    None
+pub fn validate_input_adapter(args: &LagunaTrainArgs, path: &Path) -> Result<()> {
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path.join("adapter_config.json"))?)?;
+    ensure!(
+        config["r"].as_u64() == Some(args.rank as u64),
+        "input adapter rank mismatch"
+    );
+    ensure!(
+        config["lora_alpha"].as_f64() == Some(args.alpha),
+        "input adapter alpha mismatch"
+    );
+    ensure!(
+        config["peft_type"].as_str() == Some("LORA"),
+        "input adapter must be LoRA"
+    );
+    for key in ["use_rslora", "use_dora", "fan_in_fan_out"] {
+        ensure!(
+            !config[key].as_bool().unwrap_or(false),
+            "unsupported input adapter variant: {key}"
+        );
+    }
+    ensure!(
+        config["bias"].as_str().unwrap_or("none") == "none",
+        "input adapter bias training is unsupported"
+    );
+    for key in ["modules_to_save", "rank_pattern", "alpha_pattern"] {
+        ensure!(
+            config[key].is_null() || config[key].as_object().is_some_and(|v| v.is_empty()),
+            "unsupported input adapter setting: {key}"
+        );
+    }
+    let base = config["base_model_name_or_path"]
+        .as_str()
+        .context("input adapter has no base identity")?;
+    ensure!(
+        std::fs::canonicalize(base)? == std::fs::canonicalize(&args.base)?,
+        "input adapter base mismatch"
+    );
+    if args.out.exists() {
+        ensure!(
+            std::fs::canonicalize(path)? != std::fs::canonicalize(&args.out)?,
+            "output must not overwrite input adapter"
+        );
+    }
+    Ok(())
 }

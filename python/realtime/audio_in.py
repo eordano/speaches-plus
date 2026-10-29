@@ -21,7 +21,7 @@ def _load_opus_decoder_factory() -> Any:
     except ImportError as err:
         raise RuntimeError(
             "AudioIngest requires the 'opuslib' package (>=3.0). "
-            "Install it via `pip install opuslib` (libopus must be present)."
+            "Install it via `uv pip install opuslib` (libopus must be present)."
         ) from err
 
 def _build_polyphase_kernel(up: int, down: int, half_taps: int = 32, beta: float = 8.6) -> np.ndarray:
@@ -43,7 +43,6 @@ def _polyphase_resample_48_to_16(mono_48k: np.ndarray, tail: np.ndarray) -> tupl
         _RESAMPLE_KERNEL_48_TO_16 = _build_polyphase_kernel(up=1, down=3, half_taps=32, beta=8.6)
     h = _RESAMPLE_KERNEL_48_TO_16
     n_taps = h.shape[0]
-    half = (n_taps - 1) // 2
     if tail.size:
         signal = np.concatenate([tail, mono_48k]).astype(np.float32, copy=False)
     else:

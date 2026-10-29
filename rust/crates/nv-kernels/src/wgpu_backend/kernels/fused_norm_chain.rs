@@ -1,10 +1,8 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::{pack_u16_pairs as pack_u16, unpack_u16_pairs as unpack_u16};
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
-pub const WGSL: &str = include_str!("../../../wgsl/fused_norm_chain.wgsl");
+pub const WGSL: &str = crate::wgsl!("../../../wgsl/fused_norm_chain.wgsl");
 
 pub const ENTRY_RMS_RES_RMS: &str = "e4b_rms_res_rms_bf16";
 pub const ENTRY_RES_OF_RMS: &str = "e4b_res_of_rms_bf16";

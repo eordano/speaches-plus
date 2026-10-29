@@ -12,48 +12,9 @@ use crate::mlp::Mlp;
 const MIN_TILE: usize = nv_quant::nvfp4::MIN_TILE;
 const BLOCK_SIZE: usize = nv_quant::nvfp4::BLOCK_SIZE;
 
-pub fn moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
-    key: &str,
-) -> bool {
-    !matches!(
-        std::env::var(key).ok().as_deref(),
-        Some("0") | Some("off") | Some("false") | Some("no")
-    )
-}
-
-pub fn folded_shared_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
-            "NV_MOE_SHARED_FOLD",
-        )
-    })
-}
-
-pub fn route_fuse_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
-            "NV_MOE_ROUTE_FUSE",
-        )
-    })
-}
-
-pub fn chain_slim_launches_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
-            "NV_MOE_CHAIN_SLIM",
-        )
-    })
-}
-
 const ROUTE_QUANT_SPLIT_CTAS_UNDER_CHAIN_SLIM: i32 = 8;
 
-const ROUTE_FUSE_SINGLE_CTA_TOPK_HOLDS_UP_TO_256_EXPERTS: usize = 256;
+const ROUTE_FUSE_SINGLE_CTA_TOPK_HOLDS_UP_TO_512_EXPERTS: usize = 512;
 
 pub const ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS: usize = 8;
 
@@ -178,7 +139,6 @@ pub(crate) fn marlin_moe_stack_from_linear(
             k,
             globals_in[e],
         );
-        #[allow(deprecated)]
         let d_kmajor: CudaSlice<u32> = stream.clone_htod(&kmajor)?;
         let rc = unsafe {
             let (pi, _g1) = d_kmajor.device_ptr(stream);
@@ -197,9 +157,7 @@ pub(crate) fn marlin_moe_stack_from_linear(
         scales_all.extend_from_slice(&sc.bytes_e5m3);
         globals.push(sc.global_scale_processed);
     }
-    #[allow(deprecated)]
     let scales = stream.clone_htod(&scales_all)?;
-    #[allow(deprecated)]
     let globals = stream.clone_htod(&globals)?;
     Ok(MarlinMoeStack {
         b_q,
@@ -377,18 +335,12 @@ impl MoeGroupedWeights {
                 "expert {e} down weight size mismatch"
             );
 
-            #[allow(deprecated)]
-            let gw_host = stream.memcpy_dtov(gw)?;
-            #[allow(deprecated)]
-            let gs_host = stream.memcpy_dtov(gs)?;
-            #[allow(deprecated)]
-            let uw_host = stream.memcpy_dtov(uw)?;
-            #[allow(deprecated)]
-            let us_host = stream.memcpy_dtov(us)?;
-            #[allow(deprecated)]
-            let dw_host = stream.memcpy_dtov(dw)?;
-            #[allow(deprecated)]
-            let ds_host = stream.memcpy_dtov(ds)?;
+            let gw_host = stream.clone_dtoh(gw)?;
+            let gs_host = stream.clone_dtoh(gs)?;
+            let uw_host = stream.clone_dtoh(uw)?;
+            let us_host = stream.clone_dtoh(us)?;
+            let dw_host = stream.clone_dtoh(dw)?;
+            let ds_host = stream.clone_dtoh(ds)?;
 
             gate_w_concat[e * gate_w_bytes_per_expert..(e + 1) * gate_w_bytes_per_expert]
                 .copy_from_slice(&gw_host);
@@ -414,29 +366,18 @@ impl MoeGroupedWeights {
             up_alphas[e] = ua;
             down_alphas[e] = da;
         }
-        #[allow(deprecated)]
-        let input_globals_gate_up = stream.memcpy_stod(&globals_gate_up_host)?;
-        #[allow(deprecated)]
-        let input_globals_down = stream.memcpy_stod(&globals_down_host)?;
+        let input_globals_gate_up = stream.clone_htod(&globals_gate_up_host)?;
+        let input_globals_down = stream.clone_htod(&globals_down_host)?;
 
-        #[allow(deprecated)]
-        let gate_w = stream.memcpy_stod(&gate_w_concat)?;
-        #[allow(deprecated)]
-        let gate_w_scales = stream.memcpy_stod(&gate_w_scales_concat)?;
-        #[allow(deprecated)]
-        let gate_alphas_dev = stream.memcpy_stod(&gate_alphas)?;
-        #[allow(deprecated)]
-        let up_w = stream.memcpy_stod(&up_w_concat)?;
-        #[allow(deprecated)]
-        let up_w_scales = stream.memcpy_stod(&up_w_scales_concat)?;
-        #[allow(deprecated)]
-        let up_alphas_dev = stream.memcpy_stod(&up_alphas)?;
-        #[allow(deprecated)]
-        let down_w = stream.memcpy_stod(&down_w_concat)?;
-        #[allow(deprecated)]
-        let down_w_scales = stream.memcpy_stod(&down_w_scales_concat)?;
-        #[allow(deprecated)]
-        let down_alphas_dev = stream.memcpy_stod(&down_alphas)?;
+        let gate_w = stream.clone_htod(&gate_w_concat)?;
+        let gate_w_scales = stream.clone_htod(&gate_w_scales_concat)?;
+        let gate_alphas_dev = stream.clone_htod(&gate_alphas)?;
+        let up_w = stream.clone_htod(&up_w_concat)?;
+        let up_w_scales = stream.clone_htod(&up_w_scales_concat)?;
+        let up_alphas_dev = stream.clone_htod(&up_alphas)?;
+        let down_w = stream.clone_htod(&down_w_concat)?;
+        let down_w_scales = stream.clone_htod(&down_w_scales_concat)?;
+        let down_alphas_dev = stream.clone_htod(&down_alphas)?;
 
         let built = Self {
             num_experts: routed_experts,
@@ -528,7 +469,6 @@ impl MoeGroupedWeights {
             );
             let mut grown = stream.alloc_zeros::<u8>((e + 1) * per)?;
             let n = per.min(tail.len());
-            #[allow(deprecated)]
             {
                 stream.memcpy_dtod(old, &mut grown.slice_mut(0..e * per))?;
                 stream.memcpy_dtod(
@@ -545,7 +485,6 @@ impl MoeGroupedWeights {
                 old.len()
             );
             let mut grown = stream.alloc_zeros::<f32>(e + 1)?;
-            #[allow(deprecated)]
             {
                 stream.memcpy_dtod(old, &mut grown.slice_mut(0..e))?;
                 stream.memcpy_htod(&[alpha], &mut grown.slice_mut(e..e + 1))?;
@@ -574,10 +513,8 @@ impl MoeGroupedWeights {
             globals_down_host.len(),
             e + 1
         );
-        #[allow(deprecated)]
-        let input_globals_gate_up = stream.memcpy_stod(&globals_gate_up_host)?;
-        #[allow(deprecated)]
-        let input_globals_down = stream.memcpy_stod(&globals_down_host)?;
+        let input_globals_gate_up = stream.clone_htod(&globals_gate_up_host)?;
+        let input_globals_down = stream.clone_htod(&globals_down_host)?;
 
         Ok(Self {
             num_experts: e,
@@ -608,13 +545,6 @@ impl MoeGroupedWeights {
             ),
         })
     }
-}
-
-pub fn per_expert_bytes(hidden_size: usize, intermediate_size: usize) -> usize {
-    let gate_w = intermediate_size * hidden_size / 2;
-    let down_w = hidden_size * intermediate_size / 2;
-    2 * (gate_w + swizzled_scale_bytes(intermediate_size, hidden_size))
-        + (down_w + swizzled_scale_bytes(hidden_size, intermediate_size))
 }
 
 pub fn swizzled_scale_bytes(rows: usize, cols: usize) -> usize {
@@ -695,7 +625,6 @@ pub struct PrefillDeviceRouting {
     m_total_padded: usize,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn route_topk_device(
     router_logits: &Tensor,
     selection_bias: Option<&Tensor>,
@@ -795,7 +724,6 @@ fn route_topk_device(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn route_topk_ids_on_the_device_as_u32_tokens_by_k(
     router_logits: &Tensor,
     selection_bias: Option<&Tensor>,
@@ -810,7 +738,10 @@ pub fn route_topk_ids_on_the_device_as_u32_tokens_by_k(
         Device::Cuda(d) => d.clone(),
         _ => anyhow::bail!("device routing requires CUDA"),
     };
-    anyhow::ensure!(n_tokens > 0 && k > 0 && k <= num_experts, "invalid device routing shape");
+    anyhow::ensure!(
+        n_tokens > 0 && k > 0 && k <= num_experts,
+        "invalid device routing shape"
+    );
     let stream = crate::cuda_stream::current_stream(&dev);
     let logits = router_logits.to_dtype(DType::F32)?.contiguous()?;
     anyhow::ensure!(
@@ -865,53 +796,6 @@ pub fn route_topk_ids_on_the_device_as_u32_tokens_by_k(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn route_topk_device_then_copy_compact_for_prefill_dispatch(
-    router_logits: &Tensor,
-    selection_bias: Option<&Tensor>,
-    n_tokens: usize,
-    num_experts: usize,
-    k: usize,
-    mode: i32,
-    softcap: f32,
-    norm_topk: bool,
-    routed_scaling: f32,
-    device: &Device,
-) -> Result<(Vec<u32>, Vec<f32>)> {
-    let routed = route_topk_device(
-        router_logits,
-        selection_bias,
-        n_tokens,
-        num_experts,
-        k,
-        mode,
-        softcap,
-        norm_topk,
-        routed_scaling,
-        device,
-    )?;
-
-    #[allow(deprecated)]
-    let ids_host: Vec<i32> = routed.stream.memcpy_dtov(&routed.ids)?;
-    #[allow(deprecated)]
-    let weights_host: Vec<f32> = routed.stream.memcpy_dtov(&routed.weights)?;
-    anyhow::ensure!(
-        ids_host
-            .iter()
-            .all(|&e| e >= 0 && (e as usize) < num_experts),
-        "device prefill router returned an invalid expert ID"
-    );
-    anyhow::ensure!(
-        weights_host.iter().all(|w| w.is_finite()),
-        "device prefill router returned a non-finite weight"
-    );
-    Ok((
-        ids_host.into_iter().map(|e| e as u32).collect(),
-        weights_host,
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn route_topk_and_plan_padded_on_device_for_prefill_dispatch(
     router_logits: &Tensor,
     selection_bias: Option<&Tensor>,
@@ -980,8 +864,7 @@ pub fn route_topk_and_plan_padded_on_device_for_prefill_dispatch(
         anyhow::ensure!(rc == 0, "prefill moe_permute_padded rc={rc}");
     }
 
-    #[allow(deprecated)]
-    let offsets_host: Vec<i32> = routed.stream.memcpy_dtov(&expert_offsets)?;
+    let offsets_host: Vec<i32> = routed.stream.clone_dtoh(&expert_offsets)?;
     anyhow::ensure!(
         offsets_host.len() == num_experts + 2,
         "prefill padded dispatch returned truncated validation metadata"
@@ -1074,12 +957,9 @@ pub fn forward_grouped(
         )?);
     }
 
-    #[allow(deprecated)]
-    let src_idx_dev = stream.memcpy_stod(&plan.src_idx)?;
-    #[allow(deprecated)]
-    let inv_perm_dev = stream.memcpy_stod(&plan.inv_perm)?;
-    #[allow(deprecated)]
-    let topk_weights_dev = stream.memcpy_stod(topk_weights)?;
+    let src_idx_dev = stream.clone_htod(&plan.src_idx)?;
+    let inv_perm_dev = stream.clone_htod(&plan.inv_perm)?;
+    let topk_weights_dev = stream.clone_htod(topk_weights)?;
 
     let out = forward_grouped_from_device_buffers(
         w,
@@ -1136,33 +1016,94 @@ pub fn forward_grouped_device_routing(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn forward_grouped_from_device_buffers(
+pub struct RoutedExpertActRows {
+    pub act_slots: Tensor,
+    pub slot_experts: Vec<u32>,
+    pub slot_weights: Tensor,
+}
+
+pub fn routed_expert_act_rows_through_the_served_w4a4_gate_up(
     w: &MoeGroupedWeights,
     x_flat: &Tensor,
+    router_logits: &Tensor,
     n_tokens: usize,
     k: usize,
     device: &Device,
+) -> Result<RoutedExpertActRows> {
+    let Device::Cuda(dev) = device else {
+        anyhow::bail!("expert act rows require CUDA");
+    };
+    let routing = route_topk_and_plan_padded_on_device_for_prefill_dispatch(
+        router_logits,
+        None,
+        n_tokens,
+        w.num_experts,
+        k,
+        0,
+        0.0,
+        true,
+        1.0,
+        device,
+    )?;
+    let stream = &routing.stream;
+    let (m_total, inter) = (routing.m_total_padded, w.intermediate_size);
+    let gu = grouped_gate_up_rows(
+        w,
+        x_flat,
+        n_tokens,
+        stream,
+        &routing.active_experts,
+        m_total,
+        &routing.src_idx,
+        prefill_tiles_per_grouped_call_default_256_user_signoff_20260912_bitwise_unset_is_256_and_8_restores_the_old_launch_width()?,
+    )?;
+    let wrap_bf16 = |s: CudaSlice<bf16>| -> Tensor {
+        Tensor::from_storage(
+            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(s, dev.clone())),
+            (m_total, inter),
+            candle_core::op::BackpropOp::none(),
+            false,
+        )
+    };
+    let inv: Vec<i32> = stream.clone_dtoh(&routing.inv_perm)?;
+    let ids: Vec<i32> = stream.clone_dtoh(&routing._topk_ids)?;
+    let weights: Vec<f32> = stream.clone_dtoh(&routing.topk_weights)?;
+    anyhow::ensure!(
+        inv.iter().all(|&r| r >= 0 && (r as usize) < m_total),
+        "expert act rows: a routed slot has no sorted row"
+    );
+    let rows = Tensor::from_vec(inv.iter().map(|&r| r as u32).collect::<Vec<_>>(), (n_tokens * k,), device)?;
+    let g = wrap_bf16(gu.y_gate).index_select(&rows, 0)?.to_dtype(DType::F32)?;
+    let u = wrap_bf16(gu.y_up).index_select(&rows, 0)?.to_dtype(DType::F32)?;
+    Ok(RoutedExpertActRows {
+        act_slots: candle_nn::ops::silu(&g)?.mul(&u)?,
+        slot_experts: ids.into_iter().map(|e| e as u32).collect(),
+        slot_weights: Tensor::from_vec(weights, (n_tokens, k), device)?,
+    })
+}
+
+struct GateUpRows {
+    y_gate: CudaSlice<bf16>,
+    y_up: CudaSlice<bf16>,
+    active_ids_i32: Vec<i32>,
+    input_dn_dev: CudaSlice<f32>,
+    meta_scratch: CudaSlice<u8>,
+    gemm_ws: CudaSlice<u8>,
+}
+
+fn grouped_gate_up_rows(
+    w: &MoeGroupedWeights,
+    x_flat: &Tensor,
+    n_tokens: usize,
     stream: &Arc<CudaStream>,
     active_experts: &[usize],
     m_total: usize,
     src_idx_dev: &CudaSlice<i32>,
-    inv_perm_dev: &CudaSlice<i32>,
-    topk_weights_dev: &CudaSlice<f32>,
     max_a_per_grouped_call: usize,
-) -> Result<Tensor> {
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("grouped MoE requires CUDA device"),
-    };
+) -> Result<GateUpRows> {
     let hidden = w.hidden_size;
     let inter = w.intermediate_size;
     let a = active_experts.len();
-    anyhow::ensure!(
-        a > 0 && m_total == a * MIN_TILE,
-        "grouped MoE device plan has {a} tiles and {m_total} padded rows"
-    );
-
     let active_ids_i32: Vec<i32> = active_experts.iter().map(|&e| e as i32).collect();
     let mut input_gu_mini = vec![0f32; a];
     let mut input_dn_mini = vec![0f32; a];
@@ -1171,10 +1112,8 @@ fn forward_grouped_from_device_buffers(
         input_gu_mini[i] = w.input_globals_gate_up_host[e];
         input_dn_mini[i] = w.input_globals_down_host[e];
     }
-    #[allow(deprecated)]
-    let input_gu_dev = stream.memcpy_stod(&input_gu_mini)?;
-    #[allow(deprecated)]
-    let input_dn_dev = stream.memcpy_stod(&input_dn_mini)?;
+    let input_gu_dev = stream.clone_htod(&input_gu_mini)?;
+    let input_dn_dev = stream.clone_htod(&input_dn_mini)?;
 
     let x_flat_bf = x_flat.to_dtype(DType::BF16)?.contiguous()?;
     let mut x_sorted: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m_total * hidden)? };
@@ -1190,7 +1129,7 @@ fn forward_grouped_from_device_buffers(
         let (sp, _g2) = src_idx_dev.device_ptr(stream);
         let (op, _g3) = x_sorted.device_ptr_mut(stream);
         let rc = unsafe {
-            nv_kernels::cuda::gather_rows_bf16(
+            nv_kernels::cuda::gather_rows_bf16_real_rows(
                 stream.cu_stream() as *mut c_void,
                 xp as *const u16,
                 sp as *const i32,
@@ -1200,7 +1139,7 @@ fn forward_grouped_from_device_buffers(
                 n_tokens as i32,
             )
         };
-        anyhow::ensure!(rc == 0, "gather_rows_bf16 rc={rc}");
+        anyhow::ensure!(rc == 0, "gather_rows_bf16_real_rows rc={rc}");
     }
 
     let x_fp4_bytes = m_total * hidden / 2;
@@ -1212,8 +1151,9 @@ fn forward_grouped_from_device_buffers(
         let (fp, _g2) = x_fp4.device_ptr_mut(stream);
         let (sp, _g3) = x_sf.device_ptr_mut(stream);
         let (gp, _g4) = input_gu_dev.device_ptr(stream);
+        let (rp, _g5) = src_idx_dev.device_ptr(stream);
         let rc = unsafe {
-            nv_kernels::cuda::quantize_nvfp4_bf16_per_expert(
+            nv_kernels::cuda::quantize_nvfp4_bf16_per_expert_real_rows(
                 stream.cu_stream() as *mut c_void,
                 xp as *const u16,
                 fp as *mut u8,
@@ -1222,6 +1162,7 @@ fn forward_grouped_from_device_buffers(
                 MIN_TILE as i32,
                 m_total as i32,
                 hidden as i32,
+                rp as *const i32,
             )
         };
         anyhow::ensure!(rc == 0, "quantize_nvfp4_bf16_per_expert (x) rc={rc}");
@@ -1269,6 +1210,37 @@ fn forward_grouped_from_device_buffers(
         &mut gemm_ws,
         max_a_per_grouped_call,
     )?;
+    Ok(GateUpRows { y_gate, y_up, active_ids_i32, input_dn_dev, meta_scratch, gemm_ws })
+}
+
+fn forward_grouped_from_device_buffers(
+    w: &MoeGroupedWeights,
+    x_flat: &Tensor,
+    n_tokens: usize,
+    k: usize,
+    device: &Device,
+    stream: &Arc<CudaStream>,
+    active_experts: &[usize],
+    m_total: usize,
+    src_idx_dev: &CudaSlice<i32>,
+    inv_perm_dev: &CudaSlice<i32>,
+    topk_weights_dev: &CudaSlice<f32>,
+    max_a_per_grouped_call: usize,
+) -> Result<Tensor> {
+    let dev = match device {
+        Device::Cuda(d) => d.clone(),
+        _ => anyhow::bail!("grouped MoE requires CUDA device"),
+    };
+    let hidden = w.hidden_size;
+    let inter = w.intermediate_size;
+    let a = active_experts.len();
+    anyhow::ensure!(
+        a > 0 && m_total == a * MIN_TILE,
+        "grouped MoE device plan has {a} tiles and {m_total} padded rows"
+    );
+
+    let GateUpRows { y_gate, y_up, active_ids_i32, input_dn_dev, mut meta_scratch, mut gemm_ws } =
+        grouped_gate_up_rows(w, x_flat, n_tokens, stream, active_experts, m_total, src_idx_dev, max_a_per_grouped_call)?;
 
     let y_act_fp4_bytes = m_total * inter / 2;
     let y_act_sf_bytes = swizzled_scale_bytes(m_total, inter);
@@ -1280,8 +1252,9 @@ fn forward_grouped_from_device_buffers(
         let (fp, _g3) = y_act_fp4.device_ptr_mut(stream);
         let (sp, _g4) = y_act_sf.device_ptr_mut(stream);
         let (gl, _g5) = input_dn_dev.device_ptr(stream);
+        let (rp, _g6) = src_idx_dev.device_ptr(stream);
         let rc = unsafe {
-            nv_kernels::cuda::silu_mul_quantize_nvfp4_bf16_per_expert(
+            nv_kernels::cuda::silu_mul_quantize_nvfp4_bf16_per_expert_real_rows(
                 stream.cu_stream() as *mut c_void,
                 gp_ptr as *const u16,
                 up_ptr as *const u16,
@@ -1291,6 +1264,7 @@ fn forward_grouped_from_device_buffers(
                 MIN_TILE as i32,
                 m_total as i32,
                 inter as i32,
+                rp as *const i32,
             )
         };
         anyhow::ensure!(rc == 0, "silu_mul_quantize_nvfp4_bf16_per_expert rc={rc}");
@@ -1395,10 +1369,6 @@ pub struct GroupedDecodeContext {
     y_act_fp4: CudaSlice<u8>,
     y_act_sf: CudaSlice<u8>,
     pub y_down: CudaSlice<bf16>,
-    meta_scratch: CudaSlice<u8>,
-    gemm_ws: CudaSlice<u8>,
-    meta_scratch2: CudaSlice<u8>,
-    gemm_ws2: CudaSlice<u8>,
     pub x_in: CudaSlice<bf16>,
     pub logits_f32: CudaSlice<f32>,
     sg_logits_bf16_written_by_the_router_gemv_arm: CudaSlice<bf16>,
@@ -1414,10 +1384,6 @@ pub struct GroupedDecodeContext {
 }
 
 struct DecodeChunkMeta {
-    expert_offsets: CudaSlice<i32>,
-    sf_offsets: CudaSlice<i32>,
-    problem_sizes_gate_up: CudaSlice<i32>,
-    problem_sizes_down: CudaSlice<i32>,
     chunk_size: usize,
 }
 
@@ -1482,10 +1448,8 @@ impl GroupedDecodeContext {
             src_idx_host[t * MIN_TILE] = (t / tiles_per_token) as i32;
             inv_perm_host[t] = (t * MIN_TILE) as i32;
         }
-        #[allow(deprecated)]
-        let src_idx = stream.memcpy_stod(&src_idx_host)?;
-        #[allow(deprecated)]
-        let inv_perm = stream.memcpy_stod(&inv_perm_host)?;
+        let src_idx = stream.clone_htod(&src_idx_host)?;
+        let inv_perm = stream.clone_htod(&inv_perm_host)?;
         let topk_ids = stream.alloc_zeros::<i32>(tiles)?;
         let topk_weights = stream.alloc_zeros::<f32>(tiles)?;
         let input_gu_mini = stream.alloc_zeros::<f32>(tiles)?;
@@ -1500,31 +1464,7 @@ impl GroupedDecodeContext {
         let mut off = 0usize;
         while off < tiles {
             let chunk_size = (tiles - off).min(per_call);
-            let mut expert_offsets: Vec<i32> = Vec::with_capacity(chunk_size);
-            let mut sf_offsets: Vec<i32> = Vec::with_capacity(chunk_size);
-            let mut ps_gu: Vec<i32> = Vec::with_capacity(chunk_size * 3);
-            let mut ps_dn: Vec<i32> = Vec::with_capacity(chunk_size * 3);
-            for i in 0..chunk_size {
-                expert_offsets.push((i * MIN_TILE) as i32);
-                sf_offsets.push((i * MIN_TILE) as i32);
-                ps_gu.extend_from_slice(&[1, inter as i32, hidden as i32]);
-                ps_dn.extend_from_slice(&[1, hidden as i32, inter as i32]);
-            }
-            #[allow(deprecated)]
-            let eo = stream.memcpy_stod(&expert_offsets)?;
-            #[allow(deprecated)]
-            let sfo = stream.memcpy_stod(&sf_offsets)?;
-            #[allow(deprecated)]
-            let ps_gate_up = stream.memcpy_stod(&ps_gu)?;
-            #[allow(deprecated)]
-            let ps_down = stream.memcpy_stod(&ps_dn)?;
-            chunk_meta.push(DecodeChunkMeta {
-                expert_offsets: eo,
-                sf_offsets: sfo,
-                problem_sizes_gate_up: ps_gate_up,
-                problem_sizes_down: ps_down,
-                chunk_size,
-            });
+            chunk_meta.push(DecodeChunkMeta { chunk_size });
             off += chunk_size;
         }
 
@@ -1536,10 +1476,6 @@ impl GroupedDecodeContext {
         let y_act_fp4 = unsafe { stream.alloc::<u8>(m_total * inter / 2)? };
         let y_act_sf = unsafe { stream.alloc::<u8>(swizzled_scale_bytes(m_total, inter))? };
         let y_down = unsafe { stream.alloc::<bf16>(m_total * hidden)? };
-        let meta_scratch = unsafe { stream.alloc::<u8>(128 * 1024)? };
-        let gemm_ws = unsafe { stream.alloc::<u8>(16 * 1024 * 1024)? };
-        let meta_scratch2 = unsafe { stream.alloc::<u8>(128 * 1024)? };
-        let gemm_ws2 = unsafe { stream.alloc::<u8>(16 * 1024 * 1024)? };
         let x_in = stream.alloc_zeros::<bf16>(n_tokens * hidden)?;
         let logits_f32 = stream.alloc_zeros::<f32>(n_tokens * num_experts)?;
         let sg_logits_bf16_written_by_the_router_gemv_arm = stream.alloc_zeros::<bf16>(n_tokens)?;
@@ -1572,10 +1508,6 @@ impl GroupedDecodeContext {
             y_act_fp4,
             y_act_sf,
             y_down,
-            meta_scratch,
-            gemm_ws,
-            meta_scratch2,
-            gemm_ws2,
             x_in,
             logits_f32,
             sg_logits_bf16_written_by_the_router_gemv_arm,
@@ -1606,6 +1538,11 @@ impl GroupedDecodeContext {
 
     pub fn tiles_per_token(&self) -> usize {
         self.tiles_per_token
+    }
+
+    pub fn sg_logits_bf16_written_by_the_router_gemv_arm_dev_ptr(&self, stream: &Arc<CudaStream>) -> u64 {
+        let (p, _g) = self.sg_logits_bf16_written_by_the_router_gemv_arm.device_ptr(stream);
+        p
     }
 
     pub fn folds_shared(&self) -> bool {
@@ -1641,10 +1578,6 @@ impl GroupedDecodeContext {
             });
         }
         Ok(self.marlin_scratch_built_once_per_context.as_mut().unwrap())
-    }
-
-    pub fn last_route_was_marlin(&self) -> bool {
-        self.last_chain_marlin
     }
 
     pub fn top_k(&self) -> usize {
@@ -1843,7 +1776,6 @@ impl GroupedDecodeContext {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn forward_grouped_decode(
     w: &MoeGroupedWeights,
     ctx: &mut GroupedDecodeContext,
@@ -2046,15 +1978,12 @@ pub fn forward_grouped_decode(
         &w.gate_alphas,
         &mut ctx.y_gate,
         &ctx.chunk_meta,
-        GemmShape::GateUp,
         &ctx.topk_ids,
         inter as i32,
         hidden as i32,
         w.gate_a_stride_elems,
         w.gate_b_stride_elems,
         w.gate_c_stride_elems,
-        &mut ctx.meta_scratch,
-        &mut ctx.gemm_ws,
     )?;
     prof_mark("gemm_gate", &mut prof_times, &mut prof_last);
     grouped_gemm_decode(
@@ -2066,15 +1995,12 @@ pub fn forward_grouped_decode(
         &w.up_alphas,
         &mut ctx.y_up,
         &ctx.chunk_meta,
-        GemmShape::GateUp,
         &ctx.topk_ids,
         inter as i32,
         hidden as i32,
         w.gate_a_stride_elems,
         w.gate_b_stride_elems,
         w.gate_c_stride_elems,
-        &mut ctx.meta_scratch,
-        &mut ctx.gemm_ws,
     )?;
     prof_mark("gemm_up", &mut prof_times, &mut prof_last);
 
@@ -2110,15 +2036,12 @@ pub fn forward_grouped_decode(
         &w.down_alphas,
         &mut ctx.y_down,
         &ctx.chunk_meta,
-        GemmShape::Down,
         &ctx.topk_ids,
         hidden as i32,
         inter as i32,
         w.down_a_stride_elems,
         w.down_b_stride_elems,
         w.down_c_stride_elems,
-        &mut ctx.meta_scratch,
-        &mut ctx.gemm_ws,
     )?;
     prof_mark("gemm_down", &mut prof_times, &mut prof_last);
 
@@ -2170,7 +2093,6 @@ pub fn forward_grouped_decode(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn forward_grouped_decode_into(
     w: &MoeGroupedWeights,
     ctx: &mut GroupedDecodeContext,
@@ -2214,8 +2136,7 @@ pub fn forward_grouped_decode_into(
     let stream = stream.clone();
 
     let fuse_route = n_tokens <= ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
-        && route_fuse_enabled()
-        && e <= ROUTE_FUSE_SINGLE_CTA_TOPK_HOLDS_UP_TO_256_EXPERTS;
+        && e <= ROUTE_FUSE_SINGLE_CTA_TOPK_HOLDS_UP_TO_512_EXPERTS;
     ctx.last_route_fused = fuse_route;
     if fuse_route {
         let shared_tail_id: i32 = if ctx.folds_shared() { e as i32 } else { -1 };
@@ -2253,11 +2174,7 @@ pub fn forward_grouped_decode_into(
                 shared_tail_id,
                 hidden as i32,
                 MIN_TILE as i32,
-                if chain_slim_launches_enabled() {
-                    ROUTE_QUANT_SPLIT_CTAS_UNDER_CHAIN_SLIM
-                } else {
-                    1
-                },
+                ROUTE_QUANT_SPLIT_CTAS_UNDER_CHAIN_SLIM,
             )
         };
         anyhow::ensure!(rc == 0, "moe_route_gather_quant_small_m rc={rc}");
@@ -2392,9 +2309,7 @@ pub fn forward_grouped_decode_into(
             return Ok(());
         }
     }
-    let slim = use_decode_gemv()
-        && chain_slim_launches_enabled()
-        && n_tokens <= ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
+    let slim = n_tokens <= ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
         && ctx.chunk_meta.len() == 1;
     ctx.last_chain_slim = slim;
     if slim {
@@ -2458,15 +2373,12 @@ pub fn forward_grouped_decode_into(
             &w.up_alphas,
             &mut ctx.y_up,
             &ctx.chunk_meta,
-            GemmShape::GateUp,
             &ctx.topk_ids,
             inter as i32,
             hidden as i32,
             w.gate_a_stride_elems,
             w.gate_b_stride_elems,
             w.gate_c_stride_elems,
-            &mut ctx.meta_scratch2,
-            &mut ctx.gemm_ws2,
         )?;
         grouped_gemm_decode(
             &stream,
@@ -2477,15 +2389,12 @@ pub fn forward_grouped_decode_into(
             &w.gate_alphas,
             &mut ctx.y_gate,
             &ctx.chunk_meta,
-            GemmShape::GateUp,
             &ctx.topk_ids,
             inter as i32,
             hidden as i32,
             w.gate_a_stride_elems,
             w.gate_b_stride_elems,
             w.gate_c_stride_elems,
-            &mut ctx.meta_scratch,
-            &mut ctx.gemm_ws,
         )?;
         let ev2 = s2
             .record_event(None)
@@ -2503,15 +2412,12 @@ pub fn forward_grouped_decode_into(
             &w.gate_alphas,
             &mut ctx.y_gate,
             &ctx.chunk_meta,
-            GemmShape::GateUp,
             &ctx.topk_ids,
             inter as i32,
             hidden as i32,
             w.gate_a_stride_elems,
             w.gate_b_stride_elems,
             w.gate_c_stride_elems,
-            &mut ctx.meta_scratch,
-            &mut ctx.gemm_ws,
         )?;
         grouped_gemm_decode(
             &stream,
@@ -2522,15 +2428,12 @@ pub fn forward_grouped_decode_into(
             &w.up_alphas,
             &mut ctx.y_up,
             &ctx.chunk_meta,
-            GemmShape::GateUp,
             &ctx.topk_ids,
             inter as i32,
             hidden as i32,
             w.gate_a_stride_elems,
             w.gate_b_stride_elems,
             w.gate_c_stride_elems,
-            &mut ctx.meta_scratch,
-            &mut ctx.gemm_ws,
         )?;
     }
     if !slim {
@@ -2569,15 +2472,12 @@ pub fn forward_grouped_decode_into(
         &w.down_alphas,
         &mut ctx.y_down,
         &ctx.chunk_meta,
-        GemmShape::Down,
         &ctx.topk_ids,
         hidden as i32,
         inter as i32,
         w.down_a_stride_elems,
         w.down_b_stride_elems,
         w.down_c_stride_elems,
-        &mut ctx.meta_scratch,
-        &mut ctx.gemm_ws,
     )?;
     prof_mark(4, &stream)?;
 
@@ -2605,7 +2505,6 @@ pub fn forward_grouped_decode_into(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn forward_grouped_decode_marlin_moe(
     w: &MoeGroupedWeights,
     ctx: &mut GroupedDecodeContext,
@@ -2651,7 +2550,6 @@ fn forward_grouped_decode_marlin_moe(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 fn forward_grouped_decode_marlin_moe_launches(
     ctx: &mut GroupedDecodeContext,
     tw: &MarlinMoeTwin,
@@ -2819,40 +2717,6 @@ fn forward_grouped_decode_marlin_moe_launches(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum GemmShape {
-    GateUp,
-    Down,
-}
-
-const DECODE_TILE_CTA_THRESHOLD: usize = 96;
-
-fn use_decode_tile(n: i32, num_experts: usize) -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("NV_MOE_FP4_DECODE_TILE").ok().as_deref(),
-            Some("1") | Some("on") | Some("true") | Some("yes")
-        )
-    });
-    if !enabled {
-        return false;
-    }
-    let ctas = num_experts.saturating_mul((n.max(0) as usize).div_ceil(128));
-    ctas < DECODE_TILE_CTA_THRESHOLD
-}
-
-fn use_decode_gemv() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        moe_arm_on_unless_the_key_is_explicitly_off_which_is_how_the_pre_round_82_path_is_reached(
-            "NV_MOE_FP4_DECODE_GEMV",
-        )
-    })
-}
-
 fn grouped_gemm_decode(
     stream: &Arc<CudaStream>,
     a_packed: &CudaSlice<u8>,
@@ -2862,23 +2726,29 @@ fn grouped_gemm_decode(
     alphas: &CudaSlice<f32>,
     d_bf16: &mut CudaSlice<bf16>,
     chunk_meta: &[DecodeChunkMeta],
-    shape: GemmShape,
     topk_ids: &CudaSlice<i32>,
     n: i32,
     k_dim: i32,
     a_row_stride_elems: i64,
     b_row_stride_elems: i64,
     c_row_stride_elems: i64,
-    meta_scratch: &mut CudaSlice<u8>,
-    gemm_ws: &mut CudaSlice<u8>,
 ) -> Result<()> {
     let n_us = n as usize;
     let k_us = k_dim as usize;
     let half_k = k_us / 2;
     let group_k = k_us / BLOCK_SIZE;
+    anyhow::ensure!(
+        group_k.is_multiple_of(4),
+        "decode GEMV requires K/16 divisible by 4 (K={k_dim})"
+    );
+    anyhow::ensure!(
+        a_row_stride_elems == k_dim as i64
+            && b_row_stride_elems == k_dim as i64
+            && c_row_stride_elems == n as i64,
+        "decode GEMV requires contiguous rows (a={a_row_stride_elems} b={b_row_stride_elems} c={c_row_stride_elems} n={n} k={k_dim})"
+    );
+    let num_experts_total = b_packed.len() * 2 / (n_us * k_us);
 
-    let ms_bytes = meta_scratch.len();
-    let ws_bytes = gemm_ws.len();
     let (a_base, _ga) = a_packed.device_ptr(stream);
     let (a_sf_base, _gas) = a_scales.device_ptr(stream);
     let (b_base, _gb) = b_packed.device_ptr(stream);
@@ -2886,8 +2756,6 @@ fn grouped_gemm_decode(
     let (al_base, _gal) = alphas.device_ptr(stream);
     let (ids_base, _gi) = topk_ids.device_ptr(stream);
     let (d_base, _gd) = d_bf16.device_ptr_mut(stream);
-    let (ms_ptr, _gm) = meta_scratch.device_ptr_mut(stream);
-    let (ws_ptr, _gw) = gemm_ws.device_ptr_mut(stream);
 
     let mut chunk_start = 0usize;
     for meta in chunk_meta {
@@ -2896,82 +2764,25 @@ fn grouped_gemm_decode(
         let a_sf_chunk_ptr = a_sf_base + (chunk_start_rows * group_k) as u64;
         let d_chunk_ptr = d_base + (chunk_start_rows * n_us * 2) as u64;
         let aid_ptr = ids_base + (chunk_start * std::mem::size_of::<i32>()) as u64;
-
-        if use_decode_gemv() {
-            anyhow::ensure!(
-                group_k.is_multiple_of(4),
-                "decode GEMV requires K/16 divisible by 4 (K={k_dim})"
-            );
-            anyhow::ensure!(
-                a_row_stride_elems == k_dim as i64
-                    && b_row_stride_elems == k_dim as i64
-                    && c_row_stride_elems == n as i64,
-                "decode GEMV requires contiguous rows (a={a_row_stride_elems} b={b_row_stride_elems} c={c_row_stride_elems} n={n} k={k_dim})"
-            );
-            let num_experts_total = b_packed.len() * 2 / (n_us * k_us);
-            let rc = unsafe {
-                nv_kernels::cuda::moe_grouped_fp4_gemv_m1_bf16(
-                    stream.cu_stream() as *mut c_void,
-                    a_chunk_ptr as *const u8,
-                    a_sf_chunk_ptr as *const u8,
-                    b_base as *const u8,
-                    b_sf_base as *const u8,
-                    al_base as *const f32,
-                    d_chunk_ptr as *mut u16,
-                    aid_ptr as *const i32,
-                    meta.chunk_size as i32,
-                    num_experts_total as i32,
-                    n,
-                    k_dim,
-                    MIN_TILE as i32,
-                    (MIN_TILE * n_us) as i64,
-                )
-            };
-            anyhow::ensure!(rc == 0, "moe_grouped_fp4_gemv_m1_bf16 rc={rc}");
-            chunk_start += meta.chunk_size;
-            continue;
-        }
-
-        let ps_dev = match shape {
-            GemmShape::GateUp => &meta.problem_sizes_gate_up,
-            GemmShape::Down => &meta.problem_sizes_down,
-        };
-        let (eo, _g1) = meta.expert_offsets.device_ptr(stream);
-        let (sfo, _g2) = meta.sf_offsets.device_ptr(stream);
-        let (ps, _g3) = ps_dev.device_ptr(stream);
-
-        let gemm_fn = if use_decode_tile(n, meta.chunk_size) {
-            nv_kernels::cuda::cutlass_moe_grouped_fp4_gemm_sm120_bf16_decode
-        } else {
-            nv_kernels::cuda::cutlass_moe_grouped_fp4_gemm_sm120_bf16
-        };
-
-        unsafe {
-            gemm_fn(
+        let rc = unsafe {
+            nv_kernels::cuda::moe_grouped_fp4_gemv_m1_bf16(
                 stream.cu_stream() as *mut c_void,
-                a_chunk_ptr as *const c_void,
-                a_sf_chunk_ptr as *const c_void,
-                b_base as *const c_void,
-                b_sf_base as *const c_void,
+                a_chunk_ptr as *const u8,
+                a_sf_chunk_ptr as *const u8,
+                b_base as *const u8,
+                b_sf_base as *const u8,
                 al_base as *const f32,
-                d_chunk_ptr as *mut c_void,
-                eo as *const i32,
-                sfo as *const i32,
-                ps as *const i32,
+                d_chunk_ptr as *mut u16,
                 aid_ptr as *const i32,
+                meta.chunk_size as i32,
+                num_experts_total as i32,
                 n,
                 k_dim,
-                meta.chunk_size as i32,
-                a_row_stride_elems,
-                b_row_stride_elems,
-                c_row_stride_elems,
-                ms_ptr as *mut c_void,
-                ms_bytes,
-                ws_ptr as *mut c_void,
-                ws_bytes,
+                MIN_TILE as i32,
+                (MIN_TILE * n_us) as i64,
             )
-            .map_err(|rc| anyhow::anyhow!("decode grouped FP4 GEMM rc={rc}"))?
         };
+        anyhow::ensure!(rc == 0, "moe_grouped_fp4_gemv_m1_bf16 rc={rc}");
         chunk_start += meta.chunk_size;
     }
     Ok(())
@@ -2995,13 +2806,9 @@ fn prefill_tiles_per_grouped_call_default_256_user_signoff_20260912_bitwise_unse
             );
             Ok(n)
         }
-        Err(std::env::VarError::NotPresent) => Ok(
-            if nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_LAGUNA_PREFILL_GROUP32") {
-                32
-            } else {
-                PREFILL_TILES_PER_GROUPED_CALL_DEFAULT_256_ONE_LAUNCH_PER_GEMM_STAGE
-            },
-        ),
+        Err(std::env::VarError::NotPresent) => {
+            Ok(PREFILL_TILES_PER_GROUPED_CALL_DEFAULT_256_ONE_LAUNCH_PER_GEMM_STAGE)
+        }
         Err(e) => Err(e).context("NV_LAGUNA_PREFILL_GROUP must be valid UTF-8"),
     }
 }
@@ -3066,14 +2873,10 @@ fn grouped_gemm_chunked(
             sf_offsets.push((i * min_tile) as i32);
             problem_sizes.extend_from_slice(&[min_tile as i32, n, k]);
         }
-        #[allow(deprecated)]
-        let eo_dev = stream.memcpy_stod(&expert_offsets)?;
-        #[allow(deprecated)]
-        let sfo_dev = stream.memcpy_stod(&sf_offsets)?;
-        #[allow(deprecated)]
-        let ps_dev = stream.memcpy_stod(&problem_sizes)?;
-        #[allow(deprecated)]
-        let aid_dev = stream.memcpy_stod(chunk)?;
+        let eo_dev = stream.clone_htod(&expert_offsets)?;
+        let sfo_dev = stream.clone_htod(&sf_offsets)?;
+        let ps_dev = stream.clone_htod(&problem_sizes)?;
+        let aid_dev = stream.clone_htod(chunk)?;
 
         let (eo, _g1) = eo_dev.device_ptr(stream);
         let (sfo, _g2) = sfo_dev.device_ptr(stream);
@@ -3118,34 +2921,6 @@ fn grouped_gemm_chunked(
 #[cfg(all(test, feature = "cuda"))]
 mod prefill_device_routing_tests {
     use super::*;
-
-    #[test]
-    #[ignore = "requires CUDA; directly proves copied routed F32 output remains owned after persistent scratch reuse"]
-    fn copied_scattered_f32_output_survives_context_scratch_overwrite() {
-        let device = Device::new_cuda(0).expect("CUDA");
-        let dev = match &device {
-            Device::Cuda(dev) => dev.clone(),
-            _ => unreachable!(),
-        };
-        let stream = crate::cuda_stream::current_stream(&dev);
-        let mut ctx = GroupedDecodeContext::new_multi(128, 128, 1, 1, 2, &stream).unwrap();
-        let first: Vec<f32> = (0..256).map(|i| i as f32 * 0.25 - 7.0).collect();
-        stream.memcpy_htod(&first, &mut ctx.y_acc).unwrap();
-        let owned = ctx
-            .copy_scattered_f32_into_owned_tensor(&device, &stream)
-            .unwrap();
-        let second: Vec<f32> = (0..256).map(|i| 1000.0 - i as f32).collect();
-        stream.memcpy_htod(&second, &mut ctx.y_acc).unwrap();
-        stream.synchronize().unwrap();
-        let retained = owned.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(
-            retained.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            first.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-        );
-        eprintln!(
-            "LAGUNA-B2-OWNED-OUTPUT-GATE copied_y_acc=bitwise retained_after_scratch_overwrite=bitwise"
-        );
-    }
 
     #[test]
     fn malformed_gpu_router_rows_fail_safely_and_recover_same_context() {

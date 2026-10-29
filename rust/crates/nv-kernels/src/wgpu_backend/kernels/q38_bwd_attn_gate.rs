@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result};
 
@@ -103,25 +101,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_module_stays_inside_the_measured_browser_caps() {
-        assert!(
-            !WGSL.contains("subgroup"),
-            "no subgroup ops, no directive split needed"
-        );
-        assert!(!WGSL.contains("enable "), "no enable directives");
-        assert!(!WGSL.contains("f16"), "f32 only");
-        assert_eq!(WGSL.matches("@workgroup_size(256)").count(), 1);
-        assert_eq!(WGSL.matches("var<storage").count(), 5);
-        assert_eq!(WGSL.matches("var<workgroup>").count(), 0);
-    }
-
-    #[test]
-    fn params_keep_the_sixteen_byte_uniform_layout() {
-        assert_eq!(std::mem::size_of::<AttnGateBwdParams>(), 16);
-    }
-
-    #[test]
-    fn source_declares_the_entry() {
-        assert!(compose(WGSL).contains("fn q38_attn_gate_bwd("));
+    fn the_module_stays_inside_the_measured_browser_caps_with_its_entry_and_uniform_layout() {
+        {
+            assert!(
+                !WGSL.contains("subgroup"),
+                "no subgroup ops, no directive split needed"
+            );
+            assert!(!WGSL.contains("enable "), "no enable directives");
+            assert!(!WGSL.contains("f16"), "f32 only");
+            assert_eq!(WGSL.matches("@workgroup_size(256)").count(), 1);
+            assert_eq!(WGSL.matches("var<storage").count(), 5);
+            assert_eq!(WGSL.matches("var<workgroup>").count(), 0);
+        }
+        {
+            assert_eq!(std::mem::size_of::<AttnGateBwdParams>(), 16);
+        }
+        {
+            assert!(compose(WGSL).contains("fn q38_attn_gate_bwd("));
+        }
     }
 }

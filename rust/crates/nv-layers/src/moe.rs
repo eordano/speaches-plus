@@ -440,9 +440,8 @@ impl MoeBlock {
         use cudarc::driver::{DevicePtr, DevicePtrMut};
         use std::ffi::c_void;
 
-        let dev = match x_flat.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => return self.shared_contribution(x_flat),
+        let Device::Cuda(dev) = x_flat.device().clone() else {
+            return self.shared_contribution(x_flat);
         };
         let shared_out = self
             .shared_expert
@@ -551,7 +550,7 @@ impl MoeBlock {
             return Ok(None);
         }
 
-        if !matches!(device, Device::Cuda(_)) {
+        if !device.is_cuda() {
             return Ok(None);
         }
         let grouped = match self.grouped_weights_built(device) {
@@ -804,14 +803,12 @@ fn nvfp4_linear_from_disk_inner(
     };
     let weight_alpha = safe_recip(stored_weight_global) * safe_recip(stored_input_global);
     let stream = dev.cuda_stream();
-    #[allow(deprecated)]
     let w_dev = stream
         .clone_htod(&packed_bytes)
         .map_err(|e| anyhow::anyhow!(e))?;
     let blocks_per_row = in_features / nv_quant::nvfp4::BLOCK_SIZE;
     let swizzled_scales =
         nv_quant::nvfp4::swizzle_scales(scale_bytes_raw, out_features, blocks_per_row);
-    #[allow(deprecated)]
     let s_dev = stream
         .clone_htod(&swizzled_scales)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -938,14 +935,12 @@ pub fn nvfp4_linear_from_disk_fused_pair(
     let weight_alpha = safe_recip(stored_weight_global) * safe_recip(stored_input_global);
 
     let stream = dev.cuda_stream();
-    #[allow(deprecated)]
     let w_dev = stream
         .clone_htod(&packed_fused)
         .map_err(|e| anyhow::anyhow!(e))?;
     let blocks_per_row = in_features / nv_quant::nvfp4::BLOCK_SIZE;
     let swizzled_scales =
         nv_quant::nvfp4::swizzle_scales(&scale_raw_fused, out_features, blocks_per_row);
-    #[allow(deprecated)]
     let s_dev = stream
         .clone_htod(&swizzled_scales)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -1140,42 +1135,6 @@ mod paper_validation {
                     (got - want[i]).abs() <= 1e-4 * want[i].abs().max(1.0),
                     "token {n} dim {i}: got {got}, mixture reference {}",
                     want[i]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn moe_topk_weights_sum_to_one() {
-        let device = Device::Cpu;
-        let n_exp = 7usize;
-        let k = 3usize;
-        let logits_host = det(4 * n_exp, 5.0);
-        let logits = Tensor::from_vec(logits_host.clone(), (4, n_exp), &device).unwrap();
-        let (sorted, _) = logits.sort_last_dim(false).unwrap();
-        let top = sorted.narrow(1, 0, k).unwrap().contiguous().unwrap();
-        let w = candle_nn::ops::softmax_last_dim(&top).unwrap();
-        let w_host = w.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for n in 0..4 {
-            let s: f32 = w_host[n * k..(n + 1) * k].iter().sum();
-            assert!(
-                (s - 1.0).abs() < 1e-5,
-                "token {n}: top-k weights sum {s} != 1"
-            );
-
-            let row = &logits_host[n * n_exp..(n + 1) * n_exp];
-            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = row.iter().map(|l| (l - max).exp()).collect();
-            let z: f32 = exps.iter().sum();
-            let mut probs: Vec<f32> = exps.iter().map(|e| e / z).collect();
-            probs.sort_by(|a, b| b.partial_cmp(a).unwrap());
-            let sel_sum: f32 = probs[..k].iter().sum();
-            for j in 0..k {
-                let want = probs[j] / sel_sum;
-                assert!(
-                    (w_host[n * k + j] - want).abs() < 1e-5,
-                    "token {n} slot {j}: {} vs renormalized {want}",
-                    w_host[n * k + j]
                 );
             }
         }

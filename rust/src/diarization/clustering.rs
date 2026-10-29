@@ -31,11 +31,6 @@ impl OnlineClusterer {
         }
     }
 
-    pub fn with_ema(mut self, ema_smoothing: f32) -> Self {
-        self.ema_smoothing = ema_smoothing.clamp(0.0, 0.999);
-        self
-    }
-
     pub fn reset(&mut self) {
         self.centroids.clear();
         self.next_id = 0;
@@ -120,39 +115,35 @@ mod tests {
     }
 
     #[test]
-    fn first_embedding_creates_cluster_zero() {
+    fn assign_creates_joins_and_splits_clusters_by_similarity() {
         let mut c = OnlineClusterer::new(0.5, 4);
         let v = unit(vec![1.0, 0.0, 0.0]);
         let (id, _) = c.assign(&v);
         assert_eq!(id, 0);
         assert_eq!(c.num_clusters(), 1);
+        {
+            let mut c = OnlineClusterer::new(0.5, 4);
+            let v1 = unit(vec![1.0, 0.0, 0.0]);
+            let v2 = unit(vec![0.99, 0.01, 0.0]);
+            let (id1, _) = c.assign(&v1);
+            let (id2, sim) = c.assign(&v2);
+            assert_eq!(id1, id2);
+            assert!(sim > 0.9);
+            assert_eq!(c.num_clusters(), 1);
+        }
+        {
+            let mut c = OnlineClusterer::new(0.5, 4);
+            let v1 = unit(vec![1.0, 0.0, 0.0]);
+            let v2 = unit(vec![0.0, 1.0, 0.0]);
+            let (id1, _) = c.assign(&v1);
+            let (id2, _) = c.assign(&v2);
+            assert_ne!(id1, id2);
+            assert_eq!(c.num_clusters(), 2);
+        }
     }
 
     #[test]
-    fn similar_embedding_joins_cluster() {
-        let mut c = OnlineClusterer::new(0.5, 4);
-        let v1 = unit(vec![1.0, 0.0, 0.0]);
-        let v2 = unit(vec![0.99, 0.01, 0.0]);
-        let (id1, _) = c.assign(&v1);
-        let (id2, sim) = c.assign(&v2);
-        assert_eq!(id1, id2);
-        assert!(sim > 0.9);
-        assert_eq!(c.num_clusters(), 1);
-    }
-
-    #[test]
-    fn dissimilar_embedding_creates_new_cluster() {
-        let mut c = OnlineClusterer::new(0.5, 4);
-        let v1 = unit(vec![1.0, 0.0, 0.0]);
-        let v2 = unit(vec![0.0, 1.0, 0.0]);
-        let (id1, _) = c.assign(&v1);
-        let (id2, _) = c.assign(&v2);
-        assert_ne!(id1, id2);
-        assert_eq!(c.num_clusters(), 2);
-    }
-
-    #[test]
-    fn max_speakers_caps_cluster_creation() {
+    fn max_speakers_caps_lookup_never_creates_and_reset_clears() {
         let mut c = OnlineClusterer::new(0.99, 2);
         let v1 = unit(vec![1.0, 0.0, 0.0]);
         let v2 = unit(vec![0.0, 1.0, 0.0]);
@@ -162,25 +153,22 @@ mod tests {
         let (_, _) = c.assign(&v3);
 
         assert_eq!(c.num_clusters(), 2);
+        {
+            let mut c = OnlineClusterer::new(0.5, 4);
+            let v = unit(vec![1.0, 0.0, 0.0]);
+            c.assign(&v);
+            let probe = unit(vec![0.0, 1.0, 0.0]);
+            assert!(c.lookup(&probe).is_none());
+            assert_eq!(c.num_clusters(), 1);
+        }
+        {
+            let mut c = OnlineClusterer::new(0.5, 4);
+            c.assign(&unit(vec![1.0, 0.0, 0.0]));
+            c.reset();
+            assert_eq!(c.num_clusters(), 0);
+            let (id, _) = c.assign(&unit(vec![1.0, 0.0, 0.0]));
+            assert_eq!(id, 0, "next_id should restart at 0 after reset");
+        }
     }
 
-    #[test]
-    fn lookup_does_not_create_clusters() {
-        let mut c = OnlineClusterer::new(0.5, 4);
-        let v = unit(vec![1.0, 0.0, 0.0]);
-        c.assign(&v);
-        let probe = unit(vec![0.0, 1.0, 0.0]);
-        assert!(c.lookup(&probe).is_none());
-        assert_eq!(c.num_clusters(), 1);
-    }
-
-    #[test]
-    fn reset_clears_state() {
-        let mut c = OnlineClusterer::new(0.5, 4);
-        c.assign(&unit(vec![1.0, 0.0, 0.0]));
-        c.reset();
-        assert_eq!(c.num_clusters(), 0);
-        let (id, _) = c.assign(&unit(vec![1.0, 0.0, 0.0]));
-        assert_eq!(id, 0, "next_id should restart at 0 after reset");
-    }
 }

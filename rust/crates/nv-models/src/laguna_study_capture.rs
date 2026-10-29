@@ -11,8 +11,8 @@ impl Laguna {
         layer: usize,
         max_context: usize,
     ) -> Result<LagunaStudyCaptureState> {
-        anyhow::ensure!(layer < self.layers.len(), "capture layer out of range");
-        anyhow::ensure!(
+        ensure!(layer < self.layers.len(), "capture layer out of range");
+        ensure!(
             max_context > 0 && max_context <= self.config.max_position_embeddings,
             "invalid capture context capacity"
         );
@@ -35,15 +35,15 @@ impl Laguna {
         input: &[u32],
         state: &mut LagunaStudyCaptureState,
     ) -> Result<(Tensor, usize, usize)> {
-        anyhow::ensure!(
+        ensure!(
             state.owner == self as *const Self as usize,
             "capture state belongs to a different model"
         );
-        anyhow::ensure!(
+        ensure!(
             !input.is_empty() && input.len() <= state.max_context,
             "complete capture context required; truncation forbidden"
         );
-        anyhow::ensure!(
+        ensure!(
             input.iter().all(|&t| (t as usize) < self.config.vocab_size),
             "invalid capture token"
         );
@@ -93,7 +93,7 @@ impl Laguna {
             }
             position = end;
         }
-        anyhow::ensure!(
+        ensure!(
             layer_calls == chunks * (state.layer + 1),
             "wrong capture depth"
         );
@@ -107,15 +107,15 @@ impl Laguna {
         input: &[u32],
         state: &mut LagunaStudyCaptureState,
     ) -> Result<(Tensor, usize, usize)> {
-        anyhow::ensure!(
+        ensure!(
             state.owner == self as *const Self as usize,
             "capture state belongs to a different model"
         );
-        anyhow::ensure!(
+        ensure!(
             !input.is_empty() && input.len() <= state.max_context,
             "complete capture context required; truncation forbidden"
         );
-        anyhow::ensure!(
+        ensure!(
             input.iter().all(|&t| (t as usize) < self.config.vocab_size),
             "invalid capture token"
         );
@@ -155,10 +155,14 @@ impl Laguna {
             }
             state.cache.advance(seq);
             chunks += 1;
-            captured.push(hidden.reshape((seq, self.config.hidden_size))?.to_dtype(DType::F32)?);
+            captured.push(
+                hidden
+                    .reshape((seq, self.config.hidden_size))?
+                    .to_dtype(DType::F32)?,
+            );
             position = end;
         }
-        anyhow::ensure!(
+        ensure!(
             layer_calls == chunks * (state.layer + 1),
             "wrong capture depth"
         );

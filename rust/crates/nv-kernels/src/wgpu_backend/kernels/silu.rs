@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use std::sync::OnceLock;
 
 use crate::wgpu_backend::dequant;
@@ -162,35 +160,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bf16_word_packing_round_trips() {
-        let values: Vec<u16> = vec![0x3f80, 0xbf80, 0x0000, 0x7f80, 0x4049];
-        let words = pack_bf16_words(&values);
-        assert_eq!(words.len(), 3);
-        assert_eq!(words[0], 0xbf80_3f80);
-        assert_eq!(words[2] & 0xffff_0000, 0);
-        let mut back = vec![0u16; values.len()];
-        unpack_bf16_words(&words, values.len(), &mut back);
-        assert_eq!(back, values);
-    }
-
-    #[test]
-    fn shader_declares_every_entry_point() {
-        for entry in [
-            "fn silu_f32(",
-            "fn silu_bf16(",
-            "fn silu_mul_f32(",
-            "fn silu_mul_bf16(",
-        ] {
-            assert!(WGSL.contains(entry), "missing {entry}");
+    fn packing_entries_and_params_follow_the_shader_contract() {
+        {
+            let values: Vec<u16> = vec![0x3f80, 0xbf80, 0x0000, 0x7f80, 0x4049];
+            let words = pack_bf16_words(&values);
+            assert_eq!(words.len(), 3);
+            assert_eq!(words[0], 0xbf80_3f80);
+            assert_eq!(words[2] & 0xffff_0000, 0);
+            let mut back = vec![0u16; values.len()];
+            unpack_bf16_words(&words, values.len(), &mut back);
+            assert_eq!(back, values);
         }
-        assert!(WGSL.contains("clamp(-x, -SILU_EXP_LIMIT, SILU_EXP_LIMIT)"));
-    }
-
-    #[test]
-    fn params_reject_indices_past_u32() {
-        assert!(params_for(1 << 20).is_ok());
-        if (u32::MAX as usize) < usize::MAX {
-            assert!(params_for(u32::MAX as usize + 1).is_err());
+        {
+            for entry in [
+                "fn silu_f32(",
+                "fn silu_bf16(",
+                "fn silu_mul_f32(",
+                "fn silu_mul_bf16(",
+            ] {
+                assert!(WGSL.contains(entry), "missing {entry}");
+            }
+            assert!(WGSL.contains("clamp(-x, -SILU_EXP_LIMIT, SILU_EXP_LIMIT)"));
+        }
+        {
+            assert!(params_for(1 << 20).is_ok());
+            if (u32::MAX as usize) < usize::MAX {
+                assert!(params_for(u32::MAX as usize + 1).is_err());
+            }
         }
     }
 }

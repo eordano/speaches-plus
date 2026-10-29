@@ -47,9 +47,9 @@ type tokenizerJSON struct {
 		SingleSeq     []any  `json:"single"`
 		PairSeq       []any  `json:"pair"`
 		SpecialTokens []struct {
-			ID      string `json:"id"`
-			IDs     []int  `json:"ids"`
-			Tokens  []string `json:"tokens"`
+			ID     string   `json:"id"`
+			IDs    []int    `json:"ids"`
+			Tokens []string `json:"tokens"`
 		} `json:"special_tokens"`
 	} `json:"post_processor"`
 }
@@ -365,14 +365,6 @@ var byteToRune = func() [256]rune {
 	}
 	for i, b := range bs {
 		m[b] = rune(cs[i])
-	}
-	return m
-}()
-
-var runeToByte = func() map[rune]byte {
-	m := make(map[rune]byte, 256)
-	for b, r := range byteToRune {
-		m[r] = byte(b)
 	}
 	return m
 }()

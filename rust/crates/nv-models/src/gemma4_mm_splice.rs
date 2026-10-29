@@ -7,21 +7,11 @@ pub const GEMMA4_BOI_TOKEN_ID: u32 = 255999;
 pub const GEMMA4_EOI_TOKEN_ID: u32 = 258882;
 pub const GEMMA4_BOA_TOKEN_ID: u32 = 256000;
 pub const GEMMA4_EOA_TOKEN_ID: u32 = 258883;
-pub const VISION_SOFT_TOKENS_PER_IMAGE: usize = 280;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modality {
     Image,
     Audio,
-}
-
-impl Modality {
-    pub fn placeholder_token_id(self) -> u32 {
-        match self {
-            Modality::Image => GEMMA4_IMAGE_TOKEN_ID,
-            Modality::Audio => GEMMA4_AUDIO_TOKEN_ID,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

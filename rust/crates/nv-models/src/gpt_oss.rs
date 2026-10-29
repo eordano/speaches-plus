@@ -1,8 +1,12 @@
 use anyhow::{Context, Result};
 
 #[cfg(any(feature = "cuda", feature = "wgpu"))]
+use anyhow::ensure;
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
 use nv_quant::mxfp4::BLOCK_BYTES as MX_BLOCK_BYTES;
 use nv_quant::mxfp4::{Mxfp4Tensor, BLOCK_SIZE as MX_BLOCK};
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+use nv_weights::WeightLoader;
 
 pub const SWIGLU_ALPHA: f32 = 1.702;
 
@@ -270,17 +274,13 @@ pub(crate) fn bf16_val(b: u16) -> f32 {
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu"))]
-pub(crate) fn load_bf16(
-    w: &nv_weights::WeightLoader,
-    names: &[&str],
-    shape: &[usize],
-) -> Result<Vec<u16>> {
+pub(crate) fn load_bf16(w: &WeightLoader, names: &[&str], shape: &[usize]) -> Result<Vec<u16>> {
     for n in names {
         if w.has(n) {
             let t = w
                 .get(n, candle_core::DType::BF16)
                 .with_context(|| format!("load {n}"))?;
-            anyhow::ensure!(t.dims() == shape, "{n}: shape {:?} != {shape:?}", t.dims());
+            ensure!(t.dims() == shape, "{n}: shape {:?} != {shape:?}", t.dims());
             let v: Vec<half::bf16> = t.flatten_all()?.to_vec1()?;
             return Ok(v.into_iter().map(|x| x.to_bits()).collect());
         }
@@ -289,18 +289,14 @@ pub(crate) fn load_bf16(
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu"))]
-pub(crate) fn load_f32_vec(
-    w: &nv_weights::WeightLoader,
-    name: &str,
-    dim: usize,
-) -> Result<Vec<f32>> {
+pub(crate) fn load_f32_vec(w: &WeightLoader, name: &str, dim: usize) -> Result<Vec<f32>> {
     let raw = load_bf16(w, &[name], &[dim])?;
     Ok(raw.into_iter().map(bf16_val).collect())
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub(crate) fn load_lin(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     module: &str,
     n: usize,
     k: usize,
@@ -320,7 +316,7 @@ pub(crate) fn load_lin(
 
 #[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub(crate) fn load_mx_stack(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     base: &str,
     e: usize,
     n: usize,
@@ -333,24 +329,24 @@ pub(crate) fn load_mx_stack(
     let bshape = w
         .shape_of(&bl)
         .ok_or_else(|| anyhow::anyhow!("missing {bl}"))?;
-    anyhow::ensure!(
+    ensure!(
         bshape == [e, n, kb, MX_BLOCK_BYTES],
         "{bl}: shape {bshape:?}, want [{e}, {n}, {kb}, {MX_BLOCK_BYTES}]"
     );
     let sshape = w
         .shape_of(&sc)
         .ok_or_else(|| anyhow::anyhow!("missing {sc}"))?;
-    anyhow::ensure!(
+    ensure!(
         sshape == [e, n, kb],
         "{sc}: shape {sshape:?}, want [{e}, {n}, {kb}]"
     );
     let blocks = w.raw_bytes(&bl)?.to_vec();
     let scales = w.raw_bytes(&sc)?.to_vec();
-    anyhow::ensure!(
+    ensure!(
         blocks.len() == e * n * kb * MX_BLOCK_BYTES,
         "{bl}: byte count"
     );
-    anyhow::ensure!(scales.len() == e * n * kb, "{sc}: byte count");
+    ensure!(scales.len() == e * n * kb, "{sc}: byte count");
     let bias = load_bf16(w, &[&bi], &[e, n])?;
     Ok(HostMxStack {
         blocks,
@@ -363,11 +359,7 @@ pub(crate) fn load_mx_stack(
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu"))]
-pub(crate) fn load_layer(
-    cfg: &GptOssConfig,
-    w: &nv_weights::WeightLoader,
-    idx: usize,
-) -> Result<HostLayer> {
+pub(crate) fn load_layer(cfg: &GptOssConfig, w: &WeightLoader, idx: usize) -> Result<HostLayer> {
     let p = format!("model.layers.{idx}");
     let hd = cfg.head_dim;
     let q_out = cfg.num_attention_heads * hd;

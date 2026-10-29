@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
 use crate::wgpu_backend::pack::pack_u16_pairs as pack_u16;
@@ -163,6 +161,71 @@ fn sg_acc_step(grain: ScaleGrain, indent: &str, acc: &str, xb: &str) -> String {
     }
 }
 
+const SG_PARAMS: &str = "struct GemvW4A16SgParams {
+    n_rows: u32,
+    k_elems: u32,
+    gs: u32,
+    w_row_words: u32,
+    scale_row_stride: u32,
+    groups_x: u32,
+};
+
+";
+
+const SG_MK_BINDINGS: &str = "struct SgSplitParams {
+    q_rows: u32,
+    kv_rows: u32,
+    v_off: u32,
+    pad0: u32,
+};
+
+struct SgMkParams {
+    m: u32,
+    x_stride_words: u32,
+    y_stride_words: u32,
+    dst_word_off: u32,
+};
+
+@group(0) @binding(1) var<storage, read> sgp_scale: array<u32>;
+@group(0) @binding(3) var<storage, read_write> sgp_y: array<u32>;
+@group(0) @binding(4) var<uniform> sgp_params: GemvW4A16SgParams;
+@group(0) @binding(6) var<storage, read> sgp_packed4: array<vec4<u32>>;
+@group(0) @binding(7) var<storage, read> sgp_x4: array<vec4<u32>>;
+@group(0) @binding(31) var<storage, read_write> sgp_y_q: array<u32>;
+@group(0) @binding(32) var<storage, read_write> sgp_y_k: array<u32>;
+@group(0) @binding(33) var<storage, read_write> sgp_y_v: array<u32>;
+@group(0) @binding(34) var<uniform> sgp_split: SgSplitParams;
+@group(0) @binding(35) var<uniform> sgp_mk: SgMkParams;
+
+";
+
+const SGP_DOT: &str = "fn sgp_dot8(pv: u32, xw: vec4<u32>, acc_in: f32) -> f32 {
+    let qe = vec4<f32>(unpack4xU8(pv & 0x0f0f0f0fu)) - vec4<f32>(8.0);
+    let qo = vec4<f32>(unpack4xU8((pv >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);
+    let xe = bitcast<vec4<f32>>(xw << vec4<u32>(16u));
+    let xo = bitcast<vec4<f32>>(xw & vec4<u32>(0xffff0000u));
+    var s = acc_in;
+    s = fma(qe.x, xe.x, s);
+    s = fma(qo.x, xo.x, s);
+    s = fma(qe.y, xe.y, s);
+    s = fma(qo.y, xo.y, s);
+    s = fma(qe.z, xe.z, s);
+    s = fma(qo.z, xo.z, s);
+    s = fma(qe.w, xe.w, s);
+    s = fma(qo.w, xo.w, s);
+    return s;
+}
+
+fn sgp_dot32(wv: vec4<u32>, xb: u32) -> f32 {
+    var a = 0.0;
+    a = sgp_dot8(wv.x, sgp_x4[xb], a);
+    a = sgp_dot8(wv.y, sgp_x4[xb + 1u], a);
+    a = sgp_dot8(wv.z, sgp_x4[xb + 2u], a);
+    a = sgp_dot8(wv.w, sgp_x4[xb + 3u], a);
+    return a;
+}
+";
+
 pub fn sg_pk_source() -> String {
     sg_pk_source_grain(ScaleGrain::Ge32)
 }
@@ -174,46 +237,44 @@ pub fn sg_pk_source_grain(grain: ScaleGrain) -> String {
     let rows = SG_PK_ROWS;
     assert!(x.is_power_of_two() && rows >= 2 && rows.is_multiple_of(2));
     let mut b = String::new();
-    b.push_str(
-        "struct GemvW4A16SgParams {\n    n_rows: u32,\n    k_elems: u32,\n    gs: u32,\n    w_row_words: u32,\n    scale_row_stride: u32,\n    groups_x: u32,\n};\n\n",
-    );
-    b.push_str("struct SgPkOffParams {\n    dst_word_off: u32,\n    pad0: u32,\n    pad1: u32,\n    pad2: u32,\n};\n\n");
-    b.push_str("struct SgSplitParams {\n    q_rows: u32,\n    kv_rows: u32,\n    v_off: u32,\n    pad0: u32,\n};\n\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> sgp_scale: array<u32>;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> sgp_y: array<u32>;\n");
-    b.push_str("@group(0) @binding(4) var<uniform> sgp_params: GemvW4A16SgParams;\n");
-    b.push_str("@group(0) @binding(6) var<storage, read> sgp_packed4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(7) var<storage, read> sgp_x4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(30) var<uniform> sgp_off: SgPkOffParams;\n");
-    b.push_str("@group(0) @binding(31) var<storage, read_write> sgp_y_q: array<u32>;\n");
-    b.push_str("@group(0) @binding(32) var<storage, read_write> sgp_y_k: array<u32>;\n");
-    b.push_str("@group(0) @binding(33) var<storage, read_write> sgp_y_v: array<u32>;\n");
-    b.push_str("@group(0) @binding(34) var<uniform> sgp_split: SgSplitParams;\n\n");
-    writeln!(b, "var<workgroup> sgp_row_tot: array<f32, {rows}>;").unwrap();
-    b.push_str("\nfn sgp_dot8(pv: u32, xw: vec4<u32>, acc_in: f32) -> f32 {\n");
-    b.push_str("    let qe = vec4<f32>(unpack4xU8(pv & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    let qo = vec4<f32>(unpack4xU8((pv >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    let xe = bitcast<vec4<f32>>(xw << vec4<u32>(16u));\n");
-    b.push_str("    let xo = bitcast<vec4<f32>>(xw & vec4<u32>(0xffff0000u));\n");
-    b.push_str("    var s = acc_in;\n");
-    b.push_str("    s = fma(qe.x, xe.x, s);\n    s = fma(qo.x, xo.x, s);\n");
-    b.push_str("    s = fma(qe.y, xe.y, s);\n    s = fma(qo.y, xo.y, s);\n");
-    b.push_str("    s = fma(qe.z, xe.z, s);\n    s = fma(qo.z, xo.z, s);\n");
-    b.push_str("    s = fma(qe.w, xe.w, s);\n    s = fma(qo.w, xo.w, s);\n");
-    b.push_str("    return s;\n}\n\n");
-    b.push_str("fn sgp_dot32(wv: vec4<u32>, xb: u32) -> f32 {\n");
-    b.push_str("    var a = 0.0;\n");
-    b.push_str("    a = sgp_dot8(wv.x, sgp_x4[xb], a);\n");
-    b.push_str("    a = sgp_dot8(wv.y, sgp_x4[xb + 1u], a);\n");
-    b.push_str("    a = sgp_dot8(wv.z, sgp_x4[xb + 2u], a);\n");
-    b.push_str("    a = sgp_dot8(wv.w, sgp_x4[xb + 3u], a);\n");
-    b.push_str("    return a;\n}\n\n");
-    b.push_str("fn sgp_row_acc(row: u32, live: bool, vlane: u32) -> f32 {\n");
-    b.push_str("    let kv = select(0u, sgp_params.k_elems >> 5u, live);\n");
-    b.push_str("    let wbase4 = select(0u, row * (sgp_params.w_row_words >> 2u), live);\n");
-    b.push_str("    let sbase = select(0u, row * sgp_params.scale_row_stride, live);\n");
-    b.push_str("    var acc = 0.0;\n");
-    writeln!(b, "    for (var v = vlane; v < kv; v = v + {x}u) {{").unwrap();
+    write!(
+        b,
+        "{SG_PARAMS}struct SgPkOffParams {{
+    dst_word_off: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}};
+
+struct SgSplitParams {{
+    q_rows: u32,
+    kv_rows: u32,
+    v_off: u32,
+    pad0: u32,
+}};
+
+@group(0) @binding(1) var<storage, read> sgp_scale: array<u32>;
+@group(0) @binding(3) var<storage, read_write> sgp_y: array<u32>;
+@group(0) @binding(4) var<uniform> sgp_params: GemvW4A16SgParams;
+@group(0) @binding(6) var<storage, read> sgp_packed4: array<vec4<u32>>;
+@group(0) @binding(7) var<storage, read> sgp_x4: array<vec4<u32>>;
+@group(0) @binding(30) var<uniform> sgp_off: SgPkOffParams;
+@group(0) @binding(31) var<storage, read_write> sgp_y_q: array<u32>;
+@group(0) @binding(32) var<storage, read_write> sgp_y_k: array<u32>;
+@group(0) @binding(33) var<storage, read_write> sgp_y_v: array<u32>;
+@group(0) @binding(34) var<uniform> sgp_split: SgSplitParams;
+
+var<workgroup> sgp_row_tot: array<f32, {rows}>;
+
+{SGP_DOT}
+fn sgp_row_acc(row: u32, live: bool, vlane: u32) -> f32 {{
+    let kv = select(0u, sgp_params.k_elems >> 5u, live);
+    let wbase4 = select(0u, row * (sgp_params.w_row_words >> 2u), live);
+    let sbase = select(0u, row * sgp_params.scale_row_stride, live);
+    var acc = 0.0;
+    for (var v = vlane; v < kv; v = v + {x}u) {{\n"
+    )
+    .unwrap();
     b.push_str(&sg_scale_step(grain));
     b.push_str("        let wv = sgp_packed4[wbase4 + v];\n");
     b.push_str(&sg_acc_step(grain, "        ", "acc", "(v << 2u)"));
@@ -228,49 +289,63 @@ pub fn sg_pk_source_grain(grain: ScaleGrain) -> String {
     }
     b.push_str("    return acc;\n}\n\n");
     let header = |b: &mut String, entry: &str| {
-        writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-        writeln!(b, "fn {entry}(").unwrap();
-        b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n");
-        b.push_str("    @builtin(subgroup_id) sgid: u32,\n");
-        b.push_str("    @builtin(subgroup_size) sgsz: u32,\n");
-        b.push_str("    @builtin(subgroup_invocation_id) slane: u32\n) {\n");
-        b.push_str("    let vt = sgid * sgsz + slane;\n");
-        writeln!(b, "    let slot = vt / {x}u;").unwrap();
-        writeln!(b, "    let vlane = slane & {}u;", x - 1).unwrap();
-        writeln!(
+        write!(
             b,
-            "    let row = (wid.x + wid.y * sgp_params.groups_x) * {rows}u + slot;"
+            "@compute @workgroup_size({wg})
+fn {entry}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_size) sgsz: u32,
+    @builtin(subgroup_invocation_id) slane: u32
+) {{
+    let vt = sgid * sgsz + slane;
+    let slot = vt / {x}u;\n"
         )
         .unwrap();
-        b.push_str("    let live = row < sgp_params.n_rows;\n");
-        b.push_str("    let acc = sgp_row_acc(row, live, vlane);\n");
-        b.push_str("    if (vlane == 0u) {\n        sgp_row_tot[slot] = acc;\n    }\n");
-        b.push_str("    workgroupBarrier();\n");
-        b.push_str("    if (vlane == 0u && live && (slot & 1u) == 0u) {\n");
-        b.push_str("        let lo = bf16_encode(acc) & 0xffffu;\n");
-        b.push_str("        let hi_live = row + 1u < sgp_params.n_rows;\n");
-        b.push_str("        let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;\n");
-        b.push_str("        let word = lo | (select(0u, hi, hi_live) << 16u);\n");
+        writeln!(b, "    let vlane = slane & {}u;", x - 1).unwrap();
+        write!(
+            b,
+            "    let row = (wid.x + wid.y * sgp_params.groups_x) * {rows}u + slot;
+    let live = row < sgp_params.n_rows;
+    let acc = sgp_row_acc(row, live, vlane);
+    if (vlane == 0u) {{
+        sgp_row_tot[slot] = acc;
+    }}
+    workgroupBarrier();
+    if (vlane == 0u && live && (slot & 1u) == 0u) {{
+        let lo = bf16_encode(acc) & 0xffffu;
+        let hi_live = row + 1u < sgp_params.n_rows;
+        let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;
+        let word = lo | (select(0u, hi, hi_live) << 16u);\n"
+        )
+        .unwrap();
     };
     header(&mut b, SG_PK_ENTRY);
-    b.push_str("        sgp_y[sgp_off.dst_word_off + (row >> 1u)] = word;\n");
-    b.push_str("    }\n}\n\n");
+    b.push_str(
+        "        sgp_y[sgp_off.dst_word_off + (row >> 1u)] = word;
+    }
+}
+\n",
+    );
     header(&mut b, SG_PK3_ENTRY);
-    b.push_str("        if (row < sgp_split.q_rows) {\n");
-    b.push_str("            sgp_y_q[row >> 1u] = word;\n");
-    b.push_str("        } else {\n");
-    b.push_str("            let kr = row - sgp_split.q_rows;\n");
-    b.push_str("            if (kr < sgp_split.kv_rows) {\n");
-    b.push_str("                sgp_y_k[kr >> 1u] = word;\n");
-    b.push_str("            }\n");
-    b.push_str("            if (row >= sgp_split.v_off) {\n");
-    b.push_str("                let vr = row - sgp_split.v_off;\n");
-    b.push_str("                if (vr < sgp_split.kv_rows) {\n");
-    b.push_str("                    sgp_y_v[vr >> 1u] = word;\n");
-    b.push_str("                }\n");
-    b.push_str("            }\n");
-    b.push_str("        }\n");
-    b.push_str("    }\n}\n");
+    b.push_str(
+        "        if (row < sgp_split.q_rows) {
+            sgp_y_q[row >> 1u] = word;
+        } else {
+            let kr = row - sgp_split.q_rows;
+            if (kr < sgp_split.kv_rows) {
+                sgp_y_k[kr >> 1u] = word;
+            }
+            if (row >= sgp_split.v_off) {
+                let vr = row - sgp_split.v_off;
+                if (vr < sgp_split.kv_rows) {
+                    sgp_y_v[vr >> 1u] = word;
+                }
+            }
+        }
+    }
+}\n",
+    );
     compose(&b)
 }
 
@@ -285,55 +360,28 @@ pub fn sg_mk_source_grain(mk_max: u32, grain: ScaleGrain) -> String {
     let rows = SG_PK_ROWS;
     assert!((1..=SG_MK_MAX).contains(&mk_max));
     let mut b = String::new();
-    b.push_str(
-        "struct GemvW4A16SgParams {\n    n_rows: u32,\n    k_elems: u32,\n    gs: u32,\n    w_row_words: u32,\n    scale_row_stride: u32,\n    groups_x: u32,\n};\n\n",
-    );
-    b.push_str("struct SgSplitParams {\n    q_rows: u32,\n    kv_rows: u32,\n    v_off: u32,\n    pad0: u32,\n};\n\n");
-    b.push_str("struct SgMkParams {\n    m: u32,\n    x_stride_words: u32,\n    y_stride_words: u32,\n    dst_word_off: u32,\n};\n\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> sgp_scale: array<u32>;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> sgp_y: array<u32>;\n");
-    b.push_str("@group(0) @binding(4) var<uniform> sgp_params: GemvW4A16SgParams;\n");
-    b.push_str("@group(0) @binding(6) var<storage, read> sgp_packed4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(7) var<storage, read> sgp_x4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(31) var<storage, read_write> sgp_y_q: array<u32>;\n");
-    b.push_str("@group(0) @binding(32) var<storage, read_write> sgp_y_k: array<u32>;\n");
-    b.push_str("@group(0) @binding(33) var<storage, read_write> sgp_y_v: array<u32>;\n");
-    b.push_str("@group(0) @binding(34) var<uniform> sgp_split: SgSplitParams;\n");
-    b.push_str("@group(0) @binding(35) var<uniform> sgp_mk: SgMkParams;\n\n");
-    writeln!(b, "var<workgroup> sgp_row_tot: array<f32, {rows}>;").unwrap();
-    b.push_str("\nfn sgp_dot8(pv: u32, xw: vec4<u32>, acc_in: f32) -> f32 {\n");
-    b.push_str("    let qe = vec4<f32>(unpack4xU8(pv & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    let qo = vec4<f32>(unpack4xU8((pv >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    let xe = bitcast<vec4<f32>>(xw << vec4<u32>(16u));\n");
-    b.push_str("    let xo = bitcast<vec4<f32>>(xw & vec4<u32>(0xffff0000u));\n");
-    b.push_str("    var s = acc_in;\n");
-    b.push_str("    s = fma(qe.x, xe.x, s);\n    s = fma(qo.x, xo.x, s);\n");
-    b.push_str("    s = fma(qe.y, xe.y, s);\n    s = fma(qo.y, xo.y, s);\n");
-    b.push_str("    s = fma(qe.z, xe.z, s);\n    s = fma(qo.z, xo.z, s);\n");
-    b.push_str("    s = fma(qe.w, xe.w, s);\n    s = fma(qo.w, xo.w, s);\n");
-    b.push_str("    return s;\n}\n\n");
-    b.push_str("fn sgp_dot32(wv: vec4<u32>, xb: u32) -> f32 {\n");
-    b.push_str("    var a = 0.0;\n");
-    b.push_str("    a = sgp_dot8(wv.x, sgp_x4[xb], a);\n");
-    b.push_str("    a = sgp_dot8(wv.y, sgp_x4[xb + 1u], a);\n");
-    b.push_str("    a = sgp_dot8(wv.z, sgp_x4[xb + 2u], a);\n");
-    b.push_str("    a = sgp_dot8(wv.w, sgp_x4[xb + 3u], a);\n");
-    b.push_str("    return a;\n}\n\n");
-    writeln!(
+    write!(
         b,
-        "fn sgp_mk_row_acc(row: u32, live: bool, vlane: u32, accs: ptr<function, array<f32, {mk_max}>>) {{"
+        "{SG_PARAMS}{SG_MK_BINDINGS}var<workgroup> sgp_row_tot: array<f32, {rows}>;
+
+{SGP_DOT}
+fn sgp_mk_row_acc(row: u32, live: bool, vlane: u32, accs: ptr<function, array<f32, {mk_max}>>) {{
+    let kv = select(0u, sgp_params.k_elems >> 5u, live);
+    let wbase4 = select(0u, row * (sgp_params.w_row_words >> 2u), live);
+    let sbase = select(0u, row * sgp_params.scale_row_stride, live);
+    let mm = sgp_mk.m;
+    let xs4 = sgp_mk.x_stride_words >> 2u;
+    for (var v = vlane; v < kv; v = v + {x}u) {{\n"
     )
     .unwrap();
-    b.push_str("    let kv = select(0u, sgp_params.k_elems >> 5u, live);\n");
-    b.push_str("    let wbase4 = select(0u, row * (sgp_params.w_row_words >> 2u), live);\n");
-    b.push_str("    let sbase = select(0u, row * sgp_params.scale_row_stride, live);\n");
-    b.push_str("    let mm = sgp_mk.m;\n");
-    b.push_str("    let xs4 = sgp_mk.x_stride_words >> 2u;\n");
-    writeln!(b, "    for (var v = vlane; v < kv; v = v + {x}u) {{").unwrap();
     b.push_str(&sg_scale_step(grain));
-    b.push_str("        let wv = sgp_packed4[wbase4 + v];\n");
-    writeln!(b, "        for (var t = 0u; t < {mk_max}u; t = t + 1u) {{").unwrap();
-    b.push_str("            if (t < mm) {\n");
+    write!(
+        b,
+        "        let wv = sgp_packed4[wbase4 + v];
+        for (var t = 0u; t < {mk_max}u; t = t + 1u) {{
+            if (t < mm) {{\n"
+    )
+    .unwrap();
     match grain {
         ScaleGrain::Ge32 | ScaleGrain::Ge32Fixed(_) => b.push_str(
             "                (*accs)[t] = fma(sc, sgp_dot32(wv, t * xs4 + (v << 2u)), (*accs)[t]);\n",
@@ -349,27 +397,44 @@ pub fn sg_mk_source_grain(mk_max: u32, grain: ScaleGrain) -> String {
             b.push_str("                (*accs)[t] = acc_t;\n");
         }
     }
-    b.push_str("            }\n");
-    b.push_str("        }\n    }\n}\n\n");
+    b.push_str(
+        "            }
+        }
+    }
+}
+\n",
+    );
     let entry_fn = |b: &mut String, entry: &str, store: &str| {
-        writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-        writeln!(b, "fn {entry}(").unwrap();
-        b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n");
-        b.push_str("    @builtin(subgroup_id) sgid: u32,\n");
-        b.push_str("    @builtin(subgroup_size) sgsz: u32,\n");
-        b.push_str("    @builtin(subgroup_invocation_id) slane: u32\n) {\n");
-        b.push_str("    let vt = sgid * sgsz + slane;\n");
-        writeln!(b, "    let slot = vt / {x}u;").unwrap();
+        write!(
+            b,
+            "@compute @workgroup_size({wg})
+fn {entry}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_size) sgsz: u32,
+    @builtin(subgroup_invocation_id) slane: u32
+) {{
+    let vt = sgid * sgsz + slane;
+    let slot = vt / {x}u;\n"
+        )
+        .unwrap();
         writeln!(b, "    let vlane = slane & {}u;", x - 1).unwrap();
-        writeln!(b, "    let row = wid.x * {rows}u + slot;").unwrap();
-        b.push_str("    let live = row < sgp_params.n_rows;\n");
-        writeln!(b, "    var accs: array<f32, {mk_max}>;").unwrap();
-        writeln!(b, "    for (var t = 0u; t < {mk_max}u; t = t + 1u) {{").unwrap();
-        b.push_str("        accs[t] = 0.0;\n    }\n");
-        b.push_str("    sgp_mk_row_acc(row, live, vlane, &accs);\n");
-        writeln!(b, "    for (var t = 0u; t < {mk_max}u; t = t + 1u) {{").unwrap();
-        b.push_str("        if (t >= sgp_mk.m) {\n            break;\n        }\n");
-        b.push_str("        var acc = accs[t];\n");
+        write!(
+            b,
+            "    let row = wid.x * {rows}u + slot;
+    let live = row < sgp_params.n_rows;
+    var accs: array<f32, {mk_max}>;
+    for (var t = 0u; t < {mk_max}u; t = t + 1u) {{
+        accs[t] = 0.0;
+    }}
+    sgp_mk_row_acc(row, live, vlane, &accs);
+    for (var t = 0u; t < {mk_max}u; t = t + 1u) {{
+        if (t >= sgp_mk.m) {{
+            break;
+        }}
+        var acc = accs[t];\n"
+        )
+        .unwrap();
         let mut s = x / 2;
         loop {
             writeln!(b, "        acc = acc + subgroupShuffleXor(acc, {s}u);").unwrap();
@@ -378,17 +443,25 @@ pub fn sg_mk_source_grain(mk_max: u32, grain: ScaleGrain) -> String {
             }
             s /= 2;
         }
-        b.push_str("        if (vlane == 0u) {\n            sgp_row_tot[slot] = acc;\n        }\n");
-        b.push_str("        workgroupBarrier();\n");
-        b.push_str("        if (vlane == 0u && live && (slot & 1u) == 0u) {\n");
-        b.push_str("            let lo = bf16_encode(acc) & 0xffffu;\n");
-        b.push_str("            let hi_live = row + 1u < sgp_params.n_rows;\n");
-        b.push_str("            let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;\n");
-        b.push_str("            let word = lo | (select(0u, hi, hi_live) << 16u);\n");
+        b.push_str(
+            "        if (vlane == 0u) {
+            sgp_row_tot[slot] = acc;
+        }
+        workgroupBarrier();
+        if (vlane == 0u && live && (slot & 1u) == 0u) {
+            let lo = bf16_encode(acc) & 0xffffu;
+            let hi_live = row + 1u < sgp_params.n_rows;
+            let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;
+            let word = lo | (select(0u, hi, hi_live) << 16u);\n",
+        );
         b.push_str(store);
-        b.push_str("        }\n");
-        b.push_str("        workgroupBarrier();\n");
-        b.push_str("    }\n}\n\n");
+        b.push_str(
+            "        }
+        workgroupBarrier();
+    }
+}
+\n",
+        );
     };
     entry_fn(
         &mut b,
@@ -429,57 +502,39 @@ pub fn sg_mk_unrolled_source_grain(mk_max: u32, grain: ScaleGrain) -> String {
     let rows = SG_PK_ROWS;
     assert!((1..=SG_MK_MAX).contains(&mk_max));
     let mut b = String::new();
-    b.push_str(
-        "struct GemvW4A16SgParams {\n    n_rows: u32,\n    k_elems: u32,\n    gs: u32,\n    w_row_words: u32,\n    scale_row_stride: u32,\n    groups_x: u32,\n};\n\n",
-    );
-    b.push_str("struct SgSplitParams {\n    q_rows: u32,\n    kv_rows: u32,\n    v_off: u32,\n    pad0: u32,\n};\n\n");
-    b.push_str("struct SgMkParams {\n    m: u32,\n    x_stride_words: u32,\n    y_stride_words: u32,\n    dst_word_off: u32,\n};\n\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> sgp_scale: array<u32>;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> sgp_y: array<u32>;\n");
-    b.push_str("@group(0) @binding(4) var<uniform> sgp_params: GemvW4A16SgParams;\n");
-    b.push_str("@group(0) @binding(6) var<storage, read> sgp_packed4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(7) var<storage, read> sgp_x4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(31) var<storage, read_write> sgp_y_q: array<u32>;\n");
-    b.push_str("@group(0) @binding(32) var<storage, read_write> sgp_y_k: array<u32>;\n");
-    b.push_str("@group(0) @binding(33) var<storage, read_write> sgp_y_v: array<u32>;\n");
-    b.push_str("@group(0) @binding(34) var<uniform> sgp_split: SgSplitParams;\n");
-    b.push_str("@group(0) @binding(35) var<uniform> sgp_mk: SgMkParams;\n\n");
-    writeln!(b, "var<workgroup> sgp_row_tot: array<f32, {rows}>;").unwrap();
-    b.push_str("\nfn sgp_dot8(pv: u32, xw: vec4<u32>, acc_in: f32) -> f32 {\n");
-    b.push_str("    let qe = vec4<f32>(unpack4xU8(pv & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    let qo = vec4<f32>(unpack4xU8((pv >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    let xe = bitcast<vec4<f32>>(xw << vec4<u32>(16u));\n");
-    b.push_str("    let xo = bitcast<vec4<f32>>(xw & vec4<u32>(0xffff0000u));\n");
-    b.push_str("    var s = acc_in;\n");
-    b.push_str("    s = fma(qe.x, xe.x, s);\n    s = fma(qo.x, xo.x, s);\n");
-    b.push_str("    s = fma(qe.y, xe.y, s);\n    s = fma(qo.y, xo.y, s);\n");
-    b.push_str("    s = fma(qe.z, xe.z, s);\n    s = fma(qo.z, xo.z, s);\n");
-    b.push_str("    s = fma(qe.w, xe.w, s);\n    s = fma(qo.w, xo.w, s);\n");
-    b.push_str("    return s;\n}\n\n");
-    b.push_str("fn sgp_dot32(wv: vec4<u32>, xb: u32) -> f32 {\n");
-    b.push_str("    var a = 0.0;\n");
-    b.push_str("    a = sgp_dot8(wv.x, sgp_x4[xb], a);\n");
-    b.push_str("    a = sgp_dot8(wv.y, sgp_x4[xb + 1u], a);\n");
-    b.push_str("    a = sgp_dot8(wv.z, sgp_x4[xb + 2u], a);\n");
-    b.push_str("    a = sgp_dot8(wv.w, sgp_x4[xb + 3u], a);\n");
-    b.push_str("    return a;\n}\n\n");
+    write!(
+        b,
+        "{SG_PARAMS}{SG_MK_BINDINGS}var<workgroup> sgp_row_tot: array<f32, {rows}>;
+
+{SGP_DOT}\n"
+    )
+    .unwrap();
     let entry_fn = |b: &mut String, entry: &str, store: &dyn Fn(u32) -> String| {
-        writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-        writeln!(b, "fn {entry}(").unwrap();
-        b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n");
-        b.push_str("    @builtin(subgroup_id) sgid: u32,\n");
-        b.push_str("    @builtin(subgroup_size) sgsz: u32,\n");
-        b.push_str("    @builtin(subgroup_invocation_id) slane: u32\n) {\n");
-        b.push_str("    let vt = sgid * sgsz + slane;\n");
-        writeln!(b, "    let slot = vt / {x}u;").unwrap();
+        write!(
+            b,
+            "@compute @workgroup_size({wg})
+fn {entry}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_size) sgsz: u32,
+    @builtin(subgroup_invocation_id) slane: u32
+) {{
+    let vt = sgid * sgsz + slane;
+    let slot = vt / {x}u;\n"
+        )
+        .unwrap();
         writeln!(b, "    let vlane = slane & {}u;", x - 1).unwrap();
-        writeln!(b, "    let row = wid.x * {rows}u + slot;").unwrap();
-        b.push_str("    let live = row < sgp_params.n_rows;\n");
-        b.push_str("    let kv = select(0u, sgp_params.k_elems >> 5u, live);\n");
-        b.push_str("    let wbase4 = select(0u, row * (sgp_params.w_row_words >> 2u), live);\n");
-        b.push_str("    let sbase = select(0u, row * sgp_params.scale_row_stride, live);\n");
-        b.push_str("    let mm = sgp_mk.m;\n");
-        b.push_str("    let xs4 = sgp_mk.x_stride_words >> 2u;\n");
+        write!(
+            b,
+            "    let row = wid.x * {rows}u + slot;
+    let live = row < sgp_params.n_rows;
+    let kv = select(0u, sgp_params.k_elems >> 5u, live);
+    let wbase4 = select(0u, row * (sgp_params.w_row_words >> 2u), live);
+    let sbase = select(0u, row * sgp_params.scale_row_stride, live);
+    let mm = sgp_mk.m;
+    let xs4 = sgp_mk.x_stride_words >> 2u;\n"
+        )
+        .unwrap();
         for t in 0..mk_max {
             writeln!(b, "    var acc{t} = 0.0;").unwrap();
         }
@@ -498,8 +553,12 @@ pub fn sg_mk_unrolled_source_grain(mk_max: u32, grain: ScaleGrain) -> String {
         }
         b.push_str("    }\n");
         for t in 0..mk_max {
-            writeln!(b, "    if ({t}u < mm) {{").unwrap();
-            writeln!(b, "        var acc = acc{t};").unwrap();
+            writeln!(
+                b,
+                "    if ({t}u < mm) {{
+        var acc = acc{t};"
+            )
+            .unwrap();
             let mut s = x / 2;
             loop {
                 writeln!(b, "        acc = acc + subgroupShuffleXor(acc, {s}u);").unwrap();
@@ -509,18 +568,22 @@ pub fn sg_mk_unrolled_source_grain(mk_max: u32, grain: ScaleGrain) -> String {
                 s /= 2;
             }
             b.push_str(
-                "        if (vlane == 0u) {\n            sgp_row_tot[slot] = acc;\n        }\n",
+                "        if (vlane == 0u) {
+            sgp_row_tot[slot] = acc;
+        }
+        workgroupBarrier();
+        if (vlane == 0u && live && (slot & 1u) == 0u) {
+            let lo = bf16_encode(acc) & 0xffffu;
+            let hi_live = row + 1u < sgp_params.n_rows;
+            let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;
+            let word = lo | (select(0u, hi, hi_live) << 16u);\n",
             );
-            b.push_str("        workgroupBarrier();\n");
-            b.push_str("        if (vlane == 0u && live && (slot & 1u) == 0u) {\n");
-            b.push_str("            let lo = bf16_encode(acc) & 0xffffu;\n");
-            b.push_str("            let hi_live = row + 1u < sgp_params.n_rows;\n");
-            b.push_str("            let hi = bf16_encode(sgp_row_tot[slot + 1u]) & 0xffffu;\n");
-            b.push_str("            let word = lo | (select(0u, hi, hi_live) << 16u);\n");
             b.push_str(&store(t));
-            b.push_str("        }\n");
-            b.push_str("        workgroupBarrier();\n");
-            b.push_str("    }\n");
+            b.push_str(
+                "        }
+        workgroupBarrier();
+    }\n",
+            );
         }
         b.push_str("}\n\n");
     };
@@ -565,70 +628,101 @@ pub fn sg_pk_mr_source_grain(mr: u32, grain: ScaleGrain) -> String {
     assert!((2..=8).contains(&mr) && mr.is_multiple_of(2));
     let mut b = String::new();
     b.push_str(
-        "struct GemvW4A16SgParams {\n    n_rows: u32,\n    k_elems: u32,\n    gs: u32,\n    w_row_words: u32,\n    scale_row_stride: u32,\n    groups_x: u32,\n};\n\n",
+        "struct GemvW4A16SgParams {
+    n_rows: u32,
+    k_elems: u32,
+    gs: u32,
+    w_row_words: u32,
+    scale_row_stride: u32,
+    groups_x: u32,
+};
+
+struct SgPkOffParams {
+    dst_word_off: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+};
+
+struct SgSplitParams {
+    q_rows: u32,
+    kv_rows: u32,
+    v_off: u32,
+    pad0: u32,
+};
+
+@group(0) @binding(1) var<storage, read> sgp_scale: array<u32>;
+@group(0) @binding(3) var<storage, read_write> sgp_y: array<u32>;
+@group(0) @binding(4) var<uniform> sgp_params: GemvW4A16SgParams;
+@group(0) @binding(6) var<storage, read> sgp_packed4: array<vec4<u32>>;
+@group(0) @binding(7) var<storage, read> sgp_x4: array<vec4<u32>>;
+@group(0) @binding(30) var<uniform> sgp_off: SgPkOffParams;
+@group(0) @binding(31) var<storage, read_write> sgp_y_q: array<u32>;
+@group(0) @binding(32) var<storage, read_write> sgp_y_k: array<u32>;
+@group(0) @binding(33) var<storage, read_write> sgp_y_v: array<u32>;
+@group(0) @binding(34) var<uniform> sgp_split: SgSplitParams;
+
+fn sgm_dot8(pv: u32, xe: vec4<f32>, xo: vec4<f32>, acc_in: f32) -> f32 {
+    let qe = vec4<f32>(unpack4xU8(pv & 0x0f0f0f0fu)) - vec4<f32>(8.0);
+    let qo = vec4<f32>(unpack4xU8((pv >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);
+    var s = acc_in;
+    s = fma(qe.x, xe.x, s);
+    s = fma(qo.x, xo.x, s);
+    s = fma(qe.y, xe.y, s);
+    s = fma(qo.y, xo.y, s);
+    s = fma(qe.z, xe.z, s);
+    s = fma(qo.z, xo.z, s);
+    s = fma(qe.w, xe.w, s);
+    s = fma(qo.w, xo.w, s);
+    return s;
+}
+\n",
     );
-    b.push_str("struct SgPkOffParams {\n    dst_word_off: u32,\n    pad0: u32,\n    pad1: u32,\n    pad2: u32,\n};\n\n");
-    b.push_str("struct SgSplitParams {\n    q_rows: u32,\n    kv_rows: u32,\n    v_off: u32,\n    pad0: u32,\n};\n\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> sgp_scale: array<u32>;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> sgp_y: array<u32>;\n");
-    b.push_str("@group(0) @binding(4) var<uniform> sgp_params: GemvW4A16SgParams;\n");
-    b.push_str("@group(0) @binding(6) var<storage, read> sgp_packed4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(7) var<storage, read> sgp_x4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(30) var<uniform> sgp_off: SgPkOffParams;\n");
-    b.push_str("@group(0) @binding(31) var<storage, read_write> sgp_y_q: array<u32>;\n");
-    b.push_str("@group(0) @binding(32) var<storage, read_write> sgp_y_k: array<u32>;\n");
-    b.push_str("@group(0) @binding(33) var<storage, read_write> sgp_y_v: array<u32>;\n");
-    b.push_str("@group(0) @binding(34) var<uniform> sgp_split: SgSplitParams;\n\n");
-    b.push_str("fn sgm_dot8(pv: u32, xe: vec4<f32>, xo: vec4<f32>, acc_in: f32) -> f32 {\n");
-    b.push_str("    let qe = vec4<f32>(unpack4xU8(pv & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    let qo = vec4<f32>(unpack4xU8((pv >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    var s = acc_in;\n");
-    b.push_str("    s = fma(qe.x, xe.x, s);\n    s = fma(qo.x, xo.x, s);\n");
-    b.push_str("    s = fma(qe.y, xe.y, s);\n    s = fma(qo.y, xo.y, s);\n");
-    b.push_str("    s = fma(qe.z, xe.z, s);\n    s = fma(qo.z, xo.z, s);\n");
-    b.push_str("    s = fma(qe.w, xe.w, s);\n    s = fma(qo.w, xo.w, s);\n");
-    b.push_str("    return s;\n}\n\n");
     let header = |b: &mut String, entry: &str| {
-        writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-        writeln!(b, "fn {entry}(").unwrap();
-        b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n");
-        b.push_str("    @builtin(subgroup_id) sgid: u32,\n");
-        b.push_str("    @builtin(subgroup_size) sgsz: u32,\n");
-        b.push_str("    @builtin(subgroup_invocation_id) slane: u32\n) {\n");
-        b.push_str("    let vt = sgid * sgsz + slane;\n");
-        writeln!(b, "    let slot = vt / {x}u;").unwrap();
-        writeln!(b, "    let vlane = slane & {}u;", x - 1).unwrap();
-        writeln!(
+        write!(
             b,
-            "    let row0 = ((wid.x + wid.y * sgp_params.groups_x) * {slots}u + slot) * {mr}u;"
+            "@compute @workgroup_size({wg})
+fn {entry}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_size) sgsz: u32,
+    @builtin(subgroup_invocation_id) slane: u32
+) {{
+    let vt = sgid * sgsz + slane;
+    let slot = vt / {x}u;\n"
         )
         .unwrap();
-        b.push_str(
-            "    let kv = select(0u, sgp_params.k_elems >> 5u, row0 < sgp_params.n_rows);\n",
-        );
-        writeln!(b, "    var wbase4: array<u32, {mr}>;").unwrap();
-        writeln!(b, "    var sbase: array<u32, {mr}>;").unwrap();
-        writeln!(b, "    var accs: array<f32, {mr}>;").unwrap();
-        writeln!(b, "    for (var m = 0u; m < {mr}u; m = m + 1u) {{").unwrap();
-        b.push_str("        let r = row0 + m;\n");
-        b.push_str("        let ok = r < sgp_params.n_rows;\n");
-        b.push_str("        wbase4[m] = select(0u, r * (sgp_params.w_row_words >> 2u), ok);\n");
-        b.push_str("        sbase[m] = select(0u, r * sgp_params.scale_row_stride, ok);\n");
-        b.push_str("        accs[m] = 0.0;\n    }\n");
-        writeln!(b, "    for (var v = vlane; v < kv; v = v + {x}u) {{").unwrap();
-        b.push_str("        let xb = v << 2u;\n");
-        b.push_str("        let xw0 = sgp_x4[xb];\n");
-        b.push_str("        let xw1 = sgp_x4[xb + 1u];\n");
-        b.push_str("        let xw2 = sgp_x4[xb + 2u];\n");
-        b.push_str("        let xw3 = sgp_x4[xb + 3u];\n");
-        b.push_str("        let xe0 = bitcast<vec4<f32>>(xw0 << vec4<u32>(16u));\n");
-        b.push_str("        let xo0 = bitcast<vec4<f32>>(xw0 & vec4<u32>(0xffff0000u));\n");
-        b.push_str("        let xe1 = bitcast<vec4<f32>>(xw1 << vec4<u32>(16u));\n");
-        b.push_str("        let xo1 = bitcast<vec4<f32>>(xw1 & vec4<u32>(0xffff0000u));\n");
-        b.push_str("        let xe2 = bitcast<vec4<f32>>(xw2 << vec4<u32>(16u));\n");
-        b.push_str("        let xo2 = bitcast<vec4<f32>>(xw2 & vec4<u32>(0xffff0000u));\n");
-        b.push_str("        let xe3 = bitcast<vec4<f32>>(xw3 << vec4<u32>(16u));\n");
-        b.push_str("        let xo3 = bitcast<vec4<f32>>(xw3 & vec4<u32>(0xffff0000u));\n");
+        writeln!(b, "    let vlane = slane & {}u;", x - 1).unwrap();
+        write!(
+            b,
+            "    let row0 = ((wid.x + wid.y * sgp_params.groups_x) * {slots}u + slot) * {mr}u;
+    let kv = select(0u, sgp_params.k_elems >> 5u, row0 < sgp_params.n_rows);
+    var wbase4: array<u32, {mr}>;
+    var sbase: array<u32, {mr}>;
+    var accs: array<f32, {mr}>;
+    for (var m = 0u; m < {mr}u; m = m + 1u) {{
+        let r = row0 + m;
+        let ok = r < sgp_params.n_rows;
+        wbase4[m] = select(0u, r * (sgp_params.w_row_words >> 2u), ok);
+        sbase[m] = select(0u, r * sgp_params.scale_row_stride, ok);
+        accs[m] = 0.0;
+    }}
+    for (var v = vlane; v < kv; v = v + {x}u) {{
+        let xb = v << 2u;
+        let xw0 = sgp_x4[xb];
+        let xw1 = sgp_x4[xb + 1u];
+        let xw2 = sgp_x4[xb + 2u];
+        let xw3 = sgp_x4[xb + 3u];
+        let xe0 = bitcast<vec4<f32>>(xw0 << vec4<u32>(16u));
+        let xo0 = bitcast<vec4<f32>>(xw0 & vec4<u32>(0xffff0000u));
+        let xe1 = bitcast<vec4<f32>>(xw1 << vec4<u32>(16u));
+        let xo1 = bitcast<vec4<f32>>(xw1 & vec4<u32>(0xffff0000u));
+        let xe2 = bitcast<vec4<f32>>(xw2 << vec4<u32>(16u));
+        let xo2 = bitcast<vec4<f32>>(xw2 & vec4<u32>(0xffff0000u));
+        let xe3 = bitcast<vec4<f32>>(xw3 << vec4<u32>(16u));
+        let xo3 = bitcast<vec4<f32>>(xw3 & vec4<u32>(0xffff0000u));\n"
+        )
+        .unwrap();
         match grain {
             ScaleGrain::Ge32 => b.push_str("        let sgo = (v << 5u) / sgp_params.gs;\n"),
             ScaleGrain::Ge32Fixed(0) => b.push_str("        let sgo = v;\n"),
@@ -637,40 +731,51 @@ pub fn sg_pk_mr_source_grain(mr: u32, grain: ScaleGrain) -> String {
             }
             ScaleGrain::G16 => b.push_str("        let sgo = v << 1u;\n"),
         }
-        writeln!(b, "        for (var m = 0u; m < {mr}u; m = m + 1u) {{").unwrap();
-        b.push_str("            let sgi = sbase[m] + sgo;\n");
-        b.push_str("            let ssw = sgp_scale[sgi >> 1u];\n");
+        write!(
+            b,
+            "        for (var m = 0u; m < {mr}u; m = m + 1u) {{
+            let sgi = sbase[m] + sgo;
+            let ssw = sgp_scale[sgi >> 1u];\n"
+        )
+        .unwrap();
         match grain {
             ScaleGrain::Ge32 | ScaleGrain::Ge32Fixed(_) => {
                 b.push_str(
-                    "            let sc = select(bf16_lo(ssw), bf16_hi(ssw), (sgi & 1u) == 1u);\n",
+                    "            let sc = select(bf16_lo(ssw), bf16_hi(ssw), (sgi & 1u) == 1u);
+            let wv = sgp_packed4[wbase4[m] + v];
+            var a = 0.0;
+            a = sgm_dot8(wv.x, xe0, xo0, a);
+            a = sgm_dot8(wv.y, xe1, xo1, a);
+            a = sgm_dot8(wv.z, xe2, xo2, a);
+            a = sgm_dot8(wv.w, xe3, xo3, a);
+            accs[m] = fma(sc, a, accs[m]);\n",
                 );
-                b.push_str("            let wv = sgp_packed4[wbase4[m] + v];\n");
-                b.push_str("            var a = 0.0;\n");
-                b.push_str("            a = sgm_dot8(wv.x, xe0, xo0, a);\n");
-                b.push_str("            a = sgm_dot8(wv.y, xe1, xo1, a);\n");
-                b.push_str("            a = sgm_dot8(wv.z, xe2, xo2, a);\n");
-                b.push_str("            a = sgm_dot8(wv.w, xe3, xo3, a);\n");
-                b.push_str("            accs[m] = fma(sc, a, accs[m]);\n");
             }
             ScaleGrain::G16 => {
-                b.push_str("            let sc_lo = bf16_lo(ssw);\n");
-                b.push_str("            let sc_hi = bf16_hi(ssw);\n");
-                b.push_str("            let wv = sgp_packed4[wbase4[m] + v];\n");
-                b.push_str("            var a0 = 0.0;\n");
-                b.push_str("            a0 = sgm_dot8(wv.x, xe0, xo0, a0);\n");
-                b.push_str("            a0 = sgm_dot8(wv.y, xe1, xo1, a0);\n");
-                b.push_str("            var a1 = 0.0;\n");
-                b.push_str("            a1 = sgm_dot8(wv.z, xe2, xo2, a1);\n");
-                b.push_str("            a1 = sgm_dot8(wv.w, xe3, xo3, a1);\n");
-                b.push_str("            accs[m] = fma(sc_lo, a0, accs[m]);\n");
-                b.push_str("            accs[m] = fma(sc_hi, a1, accs[m]);\n");
+                b.push_str(
+                    "            let sc_lo = bf16_lo(ssw);
+            let sc_hi = bf16_hi(ssw);
+            let wv = sgp_packed4[wbase4[m] + v];
+            var a0 = 0.0;
+            a0 = sgm_dot8(wv.x, xe0, xo0, a0);
+            a0 = sgm_dot8(wv.y, xe1, xo1, a0);
+            var a1 = 0.0;
+            a1 = sgm_dot8(wv.z, xe2, xo2, a1);
+            a1 = sgm_dot8(wv.w, xe3, xo3, a1);
+            accs[m] = fma(sc_lo, a0, accs[m]);
+            accs[m] = fma(sc_hi, a1, accs[m]);\n",
+                );
             }
         }
-        b.push_str("        }\n    }\n");
-        writeln!(b, "    var tot: array<f32, {mr}>;").unwrap();
-        writeln!(b, "    for (var m = 0u; m < {mr}u; m = m + 1u) {{").unwrap();
-        b.push_str("        var acc = accs[m];\n");
+        write!(
+            b,
+            "        }}
+    }}
+    var tot: array<f32, {mr}>;
+    for (var m = 0u; m < {mr}u; m = m + 1u) {{
+        var acc = accs[m];\n"
+        )
+        .unwrap();
         let mut s = x / 2;
         while s >= 1 {
             writeln!(b, "        acc = acc + subgroupShuffleXor(acc, {s}u);").unwrap();
@@ -679,35 +784,51 @@ pub fn sg_pk_mr_source_grain(mr: u32, grain: ScaleGrain) -> String {
             }
             s /= 2;
         }
-        b.push_str("        tot[m] = acc;\n    }\n");
-        b.push_str("    if (vlane == 0u) {\n");
-        writeln!(b, "        for (var m = 0u; m < {mr}u; m = m + 2u) {{").unwrap();
-        b.push_str("            let row = row0 + m;\n");
-        b.push_str("            if (row < sgp_params.n_rows) {\n");
-        b.push_str("                let lo = bf16_encode(tot[m]) & 0xffffu;\n");
-        b.push_str("                let hi_live = row + 1u < sgp_params.n_rows;\n");
-        b.push_str("                let hi = bf16_encode(tot[m + 1u]) & 0xffffu;\n");
-        b.push_str("                let word = lo | (select(0u, hi, hi_live) << 16u);\n");
+        write!(
+            b,
+            "        tot[m] = acc;
+    }}
+    if (vlane == 0u) {{
+        for (var m = 0u; m < {mr}u; m = m + 2u) {{
+            let row = row0 + m;
+            if (row < sgp_params.n_rows) {{
+                let lo = bf16_encode(tot[m]) & 0xffffu;
+                let hi_live = row + 1u < sgp_params.n_rows;
+                let hi = bf16_encode(tot[m + 1u]) & 0xffffu;
+                let word = lo | (select(0u, hi, hi_live) << 16u);\n"
+        )
+        .unwrap();
     };
     header(&mut b, SG_PKM_ENTRY);
-    b.push_str("                sgp_y[sgp_off.dst_word_off + (row >> 1u)] = word;\n");
-    b.push_str("            }\n        }\n    }\n}\n\n");
+    b.push_str(
+        "                sgp_y[sgp_off.dst_word_off + (row >> 1u)] = word;
+            }
+        }
+    }
+}
+\n",
+    );
     header(&mut b, SG_PKM3_ENTRY);
-    b.push_str("                if (row < sgp_split.q_rows) {\n");
-    b.push_str("                    sgp_y_q[row >> 1u] = word;\n");
-    b.push_str("                } else {\n");
-    b.push_str("                    let kr = row - sgp_split.q_rows;\n");
-    b.push_str("                    if (kr < sgp_split.kv_rows) {\n");
-    b.push_str("                        sgp_y_k[kr >> 1u] = word;\n");
-    b.push_str("                    }\n");
-    b.push_str("                    if (row >= sgp_split.v_off) {\n");
-    b.push_str("                        let vr = row - sgp_split.v_off;\n");
-    b.push_str("                        if (vr < sgp_split.kv_rows) {\n");
-    b.push_str("                            sgp_y_v[vr >> 1u] = word;\n");
-    b.push_str("                        }\n");
-    b.push_str("                    }\n");
-    b.push_str("                }\n");
-    b.push_str("            }\n        }\n    }\n}\n");
+    b.push_str(
+        "                if (row < sgp_split.q_rows) {
+                    sgp_y_q[row >> 1u] = word;
+                } else {
+                    let kr = row - sgp_split.q_rows;
+                    if (kr < sgp_split.kv_rows) {
+                        sgp_y_k[kr >> 1u] = word;
+                    }
+                    if (row >= sgp_split.v_off) {
+                        let vr = row - sgp_split.v_off;
+                        if (vr < sgp_split.kv_rows) {
+                            sgp_y_v[vr >> 1u] = word;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}\n",
+    );
     compose(&b)
 }
 
@@ -717,55 +838,66 @@ pub fn sg_source(x: u32, wg: u32) -> String {
     assert!(wg.is_multiple_of(x) && wg >= x);
     let rows = wg / x;
     let mut b = String::new();
-    b.push_str(
-        "struct GemvW4A16SgParams {\n    n_rows: u32,\n    k_elems: u32,\n    gs: u32,\n    w_row_words: u32,\n    scale_row_stride: u32,\n    groups_x: u32,\n};\n\n",
-    );
-    b.push_str("@group(0) @binding(0) var<storage, read> sgw_packed4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> sgw_scale: array<u32>;\n");
-    b.push_str("@group(0) @binding(2) var<storage, read> sgw_x4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> sgw_y: array<u32>;\n");
-    b.push_str("@group(0) @binding(4) var<uniform> sgw_params: GemvW4A16SgParams;\n\n");
-    b.push_str("fn sgw_dot8(pv: u32, xw: vec4<u32>, acc_in: f32) -> f32 {\n");
-    b.push_str("    let qe = vec4<f32>(unpack4xU8(pv & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    let qo = vec4<f32>(unpack4xU8((pv >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);\n");
-    b.push_str("    let xe = bitcast<vec4<f32>>(xw << vec4<u32>(16u));\n");
-    b.push_str("    let xo = bitcast<vec4<f32>>(xw & vec4<u32>(0xffff0000u));\n");
-    b.push_str("    var s = acc_in;\n");
-    b.push_str("    s = fma(qe.x, xe.x, s);\n    s = fma(qo.x, xo.x, s);\n");
-    b.push_str("    s = fma(qe.y, xe.y, s);\n    s = fma(qo.y, xo.y, s);\n");
-    b.push_str("    s = fma(qe.z, xe.z, s);\n    s = fma(qo.z, xo.z, s);\n");
-    b.push_str("    s = fma(qe.w, xe.w, s);\n    s = fma(qo.w, xo.w, s);\n");
-    b.push_str("    return s;\n}\n\n");
-    b.push_str("fn sgw_dot32(wv: vec4<u32>, xb: u32) -> f32 {\n");
-    b.push_str("    var a = 0.0;\n");
-    b.push_str("    a = sgw_dot8(wv.x, sgw_x4[xb], a);\n");
-    b.push_str("    a = sgw_dot8(wv.y, sgw_x4[xb + 1u], a);\n");
-    b.push_str("    a = sgw_dot8(wv.z, sgw_x4[xb + 2u], a);\n");
-    b.push_str("    a = sgw_dot8(wv.w, sgw_x4[xb + 3u], a);\n");
-    b.push_str("    return a;\n}\n\n");
-    writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-    writeln!(b, "fn {SG_ENTRY}(").unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n");
-    b.push_str("    @builtin(subgroup_id) sgid: u32,\n");
-    b.push_str("    @builtin(subgroup_size) sgsz: u32,\n");
-    b.push_str("    @builtin(subgroup_invocation_id) slane: u32\n) {\n");
-    b.push_str("    let vt = sgid * sgsz + slane;\n");
-    writeln!(b, "    let slot = vt / {x}u;").unwrap();
-    writeln!(b, "    let vlane = slane & {}u;", x - 1).unwrap();
-    writeln!(
+    write!(
         b,
-        "    let row = (wid.x + wid.y * sgw_params.groups_x) * {rows}u + slot;"
+        "{SG_PARAMS}@group(0) @binding(0) var<storage, read> sgw_packed4: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> sgw_scale: array<u32>;
+@group(0) @binding(2) var<storage, read> sgw_x4: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read_write> sgw_y: array<u32>;
+@group(0) @binding(4) var<uniform> sgw_params: GemvW4A16SgParams;
+
+fn sgw_dot8(pv: u32, xw: vec4<u32>, acc_in: f32) -> f32 {{
+    let qe = vec4<f32>(unpack4xU8(pv & 0x0f0f0f0fu)) - vec4<f32>(8.0);
+    let qo = vec4<f32>(unpack4xU8((pv >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);
+    let xe = bitcast<vec4<f32>>(xw << vec4<u32>(16u));
+    let xo = bitcast<vec4<f32>>(xw & vec4<u32>(0xffff0000u));
+    var s = acc_in;
+    s = fma(qe.x, xe.x, s);
+    s = fma(qo.x, xo.x, s);
+    s = fma(qe.y, xe.y, s);
+    s = fma(qo.y, xo.y, s);
+    s = fma(qe.z, xe.z, s);
+    s = fma(qo.z, xo.z, s);
+    s = fma(qe.w, xe.w, s);
+    s = fma(qo.w, xo.w, s);
+    return s;
+}}
+
+fn sgw_dot32(wv: vec4<u32>, xb: u32) -> f32 {{
+    var a = 0.0;
+    a = sgw_dot8(wv.x, sgw_x4[xb], a);
+    a = sgw_dot8(wv.y, sgw_x4[xb + 1u], a);
+    a = sgw_dot8(wv.z, sgw_x4[xb + 2u], a);
+    a = sgw_dot8(wv.w, sgw_x4[xb + 3u], a);
+    return a;
+}}
+
+@compute @workgroup_size({wg})
+fn {SG_ENTRY}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_size) sgsz: u32,
+    @builtin(subgroup_invocation_id) slane: u32
+) {{
+    let vt = sgid * sgsz + slane;
+    let slot = vt / {x}u;\n"
     )
     .unwrap();
-    b.push_str("    let live = row < sgw_params.n_rows;\n");
-    b.push_str("    let kv = select(0u, sgw_params.k_elems >> 5u, live);\n");
-    b.push_str("    let wbase4 = select(0u, row * (sgw_params.w_row_words >> 2u), live);\n");
-    b.push_str("    let sbase = select(0u, row * sgw_params.scale_row_stride, live);\n");
-    b.push_str("    var acc = 0.0;\n");
-    writeln!(b, "    for (var v = vlane; v < kv; v = v + {x}u) {{").unwrap();
-    b.push_str("        let sc = bf16_decode(sgw_scale[sbase + ((v << 5u) / sgw_params.gs)]);\n");
-    b.push_str("        acc = fma(sc, sgw_dot32(sgw_packed4[wbase4 + v], v << 2u), acc);\n");
-    b.push_str("    }\n");
+    writeln!(b, "    let vlane = slane & {}u;", x - 1).unwrap();
+    write!(
+        b,
+        "    let row = (wid.x + wid.y * sgw_params.groups_x) * {rows}u + slot;
+    let live = row < sgw_params.n_rows;
+    let kv = select(0u, sgw_params.k_elems >> 5u, live);
+    let wbase4 = select(0u, row * (sgw_params.w_row_words >> 2u), live);
+    let sbase = select(0u, row * sgw_params.scale_row_stride, live);
+    var acc = 0.0;
+    for (var v = vlane; v < kv; v = v + {x}u) {{
+        let sc = bf16_decode(sgw_scale[sbase + ((v << 5u) / sgw_params.gs)]);
+        acc = fma(sc, sgw_dot32(sgw_packed4[wbase4 + v], v << 2u), acc);
+    }}\n"
+    )
+    .unwrap();
     let mut s = x / 2;
     while s >= 1 {
         writeln!(b, "    acc = acc + subgroupShuffleXor(acc, {s}u);").unwrap();
@@ -1034,11 +1166,123 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_follows_the_cuda_shared_memory_predicate() {
-        assert_eq!(entry_for(32), BLOCK_ENTRY);
-        assert_eq!(entry_for(MAX_SHARED_K), BLOCK_ENTRY);
-        assert_eq!(entry_for(MAX_SHARED_K + 32), ROW_ENTRY);
-        assert_eq!(entry_for(4096), ROW_ENTRY);
+    fn the_host_guards_match_cuda_and_refuse_every_grain_width_and_shape_the_sg_body_cannot_express(
+    ) {
+        {
+            assert_eq!(entry_for(32), BLOCK_ENTRY);
+            assert_eq!(entry_for(MAX_SHARED_K), BLOCK_ENTRY);
+            assert_eq!(entry_for(MAX_SHARED_K + 32), ROW_ENTRY);
+            assert_eq!(entry_for(4096), ROW_ENTRY);
+        }
+        {
+            assert!(shape_rule(4096, 128).is_ok());
+            assert!(shape_rule(4096, 8).is_ok());
+            assert!(shape_rule(48, 16).is_err());
+            assert!(shape_rule(4096, 12).is_err());
+            assert!(shape_rule(4096, 3).is_err());
+        }
+        {
+            assert_eq!(ScaleGrain::for_group_size(16), Some(ScaleGrain::G16));
+            assert_eq!(ScaleGrain::for_group_size(32), Some(ScaleGrain::Ge32));
+            assert_eq!(ScaleGrain::for_group_size(64), Some(ScaleGrain::Ge32));
+            assert_eq!(ScaleGrain::for_group_size(128), Some(ScaleGrain::Ge32));
+            assert_eq!(ScaleGrain::for_group_size(8), None);
+            assert_eq!(ScaleGrain::for_group_size(48), None);
+            assert_eq!(
+                ScaleGrain::fastest_for_group_size(32),
+                Some(ScaleGrain::Ge32Fixed(0))
+            );
+            assert_eq!(
+                ScaleGrain::fastest_for_group_size(64),
+                Some(ScaleGrain::Ge32Fixed(1))
+            );
+            assert_eq!(
+                ScaleGrain::fastest_for_group_size(128),
+                Some(ScaleGrain::Ge32Fixed(2))
+            );
+            assert_eq!(
+                ScaleGrain::fastest_for_group_size(96),
+                Some(ScaleGrain::Ge32)
+            );
+            assert_eq!(
+                ScaleGrain::fastest_for_group_size(16),
+                Some(ScaleGrain::G16)
+            );
+            assert!(ScaleGrain::Ge32Fixed(0).accepts(32));
+            assert!(!ScaleGrain::Ge32Fixed(0).accepts(64));
+            assert!(ScaleGrain::Ge32.accepts(64) && !ScaleGrain::Ge32.accepts(16));
+            assert!(ScaleGrain::G16.accepts(16) && !ScaleGrain::G16.accepts(32));
+            assert!(sg_pk_source_grain(ScaleGrain::Ge32Fixed(0)).contains("let sgi = sbase + v;"));
+            assert!(sg_pk_source_grain(ScaleGrain::Ge32Fixed(2))
+                .contains("let sgi = sbase + (v >> 2u);"));
+            assert!(!sg_pk_source_grain(ScaleGrain::Ge32Fixed(1)).contains("/ sgp_params.gs"));
+            assert_eq!(
+                w4_route_grain(43008, 5376, 16, true, false),
+                Some((W4Route::Sg16, ScaleGrain::G16))
+            );
+            assert_eq!(
+                w4_route_grain(5376, 21504, 16, true, false),
+                Some((W4Route::Sg16, ScaleGrain::G16))
+            );
+            assert_eq!(
+                w4_route_grain(5376, 21504, 32, true, false),
+                Some((W4Route::Sg16, ScaleGrain::Ge32Fixed(0)))
+            );
+            assert_eq!(
+                w4_route_grain(512, 21504, 32, false, false),
+                Some((W4Route::V4, ScaleGrain::Ge32Fixed(0)))
+            );
+            assert_eq!(
+                w4_route_grain(43008, 5376, 96, true, false),
+                Some((W4Route::Sg16, ScaleGrain::Ge32))
+            );
+            assert_eq!(
+                w4_route_grain(43008, 5376, 16, false, false),
+                Some((W4Route::Block, ScaleGrain::G16))
+            );
+            assert_eq!(w4_route_grain(43008, 5376, 8, true, false), None);
+            assert!(g16_shape_rule(5376).is_ok());
+            assert!(g16_shape_rule(21504).is_ok());
+            assert!(g16_shape_rule(48).is_err());
+        }
+        {
+            assert!(require_grain(ScaleGrain::Ge32, 16).is_err());
+            assert!(require_grain(ScaleGrain::Ge32, 8).is_err());
+            assert!(require_grain(ScaleGrain::Ge32, 32).is_ok());
+            assert!(require_grain(ScaleGrain::G16, 32).is_err());
+            assert!(require_grain(ScaleGrain::G16, 16).is_ok());
+
+            assert!(require_grain(ScaleGrain::Ge32Fixed(0), 64).is_err());
+            assert!(require_grain(ScaleGrain::Ge32Fixed(1), 32).is_err());
+            assert!(require_grain(ScaleGrain::Ge32Fixed(1), 64).is_ok());
+            for gs in [16usize, 32, 64, 128] {
+                let (src, grain) = sg_pk_source_for(gs).expect("source");
+                assert!(grain.accepts(gs));
+                assert_eq!(src, sg_pk_source_grain(grain));
+                assert!(src.contains(SG_PK_ENTRY));
+                assert!(!src.contains("/ sgp_params.gs"));
+            }
+            assert!(sg_pk_source_for(96).is_ok());
+            assert!(sg_pk_source_for(8).is_err());
+            assert!(sg_pk_source_for(48).is_err());
+        }
+        {
+            assert!(sg_pk_supported(Some(16)));
+            assert!(sg_pk_supported(Some(32)));
+            assert!(sg_pk_supported(Some(64)));
+            assert!(!sg_pk_supported(Some(8)));
+            assert!(!sg_pk_supported(Some(4)));
+            assert!(!sg_pk_supported(None));
+        }
+        {
+            assert_eq!(sg_lane_width(true, 4, 64, Some(32)), Some(32));
+            assert_eq!(sg_lane_width(true, 4, 64, Some(16)), Some(16));
+            assert_eq!(sg_lane_width(true, 4, 64, None), Some(4));
+            assert_eq!(sg_lane_width(true, 32, 32, None), Some(32));
+            assert_eq!(sg_lane_width(true, 64, 64, None), Some(32));
+            assert_eq!(sg_lane_width(false, 32, 32, Some(32)), None);
+            assert_eq!(sg_lane_width(true, 2, 64, None), None);
+        }
     }
 
     const E4B_QKV: (usize, usize) = (3072, 2560);
@@ -1053,337 +1297,203 @@ mod tests {
     }
 
     #[test]
-    fn w4_route_picks_the_measured_winner_at_every_ladder_shape() {
-        assert_eq!(route(E4B_GATE_UP), W4Route::Sg16);
-        assert_eq!(route(E4B_QKV), W4Route::Sg16);
-        assert_eq!(route(E4B_O), W4Route::Sg16);
-        assert_eq!(route(B31_GATE_UP), W4Route::Sg16);
-        assert_eq!(route(E4B_DOWN), W4Route::Sg16);
-        assert_eq!(route(B31_DOWN), W4Route::Sg16);
-    }
-
-    #[test]
-    fn w4_route_is_a_capability_question_not_an_aspect_ratio() {
-        for k in [512usize, 2048, 8192, 21504] {
-            for n in [64usize, 512, 1024, 4096, 248320] {
-                assert_eq!(w4_route(n, k, 32, true, false), W4Route::Sg16);
-                assert_eq!(w4_route(n, k, 32, false, false), W4Route::V4);
-                assert_eq!(w4_route(n, k, 16, true, false), W4Route::Block);
-                assert_eq!(w4_route(n, k, 32, true, true), W4Route::Block);
+    fn w4_route_picks_the_measured_winner_and_falls_back_on_capability_not_aspect_ratio() {
+        {
+            assert_eq!(route(E4B_GATE_UP), W4Route::Sg16);
+            assert_eq!(route(E4B_QKV), W4Route::Sg16);
+            assert_eq!(route(E4B_O), W4Route::Sg16);
+            assert_eq!(route(B31_GATE_UP), W4Route::Sg16);
+            assert_eq!(route(E4B_DOWN), W4Route::Sg16);
+            assert_eq!(route(B31_DOWN), W4Route::Sg16);
+        }
+        {
+            for k in [512usize, 2048, 8192, 21504] {
+                for n in [64usize, 512, 1024, 4096, 248320] {
+                    assert_eq!(w4_route(n, k, 32, true, false), W4Route::Sg16);
+                    assert_eq!(w4_route(n, k, 32, false, false), W4Route::V4);
+                    assert_eq!(w4_route(n, k, 16, true, false), W4Route::Block);
+                    assert_eq!(w4_route(n, k, 32, true, true), W4Route::Block);
+                }
             }
+            for scale in [1usize, 2, 3, 7] {
+                assert_eq!(
+                    route((E4B_DOWN.0 * scale, E4B_DOWN.1 * scale)),
+                    W4Route::Sg16
+                );
+                assert_eq!(
+                    route((E4B_GATE_UP.0 * scale, E4B_GATE_UP.1 * scale)),
+                    W4Route::Sg16
+                );
+            }
+            assert!(prefers_v4(512, 2048));
+            assert!(!prefers_v4(512, 2016));
+            assert!(prefers_v4(64, 4096));
+            assert!(!prefers_v4(4096, 4096));
+            assert!(!prefers_v4(0, 4096));
         }
-        for scale in [1usize, 2, 3, 7] {
-            assert_eq!(
-                route((E4B_DOWN.0 * scale, E4B_DOWN.1 * scale)),
-                W4Route::Sg16
-            );
-            assert_eq!(
-                route((E4B_GATE_UP.0 * scale, E4B_GATE_UP.1 * scale)),
-                W4Route::Sg16
-            );
+        {
+            assert_eq!(w4_route(20480, 2560, 32, true, true), W4Route::Block);
+            assert_eq!(w4_route(2560, 10240, 32, true, true), W4Route::Block);
+            assert_eq!(w4_route(20480, 2560, 16, true, false), W4Route::Block);
+            assert_eq!(w4_route(20480, 2560, 32, false, false), W4Route::V4);
+            assert_eq!(w4_route(2560, 10240, 32, false, false), W4Route::V4);
+            assert_eq!(route_rows_per_group(W4Route::Sg16), SG_PK_ROWS);
+            assert_eq!(route_rows_per_group(W4Route::V4), ROWS_PER_GROUP);
+            assert_eq!(route_rows_per_group(W4Route::Block), ROWS_PER_GROUP);
         }
-        assert!(prefers_v4(512, 2048));
-        assert!(!prefers_v4(512, 2016));
-        assert!(prefers_v4(64, 4096));
-        assert!(!prefers_v4(4096, 4096));
-        assert!(!prefers_v4(0, 4096));
     }
 
     #[test]
-    fn w4_route_keeps_the_block_and_no_subgroup_fallbacks() {
-        assert_eq!(w4_route(20480, 2560, 32, true, true), W4Route::Block);
-        assert_eq!(w4_route(2560, 10240, 32, true, true), W4Route::Block);
-        assert_eq!(w4_route(20480, 2560, 16, true, false), W4Route::Block);
-        assert_eq!(w4_route(20480, 2560, 32, false, false), W4Route::V4);
-        assert_eq!(w4_route(2560, 10240, 32, false, false), W4Route::V4);
-        assert_eq!(route_rows_per_group(W4Route::Sg16), SG_PK_ROWS);
-        assert_eq!(route_rows_per_group(W4Route::V4), ROWS_PER_GROUP);
-        assert_eq!(route_rows_per_group(W4Route::Block), ROWS_PER_GROUP);
-    }
-
-    #[test]
-    fn shape_rule_matches_the_cuda_host_guard() {
-        assert!(shape_rule(4096, 128).is_ok());
-        assert!(shape_rule(4096, 8).is_ok());
-        assert!(shape_rule(48, 16).is_err());
-        assert!(shape_rule(4096, 12).is_err());
-        assert!(shape_rule(4096, 3).is_err());
-    }
-
-    #[test]
-    fn wgsl_declares_every_entry_point() {
-        assert!(WGSL.contains(BLOCK_ENTRY));
-        assert!(WGSL.contains(ROW_ENTRY));
-        assert!(WGSL.contains(GELU_PLI_ENTRY));
-        assert!(compose(WGSL).contains("fn u4_unpack("));
-    }
-
-    #[test]
-    fn wgsl_declares_the_vec4_entry_points() {
-        assert!(WGSL.contains(V4_ENTRY));
-        assert!(WGSL.contains("unpack4xU8"));
-    }
-
-    #[test]
-    fn sg_source_declares_the_subgroup_entry() {
-        let src = sg_source(4, 256);
-        assert!(src.contains(SG_ENTRY));
-        assert!(src.contains("subgroupShuffleXor(acc, 2u)"));
-        assert!(src.contains("subgroupShuffleXor(acc, 1u)"));
-        assert!(src.contains("fn bf16_encode("));
-        let wide = sg_source(32, 256);
-        assert!(wide.contains("subgroupShuffleXor(acc, 16u)"));
-    }
-
-    #[test]
-    fn sg_pk_source_declares_both_packed_entries() {
-        let src = sg_pk_source();
-        assert!(src.contains(SG_PK_ENTRY));
-        assert!(src.contains(SG_PK3_ENTRY));
-        assert!(src.contains("subgroupShuffleXor(acc, 8u)"));
-        assert!(src.contains("subgroupShuffleXor(acc, 1u)"));
-        assert!(!src.contains("subgroupShuffleXor(acc, 16u)"));
-        assert!(src.contains("sgp_off.dst_word_off"));
-        assert!(src.contains("sgp_split.q_rows"));
-        assert!(src.contains("fn bf16_encode("));
-        assert!(src.contains("bf16_lo(ssw)"));
-        assert!(src.contains("sgp_scale[sgi >> 1u]"));
-        assert_eq!(SG_PK_ROWS % 2, 0);
-    }
-
-    #[test]
-    fn sg_pk_mr_source_declares_both_row_blocked_entries() {
-        for mr in [2u32, 4, 8] {
-            let src = sg_pk_mr_source(mr);
-            assert!(src.contains(SG_PKM_ENTRY));
-            assert!(src.contains(SG_PKM3_ENTRY));
-            assert!(src.contains(&format!("array<f32, {mr}>")));
-            assert!(src.contains(&format!("* {mr}u;")));
+    fn every_source_declares_its_entries_keeps_ge32_codegen_expresses_group_sixteen_and_branches_the_wide_arm_on_divisibility(
+    ) {
+        {
+            assert!(WGSL.contains(BLOCK_ENTRY));
+            assert!(WGSL.contains(ROW_ENTRY));
+            assert!(WGSL.contains(GELU_PLI_ENTRY));
+            assert!(compose(WGSL).contains("fn u4_unpack("));
+        }
+        {
+            assert!(WGSL.contains(V4_ENTRY));
+            assert!(WGSL.contains("unpack4xU8"));
+        }
+        {
+            let src = sg_source(4, 256);
+            assert!(src.contains(SG_ENTRY));
+            assert!(src.contains("subgroupShuffleXor(acc, 2u)"));
+            assert!(src.contains("subgroupShuffleXor(acc, 1u)"));
+            assert!(src.contains("fn bf16_encode("));
+            let wide = sg_source(32, 256);
+            assert!(wide.contains("subgroupShuffleXor(acc, 16u)"));
+        }
+        {
+            let src = sg_pk_source();
+            assert!(src.contains(SG_PK_ENTRY));
+            assert!(src.contains(SG_PK3_ENTRY));
             assert!(src.contains("subgroupShuffleXor(acc, 8u)"));
             assert!(src.contains("subgroupShuffleXor(acc, 1u)"));
             assert!(!src.contains("subgroupShuffleXor(acc, 16u)"));
-            assert!(!src.contains("var<workgroup>"));
-            assert!(src.contains("sgp_scale[sgi >> 1u]"));
             assert!(src.contains("sgp_off.dst_word_off"));
             assert!(src.contains("sgp_split.q_rows"));
-        }
-    }
-
-    #[test]
-    fn sg_mk_source_declares_both_mk_entries() {
-        for mk_max in [2u32, 8, 16] {
-            let src = sg_mk_source(mk_max);
-            assert!(src.contains(SG_MK_PK_ENTRY));
-            assert!(src.contains(SG_MK_PK3_ENTRY));
-            assert!(src.contains(&format!("array<f32, {mk_max}>")));
-            assert!(src.contains("subgroupShuffleXor(acc, 8u)"));
-            assert!(src.contains("subgroupShuffleXor(acc, 1u)"));
-            assert!(!src.contains("subgroupShuffleXor(acc, 16u)"));
-            assert!(src.contains("sgp_mk.dst_word_off"));
-            assert!(src.contains("sgp_split.q_rows"));
             assert!(src.contains("fn bf16_encode("));
+            assert!(src.contains("bf16_lo(ssw)"));
             assert!(src.contains("sgp_scale[sgi >> 1u]"));
+            assert_eq!(SG_PK_ROWS % 2, 0);
         }
-    }
-
-    #[test]
-    fn ge32_codegen_is_unchanged_and_g16_consumes_two_scales_per_step() {
-        let ge32 = sg_pk_source_grain(ScaleGrain::Ge32);
-        assert_eq!(ge32, sg_pk_source());
-        assert!(ge32.contains("(v << 5u) / sgp_params.gs"));
-        assert!(!ge32.contains("sc_hi"));
-        let g16 = sg_pk_source_grain(ScaleGrain::G16);
-        assert!(g16.contains("let sgi = sbase + (v << 1u);"));
-        assert!(g16.contains("let sc_lo = bf16_lo(ssw);"));
-        assert!(g16.contains("let sc_hi = bf16_hi(ssw);"));
-        assert!(!g16.contains("/ sgp_params.gs"));
-        assert!(g16.contains(SG_PK_ENTRY) && g16.contains(SG_PK3_ENTRY));
-        for mk in [1u32, 4, 16] {
-            let mk16 = sg_mk_unrolled_source_grain(mk, ScaleGrain::G16);
-            assert_eq!(mk16.matches("let sc_lo = bf16_lo(ssw);").count(), 2);
-            assert!(mk16.contains(SG_MK_PK_ENTRY) && mk16.contains(SG_MK_PK3_ENTRY));
-            assert_eq!(
-                sg_mk_unrolled_source_grain(mk, ScaleGrain::Ge32),
-                sg_mk_unrolled_source(mk)
-            );
+        {
+            for mr in [2u32, 4, 8] {
+                let src = sg_pk_mr_source(mr);
+                assert!(src.contains(SG_PKM_ENTRY));
+                assert!(src.contains(SG_PKM3_ENTRY));
+                assert!(src.contains(&format!("array<f32, {mr}>")));
+                assert!(src.contains(&format!("* {mr}u;")));
+                assert!(src.contains("subgroupShuffleXor(acc, 8u)"));
+                assert!(src.contains("subgroupShuffleXor(acc, 1u)"));
+                assert!(!src.contains("subgroupShuffleXor(acc, 16u)"));
+                assert!(!src.contains("var<workgroup>"));
+                assert!(src.contains("sgp_scale[sgi >> 1u]"));
+                assert!(src.contains("sgp_off.dst_word_off"));
+                assert!(src.contains("sgp_split.q_rows"));
+            }
         }
-    }
-
-    #[test]
-    fn grain_selection_rejects_group_sizes_the_sg_body_cannot_express() {
-        assert_eq!(ScaleGrain::for_group_size(16), Some(ScaleGrain::G16));
-        assert_eq!(ScaleGrain::for_group_size(32), Some(ScaleGrain::Ge32));
-        assert_eq!(ScaleGrain::for_group_size(64), Some(ScaleGrain::Ge32));
-        assert_eq!(ScaleGrain::for_group_size(128), Some(ScaleGrain::Ge32));
-        assert_eq!(ScaleGrain::for_group_size(8), None);
-        assert_eq!(ScaleGrain::for_group_size(48), None);
-        assert_eq!(
-            ScaleGrain::fastest_for_group_size(32),
-            Some(ScaleGrain::Ge32Fixed(0))
-        );
-        assert_eq!(
-            ScaleGrain::fastest_for_group_size(64),
-            Some(ScaleGrain::Ge32Fixed(1))
-        );
-        assert_eq!(
-            ScaleGrain::fastest_for_group_size(128),
-            Some(ScaleGrain::Ge32Fixed(2))
-        );
-        assert_eq!(
-            ScaleGrain::fastest_for_group_size(96),
-            Some(ScaleGrain::Ge32)
-        );
-        assert_eq!(
-            ScaleGrain::fastest_for_group_size(16),
-            Some(ScaleGrain::G16)
-        );
-        assert!(ScaleGrain::Ge32Fixed(0).accepts(32));
-        assert!(!ScaleGrain::Ge32Fixed(0).accepts(64));
-        assert!(ScaleGrain::Ge32.accepts(64) && !ScaleGrain::Ge32.accepts(16));
-        assert!(ScaleGrain::G16.accepts(16) && !ScaleGrain::G16.accepts(32));
-        assert!(sg_pk_source_grain(ScaleGrain::Ge32Fixed(0)).contains("let sgi = sbase + v;"));
-        assert!(
-            sg_pk_source_grain(ScaleGrain::Ge32Fixed(2)).contains("let sgi = sbase + (v >> 2u);")
-        );
-        assert!(!sg_pk_source_grain(ScaleGrain::Ge32Fixed(1)).contains("/ sgp_params.gs"));
-        assert_eq!(
-            w4_route_grain(43008, 5376, 16, true, false),
-            Some((W4Route::Sg16, ScaleGrain::G16))
-        );
-        assert_eq!(
-            w4_route_grain(5376, 21504, 16, true, false),
-            Some((W4Route::Sg16, ScaleGrain::G16))
-        );
-        assert_eq!(
-            w4_route_grain(5376, 21504, 32, true, false),
-            Some((W4Route::Sg16, ScaleGrain::Ge32Fixed(0)))
-        );
-        assert_eq!(
-            w4_route_grain(512, 21504, 32, false, false),
-            Some((W4Route::V4, ScaleGrain::Ge32Fixed(0)))
-        );
-        assert_eq!(
-            w4_route_grain(43008, 5376, 96, true, false),
-            Some((W4Route::Sg16, ScaleGrain::Ge32))
-        );
-        assert_eq!(
-            w4_route_grain(43008, 5376, 16, false, false),
-            Some((W4Route::Block, ScaleGrain::G16))
-        );
-        assert_eq!(w4_route_grain(43008, 5376, 8, true, false), None);
-        assert!(g16_shape_rule(5376).is_ok());
-        assert!(g16_shape_rule(21504).is_ok());
-        assert!(g16_shape_rule(48).is_err());
-    }
-
-    #[test]
-    fn the_mk_and_mr_generators_can_now_express_group_sixteen() {
-        for mk in [1u32, 4, 16] {
-            assert_eq!(sg_mk_source_grain(mk, ScaleGrain::Ge32), sg_mk_source(mk));
-            let ge32 = sg_mk_source(mk);
-            assert!(ge32.contains("let sgi = sbase + ((v << 5u) / sgp_params.gs);"));
+        {
+            for mk_max in [2u32, 8, 16] {
+                let src = sg_mk_source(mk_max);
+                assert!(src.contains(SG_MK_PK_ENTRY));
+                assert!(src.contains(SG_MK_PK3_ENTRY));
+                assert!(src.contains(&format!("array<f32, {mk_max}>")));
+                assert!(src.contains("subgroupShuffleXor(acc, 8u)"));
+                assert!(src.contains("subgroupShuffleXor(acc, 1u)"));
+                assert!(!src.contains("subgroupShuffleXor(acc, 16u)"));
+                assert!(src.contains("sgp_mk.dst_word_off"));
+                assert!(src.contains("sgp_split.q_rows"));
+                assert!(src.contains("fn bf16_encode("));
+                assert!(src.contains("sgp_scale[sgi >> 1u]"));
+            }
+        }
+        {
+            let ge32 = sg_pk_source_grain(ScaleGrain::Ge32);
+            assert_eq!(ge32, sg_pk_source());
+            assert!(ge32.contains("(v << 5u) / sgp_params.gs"));
             assert!(!ge32.contains("sc_hi"));
-            let g16 = sg_mk_source_grain(mk, ScaleGrain::G16);
+            let g16 = sg_pk_source_grain(ScaleGrain::G16);
             assert!(g16.contains("let sgi = sbase + (v << 1u);"));
+            assert!(g16.contains("let sc_lo = bf16_lo(ssw);"));
             assert!(g16.contains("let sc_hi = bf16_hi(ssw);"));
             assert!(!g16.contains("/ sgp_params.gs"));
-            assert!(g16.contains(SG_MK_PK_ENTRY) && g16.contains(SG_MK_PK3_ENTRY));
-            let fixed = sg_mk_source_grain(mk, ScaleGrain::Ge32Fixed(2));
-            assert!(fixed.contains("let sgi = sbase + (v >> 2u);"));
-            assert!(!fixed.contains("/ sgp_params.gs"));
+            assert!(g16.contains(SG_PK_ENTRY) && g16.contains(SG_PK3_ENTRY));
+            for mk in [1u32, 4, 16] {
+                let mk16 = sg_mk_unrolled_source_grain(mk, ScaleGrain::G16);
+                assert_eq!(mk16.matches("let sc_lo = bf16_lo(ssw);").count(), 2);
+                assert!(mk16.contains(SG_MK_PK_ENTRY) && mk16.contains(SG_MK_PK3_ENTRY));
+                assert_eq!(
+                    sg_mk_unrolled_source_grain(mk, ScaleGrain::Ge32),
+                    sg_mk_unrolled_source(mk)
+                );
+            }
         }
-        for mr in [2u32, 4, 8] {
+        {
+            for mk in [1u32, 4, 16] {
+                assert_eq!(sg_mk_source_grain(mk, ScaleGrain::Ge32), sg_mk_source(mk));
+                let ge32 = sg_mk_source(mk);
+                assert!(ge32.contains("let sgi = sbase + ((v << 5u) / sgp_params.gs);"));
+                assert!(!ge32.contains("sc_hi"));
+                let g16 = sg_mk_source_grain(mk, ScaleGrain::G16);
+                assert!(g16.contains("let sgi = sbase + (v << 1u);"));
+                assert!(g16.contains("let sc_hi = bf16_hi(ssw);"));
+                assert!(!g16.contains("/ sgp_params.gs"));
+                assert!(g16.contains(SG_MK_PK_ENTRY) && g16.contains(SG_MK_PK3_ENTRY));
+                let fixed = sg_mk_source_grain(mk, ScaleGrain::Ge32Fixed(2));
+                assert!(fixed.contains("let sgi = sbase + (v >> 2u);"));
+                assert!(!fixed.contains("/ sgp_params.gs"));
+            }
+            for mr in [2u32, 4, 8] {
+                assert_eq!(
+                    sg_pk_mr_source_grain(mr, ScaleGrain::Ge32),
+                    sg_pk_mr_source(mr)
+                );
+                assert!(sg_pk_mr_source(mr).contains("let sgo = (v << 5u) / sgp_params.gs;"));
+                let g16 = sg_pk_mr_source_grain(mr, ScaleGrain::G16);
+                assert!(g16.contains("let sgo = v << 1u;"));
+                assert!(g16.contains("accs[m] = fma(sc_lo, a0, accs[m]);"));
+                assert!(g16.contains("accs[m] = fma(sc_hi, a1, accs[m]);"));
+                assert!(!g16.contains("/ sgp_params.gs"));
+                assert!(g16.contains(SG_PKM_ENTRY) && g16.contains(SG_PKM3_ENTRY));
+                assert!(
+                    sg_pk_mr_source_grain(mr, ScaleGrain::Ge32Fixed(0)).contains("let sgo = v;")
+                );
+                assert!(sg_pk_mr_source_grain(mr, ScaleGrain::Ge32Fixed(1))
+                    .contains("let sgo = v >> 1u;"));
+            }
+        }
+        {
+            let src = compose(WGSL);
+            for f in ["fn w4a16_row_acc_v4(", "fn w4a16_row_acc_block("] {
+                let body = &src[src.find(f).expect("body")..];
+                let body = &body[..body.find("\n@compute").unwrap_or(body.len())];
+                assert!(
+                    body.contains("if ((gs & 31u) == 0u)"),
+                    "{f} wide-arm gate: {body}"
+                );
+                assert!(body.contains("kb / gs"));
+            }
+            let row = &src[src.find("fn gemv_w4a16_row(").expect("row entry")..];
+            assert!(row.contains("let wide = (gs & 31u) == 0u;"));
+        }
+    }
+
+    #[test]
+    fn scale_words_carry_one_bf16_each_and_packed_words_two() {
+        {
+            assert_eq!(widen_u16(&[0x3f80, 0xbf00]), vec![0x3f80u32, 0xbf00u32]);
+            assert_eq!(pack_u16(&[0x1234, 0xabcd]), vec![0xabcd_1234u32]);
+        }
+        {
+            assert_eq!(pack_scale_words(&[0x3f80, 0xbf00]), vec![0xbf00_3f80u32]);
             assert_eq!(
-                sg_pk_mr_source_grain(mr, ScaleGrain::Ge32),
-                sg_pk_mr_source(mr)
+                pack_scale_words(&[0x3f80, 0xbf00, 0x1234]),
+                vec![0xbf00_3f80u32, 0x0000_1234u32]
             );
-            assert!(sg_pk_mr_source(mr).contains("let sgo = (v << 5u) / sgp_params.gs;"));
-            let g16 = sg_pk_mr_source_grain(mr, ScaleGrain::G16);
-            assert!(g16.contains("let sgo = v << 1u;"));
-            assert!(g16.contains("accs[m] = fma(sc_lo, a0, accs[m]);"));
-            assert!(g16.contains("accs[m] = fma(sc_hi, a1, accs[m]);"));
-            assert!(!g16.contains("/ sgp_params.gs"));
-            assert!(g16.contains(SG_PKM_ENTRY) && g16.contains(SG_PKM3_ENTRY));
-            assert!(sg_pk_mr_source_grain(mr, ScaleGrain::Ge32Fixed(0)).contains("let sgo = v;"));
-            assert!(
-                sg_pk_mr_source_grain(mr, ScaleGrain::Ge32Fixed(1)).contains("let sgo = v >> 1u;")
-            );
+            assert_eq!(pack_scale_words(&[]), vec![0u32]);
         }
-    }
-
-    #[test]
-    fn the_wide_arm_branches_on_divisibility_not_magnitude() {
-        let src = compose(WGSL);
-        for f in ["fn w4a16_row_acc_v4(", "fn w4a16_row_acc_block("] {
-            let body = &src[src.find(f).expect("body")..];
-            let body = &body[..body.find("\n@compute").unwrap_or(body.len())];
-            assert!(
-                body.contains("if ((gs & 31u) == 0u)"),
-                "{f} wide-arm gate: {body}"
-            );
-            assert!(body.contains("kb / gs"));
-        }
-        let row = &src[src.find("fn gemv_w4a16_row(").expect("row entry")..];
-        assert!(row.contains("let wide = (gs & 31u) == 0u;"));
-    }
-
-    #[test]
-    fn the_dispatch_site_guard_refuses_every_mismatched_grain() {
-        assert!(require_grain(ScaleGrain::Ge32, 16).is_err());
-        assert!(require_grain(ScaleGrain::Ge32, 8).is_err());
-        assert!(require_grain(ScaleGrain::Ge32, 32).is_ok());
-        assert!(require_grain(ScaleGrain::G16, 32).is_err());
-        assert!(require_grain(ScaleGrain::G16, 16).is_ok());
-
-        assert!(require_grain(ScaleGrain::Ge32Fixed(0), 64).is_err());
-        assert!(require_grain(ScaleGrain::Ge32Fixed(1), 32).is_err());
-        assert!(require_grain(ScaleGrain::Ge32Fixed(1), 64).is_ok());
-        for gs in [16usize, 32, 64, 128] {
-            let (src, grain) = sg_pk_source_for(gs).expect("source");
-            assert!(grain.accepts(gs));
-            assert_eq!(src, sg_pk_source_grain(grain));
-            assert!(src.contains(SG_PK_ENTRY));
-            assert!(!src.contains("/ sgp_params.gs"));
-        }
-        assert!(sg_pk_source_for(96).is_ok());
-        assert!(sg_pk_source_for(8).is_err());
-        assert!(sg_pk_source_for(48).is_err());
-    }
-
-    #[test]
-    fn sg_pk_support_needs_a_probed_multiple_of_sixteen() {
-        assert!(sg_pk_supported(Some(16)));
-        assert!(sg_pk_supported(Some(32)));
-        assert!(sg_pk_supported(Some(64)));
-        assert!(!sg_pk_supported(Some(8)));
-        assert!(!sg_pk_supported(Some(4)));
-        assert!(!sg_pk_supported(None));
-    }
-
-    #[test]
-    fn sg_lane_width_follows_the_bf16_discipline() {
-        assert_eq!(sg_lane_width(true, 4, 64, Some(32)), Some(32));
-        assert_eq!(sg_lane_width(true, 4, 64, Some(16)), Some(16));
-        assert_eq!(sg_lane_width(true, 4, 64, None), Some(4));
-        assert_eq!(sg_lane_width(true, 32, 32, None), Some(32));
-        assert_eq!(sg_lane_width(true, 64, 64, None), Some(32));
-        assert_eq!(sg_lane_width(false, 32, 32, Some(32)), None);
-        assert_eq!(sg_lane_width(true, 2, 64, None), None);
-    }
-
-    #[test]
-    fn scale_words_carry_one_bf16_each() {
-        assert_eq!(widen_u16(&[0x3f80, 0xbf00]), vec![0x3f80u32, 0xbf00u32]);
-        assert_eq!(pack_u16(&[0x1234, 0xabcd]), vec![0xabcd_1234u32]);
-    }
-
-    #[test]
-    fn packed_scale_words_carry_two_bf16_each() {
-        assert_eq!(pack_scale_words(&[0x3f80, 0xbf00]), vec![0xbf00_3f80u32]);
-        assert_eq!(
-            pack_scale_words(&[0x3f80, 0xbf00, 0x1234]),
-            vec![0xbf00_3f80u32, 0x0000_1234u32]
-        );
-        assert_eq!(pack_scale_words(&[]), vec![0u32]);
     }
 }

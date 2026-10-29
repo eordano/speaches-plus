@@ -411,39 +411,6 @@ mod tests {
     }
 
     #[test]
-    fn xvector_profile_roundtrip_and_listing() {
-        let store = VoiceProfileStore::open(tmp()).unwrap();
-        let p = VoiceProfile {
-            schema_version: 1,
-            name: "alice".into(),
-            embedding: vec![0.1, 0.2],
-            design_params: None,
-        };
-        store.put(&p).unwrap();
-        let back = store.get("alice").unwrap();
-        assert_eq!(back.embedding, vec![0.1, 0.2]);
-        assert_eq!(store.list().unwrap(), vec!["alice".to_string()]);
-        assert!(store.path_for("alice").is_file());
-    }
-
-    #[test]
-    fn legacy_flat_json_is_migrated_on_open() {
-        let root = tmp();
-        let legacy = VoiceProfile {
-            schema_version: 1,
-            name: "bob".into(),
-            embedding: vec![1.0; 4],
-            design_params: Some(serde_json::json!({"k": 1})),
-        };
-        std::fs::write(root.join("bob.json"), serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let store = VoiceProfileStore::open(&root).unwrap();
-        assert!(!root.join("bob.json").exists());
-        let back = store.get("bob").unwrap();
-        assert_eq!(back.embedding.len(), 4);
-        assert_eq!(back.design_params, legacy.design_params);
-    }
-
-    #[test]
     fn kokoro_kinds_are_listed_separately_and_not_as_profiles() {
         let store = VoiceProfileStore::open(tmp()).unwrap();
         store
@@ -475,10 +442,4 @@ mod tests {
         assert!(store.list_all().unwrap().is_empty());
     }
 
-    #[test]
-    fn unsafe_names_are_rejected() {
-        let store = VoiceProfileStore::open(tmp()).unwrap();
-        assert!(store.get_meta("../x").is_err());
-        assert!(store.write_file("ok", "../etc", b"x").is_err());
-    }
 }

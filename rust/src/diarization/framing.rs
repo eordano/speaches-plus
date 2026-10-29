@@ -15,14 +15,6 @@ pub struct Span {
     pub sample_end: usize,
     pub t_start_ms: u64,
     pub t_end_ms: u64,
-    pub local_speaker: usize,
-    pub overlap: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct ChunkSpans {
-    pub chunk_index: usize,
-    pub spans: Vec<Span>,
 }
 
 pub fn slide_chunks(
@@ -97,13 +89,6 @@ pub fn extract_spans(
     let frame_ms = 1000.0f32 / frame_rate_hz as f32;
     let samples_per_frame = (16_000.0 / frame_rate_hz as f32) as usize;
 
-    let mut overlap = vec![false; multihot.frames];
-    for (f, o) in overlap.iter_mut().enumerate() {
-        let row = multihot.row(f);
-        let active: usize = row.iter().filter(|&&v| v != 0).count();
-        *o = active >= 2;
-    }
-
     let mut out = Vec::new();
     for s in 0..multihot.speakers {
         let mut run_start: Option<usize> = None;
@@ -116,8 +101,6 @@ pub fn extract_spans(
                         &mut out,
                         start,
                         f,
-                        s,
-                        &overlap,
                         frame_ms,
                         t_offset_ms,
                         samples_per_frame,
@@ -133,8 +116,6 @@ pub fn extract_spans(
                 &mut out,
                 start,
                 multihot.frames,
-                s,
-                &overlap,
                 frame_ms,
                 t_offset_ms,
                 samples_per_frame,
@@ -146,13 +127,10 @@ pub fn extract_spans(
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_span(
     out: &mut Vec<Span>,
     start: usize,
     end: usize,
-    speaker: usize,
-    overlap: &[bool],
     frame_ms: f32,
     t_offset_ms: u64,
     samples_per_frame: usize,
@@ -166,9 +144,6 @@ fn push_span(
         return;
     }
 
-    let overlap_frames: usize = (start..end).filter(|&i| overlap[i]).count();
-    let is_overlap = overlap_frames * 2 > length;
-
     let t_start_ms = t_offset_ms + (start as f32 * frame_ms) as u64;
     let t_end_ms = t_offset_ms + (end as f32 * frame_ms) as u64;
     out.push(Span {
@@ -176,8 +151,6 @@ fn push_span(
         sample_end: t_offset_to_samples(t_offset_ms) + end * samples_per_frame,
         t_start_ms,
         t_end_ms,
-        local_speaker: speaker,
-        overlap: is_overlap,
     });
 }
 
@@ -211,26 +184,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slide_chunks_pads_short_utterance() {
+    fn slide_chunks_pads_short_and_overlaps_long_utterances() {
         let audio = vec![1.0f32; 8_000];
         let chunks = slide_chunks(&audio, 16_000, 5.0, 0.1);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].samples.len(), 80_000);
 
         assert_eq!(chunks[0].samples[10_000], 0.0);
+        {
+            let audio = vec![1.0f32; 16_000 * 11];
+            let chunks = slide_chunks(&audio, 16_000, 5.0, 0.1);
+
+            assert!(chunks.len() >= 12);
+            assert_eq!(chunks[1].t_offset_ms, 500);
+        }
     }
 
     #[test]
-    fn slide_chunks_overlapping_long_utterance() {
-        let audio = vec![1.0f32; 16_000 * 11];
-        let chunks = slide_chunks(&audio, 16_000, 5.0, 0.1);
-
-        assert!(chunks.len() >= 12);
-        assert_eq!(chunks[1].t_offset_ms, 500);
-    }
-
-    #[test]
-    fn median_filter_smooths_singleton_blip() {
+    fn median_filter_smooths_blips_and_coalesce_merges_adjacent_same_speaker() {
         let speakers = 1;
         let frames = 7;
         let data = vec![1, 1, 1, 0, 1, 1, 1];
@@ -241,32 +212,31 @@ mod tests {
         };
         let smoothed = median_filter_multihot(&ml, 3);
         assert_eq!(smoothed.row(3), &[1], "singleton blip should be filtered");
+        {
+            let segs = vec![
+                DiarSegment {
+                    speaker: 0,
+                    t_start_ms: 0,
+                    t_end_ms: 500,
+                    confidence: 0.9,
+                },
+                DiarSegment {
+                    speaker: 0,
+                    t_start_ms: 600,
+                    t_end_ms: 1000,
+                    confidence: 0.85,
+                },
+                DiarSegment {
+                    speaker: 1,
+                    t_start_ms: 1100,
+                    t_end_ms: 1500,
+                    confidence: 0.8,
+                },
+            ];
+            let merged = coalesce_segments(segs);
+            assert_eq!(merged.len(), 2);
+            assert_eq!(merged[0].t_end_ms, 1000);
+        }
     }
 
-    #[test]
-    fn coalesce_merges_adjacent_same_speaker() {
-        let segs = vec![
-            DiarSegment {
-                speaker: 0,
-                t_start_ms: 0,
-                t_end_ms: 500,
-                confidence: 0.9,
-            },
-            DiarSegment {
-                speaker: 0,
-                t_start_ms: 600,
-                t_end_ms: 1000,
-                confidence: 0.85,
-            },
-            DiarSegment {
-                speaker: 1,
-                t_start_ms: 1100,
-                t_end_ms: 1500,
-                confidence: 0.8,
-            },
-        ];
-        let merged = coalesce_segments(segs);
-        assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].t_end_ms, 1000);
-    }
 }

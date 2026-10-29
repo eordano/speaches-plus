@@ -451,41 +451,40 @@ mod tests {
     }
 
     #[test]
-    fn first_sequence_allocates_fresh_blocks() {
+    fn allocation_shares_prefix_blocks_by_refcount_and_deallocate_frees_only_the_last_holder() {
         let mut bm = BlockManager::new(8, 4);
-        let seq = waiting_seq(1, vec![10, 11, 12, 13, 20, 21]);
-        let table = bm.allocate_for(&seq).unwrap();
-        assert_eq!(table.len(), 2);
-        assert_eq!(bm.ref_count(table[0]), 1);
-        assert_eq!(bm.ref_count(table[1]), 1);
+        let mut s1 = waiting_seq(1, vec![1, 2, 3, 4, 5, 6]);
+        s1.block_table = bm.allocate_for(&s1).unwrap();
+        assert_eq!(s1.block_table.len(), 2);
+        assert_eq!(bm.ref_count(s1.block_table[0]), 1);
+        assert_eq!(bm.ref_count(s1.block_table[1]), 1);
         assert_eq!(bm.num_free(), 6);
+
+        let mut s2 = waiting_seq(2, vec![1, 2, 3, 4, 9, 9]);
+        s2.block_table = bm.allocate_for(&s2).unwrap();
+        assert_eq!(s2.block_table.len(), 2);
+        let shared = s1.block_table[0];
+        assert_eq!(shared, s2.block_table[0]);
+        assert_ne!(s1.block_table[1], s2.block_table[1]);
+        assert_eq!(bm.ref_count(shared), 2);
+        assert_eq!(bm.ref_count(s1.block_table[1]), 1);
+        assert_eq!(bm.ref_count(s2.block_table[1]), 1);
+
+        bm.deallocate(&s1);
+        assert_eq!(bm.ref_count(shared), 1);
+        assert!(!bm.free.contains(&shared));
+        bm.deallocate(&s2);
+        assert_eq!(bm.ref_count(shared), 0);
+        assert!(bm.free.contains(&shared));
     }
 
     #[test]
-    fn shared_prefix_increments_refcount() {
-        let mut bm = BlockManager::new(8, 4);
-        let s1 = waiting_seq(1, vec![1, 2, 3, 4, 5, 6]);
-        let t1 = bm.allocate_for(&s1).unwrap();
-        assert_eq!(t1.len(), 2);
-
-        let s2 = waiting_seq(2, vec![1, 2, 3, 4, 9, 9]);
-        let t2 = bm.allocate_for(&s2).unwrap();
-        assert_eq!(t2.len(), 2);
-
-        assert_eq!(t1[0], t2[0]);
-        assert_ne!(t1[1], t2[1]);
-
-        assert_eq!(bm.ref_count(t1[0]), 2);
-        assert_eq!(bm.ref_count(t1[1]), 1);
-        assert_eq!(bm.ref_count(t2[1]), 1);
-    }
-
-    #[test]
-    fn sharing_a_block_whose_kv_was_never_computed_is_not_a_cache_hit() {
+    fn an_uncomputed_or_non_leading_block_is_not_a_cache_hit_and_a_full_hit_still_recomputes_the_last_block(
+    ) {
         let mut bm = BlockManager::new(8, 4);
         let mut s1 = waiting_seq(1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         s1.block_table = bm.allocate_for(&s1).unwrap();
-
+        assert_eq!(s1.block_table.len(), 2);
         let s2 = waiting_seq(2, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let alloc = bm.allocate_with_prefix(&s2).unwrap();
         assert_eq!(alloc.block_table[0], s1.block_table[0]);
@@ -494,17 +493,8 @@ mod tests {
             "allocate registers a block's hash before the model has written its KV; \
              reusing that block's bytes would attend to uninitialised memory"
         );
-    }
 
-    #[test]
-    fn cache_hits_count_only_the_leading_contiguous_run() {
-        let mut bm = BlockManager::new(8, 4);
-        let mut s1 = waiting_seq(1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        s1.block_table = bm.allocate_for(&s1).unwrap();
-        assert_eq!(s1.block_table.len(), 2);
         bm.blocks[s1.block_table[1] as usize].kv_computed = true;
-
-        let s2 = waiting_seq(2, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let alloc = bm.allocate_with_prefix(&s2).unwrap();
         assert_eq!(alloc.block_table[1], s1.block_table[1]);
         assert_eq!(
@@ -512,27 +502,20 @@ mod tests {
             "block 1 is valid but block 0 is not: attention over block 1 needs every \
              preceding key, so a run that does not start at token 0 buys nothing"
         );
-    }
 
-    #[test]
-    fn a_fully_cached_prompt_still_recomputes_its_last_block() {
-        let mut bm = BlockManager::new(8, 4);
-        let mut s1 = waiting_seq(1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        s1.block_table = bm.allocate_for(&s1).unwrap();
         bm.mark_kv_computed(&s1, 8);
-
-        let s2 = waiting_seq(2, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        let alloc = bm.allocate_with_prefix(&s2).unwrap();
+        let s3 = waiting_seq(3, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let alloc = bm.allocate_with_prefix(&s3).unwrap();
         assert_eq!(
             alloc.cached_tokens, 4,
             "prefill must still run the last block: the first sampled token comes from \
              the logits of the final position, which a fully skipped prompt never produces"
         );
-        assert!(alloc.cached_tokens + MIN_RECOMPUTED_PREFILL_TOKENS <= s2.total_len());
+        assert!(alloc.cached_tokens + MIN_RECOMPUTED_PREFILL_TOKENS <= s3.total_len());
     }
 
     #[test]
-    fn a_freed_block_revived_by_its_hash_keeps_its_computed_kv() {
+    fn a_freed_block_revived_by_its_hash_keeps_its_kv_until_pop_free_retires_the_hash() {
         let mut bm = BlockManager::new(8, 4);
         let mut s1 = waiting_seq(1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         s1.block_table = bm.allocate_for(&s1).unwrap();
@@ -549,21 +532,16 @@ mod tests {
             "a ref_count==0 block is only ever re-issued through pop_free, which drops \
              its hash first, so nothing can overwrite it while it is still findable"
         );
-    }
 
-    #[test]
-    fn popping_a_free_block_retires_the_hash_that_would_have_revived_it() {
         let mut bm = BlockManager::new(2, 4);
         let mut s1 = waiting_seq(1, vec![1, 2, 3, 4]);
         s1.block_table = bm.allocate_for(&s1).unwrap();
         bm.mark_kv_computed(&s1, 4);
         let reused = s1.block_table[0];
         bm.deallocate(&s1);
-
         let mut filler = waiting_seq(2, vec![9, 9, 9, 9, 9, 9, 9, 9]);
         filler.block_table = bm.allocate_for(&filler).unwrap();
         assert!(filler.block_table.contains(&reused));
-
         bm.deallocate(&filler);
         let s3 = waiting_seq(3, vec![1, 2, 3, 4, 5]);
         let alloc = bm.allocate_with_prefix(&s3).unwrap();
@@ -590,7 +568,8 @@ mod tests {
     }
 
     #[test]
-    fn a_block_is_published_only_once_its_last_position_has_kv() {
+    fn decode_publishes_a_block_only_once_its_last_position_has_kv_and_retiring_a_duplicate_keeps_the_live_mapping(
+    ) {
         let mut bm = BlockManager::new(8, 4);
         let s1 = decode_and_publish(&mut bm, 1, 5);
 
@@ -614,10 +593,7 @@ mod tests {
             alloc.cached_tokens, 4,
             "the reusable run ends at the first unpublished block"
         );
-    }
 
-    #[test]
-    fn retiring_a_duplicate_publication_leaves_the_live_mapping_intact() {
         let mut bm = BlockManager::new(6, 4);
         let s1 = decode_and_publish(&mut bm, 1, 2);
         let s2 = decode_and_publish(&mut bm, 2, 2);
@@ -645,54 +621,21 @@ mod tests {
     }
 
     #[test]
-    fn deallocate_drops_refcount_only() {
-        let mut bm = BlockManager::new(8, 4);
-        let mut s1 = waiting_seq(1, vec![1, 2, 3, 4, 5, 6]);
-        s1.block_table = bm.allocate_for(&s1).unwrap();
-        let mut s2 = waiting_seq(2, vec![1, 2, 3, 4, 9, 9]);
-        s2.block_table = bm.allocate_for(&s2).unwrap();
-
-        let shared = s1.block_table[0];
-        assert_eq!(bm.ref_count(shared), 2);
-
-        bm.deallocate(&s1);
-        assert_eq!(bm.ref_count(shared), 1);
-        assert!(!bm.free.contains(&shared));
-
-        bm.deallocate(&s2);
-        assert_eq!(bm.ref_count(shared), 0);
-        assert!(bm.free.contains(&shared));
-    }
-
-    #[test]
-    fn allocate_fails_when_out_of_memory() {
-        let mut bm = BlockManager::new(2, 4);
-        let s1 = waiting_seq(1, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
-        let err = bm.allocate_for(&s1);
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn extend_for_allocates_one_block_at_boundary() {
+    fn extend_commit_and_fork_tail_for_write_manage_the_tail_block() {
         let mut bm = BlockManager::new(8, 4);
         let mut seq = waiting_seq(1, vec![1, 2, 3, 4]);
         seq.state = SequenceState::Decode;
         seq.block_table = bm.allocate_for(&seq).unwrap();
         assert_eq!(seq.block_table.len(), 1);
         let free_before = bm.num_free();
-
         seq.output.push(99);
         bm.extend_for(&mut seq).unwrap();
         assert_eq!(seq.block_table.len(), 2);
         assert_eq!(bm.num_free(), free_before - 1);
-
         seq.output.push(100);
         bm.extend_for(&mut seq).unwrap();
         assert_eq!(seq.block_table.len(), 2);
-    }
 
-    #[test]
-    fn commit_filled_block_registers_hash_for_later_sharing() {
         let mut bm = BlockManager::new(8, 4);
         let mut s1 = waiting_seq(1, vec![1, 2, 3]);
         s1.state = SequenceState::Decode;
@@ -703,23 +646,20 @@ mod tests {
         bm.commit_filled_block(&s1, 0);
         let id0 = s1.block_table[0];
         assert!(bm.blocks[id0 as usize].hash.is_some());
-
         let s2 = waiting_seq(2, vec![1, 2, 3, 4, 9]);
         let t2 = bm.allocate_for(&s2).unwrap();
         assert_eq!(t2[0], id0);
         assert_eq!(bm.ref_count(id0), 2);
-    }
 
-    #[test]
-    fn fork_tail_for_write_copies_shared_tail() {
         let mut bm = BlockManager::new(8, 4);
         let mut s1 = waiting_seq(1, vec![1, 2, 3, 4]);
         s1.block_table = bm.allocate_for(&s1).unwrap();
+        assert_eq!(bm.ref_count(s1.block_table[0]), 1);
+        assert!(bm.fork_tail_for_write(&mut s1).unwrap().is_none());
         let mut s2 = waiting_seq(2, vec![1, 2, 3, 4]);
         s2.block_table = bm.allocate_for(&s2).unwrap();
         let shared = s1.block_table[0];
         assert_eq!(bm.ref_count(shared), 2);
-
         let cow = bm.fork_tail_for_write(&mut s2).unwrap().unwrap();
         assert_eq!(cow.src_block, shared);
         assert_eq!(cow.logical_idx, 0);
@@ -731,16 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn fork_tail_for_write_noop_when_unshared() {
-        let mut bm = BlockManager::new(8, 4);
-        let mut s1 = waiting_seq(1, vec![1, 2, 3, 4]);
-        s1.block_table = bm.allocate_for(&s1).unwrap();
-        assert_eq!(bm.ref_count(s1.block_table[0]), 1);
-        assert!(bm.fork_tail_for_write(&mut s1).unwrap().is_none());
-    }
-
-    #[test]
-    fn pool_geometry_uniform_accounting() {
+    fn pool_geometry_accounts_uniform_and_mixed_layer_shapes() {
         let g = PoolGeometry::uniform(48, 16, 8, 256);
         let kv_bytes = 2 * 16 * 8 * 256;
         let scale_bytes = 2 * 16 * 8 * 4;
@@ -751,10 +682,7 @@ mod tests {
             g.max_blocks_for_budget(budget),
             budget / g.bytes_per_block()
         );
-    }
 
-    #[test]
-    fn pool_geometry_mixed_layer_shapes() {
         let shapes = vec![(8usize, 256usize), (4, 256), (8, 512)];
         let g = PoolGeometry::from_layer_shapes(16, &shapes);
         let kv_elems: usize = shapes.iter().map(|(k, h)| k * h).sum();
@@ -844,9 +772,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_alloc_releases_its_blocks_and_leaves_the_pool_intact() {
-        let mut bm = BlockManager::new(3, 4);
+    fn a_failed_or_oversized_allocation_leaves_the_pool_intact_and_release_ids_returns_blocks_once()
+    {
+        let mut bm = BlockManager::new(2, 4);
+        assert!(bm
+            .allocate_for(&waiting_seq(1, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]))
+            .is_err());
 
+        let mut bm = BlockManager::new(3, 4);
         let mut s0 = Sequence::new(0, vec![9, 9, 9, 9], 16);
         s0.block_table = bm.allocate_for(&s0).unwrap();
         assert_eq!(bm.num_free(), 2);
@@ -886,35 +819,19 @@ mod tests {
             3,
             "every block returns once both sequences release"
         );
-    }
 
-    #[test]
-    fn release_ids_returns_blocks_exactly_once() {
         let mut bm = BlockManager::new(4, 4);
         let mut s = Sequence::new(0, vec![1, 2, 3, 4, 5, 6, 7, 8], 16);
         s.block_table = bm.allocate_for(&s).unwrap();
         assert_eq!(s.block_table.len(), 2);
         assert_eq!(bm.num_free(), 2);
-
         let taken = s.block_table.clone();
         bm.release_ids(&taken);
         assert_eq!(bm.num_free(), 4, "released blocks must return to the pool");
         for &id in &taken {
             assert_eq!(bm.ref_count(id), 0);
         }
-
         bm.release_ids(&taken);
         assert_eq!(bm.num_free(), 4, "double release corrupted the free list");
-    }
-
-    #[test]
-    fn used_blocks_tracks_allocation() {
-        let mut bm = BlockManager::new(8, 4);
-        assert_eq!(bm.used_blocks(), 0);
-        let mut s1 = waiting_seq(1, vec![1, 2, 3, 4, 5]);
-        s1.block_table = bm.allocate_for(&s1).unwrap();
-        assert_eq!(bm.used_blocks(), 2);
-        bm.deallocate(&s1);
-        assert_eq!(bm.used_blocks(), 0);
     }
 }

@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
@@ -163,27 +161,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_module_stays_inside_the_measured_browser_caps() {
-        assert!(
-            !WGSL.contains("subgroup"),
-            "no subgroup ops, no directive split needed"
-        );
-        assert!(!WGSL.contains("enable "), "no enable directives");
-        assert!(!WGSL.contains("f16"), "f32 only");
-        assert_eq!(WGSL.matches("@workgroup_size(256)").count(), 1);
-        assert_eq!(
-            WGSL.matches("var<storage").count(),
-            7,
-            "7 storage declarations, under the measured maxStorageBuffersPerShaderStage=10"
-        );
-        assert_eq!(WGSL.matches("var<workgroup>").count(), 2);
-        assert_eq!(SCRATCH_BYTES, 2048);
-        const { assert!(SCRATCH_BYTES <= 32768) };
-    }
-
-    #[test]
-    fn params_keep_the_thirty_two_byte_uniform_layout() {
-        assert_eq!(std::mem::size_of::<QkNormRopeBwdParams>(), 32);
+    fn the_module_stays_inside_the_measured_browser_caps_with_its_entry_and_uniform_layout() {
+        {
+            assert!(
+                !WGSL.contains("subgroup"),
+                "no subgroup ops, no directive split needed"
+            );
+            assert!(!WGSL.contains("enable "), "no enable directives");
+            assert!(!WGSL.contains("f16"), "f32 only");
+            assert_eq!(WGSL.matches("@workgroup_size(256)").count(), 1);
+            assert_eq!(
+                WGSL.matches("var<storage").count(),
+                7,
+                "7 storage declarations, under the measured maxStorageBuffersPerShaderStage=10"
+            );
+            assert_eq!(WGSL.matches("var<workgroup>").count(), 2);
+            assert_eq!(SCRATCH_BYTES, 2048);
+            const { assert!(SCRATCH_BYTES <= 32768) };
+        }
+        {
+            assert_eq!(std::mem::size_of::<QkNormRopeBwdParams>(), 32);
+        }
+        {
+            assert!(compose(WGSL).contains("fn q38_qknorm_rope_bwd("));
+        }
     }
 
     #[test]
@@ -213,10 +214,5 @@ mod tests {
             .unwrap_err();
             assert!(matches!(e, WgpuError::Shape(_)), "{e}");
         }
-    }
-
-    #[test]
-    fn source_declares_the_entry() {
-        assert!(compose(WGSL).contains("fn q38_qknorm_rope_bwd("));
     }
 }

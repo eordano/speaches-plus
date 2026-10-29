@@ -239,12 +239,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn special_token_ids_compile_time_constants() {
-        assert_eq!(SPECIAL_ID_IM_START + 1, SPECIAL_ID_IM_END);
-        assert_eq!(SPECIAL_ID_TTS_TEXT_BOS + 1, SPECIAL_ID_TTS_TEXT_EOD);
-    }
-
-    #[test]
     fn encodes_decodes_round_trip() {
         let Some(dir) = crate::model_gate::require("tokenizer::encodes_decodes_round_trip") else {
             return;

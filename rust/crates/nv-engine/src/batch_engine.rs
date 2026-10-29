@@ -219,7 +219,14 @@ impl<S: BatchStepper> BatchEngine<S> {
             });
             return seq_id;
         }
-        let seq = Sequence::new(seq_id, req.prompt_tokens, req.max_new_tokens);
+        let max_new_tokens_that_finish_inside_the_pool = req
+            .max_new_tokens
+            .min(capacity_tokens - req.prompt_tokens.len() - 1);
+        let seq = Sequence::new(
+            seq_id,
+            req.prompt_tokens,
+            max_new_tokens_that_finish_inside_the_pool,
+        );
         self.stepper.on_admit(seq_id, &req.sampling);
         self.scheduler.enqueue_with_eos_ids(seq, req.eos_token_ids);
         self.meta.insert(
@@ -383,21 +390,25 @@ impl<S: BatchStepper> BatchEngine<S> {
 
     fn emit_tokens(&mut self, seq_ids: &[u64], tokens: &[u32], failures: &[StepFailure]) {
         for (sid, &tok) in seq_ids.iter().zip(tokens.iter()) {
-            if let Some(f) = failures.iter().find(|f| f.seq_id == *sid) {
-                if let Some(m) = self.meta.get_mut(sid) {
-                    let _ = m.reply.try_send(EngineEvent::Error {
-                        seq_id: *sid,
-                        message: f.message.clone(),
-                    });
-                }
+            let Some(m) = self.meta.get_mut(sid) else {
                 continue;
-            }
-            if let Some(m) = self.meta.get_mut(sid) {
-                m.completion_tokens += 1;
-                let _ = m.reply.try_send(EngineEvent::Token {
+            };
+            let event = match failures.iter().find(|f| f.seq_id == *sid) {
+                Some(f) => EngineEvent::Error {
                     seq_id: *sid,
-                    token: tok,
-                });
+                    message: f.message.clone(),
+                },
+                None => {
+                    m.completion_tokens += 1;
+                    EngineEvent::Token {
+                        seq_id: *sid,
+                        token: tok,
+                    }
+                }
+            };
+            if m.reply.try_send(event).is_err() {
+                self.meta.remove(sid);
+                self.abort(*sid);
             }
         }
     }
@@ -487,17 +498,36 @@ mod tests {
         out
     }
 
+    fn request(prompt_tokens: Vec<u32>, max_new_tokens: usize, reply: mpsc::Sender<EngineEvent>) -> GenRequest {
+        GenRequest {
+            prompt_tokens,
+            max_new_tokens,
+            eos_token_ids: vec![],
+            sampling: SamplingConfig::default(),
+            reply,
+        }
+    }
+
+    fn run_to_idle<S: BatchStepper>(engine: &mut BatchEngine<S>, limit: usize) {
+        let mut guard = 0;
+        while engine.has_work() && guard < limit {
+            engine.step().unwrap();
+            guard += 1;
+        }
+    }
+
+    fn token_count(events: &[EngineEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Token { .. }))
+            .count()
+    }
+
     #[test]
     fn abort_settles_the_engine_and_notifies_the_client() {
         let mut engine = BatchEngine::new(cfg(), CountingStepper::new());
         let (tx, mut rx) = mpsc::channel(64);
-        let id = engine.admit(GenRequest {
-            prompt_tokens: vec![1, 2, 3, 4, 5],
-            max_new_tokens: 64,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx,
-        });
+        let id = engine.admit(request(vec![1, 2, 3, 4, 5], 64, tx));
         engine.step().unwrap();
 
         engine.abort(id);
@@ -519,84 +549,61 @@ mod tests {
     }
 
     #[test]
-    fn single_request_runs_to_completion() {
+    fn a_token_the_reader_cannot_take_aborts_its_sequence_instead_of_vanishing() {
         let mut engine = BatchEngine::new(cfg(), CountingStepper::new());
-        let (tx, mut rx) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: vec![1, 2, 3, 4, 5],
-            max_new_tokens: 3,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx,
-        });
-
-        let mut guard = 0;
-        while engine.has_work() && guard < 100 {
-            engine.step().unwrap();
-            guard += 1;
-        }
-
+        let (tx, mut rx) = mpsc::channel(2);
+        engine.admit(request(vec![1, 2, 3], 8, tx));
+        run_to_idle(&mut engine, 100);
+        assert_eq!(
+            engine.stepper.decoded.len(),
+            1,
+            "the first decoded token found the reply channel full: the engine must stop the \
+             sequence there, not keep decoding tokens nobody receives"
+        );
         let events = collect(&mut rx);
-        let tokens: Vec<u32> = events
-            .iter()
-            .filter_map(|e| match e {
-                EngineEvent::Token { token, .. } => Some(*token),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(tokens.len(), 3);
-        let done = events.iter().any(|e| {
+        assert!(
             matches!(
-                e,
-                EngineEvent::Done {
-                    reason: FinishReason::MaxTokens,
-                    completion_tokens: 3,
-                    ..
-                }
-            )
-        });
-        assert!(done, "expected MaxTokens Done event, got {events:?}");
+                events.as_slice(),
+                [
+                    EngineEvent::Started { .. },
+                    EngineEvent::Token { token: 1000, .. }
+                ]
+            ),
+            "{events:?}"
+        );
+        assert!(
+            rx.is_closed(),
+            "the reply closes without Done, so the reader reports an interrupted request"
+        );
     }
 
     #[test]
-    fn two_requests_decode_in_the_same_batch() {
+    fn two_requests_decode_in_the_same_batch_and_each_runs_to_a_max_tokens_done() {
         let mut engine = BatchEngine::new(cfg(), CountingStepper::new());
         let (tx1, mut rx1) = mpsc::channel(64);
         let (tx2, mut rx2) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: vec![1, 2, 3],
-            max_new_tokens: 4,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx1,
-        });
-        engine.admit(GenRequest {
-            prompt_tokens: vec![7, 8, 9],
-            max_new_tokens: 4,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx2,
-        });
-
-        let mut guard = 0;
-        while engine.has_work() && guard < 100 {
-            engine.step().unwrap();
-            guard += 1;
-        }
+        engine.admit(request(vec![1, 2, 3], 4, tx1));
+        engine.admit(request(vec![7, 8, 9], 4, tx2));
+        run_to_idle(&mut engine, 100);
 
         let max_decode_batch = engine.stepper.decoded.iter().copied().max().unwrap_or(0);
         assert_eq!(max_decode_batch, 2, "two seqs should share a decode step");
 
-        let t1 = collect(&mut rx1)
-            .iter()
-            .filter(|e| matches!(e, EngineEvent::Token { .. }))
-            .count();
-        let t2 = collect(&mut rx2)
-            .iter()
-            .filter(|e| matches!(e, EngineEvent::Token { .. }))
-            .count();
-        assert_eq!(t1, 4);
-        assert_eq!(t2, 4);
+        for rx in [&mut rx1, &mut rx2] {
+            let events = collect(rx);
+            assert_eq!(token_count(&events), 4);
+            let done = events.iter().any(|e| {
+                matches!(
+                    e,
+                    EngineEvent::Done {
+                        reason: FinishReason::MaxTokens,
+                        completion_tokens: 4,
+                        ..
+                    }
+                )
+            });
+            assert!(done, "expected MaxTokens Done event, got {events:?}");
+        }
     }
 
     #[test]
@@ -645,13 +652,7 @@ mod tests {
             },
         );
         let (tx, _rx) = mpsc::channel(64);
-        let id = engine.admit(GenRequest {
-            prompt_tokens: vec![1, 2, 3],
-            max_new_tokens: 16,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx,
-        });
+        let id = engine.admit(request(vec![1, 2, 3], 16, tx));
         engine.step().unwrap();
         engine.step().unwrap();
 
@@ -692,26 +693,9 @@ mod tests {
         );
         let (tx1, mut rx1) = mpsc::channel(64);
         let (tx2, mut rx2) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: vec![1, 2],
-            max_new_tokens: 2,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx1,
-        });
-        engine.admit(GenRequest {
-            prompt_tokens: vec![3, 4],
-            max_new_tokens: 2,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx2,
-        });
-
-        let mut guard = 0;
-        while engine.has_work() && guard < 100 {
-            engine.step().unwrap();
-            guard += 1;
-        }
+        engine.admit(request(vec![1, 2], 2, tx1));
+        engine.admit(request(vec![3, 4], 2, tx2));
+        run_to_idle(&mut engine, 100);
 
         let e1 = collect(&mut rx1);
         assert!(
@@ -804,25 +788,13 @@ mod tests {
             },
         );
         let (tx1, _rx1) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: vec![1, 2, 3],
-            max_new_tokens: 16,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx1,
-        });
+        engine.admit(request(vec![1, 2, 3], 16, tx1));
         engine.step().unwrap();
         assert_eq!(engine.stepper.prefills, vec![vec![1, 2, 3]]);
 
         let (tx2, _rx2) = mpsc::channel(64);
         let long_prompt: Vec<u32> = (10..20).collect();
-        let long_id = engine.admit(GenRequest {
-            prompt_tokens: long_prompt.clone(),
-            max_new_tokens: 4,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx2,
-        });
+        let long_id = engine.admit(request(long_prompt.clone(), 4, tx2));
 
         for step in 0..4 {
             engine.step().unwrap();
@@ -843,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_native_stepper_receives_ordered_chunks() {
+    fn a_chunk_native_stepper_receives_ordered_chunks_and_started_fires_once_per_request() {
         struct ChunkNativeStepper {
             next: u32,
             seen: Vec<(usize, usize, bool)>,
@@ -895,46 +867,28 @@ mod tests {
                 seen: Vec::new(),
             },
         );
-        let (tx, _rx) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: (10..20).collect(),
-            max_new_tokens: 1,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx,
-        });
-
-        let mut guard = 0;
-        while engine.has_work() && guard < 100 {
-            engine.step().unwrap();
-            guard += 1;
-        }
-
+        let (tx, mut rx) = mpsc::channel(64);
+        engine.admit(request((10..20).collect(), 1, tx));
+        run_to_idle(&mut engine, 100);
         assert_eq!(
             engine.stepper.seen,
             vec![(0, 4, false), (4, 4, false), (8, 2, true)],
             "chunks must cover the prompt contiguously with is_final only on the last"
         );
-    }
+        let events = collect(&mut rx);
+        let started = events
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Started { .. }))
+            .count();
+        assert_eq!(
+            started, 1,
+            "Started must fire on the first chunk only, got {events:?}"
+        );
 
-    #[test]
-    fn mixed_batch_emits_started_once_per_request() {
         let mut engine = BatchEngine::new(chunk_cfg(), CountingStepper::new());
         let (tx, mut rx) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: (10..20).collect(),
-            max_new_tokens: 1,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx,
-        });
-
-        let mut guard = 0;
-        while engine.has_work() && guard < 100 {
-            engine.step().unwrap();
-            guard += 1;
-        }
-
+        engine.admit(request((10..20).collect(), 1, tx));
+        run_to_idle(&mut engine, 100);
         let events = collect(&mut rx);
         let started = events
             .iter()
@@ -1007,45 +961,27 @@ mod tests {
             },
         );
         let (tx1, _rx1) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: (1..=8).collect(),
-            max_new_tokens: 4,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx1,
-        });
+        engine.admit(request((1..=8).collect(), 4, tx1));
         engine.step().unwrap();
 
         let (tx2, _rx2) = mpsc::channel(64);
         let mut second: Vec<u32> = (1..=8).collect();
         second.extend_from_slice(&[70, 71]);
-        engine.admit(GenRequest {
-            prompt_tokens: second,
-            max_new_tokens: 1,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx2,
-        });
+        engine.admit(request(second, 1, tx2));
         engine.step().unwrap();
         engine.stepper.starts.clone()
     }
 
     #[test]
-    fn a_reuse_capable_stepper_resumes_a_shared_prompt_mid_way() {
-        let starts = shared_prefix_chunk_starts(true);
+    fn a_stepper_resumes_a_shared_prompt_mid_way_only_when_it_claims_prefix_reuse() {
         assert_eq!(
-            starts,
+            shared_prefix_chunk_starts(true),
             vec![(1, 0, 8), (2, 8, 10)],
             "the second prompt shares two whole blocks with the first, so its only chunk \
              must start at token 8 and forward just the tail"
         );
-    }
-
-    #[test]
-    fn a_stepper_that_cannot_resume_mid_prompt_still_gets_whole_prompts() {
-        let starts = shared_prefix_chunk_starts(false);
         assert_eq!(
-            starts,
+            shared_prefix_chunk_starts(false),
             vec![(1, 0, 8), (2, 0, 10)],
             "a stepper that tracks its own per-sequence cache length would fail a chunk \
              starting past 0, so reuse stays off until it claims it"
@@ -1053,34 +989,14 @@ mod tests {
     }
 
     #[test]
-    fn max_waiting_for_defaults_and_overrides() {
-        assert_eq!(max_waiting_for(8, None), 32);
-        assert_eq!(max_waiting_for(1, None), 16);
-        assert_eq!(max_waiting_for(8, Some(100)), 100);
-        assert_eq!(max_waiting_for(8, Some(0)), 32);
-    }
-
-    #[test]
-    fn admit_rejects_when_waiting_queue_is_full() {
+    fn admit_rejects_a_full_queue_and_an_oversized_prompt_but_clamps_a_request_that_would_outgrow_the_pool(
+    ) {
         let mut engine = BatchEngine::new(cfg(), CountingStepper::new());
         engine.set_max_waiting(1);
         let (tx1, mut rx1) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: vec![1, 2, 3],
-            max_new_tokens: 4,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx1,
-        });
+        engine.admit(request(vec![1, 2, 3], 4, tx1));
         let (tx2, mut rx2) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: vec![4, 5, 6],
-            max_new_tokens: 4,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx2,
-        });
-
+        engine.admit(request(vec![4, 5, 6], 4, tx2));
         let e2 = collect(&mut rx2);
         assert!(
             e2.iter().any(|e| matches!(e, EngineEvent::Error { .. })),
@@ -1093,30 +1009,16 @@ mod tests {
                 ..
             }
         )));
+        run_to_idle(&mut engine, 100);
+        assert_eq!(
+            token_count(&collect(&mut rx1)),
+            4,
+            "first request must still run to completion"
+        );
 
-        let mut guard = 0;
-        while engine.has_work() && guard < 100 {
-            engine.step().unwrap();
-            guard += 1;
-        }
-        let t1 = collect(&mut rx1)
-            .iter()
-            .filter(|e| matches!(e, EngineEvent::Token { .. }))
-            .count();
-        assert_eq!(t1, 4, "first request must still run to completion");
-    }
-
-    #[test]
-    fn admit_rejects_prompt_exceeding_kv_capacity() {
         let mut engine = BatchEngine::new(cfg(), CountingStepper::new());
         let (tx, mut rx) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: (0..1024u32).collect(),
-            max_new_tokens: 4,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx,
-        });
+        engine.admit(request((0..1024u32).collect(), 4, tx));
         let events = collect(&mut rx);
         assert!(
             events.iter().any(|e| matches!(
@@ -1133,102 +1035,57 @@ mod tests {
             }
         )));
         assert!(!engine.has_work(), "rejected request must not be enqueued");
-
         let (tx2, mut rx2) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: (0..1023u32).collect(),
-            max_new_tokens: 1,
-            eos_token_ids: vec![],
-            sampling: SamplingConfig::default(),
-            reply: tx2,
-        });
-        let mut guard = 0;
-        while engine.has_work() && guard < 2100 {
-            engine.step().unwrap();
-            guard += 1;
-        }
-        let t2 = collect(&mut rx2)
-            .iter()
-            .filter(|e| matches!(e, EngineEvent::Token { .. }))
-            .count();
-        assert_eq!(t2, 1, "capacity-fitting request must still complete");
+        engine.admit(request((0..1023u32).collect(), 1, tx2));
+        run_to_idle(&mut engine, 2100);
+        assert_eq!(
+            token_count(&collect(&mut rx2)),
+            1,
+            "capacity-fitting request must still complete"
+        );
+
+        let mut engine = BatchEngine::new(
+            SchedulerConfig {
+                max_batch_size: 4,
+                max_batched_tokens: 4096,
+                block_size: 16,
+                num_blocks: 4,
+            },
+            CountingStepper::new(),
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        engine.admit(request((0..60).collect(), 16, tx));
+        run_to_idle(&mut engine, 100);
+        let events = collect(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Error { .. })),
+            "a 60-token prompt in a 64-token pool must be clamped at admission, not aborted \
+             mid-stream with an out-of-memory error: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                EngineEvent::Done {
+                    reason: FinishReason::MaxTokens,
+                    completion_tokens: 3,
+                    ..
+                }
+            )),
+            "prompt + max_new_tokens + 1 fits the pool, as kv_window clamps the per-request \
+             path: {events:?}"
+        );
     }
 
     #[test]
-    fn eos_stops_one_seq_while_other_continues() {
+    fn every_eos_id_stops_its_own_sequence_while_a_peer_runs_to_max_tokens() {
+        const EOS_IDS_A_31B_CHECKPOINT_CARRIES: [u32; 3] = [1, 50, 106];
+
         struct EosStepper {
             n: u32,
         }
         impl BatchStepper for EosStepper {
-            fn prefill(&mut self, items: &[PrefillInput]) -> Result<Vec<StepResult>> {
-                Ok(items
-                    .iter()
-                    .map(|it| StepResult {
-                        seq_id: it.seq_id,
-                        token: 5,
-                    })
-                    .collect())
-            }
-            fn decode(&mut self, items: &[SeqInput]) -> Result<Vec<StepResult>> {
-                self.n += 1;
-                Ok(items
-                    .iter()
-                    .map(|it| {
-                        let token = if it.seq_id == 1 && self.n == 1 { 99 } else { 5 };
-                        StepResult {
-                            seq_id: it.seq_id,
-                            token,
-                        }
-                    })
-                    .collect())
-            }
-        }
-
-        let mut engine = BatchEngine::new(cfg(), EosStepper { n: 0 });
-        let (tx1, mut rx1) = mpsc::channel(64);
-        let (tx2, mut rx2) = mpsc::channel(64);
-        engine.admit(GenRequest {
-            prompt_tokens: vec![1, 2, 3],
-            max_new_tokens: 10,
-            eos_token_ids: vec![99],
-            sampling: SamplingConfig::default(),
-            reply: tx1,
-        });
-        engine.admit(GenRequest {
-            prompt_tokens: vec![4, 5, 6],
-            max_new_tokens: 3,
-            eos_token_ids: vec![99],
-            sampling: SamplingConfig::default(),
-            reply: tx2,
-        });
-
-        let mut guard = 0;
-        while engine.has_work() && guard < 100 {
-            engine.step().unwrap();
-            guard += 1;
-        }
-
-        let e1 = collect(&mut rx1);
-        let done1 = e1.iter().find_map(|e| match e {
-            EngineEvent::Done { reason, .. } => Some(*reason),
-            _ => None,
-        });
-        assert_eq!(done1, Some(FinishReason::Eos));
-
-        let e2 = collect(&mut rx2);
-        let done2 = e2.iter().find_map(|e| match e {
-            EngineEvent::Done { reason, .. } => Some(*reason),
-            _ => None,
-        });
-        assert_eq!(done2, Some(FinishReason::MaxTokens));
-    }
-
-    #[test]
-    fn every_eos_id_stops_a_sequence_not_only_the_first() {
-        const EOS_IDS_A_31B_CHECKPOINT_CARRIES: [u32; 3] = [1, 50, 106];
-
-        struct NonFirstEosStepper;
-        impl BatchStepper for NonFirstEosStepper {
             fn prefill(&mut self, items: &[PrefillInput]) -> Result<Vec<StepResult>> {
                 Ok(items
                     .iter()
@@ -1239,36 +1096,41 @@ mod tests {
                     .collect())
             }
             fn decode(&mut self, items: &[SeqInput]) -> Result<Vec<StepResult>> {
+                self.n += 1;
                 Ok(items
                     .iter()
                     .map(|it| StepResult {
                         seq_id: it.seq_id,
-                        token: if it.seq_id == 1 { 50 } else { 106 },
+                        token: match (it.seq_id, self.n) {
+                            (1, 1) => 50,
+                            (2, 2) => 106,
+                            _ => 5,
+                        },
                     })
                     .collect())
             }
         }
 
-        let mut engine = BatchEngine::new(cfg(), NonFirstEosStepper);
+        let mut engine = BatchEngine::new(cfg(), EosStepper { n: 0 });
         let (tx1, mut rx1) = mpsc::channel(256);
         let (tx2, mut rx2) = mpsc::channel(256);
-        for tx in [tx1, tx2] {
+        let (tx3, mut rx3) = mpsc::channel(256);
+        for (tx, max_new) in [(tx1, 64usize), (tx2, 64), (tx3, 3)] {
             engine.admit(GenRequest {
                 prompt_tokens: vec![1, 2, 3],
-                max_new_tokens: 64,
+                max_new_tokens: max_new,
                 eos_token_ids: EOS_IDS_A_31B_CHECKPOINT_CARRIES.to_vec(),
                 sampling: SamplingConfig::default(),
                 reply: tx,
             });
         }
+        run_to_idle(&mut engine, 200);
 
-        let mut guard = 0;
-        while engine.has_work() && guard < 200 {
-            engine.step().unwrap();
-            guard += 1;
-        }
-
-        for (rx, emitted) in [(&mut rx1, 50u32), (&mut rx2, 106u32)] {
+        for (rx, emitted, want) in [
+            (&mut rx1, 50u32, (FinishReason::Eos, 2u32)),
+            (&mut rx2, 106, (FinishReason::Eos, 3)),
+            (&mut rx3, 5, (FinishReason::MaxTokens, 3)),
+        ] {
             let events = collect(rx);
             let done = events.iter().find_map(|e| match e {
                 EngineEvent::Done {
@@ -1280,10 +1142,10 @@ mod tests {
             });
             assert_eq!(
                 done,
-                Some((FinishReason::Eos, 2)),
-                "eos_token_ids {EOS_IDS_A_31B_CHECKPOINT_CARRIES:?}: token {emitted} is a member, \
-                 so the sequence must stop on it after 2 tokens; a first-id-only stop runs to \
-                 max_new_tokens instead. events={events:?}"
+                Some(want),
+                "eos_token_ids {EOS_IDS_A_31B_CHECKPOINT_CARRIES:?}: token {emitted} decides the \
+                 stop; a first-id-only stop runs every sequence to max_new_tokens instead. \
+                 events={events:?}"
             );
         }
     }

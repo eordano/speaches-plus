@@ -634,9 +634,8 @@ mod cuda_runtime {
 
     impl LoraDispatch {
         pub fn new(device: &Device, max_tokens: usize, max_loras: usize) -> Result<Arc<Self>> {
-            let dev = match device {
-                Device::Cuda(d) => d.clone(),
-                _ => bail!("LoraDispatch requires a CUDA device"),
+            let Device::Cuda(dev) = device.clone() else {
+                bail!("LoraDispatch requires a CUDA device")
             };
             if max_tokens == 0 || max_loras == 0 {
                 bail!("LoraDispatch dims must be non-zero");
@@ -860,15 +859,10 @@ mod cuda_runtime {
                 .collect();
             let b_stride: Vec<i64> = widths.iter().map(|&w| (w * rank) as i64).collect();
 
-            #[allow(deprecated)]
             let a_ptrs_d = stream.clone_htod(&a_addrs).map_err(|e| anyhow!(e))?;
-            #[allow(deprecated)]
             let b_ptrs_d = stream.clone_htod(&b_addrs).map_err(|e| anyhow!(e))?;
-            #[allow(deprecated)]
             let slice_n_d = stream.clone_htod(&slice_n).map_err(|e| anyhow!(e))?;
-            #[allow(deprecated)]
             let slice_start_d = stream.clone_htod(&slice_start).map_err(|e| anyhow!(e))?;
-            #[allow(deprecated)]
             let b_stride_d = stream.clone_htod(&b_stride).map_err(|e| anyhow!(e))?;
             let mut buffer = stream
                 .alloc_zeros::<f32>(n_slices * dispatch.max_tokens() * rank)
@@ -963,7 +957,7 @@ mod cuda_runtime {
             if y2.dtype() != DType::BF16 {
                 bail!("LoraHook.apply: y must be bf16");
             }
-            if !matches!(x2.device(), Device::Cuda(_)) {
+            if !x2.device().is_cuda() {
                 bail!("LoraHook.apply: armed LoRA requires CUDA input");
             }
 
@@ -1111,10 +1105,6 @@ impl LoraSlotManager {
 
     pub fn stack(&self, name: &str) -> Option<&LoraSlotStack> {
         self.stacks.iter().find(|(n, _)| n == name).map(|(_, s)| s)
-    }
-
-    pub fn module_names(&self) -> Vec<&str> {
-        self.stacks.iter().map(|(n, _)| n.as_str()).collect()
     }
 
     pub fn activate(&mut self, id: u64, adapter: &LoraAdapter) -> Result<usize> {

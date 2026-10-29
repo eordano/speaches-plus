@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use cudarc::driver::CudaStream;
 use half::bf16;
 use std::sync::Arc;
@@ -64,15 +64,15 @@ impl LagunaKvCacheFp8 {
     }
 
     fn prefix_layout(&self) -> Result<(PrefixLayout, Arc<CudaStream>)> {
-        anyhow::ensure!(
-            std::env::var_os("NV_LAGUNA_RING_ATTN").is_none(),
+        ensure!(
+            !nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_RING_ATTN"),
             "FP8 prefix reuse refuses the explicit ring-attention arm"
         );
-        anyhow::ensure!(
+        ensure!(
             self.scale_policy == LagunaFp8ScalePolicy::FixedOne,
             "FP8 prefix reuse supports only immutable FixedOne storage"
         );
-        anyhow::ensure!(
+        ensure!(
             !self.layers.is_empty()
                 && self.layers.len() == self.layer_windows.len()
                 && self.layers.len() == self.layer_stored.len()
@@ -81,7 +81,7 @@ impl LagunaKvCacheFp8 {
             "FP8 prefix cache metadata mismatch"
         );
         let stream = prefix_stream(&self.device)?;
-        anyhow::ensure!(
+        ensure!(
             Arc::ptr_eq(self.meta_dev.context(), stream.context())
                 && Arc::ptr_eq(self.n_total_dev.context(), stream.context()),
             "FP8 prefix metadata context mismatch"
@@ -119,7 +119,7 @@ impl LagunaKvCacheFp8 {
                 ) => {
                     let elements = checked_bytes(self.max_seq_len, re, 1)?;
                     let scales = checked_bytes(self.max_seq_len, self.n_kv, 1)?;
-                    anyhow::ensure!(
+                    ensure!(
                         k_fp8.len() == elements
                             && v_fp8.len() == elements
                             && k_scales.len() == scales
@@ -133,7 +133,7 @@ impl LagunaKvCacheFp8 {
                     full_layers += 1;
                 }
                 (Some(window), Fp8LayerSlot::Bf16 { k, v }) => {
-                    anyhow::ensure!(
+                    ensure!(
                         window > 0
                             && window == self.s_window
                             && self.s_cap > 0
@@ -147,7 +147,7 @@ impl LagunaKvCacheFp8 {
                 _ => anyhow::bail!("FP8 prefix refuses mixed/full-BF16 fallback at layer {li}"),
             }
         }
-        anyhow::ensure!(
+        ensure!(
             full_layers > 0,
             "FP8 prefix requires an FP8 full-attention layer"
         );
@@ -155,7 +155,7 @@ impl LagunaKvCacheFp8 {
     }
 
     fn prefix_initialized(&self) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.current_len > 0
                 && self.current_len <= self.max_seq_len
                 && self.full_stored == self.current_len
@@ -169,7 +169,7 @@ impl LagunaKvCacheFp8 {
             } else {
                 self.full_stored
             };
-            anyhow::ensure!(
+            ensure!(
                 self.layer_stored[li] == stored
                     && window.is_none_or(|w| stored >= w.min(self.current_len)),
                 "FP8 prefix layer {li} is not fully initialized"
@@ -186,7 +186,7 @@ impl LagunaKvCacheFp8 {
 
     pub fn snapshot_full_bytes(&self, pos: usize) -> Result<usize> {
         let (layout, _) = self.prefix_layout()?;
-        anyhow::ensure!(
+        ensure!(
             self.holds_full_rows(pos),
             "FP8 prefix no longer holds full rows through {pos}"
         );
@@ -242,7 +242,7 @@ impl LagunaKvCacheFp8 {
                 let v = read_device_slice(&stream, &v_fp8.slice(..elements))?;
                 let k_scales = read_device_slice(&stream, &k_scales.slice(..scales))?;
                 let v_scales = read_device_slice(&stream, &v_scales.slice(..scales))?;
-                anyhow::ensure!(
+                ensure!(
                     k_scales
                         .iter()
                         .chain(&v_scales)
@@ -286,7 +286,7 @@ impl LagunaKvCacheFp8 {
         let (layout, stream) = self.prefix_layout()?;
         let target = sliding.pos;
         let re = layout.row_elems()?;
-        anyhow::ensure!(
+        ensure!(
             target > 0
                 && target <= self.max_seq_len
                 && layout.matches(&sliding.layout)
@@ -296,13 +296,13 @@ impl LagunaKvCacheFp8 {
         );
         for ((k, v), window) in sliding.rows.iter().zip(layout.windows.iter().flatten()) {
             let need = checked_bytes((*window).min(target), re, 1)?;
-            anyhow::ensure!(
+            ensure!(
                 k.len() == need && v.len() == need,
                 "FP8 prefix sliding source length mismatch"
             );
         }
         if let Some(full) = full {
-            anyhow::ensure!(
+            ensure!(
                 full.pos >= target
                     && full.pos <= self.max_seq_len
                     && layout.matches(&full.layout)
@@ -313,7 +313,7 @@ impl LagunaKvCacheFp8 {
             let elements = checked_bytes(full.pos, re, 1)?;
             let scales = checked_bytes(full.pos, self.n_kv, 1)?;
             for row in &full.rows {
-                anyhow::ensure!(
+                ensure!(
                     row.k.len() == elements
                         && row.v.len() == elements
                         && row.k_scales.len() == scales
@@ -327,7 +327,7 @@ impl LagunaKvCacheFp8 {
                 );
             }
         } else {
-            anyhow::ensure!(
+            ensure!(
                 self.holds_full_rows(target),
                 "FP8 prefix resident full rows are unavailable"
             );
@@ -357,15 +357,15 @@ impl LagunaKvCacheFp8 {
                             let copy = stream
                                 .memcpy_htod(&src[..elements], &mut dst.slice_mut(..elements));
                             let sync = stream.synchronize();
-                            copy.map_err(|e| anyhow::anyhow!(e))?;
-                            sync.map_err(|e| anyhow::anyhow!(e))?;
+                            copy?;
+                            sync?;
                         }
                         for (dst, src) in [(k_scales, &row.k_scales), (v_scales, &row.v_scales)] {
                             let copy =
                                 stream.memcpy_htod(&src[..scales], &mut dst.slice_mut(..scales));
                             let sync = stream.synchronize();
-                            copy.map_err(|e| anyhow::anyhow!(e))?;
-                            sync.map_err(|e| anyhow::anyhow!(e))?;
+                            copy?;
+                            sync?;
                         }
                     }
                 }
@@ -397,9 +397,9 @@ impl LagunaKvCacheFp8 {
             let metadata = stream.memcpy_htod(&self.host_meta[..], &mut self.meta_dev);
             let total = stream.memcpy_htod(&self.host_n_total[..], &mut self.n_total_dev);
             let sync = stream.synchronize();
-            metadata.map_err(|e| anyhow::anyhow!(e))?;
-            total.map_err(|e| anyhow::anyhow!(e))?;
-            sync.map_err(|e| anyhow::anyhow!(e))?;
+            metadata?;
+            total?;
+            sync?;
             self.full_stored = target;
             self.s_stored = stored;
             self.current_len = target;
@@ -465,11 +465,7 @@ mod tests {
                     &cache.device,
                 )?;
                 cache.write_at_impl(layer, &k, &v)?;
-                cache
-                    .dev
-                    .cuda_stream()
-                    .synchronize()
-                    .map_err(|e| anyhow::anyhow!(e))?;
+                cache.dev.cuda_stream().synchronize()?;
             }
             cache.advance(rows);
         }
@@ -486,15 +482,13 @@ mod tests {
         out.extend(cache.layer_stored.iter().map(|n| *n as u32));
         out.extend(
             stream
-                .clone_dtoh(&cache.meta_dev)
-                .map_err(|e| anyhow::anyhow!(e))?
+                .clone_dtoh(&cache.meta_dev)?
                 .iter()
                 .map(|n| *n as u32),
         );
         out.extend(
             stream
-                .clone_dtoh(&cache.n_total_dev)
-                .map_err(|e| anyhow::anyhow!(e))?
+                .clone_dtoh(&cache.n_total_dev)?
                 .iter()
                 .map(|n| *n as u32),
         );
@@ -509,8 +503,7 @@ mod tests {
                     for packed in [k_fp8, v_fp8] {
                         out.extend(
                             stream
-                                .clone_dtoh(&packed.slice(..cache.current_len * 1024))
-                                .map_err(|e| anyhow::anyhow!(e))?
+                                .clone_dtoh(&packed.slice(..cache.current_len * 1024))?
                                 .into_iter()
                                 .map(u32::from),
                         );
@@ -518,8 +511,7 @@ mod tests {
                     for scales in [k_scales, v_scales] {
                         out.extend(
                             stream
-                                .clone_dtoh(&scales.slice(..cache.current_len * 8))
-                                .map_err(|e| anyhow::anyhow!(e))?
+                                .clone_dtoh(&scales.slice(..cache.current_len * 8))?
                                 .into_iter()
                                 .map(f32::to_bits),
                         );
@@ -555,9 +547,7 @@ mod tests {
             unreachable!()
         };
         for (packed, scales, offset) in [(k_fp8, k_scales, 0), (v_fp8, v_scales, 1)] {
-            let actual = stream
-                .clone_dtoh(&packed.slice(..pos * 1024))
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let actual = stream.clone_dtoh(&packed.slice(..pos * 1024))?;
             assert_eq!(
                 actual,
                 (0..pos * 1024)
@@ -565,8 +555,7 @@ mod tests {
                     .collect::<Vec<_>>()
             );
             assert!(stream
-                .clone_dtoh(&scales.slice(..pos * 8))
-                .map_err(|e| anyhow::anyhow!(e))?
+                .clone_dtoh(&scales.slice(..pos * 8))?
                 .iter()
                 .all(|value| value.to_bits() == 1.0f32.to_bits()));
         }
@@ -621,8 +610,8 @@ mod tests {
     fn fixed_one_prefix_cuda_gate() -> Result<()> {
         anyhow::ensure!(std::env::var("NV_LAGUNA_PREFIX_CUDA_TEST").as_deref() == Ok("1")
             && std::env::var("NV_LAGUNA_FP8_UNIT_SCALE").as_deref() == Ok("1")
-            && std::env::var_os("NV_LAGUNA_FP8_BF16_FULL").is_none()
-            && std::env::var_os("NV_LAGUNA_RING_ATTN").is_none(),
+            && !nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_FP8_BF16_FULL")
+            && !nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_RING_ATTN"),
             "set NV_LAGUNA_PREFIX_CUDA_TEST=1, UNIT_SCALE=1 and unset FP8_BF16_FULL/RING_ATTN; no skip-as-pass");
         let config = LagunaConfig::from_hf_json_str(
             r#"{
@@ -688,10 +677,7 @@ mod tests {
         assert!(cache.rewind_to(&a, Some(&full)).is_err());
         cache.scale_policy = LagunaFp8ScalePolicy::FixedOne;
         assert_eq!(inspect(&cache)?, before);
-        let forked = stream
-            .context()
-            .new_stream()
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let forked = stream.context().new_stream()?;
         let refused =
             nv_layers::cuda_stream::with_stream(forked, || cache.rewind_to(&a, Some(&full)));
         assert!(refused.is_err());
@@ -719,14 +705,11 @@ mod tests {
                     .0;
                 ptr
             };
-            let graph_stream = stream
-                .context()
-                .new_stream()
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let graph_stream = stream.context().new_stream()?;
             let mut graph = CudaGraphRunner::new(graph_stream.clone());
             let p = pointers(&cache);
             cache.prepare_for_decode_dev(cache.current_len, cache.current_len + m)?;
-            stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+            stream.synchronize()?;
             graph.run(m as u64, |s| {
                 let rc = unsafe {
                     nv_kernels::cuda::kv_append_fp8_unit_scale(
@@ -762,17 +745,17 @@ mod tests {
                 }
                 Ok(())
             })?;
-            graph_stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+            graph_stream.synchronize()?;
             assert!(graph.has_cached_token(m as u64) && graph.cached_node_count() > 0);
             cache.reset();
             cache.rewind_to(&a, Some(&full))?;
             check(&cache, 11)?;
             cache.prepare_for_decode_dev(1024, 1024 + m)?;
-            stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+            stream.synchronize()?;
             graph.run(m as u64, |_| {
                 anyhow::bail!("prefix restore unexpectedly recaptured retained writer")
             })?;
-            graph_stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+            graph_stream.synchronize()?;
             cache.advance(m);
             cache.note_graph_write();
             let Fp8LayerSlot::Full {
@@ -786,9 +769,7 @@ mod tests {
             };
             for packed in [k_fp8, v_fp8] {
                 assert_eq!(
-                    stream
-                        .clone_dtoh(&packed.slice(1024 * 1024..(1024 + m) * 1024))
-                        .map_err(|e| anyhow::anyhow!(e))?,
+                    stream.clone_dtoh(&packed.slice(1024 * 1024..(1024 + m) * 1024))?,
                     (1024 * 1024..(1024 + m) * 1024)
                         .map(|i| code(i, 91))
                         .collect::<Vec<_>>()
@@ -796,8 +777,7 @@ mod tests {
             }
             for scales in [k_scales, v_scales] {
                 assert!(stream
-                    .clone_dtoh(&scales.slice(1024 * 8..(1024 + m) * 8))
-                    .map_err(|e| anyhow::anyhow!(e))?
+                    .clone_dtoh(&scales.slice(1024 * 8..(1024 + m) * 8))?
                     .iter()
                     .all(|v| v.to_bits() == 1.0f32.to_bits()));
             }
@@ -821,10 +801,8 @@ mod tests {
             }
             assert_eq!(pointers(&cache), original_pointers);
             graph.invalidate();
-            stream
-                .context()
-                .synchronize()
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let _no_capture_in_flight = nv_kernels::capture_exclusion::no_capture_in_flight();
+            stream.context().synchronize()?;
         }
         cache.reset();
         cache.rewind_to(&b, Some(&full))?;

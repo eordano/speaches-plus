@@ -1,53 +1,38 @@
 use nv_lookup::SuffixAutomaton;
-
-pub const NV_Q38_SPEC_SUFFIX_ENV: &str = "NV_Q38_SPEC_SUFFIX";
-
-pub const NV_Q38_SPEC_SUFFIX_DEFAULT_ON_0_RESTORES_THE_PLAIN_MTP_CHAIN_FLIPPED_2026_09_04_BITWISE_LOSSLESS_BY_QWEN38_SUFSPEC_GATE_AND_279_264_147_TOK_S_VS_THE_PLAIN_166_156_99: &str =
-    NV_Q38_SPEC_SUFFIX_ENV;
-
-pub fn spec_suffix_selected(raw: Option<&str>) -> bool {
-    !matches!(raw.map(str::trim), Some("0"))
-}
+use std::sync::Once;
 
 pub const SUFFIX_LOSSLESSNESS_IS_CERTIFIED_ONLY_AT_MTP_CHAIN_DEPTH_3_BECAUSE_QWEN38_SUFSPEC_GATE_DIVERGES_ON_TILED_AND_FREEFORM_AT_K4: usize = 3;
 pub const NV_Q38_SPEC_SUFFIX_K2_UNCERTIFIED_ENV: &str = "NV_Q38_SPEC_SUFFIX_K2_UNCERTIFIED";
 pub const SUFFIX_K2_OVERRIDE_IS_OPT_IN_BECAUSE_K2_VERIFY_REASSOCIATES_AND_FAILED_THE_THREE_CLASS_WALK: usize = 2;
 
 pub fn spec_suffix_selected_with_uncertified_k2_opt_in(
-    raw: Option<&str>,
     k: usize,
     override_raw: Option<&str>,
 ) -> bool {
-    spec_suffix_selected_at_a_certified_chain_depth(raw, k)
-        || (spec_suffix_selected(raw)
-            && k == SUFFIX_K2_OVERRIDE_IS_OPT_IN_BECAUSE_K2_VERIFY_REASSOCIATES_AND_FAILED_THE_THREE_CLASS_WALK
+    spec_suffix_selected_at_a_certified_chain_depth(k)
+        || (k == SUFFIX_K2_OVERRIDE_IS_OPT_IN_BECAUSE_K2_VERIFY_REASSOCIATES_AND_FAILED_THE_THREE_CLASS_WALK
             && override_raw == Some("1"))
 }
 
-pub fn spec_suffix_selected_at_a_certified_chain_depth(raw: Option<&str>, k: usize) -> bool {
-    spec_suffix_selected(raw)
-        && k == SUFFIX_LOSSLESSNESS_IS_CERTIFIED_ONLY_AT_MTP_CHAIN_DEPTH_3_BECAUSE_QWEN38_SUFSPEC_GATE_DIVERGES_ON_TILED_AND_FREEFORM_AT_K4
+pub fn spec_suffix_selected_at_a_certified_chain_depth(k: usize) -> bool {
+    k == SUFFIX_LOSSLESSNESS_IS_CERTIFIED_ONLY_AT_MTP_CHAIN_DEPTH_3_BECAUSE_QWEN38_SUFSPEC_GATE_DIVERGES_ON_TILED_AND_FREEFORM_AT_K4
 }
 
 pub fn spec_suffix_selected_from_env() -> bool {
-    let raw = std::env::var(NV_Q38_SPEC_SUFFIX_ENV).ok();
     let k = crate::qwen38_mtp::mtp_chain_depth_from_env();
     let override_raw = std::env::var(NV_Q38_SPEC_SUFFIX_K2_UNCERTIFIED_ENV).ok();
-    let on =
-        spec_suffix_selected_with_uncertified_k2_opt_in(raw.as_deref(), k, override_raw.as_deref());
+    let on = spec_suffix_selected_with_uncertified_k2_opt_in(k, override_raw.as_deref());
     if on && k == SUFFIX_K2_OVERRIDE_IS_OPT_IN_BECAUSE_K2_VERIFY_REASSOCIATES_AND_FAILED_THE_THREE_CLASS_WALK {
-        static NOTED_K2: std::sync::Once = std::sync::Once::new();
+        static NOTED_K2: Once = Once::new();
         NOTED_K2.call_once(|| eprintln!("[qwen3.8-sufspec] explicit uncertified k2+suffix experiment; plain k2 failed its quality certificate and this combined route requires its own certificate"));
     }
-    if spec_suffix_selected(raw.as_deref()) && !on {
-        static NOTED: std::sync::Once = std::sync::Once::new();
+    if !on {
+        static NOTED: Once = Once::new();
         NOTED.call_once(|| {
             eprintln!(
-                "[qwen3.8-sufspec] {NV_Q38_SPEC_SUFFIX_ENV}=1 IGNORED at NV_MTP_K={k}: the \
-                 suffix hybrid's greedy-emitted-stream identity gate (qwen38_sufspec_gate) \
-                 passes only at chain depth {}, and diverges on the tiled and freeform classes \
-                 at k=4, so arming it here would change WHAT is emitted. Set NV_MTP_K={} to \
-                 take the certified suffix arm.",
+                "[qwen3.8-sufspec] suffix hybrid off at NV_MTP_K={k}: its greedy-emitted-stream \
+                 identity is certified only at chain depth {}, and diverges on the tiled and \
+                 freeform classes at k=4. Set NV_MTP_K={} to take the certified suffix arm.",
                 SUFFIX_LOSSLESSNESS_IS_CERTIFIED_ONLY_AT_MTP_CHAIN_DEPTH_3_BECAUSE_QWEN38_SUFSPEC_GATE_DIVERGES_ON_TILED_AND_FREEFORM_AT_K4,
                 SUFFIX_LOSSLESSNESS_IS_CERTIFIED_ONLY_AT_MTP_CHAIN_DEPTH_3_BECAUSE_QWEN38_SUFSPEC_GATE_DIVERGES_ON_TILED_AND_FREEFORM_AT_K4
             );
@@ -204,66 +189,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn env_is_opt_out_only_the_string_0_disarms() {
-        assert!(spec_suffix_selected(Some("1")));
-        assert!(spec_suffix_selected(None));
-        assert!(spec_suffix_selected(Some("true")));
-        assert!(!spec_suffix_selected(Some("0")));
-        assert!(!spec_suffix_selected(Some(" 0 ")));
-    }
-
-    #[test]
-    fn the_suffix_arm_refuses_any_chain_depth_its_identity_gate_did_not_certify() {
-        assert!(spec_suffix_selected_at_a_certified_chain_depth(
-            Some("1"),
-            3
-        ));
-        assert!(
-            spec_suffix_selected_at_a_certified_chain_depth(None, 3),
-            "the arm is default-ON at the certified depth since 2026-09-04"
-        );
+    fn the_suffix_arm_refuses_uncertified_depths_k2_needs_its_own_opt_in_and_a_round_must_out_draft_the_mtp_chain(
+    ) {
+        assert!(spec_suffix_selected_at_a_certified_chain_depth(3));
         for k in [1usize, 2, 4, 5, 6, 7] {
             assert!(
-                !spec_suffix_selected_at_a_certified_chain_depth(None, k),
-                "an uncertified chain depth must disarm the default-on suffix arm at k={k}"
-            );
-            assert!(
-                !spec_suffix_selected_at_a_certified_chain_depth(Some("1"), k),
-                "qwen38_sufspec_gate proves the greedy emitted stream bitwise identical only at \
-                 chain depth 3; at k={k} it diverges on tiled and freeform, so the arm must \
-                 decline rather than silently change what is emitted"
+                !spec_suffix_selected_at_a_certified_chain_depth(k),
+                "the greedy emitted stream is certified bitwise identical only at chain depth 3; \
+                 at k={k} it diverges on tiled and freeform, so the arm must decline rather than \
+                 silently change what is emitted"
             );
         }
-        assert!(!spec_suffix_selected_at_a_certified_chain_depth(
-            Some("0"),
-            3
-        ));
-    }
-
-    #[test]
-    fn uncertified_k2_requires_its_own_explicit_override_and_suffix_zero_still_wins() {
         for k in 1..=7 {
-            for raw in [None, Some("1"), Some("0"), Some(" 0 ")] {
-                for opt in [None, Some("0"), Some("1"), Some("true"), Some(" 1")] {
-                    assert_eq!(
-                        spec_suffix_selected_with_uncertified_k2_opt_in(raw, k, opt),
-                        spec_suffix_selected(raw) && (k == 3 || (k == 2 && opt == Some("1")))
-                    );
-                }
+            for opt in [None, Some("0"), Some("1"), Some("true"), Some(" 1")] {
+                assert_eq!(
+                    spec_suffix_selected_with_uncertified_k2_opt_in(k, opt),
+                    k == 3 || (k == 2 && opt == Some("1"))
+                );
             }
         }
         assert_eq!(suffix_min_draft_strictly_more_than_the_live_mtp_chain(2), 4);
-    }
-
-    #[test]
-    fn a_suffix_round_must_out_draft_the_live_mtp_chain() {
         assert_eq!(suffix_min_draft_strictly_more_than_the_live_mtp_chain(3), 4);
         assert_eq!(suffix_min_draft_strictly_more_than_the_live_mtp_chain(4), 5);
         assert_eq!(suffix_min_draft_strictly_more_than_the_live_mtp_chain(1), 4);
     }
 
     #[test]
-    fn repeated_block_proposes_and_short_headroom_declines() {
+    fn repeated_block_proposes_short_match_or_headroom_declines_and_override_max_7_proposes_seven()
+    {
         let mut arm = SuffixSpecArm::new();
         let block: Vec<u32> = (0..24).collect();
         arm.extend_capped(&block);
@@ -286,15 +239,26 @@ mod tests {
             "a round with only 3 draft rows of kv headroom is below the suffix minimum and \
              must fall back to the mtp chain"
         );
-    }
 
-    #[test]
-    fn short_match_stays_none_below_min_match() {
         let mut arm = SuffixSpecArm::new();
         arm.extend_capped(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 1, 2, 3]);
         assert!(
             arm.propose_for_round(64).is_none(),
             "a 3-token trailing match is under SUFFIX_MIN_MATCH and must not draft"
+        );
+
+        let mut arm = SuffixSpecArm::with_draft_max(7);
+        let block: Vec<u32> = (0..24).collect();
+        arm.extend_capped(&block);
+        arm.extend_capped(&[900, 901, 902, 903]);
+        arm.extend_capped(&block[..20]);
+        let p = arm
+            .propose_for_round(64)
+            .expect("a 20-token re-match must propose");
+        assert_eq!(p, vec![20, 21, 22, 23, 900, 901, 902]);
+        assert!(
+            arm.propose_for_round(3).is_none(),
+            "kv headroom below the suffix minimum still falls back to the mtp chain"
         );
     }
 
@@ -320,23 +284,8 @@ mod tests {
     }
 
     #[test]
-    fn precapture_shapes_cover_every_reachable_verify_m_at_the_shipped_and_override_maxima() {
-        assert_eq!(
-            verify_shapes_for_draft_max(
-                SUFFIX_DRAFT_MAX_7_LOSSLESS_AFTER_THE_M67HUNT_AND_ARMV_PLAN_FIXES_STREAMS_BITWISE_THE_CLAMP5_HASHES_ON_EVERY_CLASS_BOTH_TC_SETTINGS_PLUS_5PCT_AGENTIC
-            ),
-            vec![5, 6, 7, 8]
-        );
-        assert_eq!(
-            verify_shapes_for_draft_max(
-                SUFFIX_DRAFT_OVERRIDE_CEILING_7_BECAUSE_DEEP_RUNGS_ARE_PRICED_BUT_THE_TCTILE_ARM_STOPS_AT_8_THE_GDN_MROW_CAP_AT_16_AND_ONLY_THE_TCTILE_CERT_MAY_FLIP_IT
-            ),
-            vec![5, 6, 7, 8]
-        );
-    }
-
-    #[test]
-    fn draft_max_override_defaults_to_the_shipped_clamp_and_parses_the_band() {
+    fn draft_max_override_defaults_to_the_shipped_clamp_refuses_0_and_8_and_precapture_shapes_cover_every_verify_m(
+    ) {
         assert_eq!(
             suffix_draft_max(None),
             SUFFIX_DRAFT_MAX_7_LOSSLESS_AFTER_THE_M67HUNT_AND_ARMV_PLAN_FIXES_STREAMS_BITWISE_THE_CLAMP5_HASHES_ON_EVERY_CLASS_BOTH_TC_SETTINGS_PLUS_5PCT_AGENTIC
@@ -344,34 +293,29 @@ mod tests {
         assert_eq!(suffix_draft_max(Some(" 7 ")), 7);
         assert_eq!(suffix_draft_max(Some("1")), 1);
         assert_eq!(suffix_draft_max(Some("6")), 6);
-    }
-
-    #[test]
-    #[should_panic(expected = "refused")]
-    fn draft_max_8_is_refused_because_nothing_past_m8_verify_is_measured() {
-        suffix_draft_max(Some("8"));
-    }
-
-    #[test]
-    #[should_panic(expected = "refused")]
-    fn draft_max_0_is_refused() {
-        suffix_draft_max(Some("0"));
-    }
-
-    #[test]
-    fn override_max_7_proposes_seven_and_the_shape_ladder_stays_reachable() {
-        let mut arm = SuffixSpecArm::with_draft_max(7);
-        let block: Vec<u32> = (0..24).collect();
-        arm.extend_capped(&block);
-        arm.extend_capped(&[900, 901, 902, 903]);
-        arm.extend_capped(&block[..20]);
-        let p = arm
-            .propose_for_round(64)
-            .expect("a 20-token re-match must propose");
-        assert_eq!(p, vec![20, 21, 22, 23, 900, 901, 902]);
-        assert!(
-            arm.propose_for_round(3).is_none(),
-            "kv headroom below the suffix minimum still falls back to the mtp chain"
-        );
+        for raw in ["8", "0"] {
+            let refused = std::panic::catch_unwind(|| suffix_draft_max(Some(raw)))
+                .expect_err("nothing past m8 verify is measured and 0 drafts nothing");
+            let msg = refused
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| refused.downcast_ref::<&str>().map(|m| m.to_string()))
+                .unwrap_or_default();
+            assert!(msg.contains("refused"), "{raw}: {msg}");
+        }
+        {
+            assert_eq!(
+                verify_shapes_for_draft_max(
+                    SUFFIX_DRAFT_MAX_7_LOSSLESS_AFTER_THE_M67HUNT_AND_ARMV_PLAN_FIXES_STREAMS_BITWISE_THE_CLAMP5_HASHES_ON_EVERY_CLASS_BOTH_TC_SETTINGS_PLUS_5PCT_AGENTIC
+                ),
+                vec![5, 6, 7, 8]
+            );
+            assert_eq!(
+                verify_shapes_for_draft_max(
+                    SUFFIX_DRAFT_OVERRIDE_CEILING_7_BECAUSE_DEEP_RUNGS_ARE_PRICED_BUT_THE_TCTILE_ARM_STOPS_AT_8_THE_GDN_MROW_CAP_AT_16_AND_ONLY_THE_TCTILE_CERT_MAY_FLIP_IT
+                ),
+                vec![5, 6, 7, 8]
+            );
+        }
     }
 }

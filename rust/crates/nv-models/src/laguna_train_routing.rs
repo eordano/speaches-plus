@@ -1,5 +1,6 @@
 use anyhow::{ensure, Result};
 use candle_core::{DType, Tensor};
+#[cfg(feature = "cuda")]
 use std::sync::Arc;
 
 use crate::laguna::LagunaMoe;
@@ -8,6 +9,7 @@ pub const THE_EXPERT_LIST_IS_EMPTY_ONCE_THE_GROUPED_STACKS_OWN_THE_WEIGHTS: usiz
 
 pub enum RouteIds {
     Host(Vec<u32>),
+    #[cfg(feature = "cuda")]
     Device(Tensor),
 }
 
@@ -15,13 +17,10 @@ impl RouteIds {
     fn host(&self) -> Result<Vec<u32>> {
         Ok(match self {
             RouteIds::Host(v) => v.clone(),
+            #[cfg(feature = "cuda")]
             RouteIds::Device(t) => t.flatten_all()?.to_vec1::<u32>()?,
         })
     }
-}
-
-fn device_route_default_on_0_restores_the_host_topk() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_TRAIN_MOE_DEVICE_ROUTE")
 }
 
 fn selected_weights(moe: &LagunaMoe, x: &Tensor) -> Result<(RouteIds, Tensor)> {
@@ -66,7 +65,7 @@ fn selected_weights(moe: &LagunaMoe, x: &Tensor) -> Result<(RouteIds, Tensor)> {
     }
     let scores = candle_nn::ops::sigmoid(&logits)?;
     #[cfg(feature = "cuda")]
-    if matches!(x.device(), candle_core::Device::Cuda(_)) && device_route_default_on_0_restores_the_host_topk() {
+    if x.device().is_cuda() {
         let _ = nv_layers::moe_train::BLOCK8_ALIGNMENT_ON_THE_DEVICE_WHEN_THE_IDS_ARE_THERE_SO_THE_ROUTER_NEVER_DRAINS_THE_STREAM;
         let ids = nv_layers::moe_grouped::route_topk_ids_on_the_device_as_u32_tokens_by_k(
             &logits.detach(),
@@ -130,9 +129,6 @@ fn selected_weights(moe: &LagunaMoe, x: &Tensor) -> Result<(RouteIds, Tensor)> {
 
 pub const ONE_GATHER_PER_LAYER_BECAUSE_INDEX_ADD_PER_EXPERT_KEPT_A_FULL_TOKENS_X_HIDDEN_COPY_ON_THE_GRAPH_FOR_EVERY_TOUCHED_EXPERT_AND_A_SCATTER_WITH_REPEATED_ROWS_HAS_NO_DUPLICATE_CONTRACT: usize = 1;
 
-pub const NV_TRAIN_MOE_GROUPED_ENV_DEFAULT_ON_0_RESTORES_THE_PER_EXPERT_QUANT_LINEAR_PATH: &str =
-    "NV_TRAIN_MOE_GROUPED";
-
 #[cfg(feature = "cuda")]
 pub(crate) fn grouped_train_stacks(
     moe: &LagunaMoe,
@@ -142,11 +138,6 @@ pub(crate) fn grouped_train_stacks(
     let candle_core::Device::Cuda(dev) = device else {
         return None;
     };
-    if !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        NV_TRAIN_MOE_GROUPED_ENV_DEFAULT_ON_0_RESTORES_THE_PER_EXPERT_QUANT_LINEAR_PATH,
-    ) {
-        return None;
-    }
     let mut slot = moe.train_stacks.lock().ok()?;
     if let Some(s) = slot.as_ref() {
         return Some(s.clone());
@@ -184,7 +175,9 @@ pub(crate) fn forward(moe: &LagunaMoe, x_flat: &Tensor) -> Result<Tensor> {
         _ => None,
     };
     #[cfg(feature = "cuda")]
-    let router_span = span_stream.as_ref().and_then(|s| nv_layers::prof_events::span("fwd_moe_router_chain_with_host_topk", s));
+    let router_span = span_stream
+        .as_ref()
+        .and_then(|s| nv_layers::prof_events::span("fwd_moe_router_chain_with_host_topk", s));
     let (top_ids, top_weights) = selected_weights(moe, x_flat)?;
     #[cfg(feature = "cuda")]
     drop(router_span);
@@ -194,9 +187,14 @@ pub(crate) fn forward(moe: &LagunaMoe, x_flat: &Tensor) -> Result<Tensor> {
     if let Some(stacks) = grouped_train_stacks(moe, hidden, device) {
         let _ = nv_layers::moe_train::GROUPED_EXPERT_TRAINING_RUNS_FOUR_MARLIN_MOE_LAUNCHES_PER_LAYER_PER_DIRECTION_INSTEAD_OF_THREE_PER_TOUCHED_EXPERT;
         let op = match &top_ids {
-            RouteIds::Device(ids) => nv_layers::moe_train::MoeExpertsMarlinWeightedTrainOp::new_with_device_ids(
-                stacks, ids.clone(), tokens, moe.top_k,
-            ),
+            RouteIds::Device(ids) => {
+                nv_layers::moe_train::MoeExpertsMarlinWeightedTrainOp::new_with_device_ids(
+                    stacks,
+                    ids.clone(),
+                    tokens,
+                    moe.top_k,
+                )
+            }
             RouteIds::Host(ids) => nv_layers::moe_train::MoeExpertsMarlinWeightedTrainOp::new(
                 stacks, ids, tokens, moe.top_k,
             ),
@@ -206,13 +204,17 @@ pub(crate) fn forward(moe: &LagunaMoe, x_flat: &Tensor) -> Result<Tensor> {
             .to_dtype(DType::F32)?
             .reshape((tokens, moe.top_k))?
             .contiguous()?;
-        let weighted_span = span_stream.as_ref().and_then(|s| nv_layers::prof_events::span("fwd_moe_weighted_op_with_cast", s));
+        let weighted_span = span_stream
+            .as_ref()
+            .and_then(|s| nv_layers::prof_events::span("fwd_moe_weighted_op_with_cast", s));
         let mut acc = x_flat
             .to_dtype(DType::BF16)?
             .contiguous()?
             .apply_op2(&w, op)?;
         drop(weighted_span);
-        let shared_span = span_stream.as_ref().and_then(|s| nv_layers::prof_events::span("fwd_moe_shared_expert_and_combine", s));
+        let shared_span = span_stream
+            .as_ref()
+            .and_then(|s| nv_layers::prof_events::span("fwd_moe_shared_expert_and_combine", s));
         if moe.routed_scaling != 1.0 {
             acc = acc.affine(moe.routed_scaling as f64, 0.0)?;
         }
@@ -395,7 +397,14 @@ mod tests {
                 let values: Vec<f64> = X.iter().map(|&v| v as f64).collect();
                 let (expected, ids) = oracle(&values, norm, cap);
                 assert!((loss.to_scalar::<f32>().unwrap() as f64 - expected).abs() < 1e-5);
-                assert_eq!(selected_weights(&moe, x.as_tensor()).unwrap().0.host().unwrap(), ids);
+                assert_eq!(
+                    selected_weights(&moe, x.as_tensor())
+                        .unwrap()
+                        .0
+                        .host()
+                        .unwrap(),
+                    ids
+                );
                 assert_eq!(moe.route_host(&x.as_tensor().detach(), 3).unwrap().0, ids);
                 for i in 0..values.len() {
                     let mut plus = values.clone();
@@ -439,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_bias_only_ranks_experts_and_ties_choose_lower_ids() {
+    fn selection_bias_only_ranks_experts_zero_scores_do_not_divide_by_zero_and_malformed_routes_error() {
         let mut moe = fixture(false, 0.0);
         let x = Tensor::zeros((1, 2), DType::F32, &Device::Cpu).unwrap();
         moe.selection_bias = Tensor::zeros(3, DType::F32, &Device::Cpu).unwrap();
@@ -458,10 +467,7 @@ mod tests {
             w.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             [0.5, 0.5]
         );
-    }
 
-    #[test]
-    fn zero_selected_scores_do_not_divide_by_zero() {
         let mut moe = fixture(true, 0.0);
         moe.gate =
             Linear::new(Tensor::full(-1000f32, (3, 2), &Device::Cpu).unwrap(), None).unwrap();
@@ -490,10 +496,7 @@ mod tests {
             .unwrap()
             .iter()
             .all(|v| v.is_finite()));
-    }
 
-    #[test]
-    fn malformed_and_nonfinite_routes_return_errors() {
         let x = Tensor::zeros((1, 2), DType::F32, &Device::Cpu).unwrap();
         let mut moe = fixture(true, 0.0);
         moe.top_k = 0;

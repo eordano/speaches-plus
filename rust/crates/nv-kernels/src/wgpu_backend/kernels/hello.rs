@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result};
 
@@ -57,13 +55,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wgsl_declares_the_entry_point() {
-        assert!(WGSL.contains(ENTRY));
-    }
-
-    #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert_eq!(std::mem::size_of::<HelloParams>() % 16, 0);
+    fn hello_declares_its_entry_and_fills_the_index_ramp() {
+        {
+            assert!(WGSL.contains(ENTRY));
+        }
+        {
+            assert_eq!(std::mem::size_of::<HelloParams>() % 16, 0);
+        }
+        {
+            let Some(ctx) = wgpu_ctx("hello") else {
+                return;
+            };
+            for n in [1usize, 255, 256, 257, 1000] {
+                let mut out = vec![-1.0f32; n];
+                hello_launch(ctx, &mut out).unwrap();
+                for (i, v) in out.iter().enumerate() {
+                    assert_eq!(v.to_bits(), (i as f32).to_bits(), "n={n} idx={i}");
+                }
+            }
+            eprintln!("hello: index ramp exact for n in {{1,255,256,257,1000}}");
+        }
     }
 
     fn require() -> bool {
@@ -88,21 +99,6 @@ mod tests {
                 None
             }
         }
-    }
-
-    #[test]
-    fn hello_fills_the_index_ramp() {
-        let Some(ctx) = wgpu_ctx("hello") else {
-            return;
-        };
-        for n in [1usize, 255, 256, 257, 1000] {
-            let mut out = vec![-1.0f32; n];
-            hello_launch(ctx, &mut out).unwrap();
-            for (i, v) in out.iter().enumerate() {
-                assert_eq!(v.to_bits(), (i as f32).to_bits(), "n={n} idx={i}");
-            }
-        }
-        eprintln!("hello: index ramp exact for n in {{1,255,256,257,1000}}");
     }
 
     #[cfg(feature = "cuda")]
@@ -134,8 +130,7 @@ mod tests {
             };
             assert_eq!(rc, 0, "cuda hello_launch rc={rc} n={n}");
             stream.synchronize().unwrap();
-            #[allow(deprecated)]
-            let golden = stream.memcpy_dtov(&dout).unwrap();
+            let golden = stream.clone_dtoh(&dout).unwrap();
             let mut got = vec![f32::NAN; n];
             hello_launch(ctx, &mut got).unwrap();
             for (i, (a, b)) in golden.iter().zip(got.iter()).enumerate() {

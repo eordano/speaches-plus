@@ -1,5 +1,15 @@
-use anyhow::Result;
+use crate::{dispatch_pass, submit_passes};
+use anyhow::{anyhow, bail, ensure, Result};
+use bytemuck::{bytes_of, cast_slice};
+use nv_weights::WeightLoader;
+use pollster::block_on;
+use std::env;
+use std::sync::Arc;
+use wgpu::{BindGroup, Buffer, ComputePipeline, ErrorFilter};
 
+use crate::pod;
+use crate::wgpu_ledger::hazard_tracked_storage_ids;
+use crate::wgpu_ledger::{spliced_chunk, ChunkRowSplice};
 use nv_kernels::wgpu_backend::dispatch;
 use nv_kernels::wgpu_backend::kernels as wk;
 use nv_kernels::wgpu_backend::{compose, WgpuContext};
@@ -23,20 +33,18 @@ const GEMV_WGSL: &str = include_str!("../../nv-kernels/wgsl/gow_gemv.wgsl");
 
 const MX_WGSL: &str = include_str!("../../nv-kernels/wgsl/gow_mx.wgsl");
 
-const MX_XV4_WGSL: &str = include_str!("../../nv-kernels/wgsl/gow_mx_xv4.wgsl");
+const MX_XV4_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/gow_mx_xv4.wgsl");
 
 const MX_SG_SECTION_SPLIT: &str = "const GOW_MX_SECTION_SG";
 pub const MX_SCALAR_ENTRY: &str = "gow_gemv_mx";
-pub const MX_SG_ENTRY: &str = "gow_gemv_mx_sg";
 const MX_SCALAR_ROWS_PER_WG: u32 = 2;
-const MX_SG_ROWS_PER_WG_AT_SG32_OVER_WG256: u32 = 8;
 
 pub const MX_SG_GATE_ENV: &str = "NV_GPTOSS_WGPU_MX_SG_REORDERED_SUM";
 
 pub const GOW_ARM_STACK_IS_THE_DEFAULT_FLASH_SLIDING_FUSED_GEMV_SG_AND_MX_SG_TOGETHER_CUT_KV8_DECODE_7P9_TO_6P5_MS_AT_256_AND_8P3_TO_7P0_AT_8K_PPL_65P7_IN_THE_58_TO_92_BAND_AND_ZERO_RESTORES_EACH_SERIAL_ARM: bool = true;
 
 fn arm_env_enabled_with_the_stack_default(env: &str) -> bool {
-    match std::env::var(env) {
+    match env::var(env) {
         Ok(v) => !matches!(v.trim(), "0" | "off" | "false"),
         Err(_) => GOW_ARM_STACK_IS_THE_DEFAULT_FLASH_SLIDING_FUSED_GEMV_SG_AND_MX_SG_TOGETHER_CUT_KV8_DECODE_7P9_TO_6P5_MS_AT_256_AND_8P3_TO_7P0_AT_8K_PPL_65P7_IN_THE_58_TO_92_BAND_AND_ZERO_RESTORES_EACH_SERIAL_ARM,
     }
@@ -46,31 +54,13 @@ pub fn mx_sg_reordered_sum_enabled() -> bool {
     arm_env_enabled_with_the_stack_default(MX_SG_GATE_ENV)
 }
 
-pub const MX_SG_BYTE_LUT_ENV: &str = "NV_GOW_MX_SG_BYTE_LUT";
-
-pub const MX_SG_LUT_ENTRY: &str = "gow_gemv_mx_sg_lut";
-
-pub const MX_SG_XV4_ENV: &str = "NV_GOW_MX_SG_XV4";
-
 pub const MX_SG_XV4_ENTRY: &str = "gow_gemv_mx_sg_xv4";
 
 pub const MX_SG_XV4_R2_ENV: &str = "NV_GOW_MX_SG_XV4_R2";
 
-pub const MX_SG_XV4_R2_ENTRY: &str = "gow_gemv_mx_sg_xv4_r2";
-
-pub const MX_SG_XV4_LUT_ENTRY: &str = "gow_gemv_mx_sg_xv4_lut";
-
 pub const MX_SG_XV4_R2_LUT_ENTRY: &str = "gow_gemv_mx_sg_xv4_r2_lut";
 
-pub const MX_SG_XSTAGE_ENV: &str = "NV_GOW_MX_SG_XSTAGE";
-
-pub const MX_SG_XV4_LUT_XS_ENTRY: &str = "gow_gemv_mx_sg_xv4_lut_xs";
-
-pub const MX_SG_GUPAIR_ENV: &str = "NV_GOW_MX_SG_GUPAIR";
-
 pub const MX_SG_XV4_R2_LUT_XS_ENTRY: &str = "gow_gemv_mx_sg_xv4_r2_lut_xs";
-
-pub const MX_SG_GUSW_ENV: &str = "NV_GOW_MX_SG_GUSW";
 
 pub const MX_SG_XV4_R4_LUT_XS_SWIGLU_ENTRY: &str = "gow_gemv_mx_sg_xv4_r4_lut_xs_swiglu";
 
@@ -79,8 +69,6 @@ const MX_SG_R4SW_ROWS_PER_WG: u32 = 32;
 const MX_XS_K_BLOCK_CAP_MATCHES_THE_512_VEC4_SHARED_ARRAY: usize = 128;
 
 const MX_SG_XV4_R2_ROWS_PER_WG: u32 = 16;
-
-pub const MOE_TOPK_SG32_ENV: &str = "NV_GOW_MOE_TOPK_SG32";
 
 pub const MOE_TOPK_SG32_ENTRY: &str = "gow_router_topk_sg32";
 
@@ -92,8 +80,6 @@ pub const MOE_TOPK_FUSED_PAR_ENTRY: &str = "gow_fu_router_topk_par";
 
 const FU_ROUTER_TOPK_PAR_STAGES_X_IN_THE_512_VEC4_SHARED_ARRAY: usize = 512;
 
-pub const MOE_DNCOMB_FUSE_ENV: &str = "NV_GOW_MOE_DNCOMB_FUSE";
-
 pub const NULL_DISPATCH_ENV: &str = "NV_GOW_NULLDISP";
 
 pub const NULL_DISPATCH_ENTRY: &str =
@@ -101,7 +87,7 @@ pub const NULL_DISPATCH_ENTRY: &str =
 
 pub fn null_dispatch_repeat_prices_a_dependent_dispatch_inside_this_graph_instead_of_a_microbench(
 ) -> usize {
-    std::env::var(NULL_DISPATCH_ENV)
+    env::var(NULL_DISPATCH_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(0)
@@ -117,60 +103,14 @@ pub const MOE_DNCOMB_WG64_ENV: &str = "NV_GOW_MOE_DNCOMB_WG64";
 
 pub const MX_SG_XV4_R2_LUT_DNCOMB_SGSLOT_ENTRY: &str = "gow_gemv_mx_sg_xv4_r2_lut_dncomb_sgslot";
 
-pub const MOE_DNCOMB_SGSLOT_ENV: &str = "NV_GOW_MOE_DNCOMB_SGSLOT";
-
 const DNCOMB_SGSLOT_KEEPS_EVERY_ROW_SLOT_PAIR_ON_ITS_OWN_SUBGROUP_SO_THE_RESIDENT_THREAD_COUNT_AND_MEMORY_LEVEL_PARALLELISM_MATCH_THE_SPLIT_PASS: usize = 4;
 
-fn arm_env_opt_out_default_on_unless_eq_0(env: &str) -> bool {
-    !std::env::var(env).is_ok_and(|v| v.trim() == "0")
-}
-
 fn arm_env_opt_in_default_off(env: &str) -> bool {
-    std::env::var(env).is_ok_and(|v| v.trim() == "1")
-}
-
-pub const GOW_MOE_FUSE_STACK_XV4_LUT_XSTAGE_GUPAIR_GUSW_DNCOMB_SGSLOT_SHIPS_ON_ROWS_GPTOSS_FUSE_GATED_LADDER_175P7_166P8_107P6_TOK_S_AT_256_8K_122K_CAMPAIGN_PLUS_19P9_35P6_58P2_PCT_AND_ZERO_RESTORES_EACH_ARM: bool = true;
-
-fn arm_env_enabled_with_the_moe_fuse_stack_default(env: &str) -> bool {
-    match std::env::var(env) {
-        Ok(v) => !matches!(v.trim(), "0" | "off" | "false"),
-        Err(_) => GOW_MOE_FUSE_STACK_XV4_LUT_XSTAGE_GUPAIR_GUSW_DNCOMB_SGSLOT_SHIPS_ON_ROWS_GPTOSS_FUSE_GATED_LADDER_175P7_166P8_107P6_TOK_S_AT_256_8K_122K_CAMPAIGN_PLUS_19P9_35P6_58P2_PCT_AND_ZERO_RESTORES_EACH_ARM,
-    }
-}
-
-pub fn mx_sg_byte_lut_enabled() -> bool {
-    arm_env_enabled_with_the_moe_fuse_stack_default(MX_SG_BYTE_LUT_ENV)
-}
-
-pub fn mx_sg_xv4_enabled() -> bool {
-    arm_env_enabled_with_the_moe_fuse_stack_default(MX_SG_XV4_ENV)
+    env::var(env).is_ok_and(|v| v.trim() == "1")
 }
 
 pub fn mx_sg_xv4_r2_enabled() -> bool {
     arm_env_opt_in_default_off(MX_SG_XV4_R2_ENV)
-}
-
-pub const GOW_MOE_TOPK_SG32_SHIPS_ON_SIGNED_OFF_2026_09_04_ROWS_GPTOSS_TOPKFUSED_218P7_202P3_117P9_VS_206P7_191P2_116P5_TOK_S_AT_256_8K_122K_PLUS_5P8_5P8_1P2_PCT_16X_THE_0P35_NULL_FLOOR_BITWISE_IN_BIT_ARMS_AND_ZERO_RESTORES_THE_SPLIT_TOPK: bool = true;
-
-pub fn moe_topk_sg32_enabled() -> bool {
-    match std::env::var(MOE_TOPK_SG32_ENV) {
-        Ok(v) => !matches!(v.trim(), "0" | "off" | "false"),
-        Err(_) => GOW_MOE_TOPK_SG32_SHIPS_ON_SIGNED_OFF_2026_09_04_ROWS_GPTOSS_TOPKFUSED_218P7_202P3_117P9_VS_206P7_191P2_116P5_TOK_S_AT_256_8K_122K_PLUS_5P8_5P8_1P2_PCT_16X_THE_0P35_NULL_FLOOR_BITWISE_IN_BIT_ARMS_AND_ZERO_RESTORES_THE_SPLIT_TOPK,
-    }
-}
-
-pub fn mx_sg_xstage_enabled() -> bool {
-    arm_env_enabled_with_the_moe_fuse_stack_default(MX_SG_XSTAGE_ENV)
-}
-
-pub fn mx_sg_gupair_enabled_two_adjacent_rows_share_one_staged_x_so_the_interleaved_gate_up_pair_rides_one_x_pass(
-) -> bool {
-    arm_env_enabled_with_the_moe_fuse_stack_default(MX_SG_GUPAIR_ENV)
-}
-
-pub fn mx_sg_gusw_enabled_one_subgroup_owns_two_gate_up_pairs_and_writes_the_swiglu_act_word_directly_skipping_the_swiglu_pass(
-) -> bool {
-    arm_env_enabled_with_the_moe_fuse_stack_default(MX_SG_GUSW_ENV)
 }
 
 pub const MX_KPRE_ENV: &str = "NV_GOW_MX_KPRE";
@@ -246,13 +186,21 @@ fn mx_kpre_r2_xs_source_issuing_both_rows_streams_before_the_fma_chains(blocks: 
         let guard = r == 1;
         if guard {
             for j in 0..n_full {
-                writeln!(b, "        var wv{r}_{j}: vec4<u32>;").unwrap();
-                writeln!(b, "        var sw{r}_{j}: u32;").unwrap();
+                writeln!(
+                    b,
+                    "        var wv{r}_{j}: vec4<u32>;
+        var sw{r}_{j}: u32;"
+                )
+                .unwrap();
             }
         }
         if rem > 0 {
-            writeln!(b, "        var wv{r}_r: vec4<u32>;").unwrap();
-            writeln!(b, "        var sw{r}_r: u32;").unwrap();
+            writeln!(
+                b,
+                "        var wv{r}_r: vec4<u32>;
+        var sw{r}_r: u32;"
+            )
+            .unwrap();
         }
         let (open, pad) = if guard {
             ("        if (live1) {\n".to_owned(), "            ")
@@ -403,9 +351,13 @@ fn mx_kpre_r4sw_source_issuing_all_four_rows_streams_before_the_fma_chains(
             .unwrap();
         }
         if rem > 0 {
-            writeln!(b, "        var wv{r}_r: vec4<u32>;").unwrap();
-            writeln!(b, "        var sw{r}_r: u32;").unwrap();
-            writeln!(b, "        if (lane < {rem}u) {{").unwrap();
+            writeln!(
+                b,
+                "        var wv{r}_r: vec4<u32>;
+        var sw{r}_r: u32;
+        if (lane < {rem}u) {{"
+            )
+            .unwrap();
             writeln!(
                 b,
                 "            wv{r}_r = gow_mx_w[ebase_w + wrow + {}u + (lane + {}u)];",
@@ -487,29 +439,9 @@ pub fn gemv_sg_xstage_enabled() -> bool {
     arm_env_opt_in_default_off(GEMV_SG_XSTAGE_ENV)
 }
 
-pub const QKV_FUSE_KV8_ENV: &str = "NV_GOW_QKV_FUSE_KV8";
-
 pub const QKV_FUSE_KV8_ROWS_ENTRY: &str = "gow_fu_rope_kvrows";
 
-pub fn qkv_fuse_kv8_enabled_one_fused_qkv_gemv_plus_one_rope_row_writer_replaces_the_kv8_layers_six_dispatch_split_chain(
-) -> bool {
-    arm_env_opt_out_default_on_unless_eq_0(QKV_FUSE_KV8_ENV)
-}
-
-pub const LMHEAD_I8_ENV: &str = "NV_GOW_LMHEAD_I8";
-
 pub const LMHEAD_I8_ENTRY: &str = "gow_lmhead_i8_sg";
-
-pub const LMHEAD_I8_SHIPS_ON_SIGNED_OFF_2026_09_02_CLAIMING_THE_DEPTH_GAIN_ONLY_ROWS_GPTOSS_LMHEAD_I8_GATED_156P6_TO_166P1_TOK_S_AT_8192_OVER_A_DEAD_FLAT_NULL_THE_256_CELL_IS_SUB_FLOOR_UNRESOLVED_AND_ZERO_RESTORES_THE_BF16_HEAD: bool =
-    true;
-
-pub fn lmhead_i8_enabled_rowwise_int8_head_halves_vocab_gemv_bytes_and_is_ppl_gated_not_bitwise(
-) -> bool {
-    match std::env::var(LMHEAD_I8_ENV) {
-        Ok(v) => !matches!(v.trim(), "0" | "off" | "false"),
-        Err(_) => LMHEAD_I8_SHIPS_ON_SIGNED_OFF_2026_09_02_CLAIMING_THE_DEPTH_GAIN_ONLY_ROWS_GPTOSS_LMHEAD_I8_GATED_156P6_TO_166P1_TOK_S_AT_8192_OVER_A_DEAD_FLAT_NULL_THE_256_CELL_IS_SUB_FLOOR_UNRESOLVED_AND_ZERO_RESTORES_THE_BF16_HEAD,
-    }
-}
 
 pub const GEMV_SG_R2_ENV: &str = "NV_GOW_GEMV_SG_R2";
 
@@ -569,9 +501,13 @@ fn gemv_sg_kpre_source_issuing_every_weight_load_before_the_fma_chain(k_v4: usiz
         "fn gsg_row_acc_kpre{k_v4}(row: u32, live: bool, lane: u32) -> f32 {{"
     )
     .unwrap();
-    b.push_str("    var acc = 0.0;\n    if (live) {\n");
-    b.push_str("        let wbase = row * gsg_p.w_row_v4;\n");
-    b.push_str("        let xo = gsg_p.x_off_v4;\n");
+    b.push_str(
+        "    var acc = 0.0;
+    if (live) {
+        let wbase = row * gsg_p.w_row_v4;
+        let xo = gsg_p.x_off_v4;
+",
+    );
     for j in 0..n_full {
         writeln!(
             b,
@@ -637,11 +573,6 @@ pub fn moe_router_topk_fuse_enabled() -> bool {
 pub fn moe_topk_fused_par_enabled_all_router_rows_ride_one_workgroup_as_8lane_clusters_reproducing_the_lane32_chains_and_butterfly_tree_so_the_row_serialization_that_banked_gow_fu_router_topk_negative_is_gone(
 ) -> bool {
     arm_env_opt_in_default_off(MOE_TOPK_FUSED_PAR_ENV)
-}
-
-pub fn moe_dncomb_fuse_enabled_the_down_gemv_keeps_each_expert_row_in_a_register_and_folds_the_same_ascending_fma_chain_gow_moe_combine_would_have_run(
-) -> bool {
-    arm_env_enabled_with_the_moe_fuse_stack_default(MOE_DNCOMB_FUSE_ENV)
 }
 
 pub const RMSRES_SGLAT_ENV: &str = "NV_GOW_RMSRES_SGLAT";
@@ -1397,7 +1328,7 @@ fn gow_fu_router_topk_par(
 }
 "#;
 
-const FLASH_WGSL: &str = include_str!("../../nv-kernels/wgsl/gow_flash_decode.wgsl");
+const FLASH_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/gow_flash_decode.wgsl");
 
 pub const FLASH_DECODE_ENV: &str = "NV_GPTOSS_WGPU_FLASH_DECODE";
 
@@ -1417,14 +1348,8 @@ pub fn flash_decode_enabled() -> bool {
     arm_env_enabled_with_the_stack_default(FLASH_DECODE_ENV)
 }
 
-pub const FLASH_SLIDING_ENV: &str = "NV_GPTOSS_WGPU_FLASH_SLIDING";
-
-pub fn flash_sliding_enabled() -> bool {
-    arm_env_enabled_with_the_stack_default(FLASH_SLIDING_ENV)
-}
-
 pub fn flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build() -> u32 {
-    match std::env::var("NV_GPTOSS_WGPU_FLASH_SPLITS") {
+    match env::var("NV_GPTOSS_WGPU_FLASH_SPLITS") {
         Ok(v) => {
             let n: u32 = v.trim().parse().unwrap_or_else(|_| {
                 panic!("NV_GPTOSS_WGPU_FLASH_SPLITS={v}: expected an integer split count")
@@ -1464,7 +1389,7 @@ pub fn flash_depthgate_enabled_shallow_tuned_splits_starve_the_grid_at_depth() -
 }
 
 fn flash_depthgate_forced_deep_splits_env_overrides_every_band_above_the_knee() -> Option<u32> {
-    let v = std::env::var(FLASH_DEPTHGATE_SPLITS_ENV).ok()?;
+    let v = env::var(FLASH_DEPTHGATE_SPLITS_ENV).ok()?;
     let n: u32 = v.trim().parse().unwrap_or_else(|_| {
         panic!("{FLASH_DEPTHGATE_SPLITS_ENV}={v}: expected an integer split count")
     });
@@ -1529,7 +1454,7 @@ pub fn flash_kpre_banked_negative_preloading_four_rounds_costs_more_warp_residen
 }
 
 pub fn flash_kpre_unroll() -> u32 {
-    let n = match std::env::var(FLASH_KPRE_UNROLL_ENV) {
+    let n = match env::var(FLASH_KPRE_UNROLL_ENV) {
         Ok(v) => v
             .trim()
             .parse()
@@ -1594,16 +1519,20 @@ pub fn flash_kpre_stage1_source_sd(hd: u32, fold: u32, unroll: u32, block: bool)
          vec3<u32>) {{"
     )
     .unwrap();
-    writeln!(b, "    let h0 = wg.x * {fold}u;").unwrap();
-    writeln!(b, "    let split = wg.y;").unwrap();
-    writeln!(b, "    if (h0 >= fd_params.n_heads) {{ return; }}").unwrap();
-    writeln!(b, "    let hd = fd_params.head_dim;").unwrap();
-    writeln!(b, "    let nkv = fd_params.n_kv;").unwrap();
-    writeln!(b, "    let group = fd_params.n_heads / nkv;").unwrap();
-    writeln!(b, "    let kvh = h0 / group;").unwrap();
-    writeln!(b, "    let lid = tid.x;").unwrap();
-    writeln!(b, "    let lane = lid & 31u;").unwrap();
-    writeln!(b, "    let warp = lid >> 5u;").unwrap();
+    writeln!(
+        b,
+        "    let h0 = wg.x * {fold}u;
+    let split = wg.y;
+    if (h0 >= fd_params.n_heads) {{ return; }}
+    let hd = fd_params.head_dim;
+    let nkv = fd_params.n_kv;
+    let group = fd_params.n_heads / nkv;
+    let kvh = h0 / group;
+    let lid = tid.x;
+    let lane = lid & 31u;
+    let warp = lid >> 5u;"
+    )
+    .unwrap();
     writeln!(
         b,
         "    for (var d = lid; d < hd * {fold}u; d = d + FD_BLOCK) {{ {p}_qsh[d] = fd_q[h0 * hd + \
@@ -1612,58 +1541,66 @@ pub fn flash_kpre_stage1_source_sd(hd: u32, fold: u32, unroll: u32, block: bool)
     .unwrap();
     writeln!(b, "    workgroupBarrier();").unwrap();
     for j in 0..fold {
-        writeln!(b, "    var m{j} = fd_neg_inf();").unwrap();
-        writeln!(b, "    var l{j} = 0.0;").unwrap();
+        writeln!(
+            b,
+            "    var m{j} = fd_neg_inf();
+    var l{j} = 0.0;"
+        )
+        .unwrap();
         for i in 0..accs {
             writeln!(b, "    var a{j}_{i} = 0.0;").unwrap();
         }
     }
     if block {
-        writeln!(b, "    let span = fd_params.total - fd_params.start;").unwrap();
         writeln!(
             b,
-            "    let per = (span + fd_params.splits - 1u) / fd_params.splits;"
+            "    let span = fd_params.total - fd_params.start;
+    let per = (span + fd_params.splits - 1u) / fd_params.splits;
+    let base = fd_params.start + split * per;
+    let total = min(base + per, fd_params.total);
+    let stride = FD_WARPS;"
         )
         .unwrap();
-        writeln!(b, "    let base = fd_params.start + split * per;").unwrap();
-        writeln!(b, "    let total = min(base + per, fd_params.total);").unwrap();
-        writeln!(b, "    let stride = FD_WARPS;").unwrap();
     } else {
-        writeln!(b, "    let total = fd_params.total;").unwrap();
-        writeln!(b, "    let base = fd_params.start + split * FD_WARPS;").unwrap();
-        writeln!(b, "    let stride = fd_params.splits * FD_WARPS;").unwrap();
+        writeln!(
+            b,
+            "    let total = fd_params.total;
+    let base = fd_params.start + split * FD_WARPS;
+    let stride = fd_params.splits * FD_WARPS;"
+        )
+        .unwrap();
     }
-    writeln!(b, "    var rounds = 0u;").unwrap();
     writeln!(
         b,
-        "    if (total > base) {{ rounds = (total - base + stride - 1u) / stride; }}"
+        "    var rounds = 0u;
+    if (total > base) {{ rounds = (total - base + stride - 1u) / stride; }}
+    let n4 = hd >> 2u;
+    let kpre_blocks = rounds / {unroll}u;"
     )
     .unwrap();
-    writeln!(b, "    let n4 = hd >> 2u;").unwrap();
-    writeln!(b, "    let kpre_blocks = rounds / {unroll}u;").unwrap();
 
     let preload = |b: &mut String, t: u32, r_expr: &str| {
-        writeln!(b, "        let p{t} = base + warp + ({r_expr}) * stride;").unwrap();
-        writeln!(b, "        let live{t} = p{t} < total;").unwrap();
-        writeln!(b, "        var sp{t} = p{t};").unwrap();
         writeln!(
             b,
-            "        if (fd_params.ring > 0u) {{ sp{t} = p{t} % fd_params.ring; }}"
+            "        let p{t} = base + warp + ({r_expr}) * stride;
+        let live{t} = p{t} < total;
+        var sp{t} = p{t};
+        if (fd_params.ring > 0u) {{ sp{t} = p{t} % fd_params.ring; }}
+        let kb{t} = (sp{t} * nkv + kvh) * hd;
+        var kw{t} = 0u;
+        var ks{t} = 0.0;
+        var vs{t} = 0.0;"
         )
         .unwrap();
-        writeln!(b, "        let kb{t} = (sp{t} * nkv + kvh) * hd;").unwrap();
-        writeln!(b, "        var kw{t} = 0u;").unwrap();
-        writeln!(b, "        var ks{t} = 0.0;").unwrap();
-        writeln!(b, "        var vs{t} = 0.0;").unwrap();
         for i in 0..accs {
             writeln!(b, "        var vw{t}_{i} = 0u;").unwrap();
         }
-        writeln!(b, "        if (live{t}) {{").unwrap();
-        writeln!(b, "            ks{t} = fd_k_scales[sp{t} * nkv + kvh]{sd};").unwrap();
-        writeln!(b, "            vs{t} = fd_v_scales[sp{t} * nkv + kvh]{sd};").unwrap();
         writeln!(
             b,
-            "            if (lane < n4) {{ kw{t} = fd_k_words[(kb{t} >> 2u) + lane]; }}"
+            "        if (live{t}) {{
+            ks{t} = fd_k_scales[sp{t} * nkv + kvh]{sd};
+            vs{t} = fd_v_scales[sp{t} * nkv + kvh]{sd};
+            if (lane < n4) {{ kw{t} = fd_k_words[(kb{t} >> 2u) + lane]; }}"
         )
         .unwrap();
         for i in 0..accs {
@@ -1691,14 +1628,18 @@ pub fn flash_kpre_stage1_source_sd(hd: u32, fold: u32, unroll: u32, block: bool)
         }
         writeln!(b, "            let qb{t} = lane << 2u;").unwrap();
         for j in 0..fold {
-            writeln!(b, "            {{").unwrap();
-            writeln!(b, "                let qo = {j}u * hd + qb{t};").unwrap();
-            writeln!(b, "                var s = {p}_qsh[qo + 1u] * e{t}_1;").unwrap();
-            writeln!(b, "                s = fma({p}_qsh[qo], e{t}_0, s);").unwrap();
-            writeln!(b, "                s = fma({p}_qsh[qo + 2u], e{t}_2, s);").unwrap();
-            writeln!(b, "                s = fma({p}_qsh[qo + 3u], e{t}_3, s);").unwrap();
-            writeln!(b, "                pt{t}_{j} = pt{t}_{j} + s;").unwrap();
-            writeln!(b, "            }}").unwrap();
+            writeln!(
+                b,
+                "            {{
+                let qo = {j}u * hd + qb{t};
+                var s = {p}_qsh[qo + 1u] * e{t}_1;
+                s = fma({p}_qsh[qo], e{t}_0, s);
+                s = fma({p}_qsh[qo + 2u], e{t}_2, s);
+                s = fma({p}_qsh[qo + 3u], e{t}_3, s);
+                pt{t}_{j} = pt{t}_{j} + s;
+            }}"
+            )
+            .unwrap();
         }
         writeln!(b, "        }}").unwrap();
     };
@@ -1716,19 +1657,23 @@ pub fn flash_kpre_stage1_source_sd(hd: u32, fold: u32, unroll: u32, block: bool)
     let update = |b: &mut String, t: u32| {
         writeln!(b, "        if (live{t}) {{").unwrap();
         for j in 0..fold {
-            writeln!(b, "            let mn{j} = max(m{j}, sc{t}_{j});").unwrap();
-            writeln!(b, "            let cr{j} = fd_exp(m{j} - mn{j});").unwrap();
-            writeln!(b, "            let wt{j} = fd_exp(sc{t}_{j} - mn{j});").unwrap();
-            writeln!(b, "            l{j} = fma(l{j}, cr{j}, wt{j});").unwrap();
-            writeln!(b, "            let wv{j} = wt{j} * vs{t};").unwrap();
-        }
-        for i in 0..accs {
-            writeln!(b, "            {{").unwrap();
-            writeln!(b, "                let d = lane + {i}u * FD_LANES;").unwrap();
-            writeln!(b, "                if (d < hd) {{").unwrap();
             writeln!(
                 b,
-                "                    let vx = e4m3_shift_decode_scale_must_carry_2pow120(byte_at(vw{t}_{i}, d));"
+                "            let mn{j} = max(m{j}, sc{t}_{j});
+            let cr{j} = fd_exp(m{j} - mn{j});
+            let wt{j} = fd_exp(sc{t}_{j} - mn{j});
+            l{j} = fma(l{j}, cr{j}, wt{j});
+            let wv{j} = wt{j} * vs{t};"
+            )
+            .unwrap();
+        }
+        for i in 0..accs {
+            writeln!(
+                b,
+                "            {{
+                let d = lane + {i}u * FD_LANES;
+                if (d < hd) {{
+                    let vx = e4m3_shift_decode_scale_must_carry_2pow120(byte_at(vw{t}_{i}, d));"
             )
             .unwrap();
             for j in 0..fold {
@@ -1738,8 +1683,12 @@ pub fn flash_kpre_stage1_source_sd(hd: u32, fold: u32, unroll: u32, block: bool)
                 )
                 .unwrap();
             }
-            writeln!(b, "                }}").unwrap();
-            writeln!(b, "            }}").unwrap();
+            writeln!(
+                b,
+                "                }}
+            }}"
+            )
+            .unwrap();
         }
         for j in 0..fold {
             writeln!(b, "            m{j} = mn{j};").unwrap();
@@ -1764,10 +1713,10 @@ pub fn flash_kpre_stage1_source_sd(hd: u32, fold: u32, unroll: u32, block: bool)
     for t in 0..unroll {
         update(&mut b, t);
     }
-    writeln!(b, "    }}").unwrap();
     writeln!(
         b,
-        "    for (var rr = kpre_blocks * {unroll}u; rr < rounds; rr = rr + 1u) {{"
+        "    }}
+    for (var rr = kpre_blocks * {unroll}u; rr < rounds; rr = rr + 1u) {{"
     )
     .unwrap();
     preload(&mut b, unroll, "rr");
@@ -1778,14 +1727,14 @@ pub fn flash_kpre_stage1_source_sd(hd: u32, fold: u32, unroll: u32, block: bool)
     for j in 0..fold {
         writeln!(b, "    workgroupBarrier();").unwrap();
         for i in 0..accs {
-            writeln!(b, "    {{").unwrap();
-            writeln!(b, "        let d = lane + {i}u * FD_LANES;").unwrap();
             writeln!(
                 b,
-                "        if (d < hd) {{ {p}_sacc[warp * {hd}u + d] = a{j}_{i}; }}"
+                "    {{
+        let d = lane + {i}u * FD_LANES;
+        if (d < hd) {{ {p}_sacc[warp * {hd}u + d] = a{j}_{i}; }}
+    }}"
             )
             .unwrap();
-            writeln!(b, "    }}").unwrap();
         }
         writeln!(
             b,
@@ -1819,40 +1768,30 @@ pub const FLASH_LANEPOS_MIN_TOTAL_ENV: &str = "NV_GOW_FLASH_LANEPOS_MIN_TOTAL";
 pub const LANEPOS_ENGAGES_AT_THE_MEASURED_8192_CROSSOVER_FDF_WINS_SHALLOW_LANEPOS_FROM_16K: u32 =
     8192;
 
-pub const LANEPOS_GATED_ROUTE_SHIPS_ON_ROWS_GPTOSS_FUSE_GATED_LADDER_175P7_166P8_107P6_TOK_S_AT_256_8K_122K_SHALLOW_ARGMAX_AB_FAILS_BELOW_THE_KNEE_SO_THE_GATE_NEVER_EXPOSES_IT_AND_ZERO_RESTORES_FDF_ONLY: bool =
-    true;
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FlashLaneposMode {
-    Off,
     Always,
     Gate(u32),
 }
 
-pub fn flash_lanepos_mode_unset_gates_at_the_measured_knee_1_always_0_restores_fdf_only(
+pub fn flash_lanepos_mode_gates_at_the_measured_knee_unless_1_forces_it_always(
 ) -> FlashLaneposMode {
-    let gate_at_the_measured_knee = || {
-        let knee = std::env::var(FLASH_LANEPOS_MIN_TOTAL_ENV)
+    if env::var(FLASH_LANEPOS_ENV).ok().as_deref() == Some("1") {
+        return FlashLaneposMode::Always;
+    }
+    FlashLaneposMode::Gate(
+        env::var(FLASH_LANEPOS_MIN_TOTAL_ENV)
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(
                 LANEPOS_ENGAGES_AT_THE_MEASURED_8192_CROSSOVER_FDF_WINS_SHALLOW_LANEPOS_FROM_16K,
-            );
-        FlashLaneposMode::Gate(knee)
-    };
-    match std::env::var(FLASH_LANEPOS_ENV).ok().as_deref() {
-        Some("1") => FlashLaneposMode::Always,
-        Some("gate") => gate_at_the_measured_knee(),
-        None if LANEPOS_GATED_ROUTE_SHIPS_ON_ROWS_GPTOSS_FUSE_GATED_LADDER_175P7_166P8_107P6_TOK_S_AT_256_8K_122K_SHALLOW_ARGMAX_AB_FAILS_BELOW_THE_KNEE_SO_THE_GATE_NEVER_EXPOSES_IT_AND_ZERO_RESTORES_FDF_ONLY => {
-            gate_at_the_measured_knee()
-        }
-        _ => FlashLaneposMode::Off,
-    }
+            ),
+    )
 }
 
 pub fn flash_lanepos_one_lane_owns_one_positions_whole_dot_so_no_per_position_reduce_exists() -> bool
 {
-    flash_lanepos_mode_unset_gates_at_the_measured_knee_1_always_0_restores_fdf_only()
+    flash_lanepos_mode_gates_at_the_measured_knee_unless_1_forces_it_always()
         == FlashLaneposMode::Always
 }
 
@@ -1903,29 +1842,43 @@ pub fn flash_rowpair_stage1_source_sd(hd: u32, fold: u32) -> String {
     let accs = hd / 32;
     let sd = " * bitcast<f32>(0x7B800000u)";
     let mut b = String::with_capacity(32768);
-    writeln!(b, "fn {entry}_red16(x: f32) -> f32 {{").unwrap();
-    writeln!(b, "    var a = x;").unwrap();
+    writeln!(
+        b,
+        "fn {entry}_red16(x: f32) -> f32 {{
+    var a = x;"
+    )
+    .unwrap();
     for o in [8u32, 4, 2, 1] {
         writeln!(b, "    a = a + subgroupShuffleXor(a, {o}u);").unwrap();
     }
-    writeln!(b, "    return a;\n}}\n").unwrap();
-    writeln!(b, "@compute @workgroup_size(256)").unwrap();
+    writeln!(
+        b,
+        "    return a;
+}}
+
+@compute @workgroup_size(256)"
+    )
+    .unwrap();
     writeln!(
         b,
         "fn {entry}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) tid: \
          vec3<u32>) {{"
     )
     .unwrap();
-    writeln!(b, "    let h0 = wg.x * {fold}u;").unwrap();
-    writeln!(b, "    let split = wg.y;").unwrap();
-    writeln!(b, "    if (h0 >= fd_params.n_heads) {{ return; }}").unwrap();
-    writeln!(b, "    let hd = fd_params.head_dim;").unwrap();
-    writeln!(b, "    let nkv = fd_params.n_kv;").unwrap();
-    writeln!(b, "    let group = fd_params.n_heads / nkv;").unwrap();
-    writeln!(b, "    let kvh = h0 / group;").unwrap();
-    writeln!(b, "    let lid = tid.x;").unwrap();
-    writeln!(b, "    let lane = lid & 31u;").unwrap();
-    writeln!(b, "    let warp = lid >> 5u;").unwrap();
+    writeln!(
+        b,
+        "    let h0 = wg.x * {fold}u;
+    let split = wg.y;
+    if (h0 >= fd_params.n_heads) {{ return; }}
+    let hd = fd_params.head_dim;
+    let nkv = fd_params.n_kv;
+    let group = fd_params.n_heads / nkv;
+    let kvh = h0 / group;
+    let lid = tid.x;
+    let lane = lid & 31u;
+    let warp = lid >> 5u;"
+    )
+    .unwrap();
     writeln!(
         b,
         "    for (var d = lid; d < hd * {fold}u; d = d + FD_BLOCK) {{ {p}_qsh[d] = fd_q[h0 * hd + \
@@ -1934,42 +1887,50 @@ pub fn flash_rowpair_stage1_source_sd(hd: u32, fold: u32) -> String {
     .unwrap();
     writeln!(b, "    workgroupBarrier();").unwrap();
     for j in 0..fold {
-        writeln!(b, "    var m{j} = fd_neg_inf();").unwrap();
-        writeln!(b, "    var l{j} = 0.0;").unwrap();
+        writeln!(
+            b,
+            "    var m{j} = fd_neg_inf();
+    var l{j} = 0.0;"
+        )
+        .unwrap();
         for i in 0..accs {
             writeln!(b, "    var a{j}_{i} = 0.0;").unwrap();
         }
     }
-    writeln!(b, "    let total = fd_params.total;").unwrap();
-    writeln!(b, "    let base = fd_params.start + split * FD_WARPS * 2u;").unwrap();
-    writeln!(b, "    let stride = fd_params.splits * FD_WARPS * 2u;").unwrap();
-    writeln!(b, "    var rounds = 0u;").unwrap();
     writeln!(
         b,
-        "    if (total > base) {{ rounds = (total - base + stride - 1u) / stride; }}"
+        "    let total = fd_params.total;
+    let base = fd_params.start + split * FD_WARPS * 2u;
+    let stride = fd_params.splits * FD_WARPS * 2u;
+    var rounds = 0u;
+    if (total > base) {{ rounds = (total - base + stride - 1u) / stride; }}
+    let wpl = (hd >> 2u) / {lanes}u;"
     )
     .unwrap();
-    writeln!(b, "    let wpl = (hd >> 2u) / {lanes}u;").unwrap();
     writeln!(b, "    let sub = lane & {}u;", lanes - 1).unwrap();
-    writeln!(b, "    let hi = lane >= {lanes}u;").unwrap();
-    writeln!(b, "    for (var r = 0u; r < rounds; r = r + 1u) {{").unwrap();
-    writeln!(b, "        let q0 = base + warp * 2u + r * stride;").unwrap();
-    writeln!(b, "        let qm = select(q0, q0 + 1u, hi);").unwrap();
-    writeln!(b, "        let livem = qm < total;").unwrap();
-    writeln!(b, "        var spm = qm;").unwrap();
     writeln!(
         b,
-        "        if (fd_params.ring > 0u) {{ spm = qm % fd_params.ring; }}"
+        "    let hi = lane >= {lanes}u;
+    for (var r = 0u; r < rounds; r = r + 1u) {{
+        let q0 = base + warp * 2u + r * stride;
+        let qm = select(q0, q0 + 1u, hi);
+        let livem = qm < total;
+        var spm = qm;
+        if (fd_params.ring > 0u) {{ spm = qm % fd_params.ring; }}
+        let kbm = (spm * nkv + kvh) * hd;"
     )
     .unwrap();
-    writeln!(b, "        let kbm = (spm * nkv + kvh) * hd;").unwrap();
     for j in 0..fold {
         writeln!(b, "        var pt{j} = 0.0;").unwrap();
     }
-    writeln!(b, "        if (livem) {{").unwrap();
-    writeln!(b, "            for (var t = 0u; t < wpl; t = t + 1u) {{").unwrap();
-    writeln!(b, "                let wi = sub * wpl + t;").unwrap();
-    writeln!(b, "                let kwv = fd_k_words[(kbm >> 2u) + wi];").unwrap();
+    writeln!(
+        b,
+        "        if (livem) {{
+            for (var t = 0u; t < wpl; t = t + 1u) {{
+                let wi = sub * wpl + t;
+                let kwv = fd_k_words[(kbm >> 2u) + wi];"
+    )
+    .unwrap();
     for i in 0..4u32 {
         writeln!(
             b,
@@ -1978,42 +1939,54 @@ pub fn flash_rowpair_stage1_source_sd(hd: u32, fold: u32) -> String {
         .unwrap();
     }
     for j in 0..fold {
-        writeln!(b, "                {{").unwrap();
-        writeln!(b, "                    let qo = {j}u * hd + (wi << 2u);").unwrap();
-        writeln!(b, "                    var s = {p}_qsh[qo + 1u] * e1;").unwrap();
-        writeln!(b, "                    s = fma({p}_qsh[qo], e0, s);").unwrap();
-        writeln!(b, "                    s = fma({p}_qsh[qo + 2u], e2, s);").unwrap();
-        writeln!(b, "                    s = fma({p}_qsh[qo + 3u], e3, s);").unwrap();
-        writeln!(b, "                    pt{j} = pt{j} + s;").unwrap();
-        writeln!(b, "                }}").unwrap();
-    }
-    writeln!(b, "            }}").unwrap();
-    writeln!(b, "        }}").unwrap();
-    for j in 0..fold {
-        writeln!(b, "        let rd{j} = {entry}_red16(pt{j});").unwrap();
         writeln!(
             b,
-            "        let ot{j} = subgroupShuffleXor(rd{j}, {lanes}u);"
+            "                {{
+                    let qo = {j}u * hd + (wi << 2u);
+                    var s = {p}_qsh[qo + 1u] * e1;
+                    s = fma({p}_qsh[qo], e0, s);
+                    s = fma({p}_qsh[qo + 2u], e2, s);
+                    s = fma({p}_qsh[qo + 3u], e3, s);
+                    pt{j} = pt{j} + s;
+                }}"
+        )
+        .unwrap();
+    }
+    writeln!(
+        b,
+        "            }}
+        }}"
+    )
+    .unwrap();
+    for j in 0..fold {
+        writeln!(
+            b,
+            "        let rd{j} = {entry}_red16(pt{j});
+        let ot{j} = subgroupShuffleXor(rd{j}, {lanes}u);"
         )
         .unwrap();
     }
     for i in 0..2u32 {
-        writeln!(b, "        let q{i}p = q0 + {i}u;").unwrap();
-        writeln!(b, "        let live{i} = q{i}p < total;").unwrap();
-        writeln!(b, "        var sp{i} = q{i}p;").unwrap();
         writeln!(
             b,
-            "        if (fd_params.ring > 0u) {{ sp{i} = q{i}p % fd_params.ring; }}"
+            "        let q{i}p = q0 + {i}u;
+        let live{i} = q{i}p < total;
+        var sp{i} = q{i}p;
+        if (fd_params.ring > 0u) {{ sp{i} = q{i}p % fd_params.ring; }}
+        var ks{i} = 0.0;
+        var vs{i} = 0.0;"
         )
         .unwrap();
-        writeln!(b, "        var ks{i} = 0.0;").unwrap();
-        writeln!(b, "        var vs{i} = 0.0;").unwrap();
         for a in 0..accs {
             writeln!(b, "        var vw{i}_{a} = 0u;").unwrap();
         }
-        writeln!(b, "        if (live{i}) {{").unwrap();
-        writeln!(b, "            ks{i} = fd_k_scales[sp{i} * nkv + kvh]{sd};").unwrap();
-        writeln!(b, "            vs{i} = fd_v_scales[sp{i} * nkv + kvh]{sd};").unwrap();
+        writeln!(
+            b,
+            "        if (live{i}) {{
+            ks{i} = fd_k_scales[sp{i} * nkv + kvh]{sd};
+            vs{i} = fd_v_scales[sp{i} * nkv + kvh]{sd};"
+        )
+        .unwrap();
         for a in 0..accs {
             writeln!(
                 b,
@@ -2039,19 +2012,23 @@ pub fn flash_rowpair_stage1_source_sd(hd: u32, fold: u32) -> String {
         }
         writeln!(b, "        if (live{i}) {{").unwrap();
         for j in 0..fold {
-            writeln!(b, "            let mn{j} = max(m{j}, sc{i}_{j});").unwrap();
-            writeln!(b, "            let cr{j} = fd_exp(m{j} - mn{j});").unwrap();
-            writeln!(b, "            let wt{j} = fd_exp(sc{i}_{j} - mn{j});").unwrap();
-            writeln!(b, "            l{j} = fma(l{j}, cr{j}, wt{j});").unwrap();
-            writeln!(b, "            let wv{j} = wt{j} * vs{i};").unwrap();
-        }
-        for a in 0..accs {
-            writeln!(b, "            {{").unwrap();
-            writeln!(b, "                let d = lane + {a}u * FD_LANES;").unwrap();
-            writeln!(b, "                if (d < hd) {{").unwrap();
             writeln!(
                 b,
-                "                    let vx = e4m3_shift_decode_scale_must_carry_2pow120(byte_at(vw{i}_{a}, d));"
+                "            let mn{j} = max(m{j}, sc{i}_{j});
+            let cr{j} = fd_exp(m{j} - mn{j});
+            let wt{j} = fd_exp(sc{i}_{j} - mn{j});
+            l{j} = fma(l{j}, cr{j}, wt{j});
+            let wv{j} = wt{j} * vs{i};"
+            )
+            .unwrap();
+        }
+        for a in 0..accs {
+            writeln!(
+                b,
+                "            {{
+                let d = lane + {a}u * FD_LANES;
+                if (d < hd) {{
+                    let vx = e4m3_shift_decode_scale_must_carry_2pow120(byte_at(vw{i}_{a}, d));"
             )
             .unwrap();
             for j in 0..fold {
@@ -2061,8 +2038,12 @@ pub fn flash_rowpair_stage1_source_sd(hd: u32, fold: u32) -> String {
                 )
                 .unwrap();
             }
-            writeln!(b, "                }}").unwrap();
-            writeln!(b, "            }}").unwrap();
+            writeln!(
+                b,
+                "                }}
+            }}"
+            )
+            .unwrap();
         }
         for j in 0..fold {
             writeln!(b, "            m{j} = mn{j};").unwrap();
@@ -2073,14 +2054,14 @@ pub fn flash_rowpair_stage1_source_sd(hd: u32, fold: u32) -> String {
     for j in 0..fold {
         writeln!(b, "    workgroupBarrier();").unwrap();
         for i in 0..accs {
-            writeln!(b, "    {{").unwrap();
-            writeln!(b, "        let d = lane + {i}u * FD_LANES;").unwrap();
             writeln!(
                 b,
-                "        if (d < hd) {{ {p}_sacc[warp * {hd}u + d] = a{j}_{i}; }}"
+                "    {{
+        let d = lane + {i}u * FD_LANES;
+        if (d < hd) {{ {p}_sacc[warp * {hd}u + d] = a{j}_{i}; }}
+    }}"
             )
             .unwrap();
-            writeln!(b, "    }}").unwrap();
         }
         writeln!(
             b,
@@ -2206,28 +2187,36 @@ pub fn flash_acc_stage1_source_sd(
          vec3<u32>) {{"
     )
     .unwrap();
-    writeln!(b, "    let h0 = wg.x * {fold}u;").unwrap();
-    writeln!(b, "    let split = wg.y;").unwrap();
-    writeln!(b, "    if (h0 >= fd_params.n_heads) {{ return; }}").unwrap();
-    writeln!(b, "    let hd = fd_params.head_dim;").unwrap();
-    writeln!(b, "    let nkv = fd_params.n_kv;").unwrap();
-    writeln!(b, "    let group = fd_params.n_heads / nkv;").unwrap();
-    writeln!(b, "    let kvh = h0 / group;").unwrap();
-    writeln!(b, "    let lid = tid.x;").unwrap();
-    writeln!(b, "    let lane = lid & 31u;").unwrap();
-    writeln!(b, "    let warp = lid >> 5u;").unwrap();
-    writeln!(b, "    let scaling = fd_params.scaling;").unwrap();
-    writeln!(b, "    let ring = fd_params.ring;").unwrap();
-    writeln!(b, "    let n4 = hd >> 2u;").unwrap();
-    writeln!(b, "    let hot = lane < n4;").unwrap();
+    writeln!(
+        b,
+        "    let h0 = wg.x * {fold}u;
+    let split = wg.y;
+    if (h0 >= fd_params.n_heads) {{ return; }}
+    let hd = fd_params.head_dim;
+    let nkv = fd_params.n_kv;
+    let group = fd_params.n_heads / nkv;
+    let kvh = h0 / group;
+    let lid = tid.x;
+    let lane = lid & 31u;
+    let warp = lid >> 5u;
+    let scaling = fd_params.scaling;
+    let ring = fd_params.ring;
+    let n4 = hd >> 2u;
+    let hot = lane < n4;"
+    )
+    .unwrap();
     writeln!(
         b,
         "    for (var d = lid; d < hd * {fold}u; d = d + FD_BLOCK) {{ {p}_qsh[d] = fd_q[h0 * hd + \
          d]; }}"
     )
     .unwrap();
-    writeln!(b, "    workgroupBarrier();").unwrap();
-    writeln!(b, "    let qb = select(0u, lane << 2u, hot);").unwrap();
+    writeln!(
+        b,
+        "    workgroupBarrier();
+    let qb = select(0u, lane << 2u, hot);"
+    )
+    .unwrap();
     if qreg {
         for j in 0..fold {
             for c in 0..4u32 {
@@ -2236,38 +2225,42 @@ pub fn flash_acc_stage1_source_sd(
         }
     }
     for j in 0..fold {
-        writeln!(b, "    var m{j} = fd_neg_inf();").unwrap();
-        writeln!(b, "    var l{j} = 0.0;").unwrap();
+        writeln!(
+            b,
+            "    var m{j} = fd_neg_inf();
+    var l{j} = 0.0;"
+        )
+        .unwrap();
         for i in 0..accs {
             let decl = if wgacc { "   " } else { "    var" };
             writeln!(b, "{decl} {} = 0.0;", acc(j, i)).unwrap();
         }
     }
-    writeln!(b, "    let total = fd_params.total;").unwrap();
-    writeln!(b, "    let base = fd_params.start + split * FD_WARPS;").unwrap();
-    writeln!(b, "    let stride = fd_params.splits * FD_WARPS;").unwrap();
-    writeln!(b, "    var rounds = 0u;").unwrap();
     writeln!(
         b,
-        "    if (total > base) {{ rounds = (total - base + stride - 1u) / stride; }}"
+        "    let total = fd_params.total;
+    let base = fd_params.start + split * FD_WARPS;
+    let stride = fd_params.splits * FD_WARPS;
+    var rounds = 0u;
+    if (total > base) {{ rounds = (total - base + stride - 1u) / stride; }}
+    for (var r = 0u; r < rounds; r = r + 1u) {{
+        let pp = base + warp + r * stride;
+        let live = pp < total;
+        var sp = pp;
+        if (ring > 0u) {{ sp = pp % ring; }}
+        let kbase = (sp * nkv + kvh) * hd;"
     )
     .unwrap();
-    writeln!(b, "    for (var r = 0u; r < rounds; r = r + 1u) {{").unwrap();
-    writeln!(b, "        let pp = base + warp + r * stride;").unwrap();
-    writeln!(b, "        let live = pp < total;").unwrap();
-    writeln!(b, "        var sp = pp;").unwrap();
-    writeln!(b, "        if (ring > 0u) {{ sp = pp % ring; }}").unwrap();
-    writeln!(b, "        let kbase = (sp * nkv + kvh) * hd;").unwrap();
     for j in 0..fold {
         writeln!(b, "        var pt{j} = 0.0;").unwrap();
     }
-    writeln!(b, "        var ks = 0.0;").unwrap();
-    writeln!(b, "        if (live) {{").unwrap();
-    writeln!(b, "            ks = fd_k_scales[sp * nkv + kvh]{sd};").unwrap();
-    writeln!(b, "            if (hot) {{").unwrap();
     writeln!(
         b,
-        "                let kw = fd_k_words[(kbase >> 2u) + lane];"
+        "        var ks = 0.0;
+        if (live) {{
+            ks = fd_k_scales[sp * nkv + kvh]{sd};
+            if (hot) {{
+                let kw = fd_k_words[(kbase >> 2u) + lane];"
     )
     .unwrap();
     for c in 0..4u32 {
@@ -2296,11 +2289,19 @@ pub fn flash_acc_stage1_source_sd(
         writeln!(b, "                    t = fma({}, e0, t);", q(0)).unwrap();
         writeln!(b, "                    t = fma({}, e2, t);", q(2)).unwrap();
         writeln!(b, "                    t = fma({}, e3, t);", q(3)).unwrap();
-        writeln!(b, "                    pt{j} = pt{j} + t;").unwrap();
-        writeln!(b, "                }}").unwrap();
+        writeln!(
+            b,
+            "                    pt{j} = pt{j} + t;
+                }}"
+        )
+        .unwrap();
     }
-    writeln!(b, "            }}").unwrap();
-    writeln!(b, "        }}").unwrap();
+    writeln!(
+        b,
+        "            }}
+        }}"
+    )
+    .unwrap();
     for j in 0..fold {
         writeln!(
             b,
@@ -2308,23 +2309,31 @@ pub fn flash_acc_stage1_source_sd(
         )
         .unwrap();
     }
-    writeln!(b, "        if (live) {{").unwrap();
-    writeln!(b, "            let vsc = fd_v_scales[sp * nkv + kvh]{sd};").unwrap();
+    writeln!(
+        b,
+        "        if (live) {{
+            let vsc = fd_v_scales[sp * nkv + kvh]{sd};"
+    )
+    .unwrap();
     let mut general = String::new();
     for j in 0..fold {
-        writeln!(general, "            let mn{j} = max(m{j}, sc{j});").unwrap();
-        writeln!(general, "            let cr{j} = fd_exp(m{j} - mn{j});").unwrap();
-        writeln!(general, "            let wt{j} = fd_exp(sc{j} - mn{j});").unwrap();
-        writeln!(general, "            l{j} = fma(l{j}, cr{j}, wt{j});").unwrap();
-        writeln!(general, "            let wv{j} = wt{j} * vsc;").unwrap();
-    }
-    for i in 0..accs {
-        writeln!(general, "            {{").unwrap();
-        writeln!(general, "                let d = lane + {i}u * FD_LANES;").unwrap();
-        writeln!(general, "                if (d < hd) {{").unwrap();
         writeln!(
             general,
-            "                    let vx = fd_v_fp8_sd(kbase + d);"
+            "            let mn{j} = max(m{j}, sc{j});
+            let cr{j} = fd_exp(m{j} - mn{j});
+            let wt{j} = fd_exp(sc{j} - mn{j});
+            l{j} = fma(l{j}, cr{j}, wt{j});
+            let wv{j} = wt{j} * vsc;"
+        )
+        .unwrap();
+    }
+    for i in 0..accs {
+        writeln!(
+            general,
+            "            {{
+                let d = lane + {i}u * FD_LANES;
+                if (d < hd) {{
+                    let vx = fd_v_fp8_sd(kbase + d);"
         )
         .unwrap();
         for j in 0..fold {
@@ -2335,8 +2344,12 @@ pub fn flash_acc_stage1_source_sd(
             )
             .unwrap();
         }
-        writeln!(general, "                }}").unwrap();
-        writeln!(general, "            }}").unwrap();
+        writeln!(
+            general,
+            "                }}
+            }}"
+        )
+        .unwrap();
     }
     for j in 0..fold {
         writeln!(general, "            m{j} = mn{j};").unwrap();
@@ -2350,15 +2363,23 @@ pub fn flash_acc_stage1_source_sd(
         b.push_str(&general);
         writeln!(b, "            }} else {{").unwrap();
         for j in 0..fold {
-            writeln!(b, "            let wt{j} = fd_exp(sc{j} - m{j});").unwrap();
-            writeln!(b, "            l{j} = l{j} + wt{j};").unwrap();
-            writeln!(b, "            let wv{j} = wt{j} * vsc;").unwrap();
+            writeln!(
+                b,
+                "            let wt{j} = fd_exp(sc{j} - m{j});
+            l{j} = l{j} + wt{j};
+            let wv{j} = wt{j} * vsc;"
+            )
+            .unwrap();
         }
         for i in 0..accs {
-            writeln!(b, "            {{").unwrap();
-            writeln!(b, "                let d = lane + {i}u * FD_LANES;").unwrap();
-            writeln!(b, "                if (d < hd) {{").unwrap();
-            writeln!(b, "                    let vx = fd_v_fp8_sd(kbase + d);").unwrap();
+            writeln!(
+                b,
+                "            {{
+                let d = lane + {i}u * FD_LANES;
+                if (d < hd) {{
+                    let vx = fd_v_fp8_sd(kbase + d);"
+            )
+            .unwrap();
             for j in 0..fold {
                 writeln!(
                     b,
@@ -2367,20 +2388,32 @@ pub fn flash_acc_stage1_source_sd(
                 )
                 .unwrap();
             }
-            writeln!(b, "                }}").unwrap();
-            writeln!(b, "            }}").unwrap();
+            writeln!(
+                b,
+                "                }}
+            }}"
+            )
+            .unwrap();
         }
         writeln!(b, "            }}").unwrap();
     } else {
         b.push_str(&general);
     }
-    writeln!(b, "        }}").unwrap();
-    writeln!(b, "    }}").unwrap();
+    writeln!(
+        b,
+        "        }}
+    }}"
+    )
+    .unwrap();
     for j in 0..fold {
         writeln!(b, "    workgroupBarrier();").unwrap();
         for i in 0..accs {
-            writeln!(b, "    {{").unwrap();
-            writeln!(b, "        let d = lane + {i}u * FD_LANES;").unwrap();
+            writeln!(
+                b,
+                "    {{
+        let d = lane + {i}u * FD_LANES;"
+            )
+            .unwrap();
             writeln!(
                 b,
                 "        if (d < hd) {{ {p}_sacc[warp * {hd}u + d] = {}; }}",
@@ -2413,13 +2446,6 @@ pub fn flash_acc_stage1_source_sd(
     b
 }
 
-pub const FLASH_SHIPPED_RESIDENT_WORKGROUPS_PER_SM_IN_HUNDREDTHS_IS_512_ON_188_SMS: u32 = 272;
-
-pub fn flash_accumulators_in_workgroup_memory_bytes_per_workgroup(hd: u32, fold: u32) -> u32 {
-    let per_thread_accumulator_file = fold * (hd / 32);
-    4 * (256 * per_thread_accumulator_file + hd * fold + hd * 8)
-}
-
 pub const FLASH_KVLINE_ENV: &str = "NV_GOW_FLASH_KVLINE";
 
 pub const FLASH_KVLINE_SLOTS_ENV: &str = "NV_GOW_FLASH_KVLINE_SLOTS";
@@ -2434,7 +2460,7 @@ pub fn flash_kvline_one_warp_per_kv_head_makes_a_workgroup_read_the_whole_slot_s
 }
 
 pub fn flash_kvline_slots() -> u32 {
-    let n = match std::env::var(FLASH_KVLINE_SLOTS_ENV) {
+    let n = match env::var(FLASH_KVLINE_SLOTS_ENV) {
         Ok(v) => v
             .trim()
             .parse()
@@ -2497,9 +2523,13 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
     let mut b = String::with_capacity(65536);
     writeln!(b, "var<workgroup> {p}_qsh: array<f32, {}>;", nh * hd).unwrap();
     writeln!(b, "var<workgroup> {p}_sacc: array<f32, {}>;", warps * hd).unwrap();
-    writeln!(b, "var<workgroup> {p}_sm: array<f32, {warps}>;").unwrap();
-    writeln!(b, "var<workgroup> {p}_sl: array<f32, {warps}>;").unwrap();
-    writeln!(b, "@compute @workgroup_size({wgsz})").unwrap();
+    writeln!(
+        b,
+        "var<workgroup> {p}_sm: array<f32, {warps}>;
+var<workgroup> {p}_sl: array<f32, {warps}>;
+@compute @workgroup_size({wgsz})"
+    )
+    .unwrap();
     writeln!(
         b,
         "fn {entry}(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) tid: \
@@ -2508,61 +2538,61 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
     .unwrap();
     writeln!(
         b,
-        "    if (fd_params.n_kv != {nkv}u || fd_params.n_heads != {nh}u) {{ return; }}"
+        "    if (fd_params.n_kv != {nkv}u || fd_params.n_heads != {nh}u) {{ return; }}
+    let split = wg.y;
+    let hd = fd_params.head_dim;
+    let nkv = fd_params.n_kv;
+    let lid = tid.x;
+    let lane = lid & 31u;
+    let warp = lid >> 5u;
+    let kvh = warp % {nkv}u;
+    let slot = warp / {nkv}u;
+    let h0 = kvh * {group}u;
+    let scaling = fd_params.scaling;
+    let ring = fd_params.ring;
+    let n4 = hd >> 2u;
+    let hot = lane < n4;
+    for (var d = lid; d < hd * {nh}u; d = d + {wgsz}u) {{ {p}_qsh[d] = fd_q[d]; }}
+    workgroupBarrier();
+    let qb = select(0u, lane << 2u, hot);"
     )
     .unwrap();
-    writeln!(b, "    let split = wg.y;").unwrap();
-    writeln!(b, "    let hd = fd_params.head_dim;").unwrap();
-    writeln!(b, "    let nkv = fd_params.n_kv;").unwrap();
-    writeln!(b, "    let lid = tid.x;").unwrap();
-    writeln!(b, "    let lane = lid & 31u;").unwrap();
-    writeln!(b, "    let warp = lid >> 5u;").unwrap();
-    writeln!(b, "    let kvh = warp % {nkv}u;").unwrap();
-    writeln!(b, "    let slot = warp / {nkv}u;").unwrap();
-    writeln!(b, "    let h0 = kvh * {group}u;").unwrap();
-    writeln!(b, "    let scaling = fd_params.scaling;").unwrap();
-    writeln!(b, "    let ring = fd_params.ring;").unwrap();
-    writeln!(b, "    let n4 = hd >> 2u;").unwrap();
-    writeln!(b, "    let hot = lane < n4;").unwrap();
-    writeln!(
-        b,
-        "    for (var d = lid; d < hd * {nh}u; d = d + {wgsz}u) {{ {p}_qsh[d] = fd_q[d]; }}"
-    )
-    .unwrap();
-    writeln!(b, "    workgroupBarrier();").unwrap();
-    writeln!(b, "    let qb = select(0u, lane << 2u, hot);").unwrap();
     for j in 0..group {
-        writeln!(b, "    var m{j} = fd_neg_inf();").unwrap();
-        writeln!(b, "    var l{j} = 0.0;").unwrap();
+        writeln!(
+            b,
+            "    var m{j} = fd_neg_inf();
+    var l{j} = 0.0;"
+        )
+        .unwrap();
         for i in 0..accs {
             writeln!(b, "    var a{j}_{i} = 0.0;").unwrap();
         }
     }
-    writeln!(b, "    let total = fd_params.total;").unwrap();
-    writeln!(b, "    let base = fd_params.start + split * {slots}u;").unwrap();
-    writeln!(b, "    let stride = fd_params.splits * {slots}u;").unwrap();
-    writeln!(b, "    var rounds = 0u;").unwrap();
     writeln!(
         b,
-        "    if (total > base) {{ rounds = (total - base + stride - 1u) / stride; }}"
+        "    let total = fd_params.total;
+    let base = fd_params.start + split * {slots}u;
+    let stride = fd_params.splits * {slots}u;
+    var rounds = 0u;
+    if (total > base) {{ rounds = (total - base + stride - 1u) / stride; }}
+    for (var r = 0u; r < rounds; r = r + 1u) {{
+        let pp = base + slot + r * stride;
+        let live = pp < total;
+        var sp = pp;
+        if (ring > 0u) {{ sp = pp % ring; }}
+        let kbase = (sp * nkv + kvh) * hd;"
     )
     .unwrap();
-    writeln!(b, "    for (var r = 0u; r < rounds; r = r + 1u) {{").unwrap();
-    writeln!(b, "        let pp = base + slot + r * stride;").unwrap();
-    writeln!(b, "        let live = pp < total;").unwrap();
-    writeln!(b, "        var sp = pp;").unwrap();
-    writeln!(b, "        if (ring > 0u) {{ sp = pp % ring; }}").unwrap();
-    writeln!(b, "        let kbase = (sp * nkv + kvh) * hd;").unwrap();
     for j in 0..group {
         writeln!(b, "        var pt{j} = 0.0;").unwrap();
     }
-    writeln!(b, "        var ks = 0.0;").unwrap();
-    writeln!(b, "        if (live) {{").unwrap();
-    writeln!(b, "            ks = fd_k_scales[sp * nkv + kvh]{sd};").unwrap();
-    writeln!(b, "            if (hot) {{").unwrap();
     writeln!(
         b,
-        "                let kw = fd_k_words[(kbase >> 2u) + lane];"
+        "        var ks = 0.0;
+        if (live) {{
+            ks = fd_k_scales[sp * nkv + kvh]{sd};
+            if (hot) {{
+                let kw = fd_k_words[(kbase >> 2u) + lane];"
     )
     .unwrap();
     for c in 0..4u32 {
@@ -2574,17 +2604,25 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
         .unwrap();
     }
     for j in 0..group {
-        writeln!(b, "                {{").unwrap();
-        writeln!(b, "                    let qo = (h0 + {j}u) * hd + qb;").unwrap();
-        writeln!(b, "                    var t = {p}_qsh[qo + 1u] * e1;").unwrap();
-        writeln!(b, "                    t = fma({p}_qsh[qo], e0, t);").unwrap();
-        writeln!(b, "                    t = fma({p}_qsh[qo + 2u], e2, t);").unwrap();
-        writeln!(b, "                    t = fma({p}_qsh[qo + 3u], e3, t);").unwrap();
-        writeln!(b, "                    pt{j} = pt{j} + t;").unwrap();
-        writeln!(b, "                }}").unwrap();
+        writeln!(
+            b,
+            "                {{
+                    let qo = (h0 + {j}u) * hd + qb;
+                    var t = {p}_qsh[qo + 1u] * e1;
+                    t = fma({p}_qsh[qo], e0, t);
+                    t = fma({p}_qsh[qo + 2u], e2, t);
+                    t = fma({p}_qsh[qo + 3u], e3, t);
+                    pt{j} = pt{j} + t;
+                }}"
+        )
+        .unwrap();
     }
-    writeln!(b, "            }}").unwrap();
-    writeln!(b, "        }}").unwrap();
+    writeln!(
+        b,
+        "            }}
+        }}"
+    )
+    .unwrap();
     for j in 0..group {
         writeln!(
             b,
@@ -2592,20 +2630,32 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
         )
         .unwrap();
     }
-    writeln!(b, "        if (live) {{").unwrap();
-    writeln!(b, "            let vsc = fd_v_scales[sp * nkv + kvh]{sd};").unwrap();
+    writeln!(
+        b,
+        "        if (live) {{
+            let vsc = fd_v_scales[sp * nkv + kvh]{sd};"
+    )
+    .unwrap();
     for j in 0..group {
-        writeln!(b, "            let mn{j} = max(m{j}, sc{j});").unwrap();
-        writeln!(b, "            let cr{j} = fd_exp(m{j} - mn{j});").unwrap();
-        writeln!(b, "            let wt{j} = fd_exp(sc{j} - mn{j});").unwrap();
-        writeln!(b, "            l{j} = fma(l{j}, cr{j}, wt{j});").unwrap();
-        writeln!(b, "            let wv{j} = wt{j} * vsc;").unwrap();
+        writeln!(
+            b,
+            "            let mn{j} = max(m{j}, sc{j});
+            let cr{j} = fd_exp(m{j} - mn{j});
+            let wt{j} = fd_exp(sc{j} - mn{j});
+            l{j} = fma(l{j}, cr{j}, wt{j});
+            let wv{j} = wt{j} * vsc;"
+        )
+        .unwrap();
     }
     for i in 0..accs {
-        writeln!(b, "            {{").unwrap();
-        writeln!(b, "                let d = lane + {i}u * FD_LANES;").unwrap();
-        writeln!(b, "                if (d < hd) {{").unwrap();
-        writeln!(b, "                    let vx = fd_v_fp8_sd(kbase + d);").unwrap();
+        writeln!(
+            b,
+            "            {{
+                let d = lane + {i}u * FD_LANES;
+                if (d < hd) {{
+                    let vx = fd_v_fp8_sd(kbase + d);"
+        )
+        .unwrap();
         for j in 0..group {
             writeln!(
                 b,
@@ -2613,35 +2663,43 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
             )
             .unwrap();
         }
-        writeln!(b, "                }}").unwrap();
-        writeln!(b, "            }}").unwrap();
+        writeln!(
+            b,
+            "                }}
+            }}"
+        )
+        .unwrap();
     }
     for j in 0..group {
         writeln!(b, "            m{j} = mn{j};").unwrap();
     }
-    writeln!(b, "        }}").unwrap();
-    writeln!(b, "    }}").unwrap();
+    writeln!(
+        b,
+        "        }}
+    }}"
+    )
+    .unwrap();
     let peer = format!("kvh + s * {nkv}u");
     for j in 0..group {
         writeln!(b, "    workgroupBarrier();").unwrap();
         for i in 0..accs {
-            writeln!(b, "    {{").unwrap();
-            writeln!(b, "        let d = lane + {i}u * FD_LANES;").unwrap();
             writeln!(
                 b,
-                "        if (d < hd) {{ {p}_sacc[warp * {hd}u + d] = a{j}_{i}; }}"
+                "    {{
+        let d = lane + {i}u * FD_LANES;
+        if (d < hd) {{ {p}_sacc[warp * {hd}u + d] = a{j}_{i}; }}
+    }}"
             )
             .unwrap();
-            writeln!(b, "    }}").unwrap();
         }
         writeln!(
             b,
-            "    if (lane == 0u) {{ {p}_sm[warp] = m{j}; {p}_sl[warp] = l{j}; }}"
+            "    if (lane == 0u) {{ {p}_sm[warp] = m{j}; {p}_sl[warp] = l{j}; }}
+    workgroupBarrier();
+    if (slot == 0u) {{
+        var m_blk = fd_neg_inf();"
         )
         .unwrap();
-        writeln!(b, "    workgroupBarrier();").unwrap();
-        writeln!(b, "    if (slot == 0u) {{").unwrap();
-        writeln!(b, "        var m_blk = fd_neg_inf();").unwrap();
         writeln!(
             b,
             "        for (var s = 0u; s < {slots}u; s = s + 1u) {{ m_blk = max(m_blk, \
@@ -2650,11 +2708,11 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
         .unwrap();
         writeln!(
             b,
-            "        let dst = ((h0 + {j}u) * fd_params.splits + split) * (hd + 2u);"
+            "        let dst = ((h0 + {j}u) * fd_params.splits + split) * (hd + 2u);
+        if (lane == 0u) {{
+            var l_blk = 0.0;"
         )
         .unwrap();
-        writeln!(b, "        if (lane == 0u) {{").unwrap();
-        writeln!(b, "            var l_blk = 0.0;").unwrap();
         writeln!(
             b,
             "            for (var s = 0u; s < {slots}u; s = s + 1u) {{ if ({p}_sm[{peer}] > \
@@ -2662,11 +2720,15 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
              m_blk)); }} }}"
         )
         .unwrap();
-        writeln!(b, "            fd_scratch[dst] = m_blk;").unwrap();
-        writeln!(b, "            fd_scratch[dst + 1u] = l_blk;").unwrap();
-        writeln!(b, "        }}").unwrap();
-        writeln!(b, "        for (var d = lane; d < hd; d = d + FD_LANES) {{").unwrap();
-        writeln!(b, "            var a = 0.0;").unwrap();
+        writeln!(
+            b,
+            "            fd_scratch[dst] = m_blk;
+            fd_scratch[dst + 1u] = l_blk;
+        }}
+        for (var d = lane; d < hd; d = d + FD_LANES) {{
+            var a = 0.0;"
+        )
+        .unwrap();
         writeln!(
             b,
             "            for (var s = 0u; s < {slots}u; s = s + 1u) {{ if ({p}_sm[{peer}] > \
@@ -2674,9 +2736,13 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
              - m_blk)); }} }}"
         )
         .unwrap();
-        writeln!(b, "            fd_scratch[dst + 2u + d] = a;").unwrap();
-        writeln!(b, "        }}").unwrap();
-        writeln!(b, "    }}").unwrap();
+        writeln!(
+            b,
+            "            fd_scratch[dst + 2u + d] = a;
+        }}
+    }}"
+        )
+        .unwrap();
     }
     writeln!(b, "}}").unwrap();
     assert!(
@@ -2693,19 +2759,7 @@ pub fn flash_kvline_stage1_source_sd(hd: u32, nkv: u32, group: u32, slots: u32) 
     b
 }
 
-pub const KV_FP8_ENV: &str = "NV_GOW_KV_FP8";
-
-pub const GOW_KV_FP8_DEFAULT_ON_THE_DEPTH_STACK_DOMINATES_SERIAL_AT_EVERY_MEASURED_DEPTH: bool =
-    true;
-
-pub fn kv_fp8_enabled() -> bool {
-    match std::env::var(KV_FP8_ENV) {
-        Ok(v) => !matches!(v.trim(), "0" | "off" | "false"),
-        Err(_) => GOW_KV_FP8_DEFAULT_ON_THE_DEPTH_STACK_DOMINATES_SERIAL_AT_EVERY_MEASURED_DEPTH,
-    }
-}
-
-const PF_KVQ_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_pf_kvq.wgsl");
+const PF_KVQ_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/q3m_pf_kvq.wgsl");
 
 const MOE_WGSL: &str = include_str!("../../nv-kernels/wgsl/gow_moe.wgsl");
 
@@ -2715,336 +2769,284 @@ const SPLICE_WGSL: &str = include_str!("../../nv-kernels/wgsl/gow_splice.wgsl");
 
 const VERIFY_WGSL: &str = include_str!("../../nv-kernels/wgsl/gow_verify.wgsl");
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvBf16Params {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    out_f32: u32,
-    w_row_words: u32,
-    x_off_words: u32,
-    y_off_words: u32,
-    has_bias: u32,
-    alpha: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+pod! {
+    struct GemvBf16Params {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        out_f32: u32,
+        w_row_words: u32,
+        x_off_words: u32,
+        y_off_words: u32,
+        has_bias: u32,
+        alpha: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvMxParams {
-    n_rows: u32,
-    k_blocks: u32,
-    groups_x: u32,
-    has_bias: u32,
-    w_e_stride_v4: u32,
-    sf_e_stride_bytes: u32,
-    bias_e_stride: u32,
-    x_slot_stride_words: u32,
-    y_slot_stride: u32,
-    use_sel: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct GemvMxParams {
+        n_rows: u32,
+        k_blocks: u32,
+        groups_x: u32,
+        has_bias: u32,
+        w_e_stride_v4: u32,
+        sf_e_stride_bytes: u32,
+        bias_e_stride: u32,
+        x_slot_stride_words: u32,
+        y_slot_stride: u32,
+        use_sel: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RmsParams {
-    hidden: u32,
-    batch: u32,
-    eps: f32,
-    words_per_row: u32,
-}
+    struct RmsParams {
+        hidden: u32,
+        batch: u32,
+        eps: f32,
+        words_per_row: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ResScaleParams {
-    n: u32,
-    n_words: u32,
-    scale: f32,
-    cap: f32,
-    inv_cap: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct ResScaleParams {
+        n: u32,
+        n_words: u32,
+        scale: f32,
+        cap: f32,
+        inv_cap: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RopeParams {
-    n_rows: u32,
-    head_dim: u32,
-    rot_half: u32,
-    pad0: u32,
-}
+    struct RopeParams {
+        n_rows: u32,
+        head_dim: u32,
+        rot_half: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct FusedRopeParams {
-    n_h: u32,
-    n_kv: u32,
-    head_dim: u32,
-    rot_half: u32,
-}
+    struct FusedRopeParams {
+        n_h: u32,
+        n_kv: u32,
+        head_dim: u32,
+        rot_half: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvSgParams {
-    n_rows: u32,
-    k_v4: u32,
-    groups_x: u32,
-    out_f32: u32,
-    w_row_v4: u32,
-    x_off_v4: u32,
-    y_off_words: u32,
-    has_bias: u32,
-    alpha: f32,
-    topk_k: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct GemvSgParams {
+        n_rows: u32,
+        k_v4: u32,
+        groups_x: u32,
+        out_f32: u32,
+        w_row_v4: u32,
+        x_off_v4: u32,
+        y_off_words: u32,
+        has_bias: u32,
+        alpha: f32,
+        topk_k: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct KvWriteParams {
-    words: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct KvWriteParams {
+        words: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnDecodeParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    max_seq: u32,
-    group: u32,
-    window: u32,
-    pad0: u32,
-    scale: f32,
-}
+    struct AttnDecodeParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        max_seq: u32,
+        group: u32,
+        window: u32,
+        pad0: u32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct FlashDecodeParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    splits: u32,
-    total: u32,
-    start: u32,
-    pad0: u32,
-    scale: f32,
-}
+    struct FlashDecodeParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        splits: u32,
+        total: u32,
+        start: u32,
+        pad0: u32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct SharedFdParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    total: u32,
-    start: u32,
-    splits: u32,
-    ring: u32,
-    out_bf16: u32,
-    scaling: f32,
-    pad0: u32,
-    fused: u32,
-    pad2: u32,
-    m_rows: u32,
-    window: u32,
-    pad3: u32,
-    pad4: u32,
-}
+    struct SharedFdParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        total: u32,
+        start: u32,
+        splits: u32,
+        ring: u32,
+        out_bf16: u32,
+        scaling: f32,
+        pad0: u32,
+        fused: u32,
+        pad2: u32,
+        m_rows: u32,
+        window: u32,
+        pad3: u32,
+        pad4: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct KvFp8Params {
-    n_tokens: u32,
-    n_kv: u32,
-    head_dim: u32,
-    ring: u32,
-    pairs: u32,
-    start: u32,
-    slots: u32,
-    reserved: u32,
-}
+    struct KvFp8Params {
+        n_tokens: u32,
+        n_kv: u32,
+        head_dim: u32,
+        ring: u32,
+        pairs: u32,
+        start: u32,
+        slots: u32,
+        reserved: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfKvqParams {
-    tokens: u32,
-    x_stride_elems: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct PfKvqParams {
+        tokens: u32,
+        x_stride_elems: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PackParams {
-    n_words: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct PackParams {
+        n_words: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RouterParams {
-    n_experts: u32,
-    k: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct RouterParams {
+        n_experts: u32,
+        k: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct SwigluParams {
-    n_words: u32,
-    inter_words: u32,
-    two_inter: u32,
-    pad0: u32,
-    limit: f32,
-    alpha: f32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct SwigluParams {
+        n_words: u32,
+        inter_words: u32,
+        two_inter: u32,
+        pad0: u32,
+        limit: f32,
+        alpha: f32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct CombineParams {
-    hidden_words: u32,
-    k: u32,
-    slot_stride: u32,
-    pad0: u32,
-}
+    struct CombineParams {
+        hidden_words: u32,
+        k: u32,
+        slot_stride: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GatherParams {
-    row_off: u32,
-    n_rows: u32,
-    hidden_words: u32,
-    vocab: u32,
-}
+    struct GatherParams {
+        row_off: u32,
+        n_rows: u32,
+        hidden_words: u32,
+        vocab: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ArgmaxParams {
-    n: u32,
-    groups: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct ArgmaxParams {
+        n: u32,
+        groups: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct CkParams {
-    m_live: u32,
-    base: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct CkParams {
+        m_live: u32,
+        base: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfGatherParams {
-    row_off: u32,
-    n_rows: u32,
-    hidden_words: u32,
-    vocab: u32,
-    m: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct PfGatherParams {
+        row_off: u32,
+        n_rows: u32,
+        hidden_words: u32,
+        vocab: u32,
+        m: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfGemvBf16Params {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    out_f32: u32,
-    w_row_words: u32,
-    x_row_words: u32,
-    y_row_words: u32,
-    has_bias: u32,
-    alpha: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct PfGemvBf16Params {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        out_f32: u32,
+        w_row_words: u32,
+        x_row_words: u32,
+        y_row_words: u32,
+        has_bias: u32,
+        alpha: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfGemvMxParams {
-    n_rows: u32,
-    k_blocks: u32,
-    groups_x: u32,
-    has_bias: u32,
-    w_e_stride_v4: u32,
-    sf_e_stride_bytes: u32,
-    bias_e_stride: u32,
-    x_slot_stride_words: u32,
-    x_tok_stride_words: u32,
-    y_slot_stride: u32,
-    k_top: u32,
-    pad0: u32,
-}
+    struct PfGemvMxParams {
+        n_rows: u32,
+        k_blocks: u32,
+        groups_x: u32,
+        has_bias: u32,
+        w_e_stride_v4: u32,
+        sf_e_stride_bytes: u32,
+        bias_e_stride: u32,
+        x_slot_stride_words: u32,
+        x_tok_stride_words: u32,
+        y_slot_stride: u32,
+        k_top: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfRouterParams {
-    n_experts: u32,
-    k: u32,
-    m: u32,
-    pad0: u32,
-}
+    struct PfRouterParams {
+        n_experts: u32,
+        k: u32,
+        m: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfCombineParams {
-    hidden_words: u32,
-    k: u32,
-    slot_stride: u32,
-    m: u32,
-}
+    struct PfCombineParams {
+        hidden_words: u32,
+        k: u32,
+        slot_stride: u32,
+        m: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct SpliceParams {
-    hidden_words: u32,
-    m: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct SpliceParams {
+        hidden_words: u32,
+        m: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct VerifyLmParams {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    out_f32: u32,
-    w_row_words: u32,
-    x_row_words: u32,
-    y_row_words: u32,
-    has_bias: u32,
-    alpha: f32,
-    y_off_words: u32,
-    pad0: u32,
-    pad1: u32,
+    struct VerifyLmParams {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        out_f32: u32,
+        w_row_words: u32,
+        x_row_words: u32,
+        y_row_words: u32,
+        has_bias: u32,
+        alpha: f32,
+        y_off_words: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 }
 
 pub enum WeightSource<'a> {
     Host(&'a HostWeights),
-    Loader(&'a nv_weights::WeightLoader),
+    Loader(&'a WeightLoader),
 }
 
 fn bytes_to_words(bytes: &[u8]) -> Vec<u32> {
@@ -3052,23 +3054,11 @@ fn bytes_to_words(bytes: &[u8]) -> Vec<u32> {
 }
 
 struct Pass {
-    pipeline: std::sync::Arc<wgpu::ComputePipeline>,
-    bind: wgpu::BindGroup,
+    pipeline: Arc<ComputePipeline>,
+    bind: BindGroup,
     grid: (u32, u32, u32),
     label: String,
     storage_binds_are_what_wgpu_tracks_for_hazards_uniforms_never_transition: Vec<(u32, bool)>,
-}
-
-fn wgsl_binding_is_storage_read_write_a_read_only_binding_can_never_raise_a_hazard(
-    source: &str,
-    binding: u32,
-) -> bool {
-    let needle = format!("@binding({binding})");
-    source
-        .match_indices(&needle)
-        .filter_map(|(i, _)| source[i..].split(';').next())
-        .find(|decl| decl.contains("var<"))
-        .is_none_or(|decl| decl.contains("read_write"))
 }
 
 pub use crate::wgpu_ledger::VramReport;
@@ -3080,13 +3070,13 @@ struct Builder {
     v_passes: Vec<Pass>,
     to_prefill: bool,
     to_verify: bool,
-    probes: Vec<(String, wgpu::Buffer, usize, bool)>,
+    probes: Vec<(String, Buffer, usize, bool)>,
     pf_kvq_pairs: usize,
     pf_kv_write_full_layers: usize,
     lanepos_alt_flash1_passes: Vec<Pass>,
     depthgate_flash1_pass_indices_full_attention_only_sliding_cost_does_not_scale_with_depth:
         Vec<usize>,
-    storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds: Vec<wgpu::Buffer>,
+    storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds: Vec<Buffer>,
 }
 
 impl std::ops::Deref for Builder {
@@ -3108,25 +3098,17 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<Pass> {
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
-        let mut storage_ids: Vec<(u32, bool)> = binds
-            .iter()
-            .filter(|(_, buf)| buf.usage().contains(wgpu::BufferUsages::STORAGE))
-            .map(|(slot, buf)| {
-                let w =
-                    wgsl_binding_is_storage_read_write_a_read_only_binding_can_never_raise_a_hazard(
-                        source, *slot,
-                    );
-                (self.intern_storage_buffer(buf), w)
-            })
-            .collect();
-        storage_ids.sort_unstable();
-        storage_ids.dedup();
+        let storage_ids = hazard_tracked_storage_ids(
+            &mut self.storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds,
+            source,
+            binds.iter().map(|(slot, buf)| (*slot, *buf)),
+        );
         Ok(Pass {
             pipeline,
             bind,
@@ -3141,7 +3123,7 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
         let pass = self.built_pass(label, source, entry, binds, grid)?;
@@ -3155,19 +3137,7 @@ impl Builder {
         Ok(())
     }
 
-    fn intern_storage_buffer(&mut self, buf: &wgpu::Buffer) -> u32 {
-        let reg =
-            &mut self.storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds;
-        match reg.iter().position(|b| b == buf) {
-            Some(i) => i as u32,
-            None => {
-                reg.push(buf.clone());
-                (reg.len() - 1) as u32
-            }
-        }
-    }
-
-    fn probe(&mut self, name: &str, buf: &wgpu::Buffer, elems: usize, bf16: bool) {
+    fn probe(&mut self, name: &str, buf: &Buffer, elems: usize, bf16: bool) {
         if self.probes.iter().any(|(n, _, _, _)| n == name) {
             return;
         }
@@ -3250,9 +3220,6 @@ impl Sources {
         let mut mx_kpre_blocks: Vec<usize> = Vec::new();
         if mx_kpre_enabled_baked_block_entries_issue_the_expert_weight_and_scale_stream_before_the_fma_chain()
             && sg
-            && mx_sg_xv4_enabled()
-            && mx_sg_byte_lut_enabled()
-            && mx_sg_xstage_enabled()
         {
             for k in [cfg.hidden_size, cfg.intermediate_size] {
                 if k >= MX_BLOCK
@@ -3264,10 +3231,8 @@ impl Sources {
                 }
             }
         }
-        let mx_base: &str = if sg && (mx_sg_xv4_r2_enabled() || mx_sg_xv4_enabled()) {
+        let mx_base: &str = if sg {
             MX_XV4_WGSL
-        } else if sg {
-            MX_WGSL
         } else {
             mx_scalar_section()
         };
@@ -3283,37 +3248,13 @@ impl Sources {
         Self {
             gemv: compose(GEMV_WGSL),
             mx: compose(&mx_src),
-            mx_entry: match (
-                sg,
-                mx_sg_xv4_r2_enabled(),
-                mx_sg_xv4_enabled(),
-                mx_sg_byte_lut_enabled(),
-            ) {
-                (true, true, _, true) => MX_SG_XV4_R2_LUT_ENTRY,
-                (true, true, _, false) => MX_SG_XV4_R2_ENTRY,
-                (true, false, true, true)
-                    if mx_sg_xstage_enabled()
-                        && mx_sg_gupair_enabled_two_adjacent_rows_share_one_staged_x_so_the_interleaved_gate_up_pair_rides_one_x_pass() =>
-                {
-                    MX_SG_XV4_R2_LUT_XS_ENTRY
-                }
-                (true, false, true, true) if mx_sg_xstage_enabled() => MX_SG_XV4_LUT_XS_ENTRY,
-                (true, false, true, true) => MX_SG_XV4_LUT_ENTRY,
-                (true, false, true, false) => MX_SG_XV4_ENTRY,
-                (true, false, false, true) => MX_SG_LUT_ENTRY,
-                (true, false, false, false) => MX_SG_ENTRY,
-                (false, ..) => MX_SCALAR_ENTRY,
+            mx_entry: match (sg, mx_sg_xv4_r2_enabled()) {
+                (true, true) => MX_SG_XV4_R2_LUT_ENTRY,
+                (true, false) => MX_SG_XV4_R2_LUT_XS_ENTRY,
+                (false, _) => MX_SCALAR_ENTRY,
             },
-            mx_rows_per_wg: if sg
-                && (mx_sg_xv4_r2_enabled()
-                    || (mx_sg_xv4_enabled()
-                        && mx_sg_byte_lut_enabled()
-                        && mx_sg_xstage_enabled()
-                        && mx_sg_gupair_enabled_two_adjacent_rows_share_one_staged_x_so_the_interleaved_gate_up_pair_rides_one_x_pass()))
-            {
+            mx_rows_per_wg: if sg {
                 MX_SG_XV4_R2_ROWS_PER_WG
-            } else if sg {
-                MX_SG_ROWS_PER_WG_AT_SG32_OVER_WG256
             } else {
                 MX_SCALAR_ROWS_PER_WG
             },
@@ -3348,16 +3289,16 @@ impl Sources {
 }
 
 struct Bf16Gpu {
-    w: wgpu::Buffer,
-    bias: Option<wgpu::Buffer>,
+    w: Buffer,
+    bias: Option<Buffer>,
     n: usize,
     k: usize,
 }
 
 struct MxGpu {
-    w: wgpu::Buffer,
-    scales: wgpu::Buffer,
-    bias: wgpu::Buffer,
+    w: Buffer,
+    scales: Buffer,
+    bias: Buffer,
     e: usize,
     n: usize,
     k: usize,
@@ -3367,14 +3308,9 @@ struct VerifyState {
     rows: usize,
     head_start: usize,
     passes: Vec<Pass>,
-    logits: wgpu::Buffer,
-    tokens: wgpu::Buffer,
+    logits: Buffer,
+    tokens: Buffer,
     validated: bool,
-}
-
-struct ChunkRowSplice<'a> {
-    rel_pos: usize,
-    row_words: &'a [u32],
 }
 
 pub struct GptOssWgpu {
@@ -3388,30 +3324,30 @@ pub struct GptOssWgpu {
     passes: Vec<Pass>,
     pf_passes: Vec<Pass>,
     pf_m: usize,
-    pf_tok: Option<wgpu::Buffer>,
-    pf_ck: Option<wgpu::Buffer>,
-    pf_splice: Option<wgpu::Buffer>,
-    pf_mask: Option<wgpu::Buffer>,
+    pf_tok: Option<Buffer>,
+    pf_ck: Option<Buffer>,
+    pf_splice: Option<Buffer>,
+    pf_mask: Option<Buffer>,
     verify: Option<VerifyState>,
     head_start: usize,
-    _buffers: Vec<wgpu::Buffer>,
-    tok_buf: wgpu::Buffer,
-    pos_buf: wgpu::Buffer,
-    flash_fd: Option<(wgpu::Buffer, FlashDecodeParams)>,
-    kv8_fd: Option<(wgpu::Buffer, SharedFdParams)>,
-    kv8_gfd: Option<(wgpu::Buffer, FlashDecodeParams)>,
+    _buffers: Vec<Buffer>,
+    tok_buf: Buffer,
+    pos_buf: Buffer,
+    flash_fd: Option<(Buffer, FlashDecodeParams)>,
+    kv8_fd: Option<(Buffer, SharedFdParams)>,
+    kv8_gfd: Option<(Buffer, FlashDecodeParams)>,
     depthgate_flash1_passes: Vec<usize>,
     depthgate_on: bool,
     lanepos_alt_flash1: Vec<Pass>,
     lanepos_gate_knee: Option<u32>,
     lanepos_deep_active: bool,
     depthgate_shallow_splits: u32,
-    pf_kvq: Option<wgpu::Buffer>,
-    flash_sw: Option<(wgpu::Buffer, FlashDecodeParams, u32)>,
-    token_out: wgpu::Buffer,
-    logits: wgpu::Buffer,
-    state_buffers: Vec<(wgpu::Buffer, u64)>,
-    probes: Vec<(String, wgpu::Buffer, usize, bool)>,
+    pf_kvq: Option<Buffer>,
+    flash_sw: Option<(Buffer, FlashDecodeParams, u32)>,
+    token_out: Buffer,
+    logits: Buffer,
+    state_buffers: Vec<(Buffer, u64)>,
+    probes: Vec<(String, Buffer, usize, bool)>,
     vocab: usize,
     vram: VramReport,
     mx_entry: &'static str,
@@ -3419,15 +3355,6 @@ pub struct GptOssWgpu {
 
 pub fn vram_report_enabled() -> bool {
     crate::wgpu_ledger::vram_report_var_enabled("NV_GPTOSS_WGPU_VRAM")
-}
-
-pub fn staging_flush_enabled() -> bool {
-    !matches!(
-        std::env::var("NV_GPTOSS_WGPU_STAGING_FLUSH")
-            .ok()
-            .as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
 }
 
 impl GptOssWgpu {
@@ -3507,7 +3434,7 @@ impl GptOssWgpu {
         &mut self,
         pos: usize,
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             pos <= self.max_seq,
             "synthetic fill pos {pos} past max_seq {}; the flat kv caches index slots by pos \
              and the decode window start is a pure function of pos, so pos alone is the \
@@ -3536,62 +3463,62 @@ impl GptOssWgpu {
 
     pub fn from_loader(
         config: GptOssConfig,
-        weights: &nv_weights::WeightLoader,
+        weights: &WeightLoader,
         max_seq: usize,
     ) -> Result<Self> {
         Self::build(config, WeightSource::Loader(weights), max_seq)
     }
 
     fn build(config: GptOssConfig, src: WeightSource<'_>, max_seq: usize) -> Result<Self> {
-        let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
         let s = Sources::new(ctx, &config);
         let mx_entry = s.mx_entry;
         let cfg = &config;
 
-        anyhow::ensure!(max_seq > 0, "max_seq must be positive");
-        anyhow::ensure!(
+        ensure!(max_seq > 0, "max_seq must be positive");
+        ensure!(
             cfg.hidden_size.is_multiple_of(2 * MX_BLOCK),
             "hidden_size {} must be a multiple of {}",
             cfg.hidden_size,
             2 * MX_BLOCK
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.intermediate_size.is_multiple_of(MX_BLOCK),
             "intermediate_size {} must be a multiple of {MX_BLOCK}",
             cfg.intermediate_size
         );
-        anyhow::ensure!(
+        ensure!(
             (2 * cfg.intermediate_size * cfg.hidden_size / MX_BLOCK).is_multiple_of(4)
                 && (cfg.hidden_size * cfg.intermediate_size / MX_BLOCK).is_multiple_of(4),
             "expert scale bytes must align to whole u32 words"
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.num_local_experts <= 256,
             "router top-k kernel caps num_local_experts at 256, got {}",
             cfg.num_local_experts
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.num_experts_per_tok >= 1 && cfg.num_experts_per_tok <= MAX_TOPK,
             "num_experts_per_tok {} out of range 1..={MAX_TOPK}",
             cfg.num_experts_per_tok
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.head_dim <= MAX_HEAD_DIM && cfg.head_dim.is_multiple_of(4),
             "head_dim {} must be a multiple of 4 and <= {MAX_HEAD_DIM}",
             cfg.head_dim
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.num_attention_heads
                 .is_multiple_of(cfg.num_key_value_heads),
             "attention heads must be a multiple of kv heads"
         );
-        anyhow::ensure!(
+        ensure!(
             cfg.layer_types.len() == cfg.num_hidden_layers,
             "layer_types has {} entries for {} layers",
             cfg.layer_types.len(),
             cfg.num_hidden_layers
         );
-        anyhow::ensure!(cfg.sliding_window > 0, "sliding_window must be positive");
+        ensure!(cfg.sliding_window > 0, "sliding_window must be positive");
 
         let hidden = cfg.hidden_size;
         let hidden_words = hidden / 2;
@@ -3599,7 +3526,7 @@ impl GptOssWgpu {
         let vocab = cfg.vocab_size;
 
         let mut b = Builder {
-            core: VramLedger::new(ctx, "gow-", staging_flush_enabled, STAGING_FLUSH_BYTES),
+            core: VramLedger::new(ctx, "gow-", STAGING_FLUSH_BYTES),
             passes: Vec::new(),
             pf_passes: Vec::new(),
             v_passes: Vec::new(),
@@ -3616,30 +3543,29 @@ impl GptOssWgpu {
 
         let tok_buf = b.upload_u32("gow-tok", &[0u32]);
         let pos_buf = b.upload_u32("gow-pos", &[0u32]);
-        let flash_fd: Option<(wgpu::Buffer, FlashDecodeParams)> =
-            flash_decode_enabled().then(|| {
-                let p = FlashDecodeParams {
-                    n_heads: cfg.num_attention_heads as u32,
-                    n_kv: cfg.num_key_value_heads as u32,
-                    head_dim: cfg.head_dim as u32,
-                    splits: flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build(),
-                    total: 0,
-                    start: 0,
-                    pad0: 0,
-                    scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-                };
-                (b.uni("gow-at-fl-p", p), p)
-            });
+        let flash_fd: Option<(Buffer, FlashDecodeParams)> = flash_decode_enabled().then(|| {
+            let p = FlashDecodeParams {
+                n_heads: cfg.num_attention_heads as u32,
+                n_kv: cfg.num_key_value_heads as u32,
+                head_dim: cfg.head_dim as u32,
+                splits: flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build(),
+                total: 0,
+                start: 0,
+                pad0: 0,
+                scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+            };
+            (b.uni("gow-at-fl-p", p), p)
+        });
         let kv8_geometry_ok =
             cfg.head_dim.is_multiple_of(32) && cfg.head_dim <= wk::flash_decode::MAX_HEAD_DIM;
-        if kv_fp8_enabled() && !kv8_geometry_ok {
+        if !kv8_geometry_ok {
             eprintln!(
                 "[gow-wgpu] kv-fp8 depth stack needs head_dim a multiple of 32 up to the fold \
                  generator's cap; head_dim {} keeps the serial bf16 decode arm",
                 cfg.head_dim
             );
         }
-        let kv8_shared: Option<Kv8Shared> = (kv_fp8_enabled() && kv8_geometry_ok)
+        let kv8_shared: Option<Kv8Shared> = kv8_geometry_ok
             .then(|| -> Result<Kv8Shared> {
                 let group = cfg.num_attention_heads / cfg.num_key_value_heads;
                 let fold = {
@@ -3686,7 +3612,7 @@ impl GptOssWgpu {
                 );
                 let mut kv8_fold_stage1_entry =
                     wk::flash_decode::fold_stage1_entry_sd(hd32, sg, fold as u32);
-                anyhow::ensure!(
+                ensure!(
                     [
                         flash_kpre_banked_negative_preloading_four_rounds_costs_more_warp_residency_than_the_loads_in_flight_buy(),
                         flash_rowpair_banked_neutral_two_rows_per_warp_round_fills_the_idle_lanes_and_halves_the_rounds_for_no_wall(),
@@ -3711,7 +3637,7 @@ impl GptOssWgpu {
                     let slots = flash_kvline_slots();
                     let invocations = flash_kvline_workgroup_invocations(nkv, slots);
                     let storage = flash_kvline_workgroup_storage_bytes(hd32, nkv, group as u32, slots);
-                    anyhow::ensure!(
+                    ensure!(
                         ctx.caps.max_compute_invocations_per_workgroup >= invocations
                             && ctx.caps.max_compute_workgroup_size_x >= invocations
                             && ctx.caps.workgroup_storage_fits(storage),
@@ -3824,7 +3750,7 @@ impl GptOssWgpu {
                     fd_base: fd,
                     gfd_buf: b.uni("gow-at-fd8-s2-p", gfd),
                     gfd_base: gfd,
-                    lanepos_alt_entry: match flash_lanepos_mode_unset_gates_at_the_measured_knee_1_always_0_restores_fdf_only()
+                    lanepos_alt_entry: match flash_lanepos_mode_gates_at_the_measured_knee_unless_1_forces_it_always()
                     {
                         FlashLaneposMode::Gate(_) if sg && hd32.is_multiple_of(32) => {
                             kv8_fold_stage1_source.push('\n');
@@ -3862,13 +3788,12 @@ impl GptOssWgpu {
                 })
             })
             .transpose()?;
-        let flash_sw: Option<(wgpu::Buffer, FlashDecodeParams, u32)> = match &flash_fd {
+        let flash_sw: Option<(Buffer, FlashDecodeParams, u32)> = match &flash_fd {
             Some((_, base))
-                if flash_sliding_enabled()
-                    && cfg
-                        .layer_types
-                        .iter()
-                        .any(|t| matches!(t, GptOssLayerType::Sliding)) =>
+                if cfg
+                    .layer_types
+                    .iter()
+                    .any(|t| matches!(t, GptOssLayerType::Sliding)) =>
             {
                 let mut p = *base;
                 p.splits = p.splits.min((cfg.sliding_window as u32).div_ceil(8)).max(1);
@@ -3899,7 +3824,7 @@ impl GptOssWgpu {
         let moe_out = b.zeros("gow-moeout", (hidden_words * 4) as u64);
 
         let embed = src.embed(cfg)?;
-        anyhow::ensure!(
+        ensure!(
             embed.len() == vocab * hidden,
             "embed has {} values, want {}",
             embed.len(),
@@ -3981,7 +3906,7 @@ impl GptOssWgpu {
         let cosb = b.upload_f32("gow-cos", &cos);
         let sinb = b.upload_f32("gow-sin", &sin);
 
-        let mut state_buffers: Vec<(wgpu::Buffer, u64)> = Vec::new();
+        let mut state_buffers: Vec<(Buffer, u64)> = Vec::new();
 
         for li in 0..cfg.num_hidden_layers {
             let layer = src.layer(cfg, li)?;
@@ -4183,17 +4108,15 @@ impl GptOssWgpu {
         let head_start = b.passes.len();
         let logits = b.zeros("gow-logits", (vocab * 4) as u64);
         let lm = src.lm_head(cfg)?;
-        anyhow::ensure!(
+        ensure!(
             lm.len() == vocab * hidden,
             "lm_head has {} values, want {}",
             lm.len(),
             vocab * hidden
         );
         let dummy_bias = b.upload_u32("gow-dummy-bias", &[0u32]);
-        let head_i8 =
-            lmhead_i8_enabled_rowwise_int8_head_halves_vocab_gemv_bytes_and_is_ppl_gated_not_bitwise(
-            ) && s.gemv_sg_on && hidden.is_multiple_of(16);
-        let mut lm_chunks: Vec<(wgpu::Buffer, usize, usize)> = Vec::new();
+        let head_i8 = s.gemv_sg_on && hidden.is_multiple_of(16);
+        let mut lm_chunks: Vec<(Buffer, usize, usize)> = Vec::new();
         let mut off = 0usize;
         while head_i8 && off < vocab {
             let rows = (chunk_rows * 2).min(vocab - off);
@@ -4448,9 +4371,9 @@ impl GptOssWgpu {
         };
 
         if kv8_shared.is_some() && !b.pf_passes.is_empty() {
-            anyhow::ensure!(
+            ensure!(
                 b.pf_kvq_pairs == b.pf_kv_write_full_layers,
-                "{KV_FP8_ENV} decode reads the fp8 cache for every full-attention row, so every \
+                "fp8-KV decode reads the fp8 cache for every full-attention row, so every \
                  prefill arm that writes full-layer KV must also record its quantize pair; \
                  counted {} quantize pairs against {} full-layer prefill kv writes -- an arm \
                  that skips the pair would leave chunk rows unread by decode",
@@ -4536,7 +4459,7 @@ impl GptOssWgpu {
             depthgate_flash1_passes,
             depthgate_on: flash_depthgate_enabled_shallow_tuned_splits_starve_the_grid_at_depth(),
             lanepos_alt_flash1: b.lanepos_alt_flash1_passes,
-            lanepos_gate_knee: match flash_lanepos_mode_unset_gates_at_the_measured_knee_1_always_0_restores_fdf_only()
+            lanepos_gate_knee: match flash_lanepos_mode_gates_at_the_measured_knee_unless_1_forces_it_always()
             {
                 FlashLaneposMode::Gate(k) => Some(k),
                 _ => None,
@@ -4555,8 +4478,8 @@ impl GptOssWgpu {
     }
 
     fn step_inner(&mut self, token: u32, full: bool) -> Result<()> {
-        anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
-        anyhow::ensure!(
+        ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+        ensure!(
             self.pos < self.max_seq,
             "kv cache full at {} (max_seq {})",
             self.pos,
@@ -4564,10 +4487,10 @@ impl GptOssWgpu {
         );
         self.ctx
             .queue
-            .write_buffer(&self.tok_buf, 0, bytemuck::bytes_of(&(token as i32)));
+            .write_buffer(&self.tok_buf, 0, bytes_of(&(token as i32)));
         self.ctx
             .queue
-            .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(self.pos as i32)));
+            .write_buffer(&self.pos_buf, 0, bytes_of(&(self.pos as i32)));
         if let Some(knee) = self.lanepos_gate_knee {
             let want_deep = (self.pos + 1) as u32 >= knee && !self.lanepos_alt_flash1.is_empty();
             if want_deep != self.lanepos_deep_active {
@@ -4590,7 +4513,7 @@ impl GptOssWgpu {
             if let Some(sp) = depthgate_splits {
                 p.splits = sp;
             }
-            self.ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
+            self.ctx.queue.write_buffer(buf, 0, bytes_of(&p));
         }
         if let Some((buf, base)) = &self.kv8_fd {
             let mut p = *base;
@@ -4598,12 +4521,12 @@ impl GptOssWgpu {
             if let Some(sp) = depthgate_splits {
                 p.splits = sp;
             }
-            self.ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
+            self.ctx.queue.write_buffer(buf, 0, bytes_of(&p));
         }
         if let (Some(sp), Some((buf, base))) = (depthgate_splits, &self.kv8_gfd) {
             let mut p = *base;
             p.splits = sp;
-            self.ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
+            self.ctx.queue.write_buffer(buf, 0, bytes_of(&p));
         }
         if let Some(sp) = depthgate_splits {
             for i in 0..self.depthgate_flash1_passes.len() {
@@ -4616,7 +4539,7 @@ impl GptOssWgpu {
             let total = (self.pos + 1) as u32;
             p.total = total;
             p.start = total.saturating_sub(*window);
-            self.ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
+            self.ctx.queue.write_buffer(buf, 0, bytes_of(&p));
         }
 
         let need_scope = if full {
@@ -4625,11 +4548,7 @@ impl GptOssWgpu {
             !self.validated && !self.prefix_validated
         };
         let scope = if need_scope {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         } else {
             None
         };
@@ -4639,41 +4558,23 @@ impl GptOssWgpu {
             &self.passes[..self.head_start]
         };
         if dispatch::profile::enabled() && self.ctx.caps.timestamp_query {
-            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = passes
+            let raw: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = passes
                 .iter()
                 .map(|p| (p.pipeline.as_ref(), &p.bind, p.grid))
                 .collect();
             let labels: Vec<String> = passes.iter().map(|p| p.label.clone()).collect();
             dispatch::submit_profiled_slices(self.ctx, &raw, &labels)
-                .map_err(|e| anyhow::anyhow!("profiled submit: {e}"))?;
+                .map_err(|e| anyhow!("profiled submit: {e}"))?;
         } else if let Some(k) = dispatch::submit_chunk_overlapping_encode_with_execution() {
             for chunk in passes.chunks(k) {
-                let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-                {
-                    let mut pass = enc.begin_compute_pass(&Default::default());
-                    for p in chunk {
-                        pass.set_pipeline(&p.pipeline);
-                        pass.set_bind_group(0, &p.bind, &[]);
-                        pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-                    }
-                }
-                self.ctx.queue.submit([enc.finish()]);
+                submit_passes!(self.ctx, chunk);
             }
         } else {
-            let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                for p in passes {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-                }
-            }
-            self.ctx.queue.submit([enc.finish()]);
+            submit_passes!(self.ctx, passes);
         }
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gpt_oss_wgpu decode step validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gpt_oss_wgpu decode step validation: {e}");
             }
             if full {
                 self.validated = true;
@@ -4705,29 +4606,29 @@ impl GptOssWgpu {
         splices: &[ChunkRowSplice],
     ) -> Result<()> {
         let m = self.pf_m;
-        anyhow::ensure!(
+        ensure!(
             chunk.len() == m && (1..=m).contains(&live),
             "prefill chunk is {} tokens with {live} live, want {m} with 1..={m} live",
             chunk.len()
         );
-        anyhow::ensure!(
+        ensure!(
             self.pos + live <= self.max_seq,
             "kv cache full at {} + {live} (max_seq {})",
             self.pos,
             self.max_seq
         );
         for &t in chunk {
-            anyhow::ensure!((t as usize) < self.vocab, "token {t} out of vocab");
+            ensure!((t as usize) < self.vocab, "token {t} out of vocab");
         }
         let hidden_words = self.config.hidden_size / 2;
         let mut mask = vec![0u32; m];
         for sp in splices {
-            anyhow::ensure!(
+            ensure!(
                 sp.rel_pos < live,
                 "splice rel_pos {} is not a live row of this chunk (live {live})",
                 sp.rel_pos
             );
-            anyhow::ensure!(
+            ensure!(
                 sp.row_words.len() == hidden_words,
                 "splice row has {} words, want {hidden_words}",
                 sp.row_words.len()
@@ -4740,26 +4641,22 @@ impl GptOssWgpu {
             self.ctx.queue.write_buffer(
                 splice,
                 (sp.rel_pos * hidden_words * 4) as u64,
-                bytemuck::cast_slice(sp.row_words),
+                cast_slice(sp.row_words),
             );
         }
         let mask_buf = self
             .pf_mask
             .as_ref()
             .expect("prefill chunk without pf list");
-        self.ctx
-            .queue
-            .write_buffer(mask_buf, 0, bytemuck::cast_slice(&mask));
+        self.ctx.queue.write_buffer(mask_buf, 0, cast_slice(&mask));
         let tok = self.pf_tok.as_ref().expect("prefill chunk without pf list");
         let ck = self.pf_ck.as_ref().expect("prefill chunk without pf list");
         let ids: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
-        self.ctx
-            .queue
-            .write_buffer(tok, 0, bytemuck::cast_slice(&ids));
+        self.ctx.queue.write_buffer(tok, 0, cast_slice(&ids));
         self.ctx.queue.write_buffer(
             ck,
             0,
-            bytemuck::bytes_of(&CkParams {
+            bytes_of(&CkParams {
                 m_live: live as u32,
                 base: self.pos as u32,
                 pad0: 0,
@@ -4769,11 +4666,11 @@ impl GptOssWgpu {
         if let Some(pf_kvq) = &self.pf_kvq {
             self.ctx
                 .queue
-                .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(self.pos as i32)));
+                .write_buffer(&self.pos_buf, 0, bytes_of(&(self.pos as i32)));
             self.ctx.queue.write_buffer(
                 pf_kvq,
                 0,
-                bytemuck::bytes_of(&PfKvqParams {
+                bytes_of(&PfKvqParams {
                     tokens: live as u32,
                     x_stride_elems: (self.config.num_key_value_heads * self.config.head_dim) as u32,
                     ..Default::default()
@@ -4797,36 +4694,23 @@ impl GptOssWgpu {
         let scope = if self.pf_validated {
             None
         } else {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         if dispatch::profile::enabled() && self.ctx.caps.timestamp_query {
-            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = self
+            let raw: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = self
                 .pf_passes
                 .iter()
                 .map(|p| (p.pipeline.as_ref(), &p.bind, p.grid))
                 .collect();
             let labels: Vec<String> = self.pf_passes.iter().map(|p| p.label.clone()).collect();
             dispatch::submit_profiled_slices(self.ctx, &raw, &labels)
-                .map_err(|e| anyhow::anyhow!("profiled prefill submit: {e}"))?;
+                .map_err(|e| anyhow!("profiled prefill submit: {e}"))?;
         } else {
-            let mut enc = self.ctx.device.create_command_encoder(&Default::default());
-            {
-                let mut pass = enc.begin_compute_pass(&Default::default());
-                for p in &self.pf_passes {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
-                }
-            }
-            self.ctx.queue.submit([enc.finish()]);
+            submit_passes!(self.ctx, &self.pf_passes);
         }
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gpt_oss_wgpu prefill chunk validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gpt_oss_wgpu prefill chunk validation: {e}");
             }
             self.pf_validated = true;
         }
@@ -4862,27 +4746,26 @@ impl GptOssWgpu {
         splices: &[ImageRowSplice],
     ) -> Result<usize> {
         let m = self.prefill_chunk_len();
-        anyhow::ensure!(
+        ensure!(
             m >= 2,
             "embedding-row splice prefill requires the chunked prefill graph: \
              NV_GPTOSS_WGPU_PREFILL_M>=2 and a live pf pass list"
         );
         let hidden = self.config.hidden_size;
-        let hidden_words = hidden / 2;
         let mut prev_end = 0usize;
         let mut packed: Vec<Vec<u32>> = Vec::with_capacity(splices.len());
         for sp in splices {
-            anyhow::ensure!(
+            ensure!(
                 sp.rows_bf16.len() % hidden == 0,
                 "splice rows_bf16 len {} not a multiple of hidden {hidden}",
                 sp.rows_bf16.len()
             );
             let n_slots = sp.rows_bf16.len() / hidden;
-            anyhow::ensure!(
+            ensure!(
                 sp.position >= prev_end,
                 "embedding-row splices must be sorted and non-overlapping"
             );
-            anyhow::ensure!(
+            ensure!(
                 sp.position + n_slots <= tokens.len(),
                 "splice at {} with {n_slots} rows exceeds {} tokens",
                 sp.position,
@@ -4894,23 +4777,7 @@ impl GptOssWgpu {
         let mut done = 0usize;
         while done < tokens.len() {
             let live = m.min(tokens.len() - done);
-            let mut chunk: Vec<u32> = tokens[done..done + live].to_vec();
-            let pad = *chunk.last().expect("non-empty chunk");
-            chunk.resize(m, pad);
-            let chunk_end = done + live;
-            let mut rows: Vec<ChunkRowSplice> = Vec::new();
-            for (si, sp) in splices.iter().enumerate() {
-                let n_slots = sp.rows_bf16.len() / hidden;
-                let lo = sp.position.max(done);
-                let hi = (sp.position + n_slots).min(chunk_end);
-                for abs in lo..hi {
-                    let w0 = (abs - sp.position) * hidden_words;
-                    rows.push(ChunkRowSplice {
-                        rel_pos: abs - done,
-                        row_words: &packed[si][w0..w0 + hidden_words],
-                    });
-                }
-            }
+            let (chunk, rows) = spliced_chunk(tokens, splices, &packed, hidden, m, done, live);
             self.prefill_chunk_masked(&chunk, live, &rows)?;
             done += live;
         }
@@ -4922,7 +4789,7 @@ impl GptOssWgpu {
     }
 
     pub fn advance(&mut self, n: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.pos + n <= self.max_seq,
             "advance {n} from {} past max_seq {}",
             self.pos,
@@ -4933,7 +4800,7 @@ impl GptOssWgpu {
     }
 
     fn verify_forward(&mut self, batch: &[u32]) -> Result<usize> {
-        anyhow::ensure!(
+        ensure!(
             !(flash_decode_enabled()
                 || fused_step_enabled()
                 || gemv_sg_enabled()
@@ -4945,13 +4812,13 @@ impl GptOssWgpu {
              gpt-oss verify today)"
         );
         let rows = self.verify_max_rows();
-        anyhow::ensure!(
+        ensure!(
             rows > 0,
             "verify_chain needs the M-row prefill graph and its verify epilogue: \
              NV_GPTOSS_WGPU_PREFILL_M >= 2 and {VERIFY_M_ENV} != 0"
         );
         let live = batch.len();
-        anyhow::ensure!(
+        ensure!(
             (1..=rows).contains(&live),
             "verify_chain batch of {live} out of 1..={rows}"
         );
@@ -4964,7 +4831,7 @@ impl GptOssWgpu {
         let scope = if self.pf_validated && verified {
             None
         } else {
-            Some(ctx.device.push_error_scope(wgpu::ErrorFilter::Validation))
+            Some(ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         {
             let vs = self
@@ -4975,9 +4842,7 @@ impl GptOssWgpu {
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 for p in &self.pf_passes {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                    dispatch_pass!(pass, p);
                 }
                 for (i, p) in vs.passes.iter().enumerate() {
                     let z = if i >= vs.head_start {
@@ -4993,8 +4858,8 @@ impl GptOssWgpu {
             ctx.queue.submit([enc.finish()]);
         }
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gpt_oss_wgpu verify chain validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gpt_oss_wgpu verify chain validation: {e}");
             }
             self.pf_validated = true;
             if let Some(vs) = self.verify.as_mut() {
@@ -5008,7 +4873,7 @@ impl GptOssWgpu {
         let live = self.verify_forward(batch)?;
         let vs = self.verify.as_ref().expect("verify epilogue");
         dispatch::read_back::<u32>(self.ctx, &vs.tokens, live)
-            .map_err(|e| anyhow::anyhow!("verify token readback: {e}"))
+            .map_err(|e| anyhow!("verify token readback: {e}"))
     }
 
     pub fn verify_chain_logits(&mut self, batch: &[u32]) -> Result<(Vec<u32>, Vec<f32>)> {
@@ -5016,14 +4881,14 @@ impl GptOssWgpu {
         let vocab = self.vocab;
         let vs = self.verify.as_ref().expect("verify epilogue");
         let toks = dispatch::read_back::<u32>(self.ctx, &vs.tokens, live)
-            .map_err(|e| anyhow::anyhow!("verify token readback: {e}"))?;
+            .map_err(|e| anyhow!("verify token readback: {e}"))?;
         let logits = dispatch::read_back::<f32>(self.ctx, &vs.logits, live * vocab)
-            .map_err(|e| anyhow::anyhow!("verify logits readback: {e}"))?;
+            .map_err(|e| anyhow!("verify logits readback: {e}"))?;
         Ok((toks, logits))
     }
 
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<u32> {
-        anyhow::ensure!(!tokens.is_empty(), "prefill needs at least one token");
+        ensure!(!tokens.is_empty(), "prefill needs at least one token");
         let (last, rest) = tokens.split_last().expect("non-empty");
         let done = self.prefill_tokens(rest)?;
         for t in &rest[done..] {
@@ -5062,16 +4927,15 @@ fn row_chunk(ctx: &WgpuContext, hidden: usize) -> usize {
     ((limit / per_row) as usize).max(2) & !1usize
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_bf16(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Bf16Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     out_f32: bool,
-    dummy_bias: &wgpu::Buffer,
+    dummy_bias: &Buffer,
 ) -> Result<()> {
     if s.gemv_sg_on && w.k.is_multiple_of(8) {
         let (entry, rows_per_wg) = gemv_bf16_sg_entry_and_rows_per_wg(s, w.k / 8);
@@ -5128,15 +4992,14 @@ fn push_gemv_bf16(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_mx(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &MxGpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
+    sel: &Buffer,
     slots: usize,
     x_slot_stride_words: usize,
 ) -> Result<()> {
@@ -5159,19 +5022,19 @@ fn push_gemv_mx(
             ..Default::default()
         },
     );
-    anyhow::ensure!(slots <= w.e, "more slots than experts");
+    ensure!(slots <= w.e, "more slots than experts");
     let entry: String =
         if s.mx_kpre_blocks.contains(&k_blocks) && s.mx_entry == MX_SG_XV4_R2_LUT_XS_ENTRY {
             mx_kpre_r2_xs_entry_name(k_blocks)
         } else {
             s.mx_entry.to_string()
         };
-    anyhow::ensure!(
+    ensure!(
         !entry.starts_with(MX_SG_XV4_ENTRY) || x_slot_stride_words.is_multiple_of(4),
         "the xv4 mx arms rebind x as vec4 words, so slot stride {x_slot_stride_words} must be a \
          multiple of 4"
     );
-    anyhow::ensure!(
+    ensure!(
         !entry.contains("_xs") || k_blocks <= MX_XS_K_BLOCK_CAP_MATCHES_THE_512_VEC4_SHARED_ARRAY,
         "the xstage arms hold all of x in an 8 KiB shared array, so k_blocks {k_blocks} must \
          stay within the staged capacity"
@@ -5196,15 +5059,11 @@ fn push_gemv_mx(
 pub const PREFILL_M_MAX: usize = 64;
 
 pub fn prefill_m() -> usize {
-    match std::env::var("NV_GPTOSS_WGPU_PREFILL_M")
-        .or_else(|_| std::env::var("NV_WGPU_PREFILL_M"))
+    env::var("NV_GPTOSS_WGPU_PREFILL_M")
+        .or_else(|_| env::var("NV_WGPU_PREFILL_M"))
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-    {
-        Some(0) => 0,
-        Some(m) => m.clamp(2, PREFILL_M_MAX),
-        None => 16,
-    }
+        .map_or(16, |m| m.clamp(2, PREFILL_M_MAX))
 }
 
 pub const VERIFY_M_ENV: &str = "NV_GPTOSS_WGPU_VERIFY_M";
@@ -5216,7 +5075,7 @@ pub const VERIFY_EPILOGUE_COSTS_ROWS_TIMES_VOCAB_F32_OF_LOGITS: &str =
      removes the epilogue entirely";
 
 fn verify_rows(prefill_m: usize) -> usize {
-    match std::env::var(VERIFY_M_ENV)
+    match env::var(VERIFY_M_ENV)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
     {
@@ -5228,9 +5087,9 @@ fn verify_rows(prefill_m: usize) -> usize {
 
 struct Kv8Shared {
     lanepos_alt_entry: Option<String>,
-    fd_buf: wgpu::Buffer,
+    fd_buf: Buffer,
     fd_base: SharedFdParams,
-    gfd_buf: wgpu::Buffer,
+    gfd_buf: Buffer,
     gfd_base: FlashDecodeParams,
     fold_src: String,
     fold_entry: String,
@@ -5240,11 +5099,11 @@ struct Kv8Shared {
 }
 
 struct Kv8Attn {
-    kc8: wgpu::Buffer,
-    vc8: wgpu::Buffer,
-    ksc: wgpu::Buffer,
-    vsc: wgpu::Buffer,
-    kvq_p: wgpu::Buffer,
+    kc8: Buffer,
+    vc8: Buffer,
+    ksc: Buffer,
+    vsc: Buffer,
+    kvq_p: Buffer,
 }
 
 struct AttnGpu {
@@ -5252,10 +5111,10 @@ struct AttnGpu {
     wk: Bf16Gpu,
     wv: Bf16Gpu,
     wo: Bf16Gpu,
-    kc: wgpu::Buffer,
-    vc: wgpu::Buffer,
-    sinks: wgpu::Buffer,
-    dummy_bias: wgpu::Buffer,
+    kc: Buffer,
+    vc: Buffer,
+    sinks: Buffer,
+    dummy_bias: Buffer,
     window: usize,
     kv8: Option<Kv8Attn>,
 }
@@ -5264,34 +5123,34 @@ struct MoeGpu {
     router: Bf16Gpu,
     gu: MxGpu,
     dn: MxGpu,
-    dummy_bias: wgpu::Buffer,
+    dummy_bias: Buffer,
 }
 
 struct PfScratch {
     m: usize,
-    tok: wgpu::Buffer,
-    ck: wgpu::Buffer,
-    splice: wgpu::Buffer,
-    mask: wgpu::Buffer,
-    res: wgpu::Buffer,
-    normed: wgpu::Buffer,
-    normed_post: wgpu::Buffer,
-    mixed: wgpu::Buffer,
-    moe_out: wgpu::Buffer,
-    q_raw: wgpu::Buffer,
-    k_raw: wgpu::Buffer,
-    v_raw: wgpu::Buffer,
-    q: wgpu::Buffer,
-    k: wgpu::Buffer,
-    scores: wgpu::Buffer,
-    attn: wgpu::Buffer,
-    attn_bf16: wgpu::Buffer,
-    rlogits: wgpu::Buffer,
-    ids: wgpu::Buffer,
-    wts: wgpu::Buffer,
-    y_gu: wgpu::Buffer,
-    act: wgpu::Buffer,
-    y_down: wgpu::Buffer,
+    tok: Buffer,
+    ck: Buffer,
+    splice: Buffer,
+    mask: Buffer,
+    res: Buffer,
+    normed: Buffer,
+    normed_post: Buffer,
+    mixed: Buffer,
+    moe_out: Buffer,
+    q_raw: Buffer,
+    k_raw: Buffer,
+    v_raw: Buffer,
+    q: Buffer,
+    k: Buffer,
+    scores: Buffer,
+    attn: Buffer,
+    attn_bf16: Buffer,
+    rlogits: Buffer,
+    ids: Buffer,
+    wts: Buffer,
+    y_gu: Buffer,
+    act: Buffer,
+    y_down: Buffer,
 }
 
 fn alloc_pf_scratch(b: &mut Builder, cfg: &GptOssConfig, max_seq: usize, m: usize) -> PfScratch {
@@ -5334,9 +5193,9 @@ fn pf_norm(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
     m: usize,
@@ -5359,15 +5218,14 @@ fn pf_norm(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_norm_residual(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
-    res: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    res: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
     m: usize,
@@ -5390,18 +5248,17 @@ fn pf_norm_residual(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_gemv_bf16(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Bf16Gpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_row_words: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_row_words: usize,
     out_f32: bool,
-    dummy_bias: &wgpu::Buffer,
+    dummy_bias: &Buffer,
     m: usize,
 ) -> Result<()> {
     let pairs = w.n.div_ceil(2);
@@ -5431,17 +5288,16 @@ fn pf_gemv_bf16(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_gemv_mx(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &MxGpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_tok_stride_words: usize,
     x_slot_stride_words: usize,
-    y: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
+    y: &Buffer,
+    sel: &Buffer,
     m: usize,
     k_top: usize,
 ) -> Result<()> {
@@ -5465,7 +5321,7 @@ fn pf_gemv_mx(
             ..Default::default()
         },
     );
-    anyhow::ensure!(
+    ensure!(
         k_top <= w.e,
         "router picks {k_top} of {} experts; the slot axis carries m*k_top rows, but every slot \
          must still name a real expert",
@@ -5490,14 +5346,14 @@ fn pf_gemv_mx(
 
 fn qkv_concat_host(a: &HostAttn) -> Result<HostBf16Lin> {
     let (q, k, v) = (&a.q, &a.k, &a.v);
-    anyhow::ensure!(
+    ensure!(
         q.k == k.k && q.k == v.k,
         "fused qkv gemv needs one shared input width, got {} / {} / {}",
         q.k,
         k.k,
         v.k
     );
-    anyhow::ensure!(
+    ensure!(
         q.n.is_multiple_of(2) && k.n.is_multiple_of(2),
         "fused qkv output packs bf16 pairs, so the q and k sections must hold even row counts \
          ({} / {}) or the section boundaries straddle a packed word",
@@ -5505,7 +5361,7 @@ fn qkv_concat_host(a: &HostAttn) -> Result<HostBf16Lin> {
         k.n
     );
     let any_bias = !(q.bias.is_empty() && k.bias.is_empty() && v.bias.is_empty());
-    anyhow::ensure!(
+    ensure!(
         !any_bias || (!q.bias.is_empty() && !k.bias.is_empty() && !v.bias.is_empty()),
         "fused qkv concatenates biases positionally, so either every projection carries one or none does"
     );
@@ -5552,23 +5408,22 @@ fn upload_mx(b: &mut Builder, label: &str, st: &HostMxStack) -> MxGpu {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_attn(
     b: &mut Builder,
     s: &Sources,
     cfg: &GptOssConfig,
     layer: &HostLayer,
     li: usize,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
-    pos_buf: &wgpu::Buffer,
-    cosb: &wgpu::Buffer,
-    sinb: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
+    pos_buf: &Buffer,
+    cosb: &Buffer,
+    sinb: &Buffer,
     max_seq: usize,
-    states: &mut Vec<(wgpu::Buffer, u64)>,
-    flash_fd: Option<&wgpu::Buffer>,
+    states: &mut Vec<(Buffer, u64)>,
+    flash_fd: Option<&Buffer>,
     kv8: Option<&Kv8Shared>,
-    flash_sw: Option<(&wgpu::Buffer, u32)>,
+    flash_sw: Option<(&Buffer, u32)>,
 ) -> Result<AttnGpu> {
     let a = &layer.attn;
     let hd = cfg.head_dim;
@@ -5580,10 +5435,8 @@ fn build_attn(
     };
     let use_kv8 = kv8.is_some() && window == 0;
     let fuse_qkv_except_where_kv8_quantizes_the_separate_k_and_v_rows = s.fused_on && !use_kv8;
-    let fuse_qkv_rows_for_kv8 = s.fused_on
-        && use_kv8
-        && qkv_fuse_kv8_enabled_one_fused_qkv_gemv_plus_one_rope_row_writer_replaces_the_kv8_layers_six_dispatch_split_chain();
-    anyhow::ensure!(
+    let fuse_qkv_rows_for_kv8 = s.fused_on && use_kv8;
+    ensure!(
         a.sinks.len() == n_h,
         "sinks length {} != {n_h}",
         a.sinks.len()
@@ -5603,7 +5456,7 @@ fn build_attn(
     states.push((vc.clone(), cache_bytes));
 
     let q = b.zeros("gow-at-q", (n_h * hd * 2) as u64);
-    let mut unfused_k_and_v_rows: Option<(wgpu::Buffer, wgpu::Buffer)> = None;
+    let mut unfused_k_and_v_rows: Option<(Buffer, Buffer)> = None;
     if fuse_qkv_except_where_kv8_quantizes_the_separate_k_and_v_rows {
         let qkv_lin = qkv_concat_host(a)?;
         let qkv_raw = b.zeros("gow-at-qkvraw", (qkv_lin.n * 2) as u64);
@@ -5788,12 +5641,12 @@ fn build_attn(
     let mut kv8_attn: Option<Kv8Attn> = None;
     if let (Some(k8), true) = (kv8, use_kv8) {
         let Some((k_rows, v_rows)) = unfused_k_and_v_rows.as_ref() else {
-            anyhow::bail!(
+            bail!(
                 "the kv8 arm quantizes the unfused per-layer k and v rows, so the fused qkv arm \
                  must stay off on every layer kv8 covers"
             );
         };
-        anyhow::ensure!(
+        ensure!(
             hd.is_multiple_of(32),
             "the shared fp8 fold stage1 packs 4 e4m3 bytes per word and strides head_dim in \
              32-lane strips, got {hd}"
@@ -5914,12 +5767,12 @@ fn build_attn(
             kvq_p,
         });
     } else if let Some((fp, splits)) = flash_layer {
-        anyhow::ensure!(
+        ensure!(
             hd <= MAX_HEAD_DIM && hd.is_multiple_of(2),
             "gow flash stage1 accumulates head_dim in 32-lane strips up to {MAX_HEAD_DIM} and \
              stage2 packs bf16 pairs, got {hd}"
         );
-        anyhow::ensure!(
+        ensure!(
             b.ctx.caps.max_compute_invocations_per_workgroup >= 256
                 && b.ctx.caps.max_compute_workgroup_size_x >= 256
                 && b.ctx.caps.workgroup_storage_fits(
@@ -6074,20 +5927,19 @@ fn build_attn(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_attn_prefill(
     b: &mut Builder,
     s: &Sources,
     cfg: &GptOssConfig,
     ag: &AttnGpu,
     sc: &PfScratch,
-    cosb: &wgpu::Buffer,
-    sinb: &wgpu::Buffer,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    cosb: &Buffer,
+    sinb: &Buffer,
+    x: &Buffer,
+    out: &Buffer,
     max_seq: usize,
-    pos_buf: &wgpu::Buffer,
-    pf_kvq: Option<&wgpu::Buffer>,
+    pos_buf: &Buffer,
+    pf_kvq: Option<&Buffer>,
 ) -> Result<()> {
     let m = sc.m;
     let hd = cfg.head_dim;
@@ -6209,8 +6061,8 @@ fn build_attn_prefill(
     }
     if let Some(k8) = ag.kv8.as_ref() {
         let pf_kvq = pf_kvq.ok_or_else(|| {
-            anyhow::anyhow!(
-                "{KV_FP8_ENV} full-layer prefill needs the per-chunk kvq uniform; \
+            anyhow!(
+                "fp8-KV full-layer prefill needs the per-chunk kvq uniform; \
                  build() allocates it whenever kv8 and the prefill graph coexist"
             )
         })?;
@@ -6311,8 +6163,8 @@ fn build_moe(
     s: &Sources,
     cfg: &GptOssConfig,
     m: &HostMoe,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
 ) -> Result<MoeGpu> {
     let hidden = cfg.hidden_size;
     let hidden_words = hidden / 2;
@@ -6320,18 +6172,18 @@ fn build_moe(
     let e = cfg.num_local_experts;
     let k_top = cfg.num_experts_per_tok;
 
-    anyhow::ensure!(
+    ensure!(
         m.gate_up.e == e && m.down.e == e,
         "expert stack count mismatch"
     );
-    anyhow::ensure!(
+    ensure!(
         m.gate_up.n == 2 * inter && m.gate_up.k == hidden,
         "gate_up stack is [{}, {}], want [{}, {hidden}]",
         m.gate_up.n,
         m.gate_up.k,
         2 * inter
     );
-    anyhow::ensure!(
+    ensure!(
         m.down.n == hidden && m.down.k == inter,
         "down stack is [{}, {}], want [{hidden}, {inter}]",
         m.down.n,
@@ -6435,7 +6287,7 @@ fn build_moe(
                 ..Default::default()
             },
         );
-        let topk_sg32 = moe_topk_sg32_enabled() && s.gemv_sg_on && e <= 32;
+        let topk_sg32 = s.gemv_sg_on && e <= 32;
         b.push(
             "gow-moe-topk",
             &s.moe,
@@ -6453,8 +6305,7 @@ fn build_moe(
     let dn = upload_mx(b, "gow-moe-dn", &m.down);
 
     let act = b.zeros("gow-moe-act", (k_top * inter * 2) as u64);
-    let gusw = mx_sg_gusw_enabled_one_subgroup_owns_two_gate_up_pairs_and_writes_the_swiglu_act_word_directly_skipping_the_swiglu_pass()
-        && s.mx_entry.ends_with("_xs")
+    let gusw = s.mx_entry.ends_with("_xs")
         && (2 * inter).is_multiple_of(MX_SG_R4SW_ROWS_PER_WG as usize);
     if gusw {
         let n_rows = 2 * inter;
@@ -6478,7 +6329,7 @@ fn build_moe(
                 pad1: SWIGLU_ALPHA.to_bits(),
             },
         );
-        anyhow::ensure!(
+        ensure!(
             k_blocks <= MX_XS_K_BLOCK_CAP_MATCHES_THE_512_VEC4_SHARED_ARRAY,
             "the fused gu+swiglu arm stages all of x in the 8 KiB shared array, so k_blocks \
              {k_blocks} must stay within the staged capacity"
@@ -6528,8 +6379,7 @@ fn build_moe(
     }
 
     let dn_k_blocks = dn.k / MX_BLOCK;
-    let dncomb = moe_dncomb_fuse_enabled_the_down_gemv_keeps_each_expert_row_in_a_register_and_folds_the_same_ascending_fma_chain_gow_moe_combine_would_have_run()
-        && s.mx_entry == MX_SG_XV4_R2_LUT_XS_ENTRY
+    let dncomb = s.mx_entry == MX_SG_XV4_R2_LUT_XS_ENTRY
         && !s.mx_kpre_blocks.contains(&dn_k_blocks)
         && dn_k_blocks <= MX_XS_K_BLOCK_CAP_MATCHES_THE_512_VEC4_SHARED_ARRAY
         && hidden.is_multiple_of(MX_SG_XV4_R2_ROWS_PER_WG as usize)
@@ -6538,20 +6388,8 @@ fn build_moe(
     b.probe("wts0", &wts, k_top, false);
     if dncomb {
         let wg64 = arm_env_opt_in_default_off(MOE_DNCOMB_WG64_ENV);
-        let sgslot = if std::env::var(MOE_DNCOMB_SGSLOT_ENV).is_ok() {
-            arm_env_enabled_with_the_moe_fuse_stack_default(MOE_DNCOMB_SGSLOT_ENV)
-        } else {
-            GOW_MOE_FUSE_STACK_XV4_LUT_XSTAGE_GUPAIR_GUSW_DNCOMB_SGSLOT_SHIPS_ON_ROWS_GPTOSS_FUSE_GATED_LADDER_175P7_166P8_107P6_TOK_S_AT_256_8K_122K_CAMPAIGN_PLUS_19P9_35P6_58P2_PCT_AND_ZERO_RESTORES_EACH_ARM
-                && k_top
-                    == DNCOMB_SGSLOT_KEEPS_EVERY_ROW_SLOT_PAIR_ON_ITS_OWN_SUBGROUP_SO_THE_RESIDENT_THREAD_COUNT_AND_MEMORY_LEVEL_PARALLELISM_MATCH_THE_SPLIT_PASS
-        };
-        anyhow::ensure!(
-            !sgslot
-                || k_top
-                    == DNCOMB_SGSLOT_KEEPS_EVERY_ROW_SLOT_PAIR_ON_ITS_OWN_SUBGROUP_SO_THE_RESIDENT_THREAD_COUNT_AND_MEMORY_LEVEL_PARALLELISM_MATCH_THE_SPLIT_PASS,
-            "the sgslot dncomb variant maps the 8 subgroups of a 256-thread workgroup onto \
-             k_top expert slots x 2 row pairs, so it needs exactly 4 slots, not {k_top}"
-        );
+        let sgslot = k_top
+            == DNCOMB_SGSLOT_KEEPS_EVERY_ROW_SLOT_PAIR_ON_ITS_OWN_SUBGROUP_SO_THE_RESIDENT_THREAD_COUNT_AND_MEMORY_LEVEL_PARALLELISM_MATCH_THE_SPLIT_PASS;
         let rows_per_wg = if wg64 || sgslot {
             DNCOMB_WG64_ROWS_PER_WG_RESTORES_THE_SPLIT_PASSES_720_RESIDENT_WORKGROUPS
         } else {
@@ -6559,7 +6397,7 @@ fn build_moe(
         };
         let groups = hidden.div_ceil(rows_per_wg);
         let grid = b.grid1(groups as u64, 1);
-        anyhow::ensure!(
+        ensure!(
             hidden.is_multiple_of(rows_per_wg) && rows_per_wg.is_multiple_of(2),
             "each dncomb subgroup owns an even row pair that becomes one packed bf16 output \
              word, so hidden {hidden} must divide into whole {rows_per_wg}-row workgroups"
@@ -6649,8 +6487,8 @@ fn build_moe_prefill(
     cfg: &GptOssConfig,
     mg: &MoeGpu,
     sc: &PfScratch,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
 ) -> Result<()> {
     let m = sc.m;
     let hidden = cfg.hidden_size;

@@ -26,7 +26,7 @@ fn main() {
         }
     }
     println!("cargo:rerun-if-changed=build.rs");
-    for watched in ["include", "cuda", "cuda_sm120", "hip", "cpp", "third_party"] {
+    for watched in ["include", "cuda", "cuda_sm120", "cpp", "third_party"] {
         if Path::new(watched).exists() {
             println!("cargo:rerun-if-changed={watched}");
         }

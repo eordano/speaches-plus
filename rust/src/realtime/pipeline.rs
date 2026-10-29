@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::json;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::conversation::llm::{self, ChatMessage};
@@ -14,13 +14,13 @@ use crate::stt::WhisperHandle;
 use super::audio_out;
 use super::audio_out_ws::{AudioPacer, WsAudioPacer};
 use super::inspector::InspectorEvent;
-use super::session::{CancelReason, FailReason, Session};
+use super::session::{CancelReason, FailReason, ResponseLane, Session};
 use super::state::{ConversationItem, RespPhase, SealedBuffer, VadPhase};
 use super::transport::OutboundAudioSpec;
+use super::wire::{ResponseStatus, ResponseStatusReason};
 use super::Intent;
 use crate::inspect::AudioStore;
 
-#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     target = "speaches/realtime",
     name = "eou.dispatch",
@@ -299,59 +299,49 @@ pub(super) async fn commit_after_eou(
             }))
             .await;
     }
-    let session_for_task = session.clone();
+    let wants_response = session.intent == Intent::Conversation
+        && !suppress_response
+        && session
+            .turn_detection
+            .create_response
+            .load(Ordering::Relaxed);
     let response_id = promoted_turn_wire_id(
         predicted_llm_text.is_some(),
         predicted_wire_id,
         session.id_source.response(),
     );
-    let response_id_for_task = response_id.clone();
     let assistant_item_id = session.id_source.item();
-    let assistant_item_id_for_task = assistant_item_id.as_str().to_string();
-    let transcript_so_far = Arc::new(Mutex::new(String::new()));
-    let transcript_so_far_for_task = transcript_so_far.clone();
-    let played_ms = Arc::new(AtomicU64::new(0));
-    let played_ms_for_task = played_ms.clone();
-    let wire_opened = Arc::new(AtomicBool::new(false));
-    let wire_opened_for_task = wire_opened.clone();
-    let item_id_for_task = item_id.clone();
-    let predicted_transcript_for_task = predicted_transcript.clone();
-    let predicted_llm_text_for_task = predicted_llm_text.clone();
-    let handle = tokio::spawn(session.cancel.wrap_unit(async move {
+    let session_for_task = session.clone();
+    let utterance = move |response: Option<ResponseLane>| async move {
         let _ = process_utterance(
             &session_for_task,
-            response_id_for_task.as_str(),
-            item_id_for_task,
+            item_id,
             audio,
-            played_ms_for_task,
-            assistant_item_id_for_task,
-            transcript_so_far_for_task,
             audio_ms,
             suppress_response,
-            predicted_transcript_for_task,
-            predicted_llm_text_for_task,
-            wire_opened_for_task,
+            predicted_transcript,
+            predicted_llm_text,
+            response,
         )
         .await;
-        session_for_task
-            .clear_response_if_matches(&response_id_for_task)
-            .await;
-    }));
-    let create_response = session
-        .turn_detection
-        .create_response
-        .load(Ordering::Relaxed);
-    if session.intent == Intent::Conversation && !suppress_response && create_response {
-        session
-            .register_response(
-                response_id,
-                handle,
-                played_ms,
-                assistant_item_id,
-                transcript_so_far,
-                wire_opened,
-            )
-            .await;
+    };
+    let mut state = session.state.lock().await;
+    let admitted = wants_response
+        && state
+            .resp_admit()
+            .inspect_err(|violation| {
+                info!(
+                    ?violation,
+                    "committed turn is transcribed without a response: the session already holds one"
+                )
+            })
+            .is_ok();
+    if admitted {
+        let _ = session.spawn_response_lane(&mut state, response_id, assistant_item_id, |lane| {
+            utterance(Some(lane))
+        });
+    } else {
+        tokio::spawn(session.cancel.wrap_unit(utterance(None)));
     }
 }
 
@@ -394,20 +384,15 @@ pub(super) async fn commit_bargein(session: &Arc<Session>, item_id: &str, audio_
         .await;
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn process_utterance(
     session: &Arc<Session>,
-    response_id: &str,
     item_id: String,
     audio: Vec<f32>,
-    played_ms: Arc<AtomicU64>,
-    assistant_item_id: String,
-    transcript_so_far: Arc<Mutex<String>>,
     audio_ms: u64,
     suppress_response: bool,
     cached_transcript: Option<String>,
     predicted_llm_text: Option<String>,
-    wire_opened: Arc<AtomicBool>,
+    response: Option<ResponseLane>,
 ) -> anyhow::Result<()> {
     {
         let sealed = SealedBuffer {
@@ -421,6 +406,7 @@ pub(super) async fn process_utterance(
     }
     let speaker_audio = super::speaker_id::SpeakerIdentifier::global(&session.models)
         .map(|identifier| (identifier, audio.clone()));
+    let mut confidence = super::wire::TranscriptConfidence::default();
     let transcript = if let Some(cached) = cached_transcript {
         debug!(%item_id, len = cached.len(), "using speculative STT result");
         cached
@@ -476,6 +462,7 @@ pub(super) async fn process_utterance(
             state.drop_sealed_buffer(&item_id);
             return Ok(());
         }
+        confidence = super::wire::TranscriptConfidence::from_stt(&stt_result);
         stt_result.text
     };
     if transcript.is_empty() {
@@ -522,15 +509,15 @@ pub(super) async fn process_utterance(
     if let Some(m) = &speaker {
         info!(%item_id, speaker = %m.id, name = ?m.name, score = m.score, "speaker identified");
     }
-    session
-        .send_to_client(&json!({
-            "type": "conversation.item.input_audio_transcription.completed",
-            "item_id": item_id,
-            "content_index": 0,
-            "transcript": transcript,
-            "speaker": speaker,
-        }))
-        .await;
+    let mut completed = json!({
+        "type": "conversation.item.input_audio_transcription.completed",
+        "item_id": item_id,
+        "content_index": 0,
+        "transcript": transcript,
+        "speaker": speaker,
+    });
+    confidence.attach(&mut completed);
+    session.send_to_client(&completed).await;
     {
         let mut state = session.state.lock().await;
         state.drop_sealed_buffer(&item_id);
@@ -553,29 +540,16 @@ pub(super) async fn process_utterance(
         return Ok(());
     }
 
-    if session.intent != Intent::Conversation {
+    let Some(lane) = response else {
+        debug!(%item_id, "committed turn has no response lane");
         return Ok(());
-    }
-
-    if !session
-        .turn_detection
-        .create_response
-        .load(Ordering::Relaxed)
-    {
-        debug!(%item_id, "auto-response skipped: turn_detection.create_response=false");
-        return Ok(());
-    }
-
+    };
     run_response(
         session,
-        response_id,
-        assistant_item_id,
+        lane,
         transcript,
-        played_ms,
-        transcript_so_far,
         predicted_llm_text.map(PrefilledText::Predicted),
         ResponseOverrides::default(),
-        wire_opened,
     )
     .await
 }
@@ -605,23 +579,27 @@ pub(super) struct ResponseOverrides {
     target = "speaches/realtime",
     name = "llm.dispatch",
     skip_all,
-    fields(session_id = %session.id.as_str(), response_id = %response_id, item_id = %assistant_item_id)
+    fields(session_id = %session.id.as_str(), response_id = %lane.id, item_id = %lane.assistant_item_id)
 )]
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_response(
     session: &Arc<Session>,
-    response_id: &str,
-    assistant_item_id: String,
+    lane: ResponseLane,
     last_user_text: String,
-    played_ms: Arc<AtomicU64>,
-    transcript_so_far: Arc<Mutex<String>>,
     prefilled: Option<PrefilledText>,
     overrides: ResponseOverrides,
-    wire_opened: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    super::events::emit_response_open_brackets(session, response_id, &assistant_item_id).await;
-
-    wire_opened.store(true, Ordering::Release);
+    if !session.announce_response(&lane).await {
+        return Ok(());
+    }
+    let ResponseLane {
+        id,
+        assistant_item_id,
+        played_ms,
+        transcript_so_far,
+        ..
+    } = lane;
+    let response_id = id.as_str();
+    let assistant_item_id = assistant_item_id.into_string();
 
     let client_supplied = matches!(prefilled, Some(PrefilledText::ClientSupplied(_)));
     let utterance_started = std::time::Instant::now();
@@ -643,11 +621,12 @@ pub(super) async fn run_response(
         });
         rx
     } else {
-        let Some(cfg) = &session.llm_config else {
+        let Some(cfg) = session.llm_config_for_turn() else {
             warn!("conversation intent but CHAT_COMPLETION_BASE_URL not set");
             super::events::fail_response(
                 session,
                 response_id,
+                &assistant_item_id,
                 None,
                 FailReason::LlmError,
                 &played_ms,
@@ -679,7 +658,7 @@ pub(super) async fn run_response(
             response_id: response_id.to_string(),
             model: model_name,
         });
-        llm::complete_stream_messages(cfg, messages, Some(response_id.to_string()))
+        llm::complete_stream_messages(&cfg, messages, Some(response_id.to_string()))
     };
 
     let Some(kokoro) = &session.models.kokoro else {
@@ -701,6 +680,7 @@ pub(super) async fn run_response(
                     super::events::fail_response(
                         session,
                         response_id,
+                        &assistant_item_id,
                         None,
                         FailReason::LlmError,
                         &played_ms,
@@ -713,6 +693,7 @@ pub(super) async fn run_response(
         super::events::fail_response(
             session,
             response_id,
+            &assistant_item_id,
             Some(full),
             FailReason::TtsError,
             &played_ms,
@@ -827,7 +808,7 @@ pub(super) async fn run_response(
 
                     if let Some(tail) = chunker.take_flush() {
                         if !streaming_marked {
-                            session.mark_streaming(response_id).await;
+                            session.mark_streaming(response_id, &played_ms).await;
                         }
                         if let Some(tx) = sentence_tx_opt.as_ref() {
                             let _ = tx.send(tail).await;
@@ -860,7 +841,7 @@ pub(super) async fn run_response(
                 }
                 if !delta.is_empty() {
                     if !streaming_marked {
-                        session.mark_streaming(response_id).await;
+                        session.mark_streaming(response_id, &played_ms).await;
                         streaming_marked = true;
                     }
                     super::events::emit_audio_transcript_delta(
@@ -901,6 +882,7 @@ pub(super) async fn run_response(
         super::events::fail_response(
             session,
             response_id,
+            &assistant_item_id,
             Some(full_response),
             FailReason::LlmError,
             &played_ms,
@@ -916,6 +898,7 @@ pub(super) async fn run_response(
             handle_client_too_slow(
                 session,
                 response_id,
+                &assistant_item_id,
                 &mut llm_stream,
                 full_response,
                 queued_ms,
@@ -934,8 +917,15 @@ pub(super) async fn run_response(
                 warn!(error = %err, "outbound audio flush failed");
             }
         }
-        super::events::fail_response(session, response_id, None, FailReason::LlmError, &played_ms)
-            .await;
+        super::events::fail_response(
+            session,
+            response_id,
+            &assistant_item_id,
+            None,
+            FailReason::LlmError,
+            &played_ms,
+        )
+        .await;
         return Ok(());
     }
 
@@ -950,53 +940,29 @@ pub(super) async fn run_response(
         "response complete",
     );
 
-    match drain_status {
-        "completed" => {
-            let final_played_ms = played_ms.load(Ordering::Relaxed);
-            if !client_supplied {
-                session
-                    .append_assistant_item(
-                        assistant_item_id.clone(),
-                        full_response.clone(),
-                        final_played_ms,
-                    )
-                    .await;
-            }
-            super::events::emit_bracket_close(
-                session,
-                response_id,
-                &assistant_item_id,
-                &full_response,
-            )
-            .await;
-            super::events::emit_response_done(
-                session,
-                response_id,
-                "completed",
-                Some(full_response),
-                None,
-                final_played_ms,
-            )
-            .await;
-        }
-        "incomplete" => {
-            let played = played_ms.load(Ordering::Relaxed);
-            if !client_supplied {
-                session
-                    .append_assistant_item(assistant_item_id.clone(), full_response.clone(), played)
-                    .await;
-            }
-            super::events::emit_incomplete_brackets(
-                session,
-                response_id,
-                &assistant_item_id,
-                &full_response,
-                played,
-            )
-            .await;
-        }
-        _ => {}
-    }
+    let played = played_ms.load(Ordering::Relaxed);
+    let close = match drain_status {
+        "completed" => super::events::completed_response(
+            response_id,
+            &assistant_item_id,
+            &full_response,
+            played,
+        ),
+        _ => super::events::interrupted_response(
+            response_id,
+            &assistant_item_id,
+            &full_response,
+            ResponseStatus::Incomplete,
+            ResponseStatusReason::DrainCap,
+            played,
+        ),
+    };
+    let assistant_item = (!client_supplied).then(|| {
+        ConversationItem::new_assistant_audio(assistant_item_id.clone(), full_response, played)
+    });
+    session
+        .close_response(response_id, assistant_item, close)
+        .await;
     Ok(())
 }
 
@@ -1167,8 +1133,9 @@ impl TtsWorkerOutcome {
 }
 
 async fn handle_client_too_slow(
-    session: &Session,
+    session: &Arc<Session>,
     response_id: &str,
+    item_id: &str,
     llm_stream: &mut tokio::sync::mpsc::Receiver<anyhow::Result<String>>,
     transcript_so_far: String,
     queued_ms: u64,
@@ -1192,15 +1159,19 @@ async fn handle_client_too_slow(
     } else {
         Some(transcript_so_far)
     };
-    super::events::emit_response_done(
-        session,
-        response_id,
-        "failed",
-        transcript,
-        Some(FailReason::ClientTooSlow),
-        audio_end_ms,
-    )
-    .await;
+    session
+        .close_response(
+            response_id,
+            None,
+            vec![super::events::failed_response(
+                response_id,
+                item_id,
+                transcript,
+                FailReason::ClientTooSlow,
+                audio_end_ms,
+            )],
+        )
+        .await;
 }
 
 #[tracing::instrument(
@@ -1319,23 +1290,22 @@ mod wire_id_tests {
     use crate::types::ResponseId;
 
     #[test]
-    fn promoted_turn_keeps_the_predicted_wire_id_so_labels_join_the_eager_trajectory_record() {
+    fn promoted_turns_keep_the_predicted_wire_id_and_rolled_back_turns_mint_a_fresh_one() {
         let predicted = ResponseId::new("resp_predicted");
         let fresh = ResponseId::new("resp_fresh");
         assert_eq!(
             promoted_turn_wire_id(true, Some(predicted.clone()), fresh.clone()),
             predicted,
         );
+        {
+            let predicted = ResponseId::new("resp_predicted");
+            let fresh = ResponseId::new("resp_fresh");
+            assert_eq!(
+                promoted_turn_wire_id(false, Some(predicted), fresh.clone()),
+                fresh,
+            );
+            assert_eq!(promoted_turn_wire_id(true, None, fresh.clone()), fresh);
+        }
     }
 
-    #[test]
-    fn rolled_back_turn_mints_a_fresh_wire_id_and_its_fallback_llm_call_is_tagged_with_it() {
-        let predicted = ResponseId::new("resp_predicted");
-        let fresh = ResponseId::new("resp_fresh");
-        assert_eq!(
-            promoted_turn_wire_id(false, Some(predicted), fresh.clone()),
-            fresh,
-        );
-        assert_eq!(promoted_turn_wire_id(true, None, fresh.clone()), fresh);
-    }
 }

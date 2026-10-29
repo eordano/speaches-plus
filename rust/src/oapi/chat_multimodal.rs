@@ -49,97 +49,6 @@ pub struct InputAudioSpec {
     pub format: String,
 }
 
-#[derive(Clone, Debug)]
-pub enum MmContentPart {
-    Text(String),
-    ImageUrl(ImageUrlSpec),
-    InputAudio(InputAudioSpec),
-}
-
-#[derive(Clone, Debug)]
-pub struct MmMessage {
-    pub role: String,
-    pub parts: Vec<MmContentPart>,
-}
-
-fn parse_part(p: &serde_json::Value) -> Result<MmContentPart> {
-    let ty = p
-        .get("type")
-        .and_then(|t| t.as_str())
-        .context("content part missing \"type\"")?;
-    match ty {
-        "text" => {
-            let text = p
-                .get("text")
-                .and_then(|t| t.as_str())
-                .context("text part missing \"text\"")?;
-            Ok(MmContentPart::Text(text.to_string()))
-        }
-        "image_url" => {
-            let raw = p
-                .get("image_url")
-                .context("image_url part missing \"image_url\"")?;
-            let spec: ImageUrlSpec = serde_json::from_value(raw.clone())
-                .context("image_url must be a URL string or {\"url\": ...}")?;
-            Ok(MmContentPart::ImageUrl(spec))
-        }
-        "input_audio" => {
-            let raw = p
-                .get("input_audio")
-                .context("input_audio part missing \"input_audio\"")?;
-            let spec: InputAudioSpec = serde_json::from_value(raw.clone())
-                .context("input_audio must be {\"data\": <base64>, \"format\": ...}")?;
-            Ok(MmContentPart::InputAudio(spec))
-        }
-        other => bail!(
-            "unsupported content part type {other:?} (supported: text, image_url, input_audio)"
-        ),
-    }
-}
-
-pub fn parse_mm_messages(messages: &serde_json::Value) -> Result<Vec<MmMessage>> {
-    let arr = messages.as_array().context("messages must be an array")?;
-    let mut out = Vec::with_capacity(arr.len());
-    for (i, m) in arr.iter().enumerate() {
-        let role = m
-            .get("role")
-            .and_then(|r| r.as_str())
-            .with_context(|| format!("messages[{i}] missing role"))?
-            .to_string();
-        let parts = match m.get("content") {
-            None | Some(serde_json::Value::Null) => Vec::new(),
-            Some(serde_json::Value::String(s)) => vec![MmContentPart::Text(s.clone())],
-            Some(serde_json::Value::Array(parts)) => parts
-                .iter()
-                .map(parse_part)
-                .collect::<Result<Vec<_>>>()
-                .with_context(|| format!("messages[{i}].content"))?,
-            Some(_) => bail!("messages[{i}].content must be a string or an array of parts"),
-        };
-        out.push(MmMessage { role, parts });
-    }
-    Ok(out)
-}
-
-pub fn messages_have_mm_parts(messages: &serde_json::Value) -> bool {
-    let Some(arr) = messages.as_array() else {
-        return false;
-    };
-    arr.iter().any(|m| {
-        m.get("content")
-            .and_then(|c| c.as_array())
-            .map(|parts| {
-                parts.iter().any(|p| {
-                    matches!(
-                        p.get("type").and_then(|t| t.as_str()),
-                        Some("image_url") | Some("input_audio")
-                    )
-                })
-            })
-            .unwrap_or(false)
-    })
-}
-
 pub fn decode_data_url_bytes(url: &str) -> Result<Vec<u8>> {
     let Some(rest) = url.strip_prefix("data:") else {
         bail!(
@@ -512,19 +421,6 @@ pub enum PromptSegment {
     Audio(Vec<f32>),
 }
 
-pub fn segments_from_message(msg: &MmMessage) -> Result<Vec<PromptSegment>> {
-    msg.parts
-        .iter()
-        .map(|p| match p {
-            MmContentPart::Text(t) => Ok(PromptSegment::Text(t.clone())),
-            MmContentPart::ImageUrl(spec) => {
-                Ok(PromptSegment::Image(decode_image_ref(spec.url())?))
-            }
-            MmContentPart::InputAudio(spec) => Ok(PromptSegment::Audio(decode_audio_input(spec)?)),
-        })
-        .collect()
-}
-
 #[derive(Debug)]
 pub struct PlannedImage {
     pub position: usize,
@@ -605,36 +501,6 @@ fn plan_audio_expansion(
         num_soft_tokens: num_soft,
     });
     Ok(())
-}
-
-pub fn plan_prompt<F>(
-    towers: &Gemma4MmTowers,
-    segments: &[PromptSegment],
-    device: &Device,
-    mut tokenize: F,
-) -> Result<MmPlan>
-where
-    F: FnMut(&str) -> Result<Vec<u32>>,
-{
-    let mut tokens: Vec<u32> = Vec::new();
-    let mut images = Vec::new();
-    let mut audios = Vec::new();
-    for seg in segments {
-        match seg {
-            PromptSegment::Text(t) => tokens.extend(tokenize(t)?),
-            PromptSegment::Image(img) => {
-                plan_image_expansion(towers, img, &mut tokens, &mut images, device)?
-            }
-            PromptSegment::Audio(samples) => {
-                plan_audio_expansion(towers, samples, &mut tokens, &mut audios, device)?
-            }
-        }
-    }
-    Ok(MmPlan {
-        tokens,
-        images,
-        audios,
-    })
 }
 
 #[derive(Clone, Debug, Default)]

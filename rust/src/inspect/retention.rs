@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -147,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_respects_max_count() {
+    fn cleanup_respects_max_count_and_bytes_and_skips_a_missing_dir() {
         let dir = temp_dir();
         for i in 0..5 {
             touch(&dir, &format!("sess_{}.ndjson", i), b"x");
@@ -156,30 +155,27 @@ mod tests {
         let remaining = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(remaining, 2);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cleanup_skips_nonexistent_dir() {
-        let p = std::env::temp_dir().join(format!(
-            "speaches-plus-ret-missing-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        cleanup_on_startup(&p, 10, 0, 0);
-    }
-
-    #[test]
-    fn cleanup_respects_max_bytes() {
-        let dir = temp_dir();
-        for i in 0..5 {
-            touch(&dir, &format!("sess_{}.ndjson", i), &[b'x'; 100]);
+        {
+            let p = std::env::temp_dir().join(format!(
+                "speaches-plus-ret-missing-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            cleanup_on_startup(&p, 10, 0, 0);
         }
-        cleanup_on_startup(&dir, 0, 250, 0);
-        let total: u64 = std::fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-            .sum();
-        assert!(total <= 250, "total {} exceeded 250", total);
-        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let dir = temp_dir();
+            for i in 0..5 {
+                touch(&dir, &format!("sess_{}.ndjson", i), &[b'x'; 100]);
+            }
+            cleanup_on_startup(&dir, 0, 250, 0);
+            let total: u64 = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                .sum();
+            assert!(total <= 250, "total {} exceeded 250", total);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
+
 }

@@ -23,7 +23,7 @@ const timeline = new Timeline({
 }, store);
 
 const transport = new Transport(store);
-store.transport = transport;        // topbar wants the live alive-check
+store.transport = transport;
 
 const audio = new AudioPlayer(store, timeline, document.getElementById('stAudio'));
 
@@ -35,18 +35,15 @@ setupDetail({ store, timeline });
 setupSettings();
 setupExporters({ store });
 
-// Theme attribute is now applied once at boot, since the Tweaks UI is gone.
 document.documentElement.setAttribute('data-theme', store.state.tweaks.theme || 'dark');
 setupNewSession();
 
-// ── boot ─────────────────────────────────────────────────────────────────
 async function boot() {
   const params = new URLSearchParams(location.search);
   const sid = params.get('sid');
   if (sid) {
     transport.connect(sid);
   } else {
-    // No URL session -> pick the first live or historical session.
     const r = await fetch('/v1/inspect/sessions/history').then(r => r.ok ? r.json() : []).catch(() => []);
     const live = await fetch('/v1/inspect/sessions').then(r => r.ok ? r.json() : []).catch(() => []);
     const pick = (live && live[0]) || (r && r[0]);
@@ -54,7 +51,6 @@ async function boot() {
       history.replaceState(null, '', `?sid=${encodeURIComponent(pick.id)}`);
       transport.connect(pick.id);
     } else {
-      // Empty state.
       const ids = document.getElementById('sessionIdText');
       if (ids) ids.textContent = 'click to pick a session';
     }
@@ -97,7 +93,6 @@ store.subscribe('events', () => {
   }, 400);
 });
 
-// Auto-select an interesting event ~600ms after we see events arrive.
 let autoSelected = false;
 store.subscribe('events', () => {
   if (autoSelected) return;

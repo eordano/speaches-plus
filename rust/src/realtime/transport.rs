@@ -4,14 +4,15 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::warn;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::data_channel::DataChannel;
+
+use super::audio_out::OutboundTrack;
 
 use super::framing;
 
 #[derive(Clone)]
 pub enum EventSink {
-    DataChannel(Arc<RTCDataChannel>),
+    DataChannel(Arc<dyn DataChannel>),
     WebSocket(mpsc::Sender<String>),
 }
 
@@ -28,7 +29,9 @@ impl EventSink {
     pub async fn send_text(&self, text: String) -> Result<()> {
         match self {
             EventSink::DataChannel(dc) => {
-                dc.send_text(text).await.context("data channel send_text")?;
+                dc.send_text(&text)
+                    .await
+                    .context("data channel send_text")?;
                 Ok(())
             }
             EventSink::WebSocket(tx) => tx
@@ -73,7 +76,7 @@ impl EventSink {
 
 #[derive(Clone)]
 pub enum OutboundAudioSpec {
-    Webrtc(Arc<TrackLocalStaticSample>),
+    Webrtc(Arc<OutboundTrack>),
     WebSocket {
         ws_send: mpsc::Sender<String>,
         format: String,

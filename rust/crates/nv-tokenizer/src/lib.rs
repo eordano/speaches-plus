@@ -33,7 +33,7 @@ impl ChatTemplate {
 
     pub fn render(&self, req: &ChatRequest) -> Result<String> {
         let tmpl = self.env.get_template(&self.name)?;
-        Ok(tmpl.render(minijinja::context! { messages => req.messages, add_generation_prompt => req.add_generation_prompt })?)
+        Ok(tmpl.render(minijinja::context! { messages => minijinja::value::Serde(&req.messages), add_generation_prompt => req.add_generation_prompt })?)
     }
 }
 
@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn holds_back_incomplete_utf8_across_tokens() {
+    fn holds_back_incomplete_utf8_flushes_the_tail_and_emits_nothing_for_skipped_specials() {
         let tok = tiny_tokenizer();
         let ids = [0u32, 1, 2, 3];
         let (out, pieces) = run_incremental(&tok, &ids);
@@ -162,22 +162,12 @@ mod tests {
         assert_eq!(pieces[3].as_deref(), Some("l"));
         assert_eq!(out, tok.decode(&ids, true).unwrap());
         assert_eq!(out, "hél");
-    }
-
-    #[test]
-    fn flush_emits_trailing_incomplete_sequence() {
-        let tok = tiny_tokenizer();
         let ids = [0u32, 1];
         let (out, pieces) = run_incremental(&tok, &ids);
         assert_eq!(pieces[0].as_deref(), Some("h"));
         assert_eq!(pieces[1], None);
         assert_eq!(out, tok.decode(&ids, true).unwrap());
-        assert!(out.ends_with('\u{FFFD}'));
-    }
-
-    #[test]
-    fn skipped_special_tokens_emit_nothing() {
-        let tok = tiny_tokenizer();
+        assert!(out.ends_with('\u{FFFD}'), "flush emits the trailing incomplete sequence");
         let ids = [0u32, 6, 5, 3, 3, 4];
         let (out, pieces) = run_incremental(&tok, &ids);
         assert_eq!(pieces[1], None, "special token decodes to nothing");
@@ -223,20 +213,14 @@ mod tests {
     }
 
     #[test]
-    fn shipped_truncation_actually_truncates_without_sanitize() {
-        let tok = Tokenizer::from_bytes(truncating_tokenizer_json().as_bytes()).unwrap();
-        let ids = tok.encode("hellohello", false).unwrap().get_ids().to_vec();
+    fn sanitize_for_serving_and_load_tokenizer_disable_the_shipped_truncation() {
+        let mut tok = Tokenizer::from_bytes(truncating_tokenizer_json().as_bytes()).unwrap();
+        assert!(tok.get_truncation().is_some());
         assert_eq!(
-            ids.len(),
+            tok.encode("hellohello", false).unwrap().get_ids().len(),
             3,
             "precondition: raw load must truncate to max_length"
         );
-    }
-
-    #[test]
-    fn sanitize_for_serving_disables_shipped_truncation() {
-        let mut tok = Tokenizer::from_bytes(truncating_tokenizer_json().as_bytes()).unwrap();
-        assert!(tok.get_truncation().is_some());
         sanitize_for_serving(&mut tok);
         assert!(tok.get_truncation().is_none());
         assert!(tok.get_padding().is_none());
@@ -246,10 +230,6 @@ mod tests {
             10,
             "encode past the shipped max_length must not truncate"
         );
-    }
-
-    #[test]
-    fn load_tokenizer_strips_shipped_truncation() {
         let dir =
             std::env::temp_dir().join(format!("nv-tokenizer-trunc-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -258,8 +238,7 @@ mod tests {
         let tok = load_tokenizer(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(tok.get_truncation().is_none());
-        let ids = tok.encode("hellohello", false).unwrap().get_ids().to_vec();
-        assert_eq!(ids.len(), 10);
+        assert_eq!(tok.encode("hellohello", false).unwrap().get_ids().len(), 10);
     }
 
     const HUB_ALLOW_SKIP: &str = "NV_TOKENIZER_ALLOW_SKIP";

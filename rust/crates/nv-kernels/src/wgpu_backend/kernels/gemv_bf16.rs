@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
 use crate::wgpu_backend::pack::pack_u16_pairs as pack_u16;
@@ -46,8 +44,6 @@ pub fn sg_pk_entry(wg: u32) -> (&'static str, u32) {
     }
 }
 
-pub const ADVERTISED_SUBGROUP_ONLY_ENV: &str = "NV_KERNELS_WGPU_GEMV_BF16_ADVERTISED_SUBGROUP";
-
 pub fn known_subgroup_width(
     subgroup: bool,
     min_size: u32,
@@ -69,11 +65,6 @@ pub fn sg32_from(subgroup: bool, min_size: u32, max_size: u32, probed: Option<u3
 }
 
 pub fn probed_subgroup_width(ctx: &WgpuContext) -> Option<u32> {
-    if nv_config::env_arm_opt_in_set_to_anything_but_0_cached_first_read_wins!(
-        ADVERTISED_SUBGROUP_ONLY_ENV
-    ) {
-        return None;
-    }
     ctx.subgroup_width()
 }
 
@@ -127,59 +118,58 @@ pub fn adaptive_source(x: u32, wg: u32) -> String {
     let rows = wg / x;
     let (fold, shuffle) = reduction_strides(x);
     let mut b = String::new();
-    b.push_str(
-        "struct GemvAdaptiveParams {\n    n_rows: u32,\n    k_elems: u32,\n    w_row_words: u32,\n    groups_x: u32,\n};\n\n",
-    );
-    b.push_str("@group(0) @binding(0) var<storage, read> ga_w4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> ga_x4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(2) var<storage, read_write> ga_y: array<u32>;\n");
-    b.push_str("@group(0) @binding(3) var<uniform> ga_params: GemvAdaptiveParams;\n\n");
-    writeln!(b, "@compute @workgroup_size({wg})").unwrap();
-    writeln!(b, "fn {ADAPTIVE_ENTRY}(").unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n");
-    b.push_str("    @builtin(subgroup_id) sgid: u32,\n");
-    b.push_str("    @builtin(subgroup_size) sgsz: u32,\n");
-    b.push_str("    @builtin(subgroup_invocation_id) slane: u32\n) {\n");
-    b.push_str("    let vt = sgid * sgsz + slane;\n");
-    writeln!(b, "    let slot = vt / {x}u;").unwrap();
+    write!(
+        b,
+        "struct GemvAdaptiveParams {{
+    n_rows: u32,
+    k_elems: u32,
+    w_row_words: u32,
+    groups_x: u32,
+}};
+
+@group(0) @binding(0) var<storage, read> ga_w4: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> ga_x4: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> ga_y: array<u32>;
+@group(0) @binding(3) var<uniform> ga_params: GemvAdaptiveParams;
+
+@compute @workgroup_size({wg})
+fn {ADAPTIVE_ENTRY}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(subgroup_id) sgid: u32,
+    @builtin(subgroup_size) sgsz: u32,
+    @builtin(subgroup_invocation_id) slane: u32
+) {{
+    let vt = sgid * sgsz + slane;
+    let slot = vt / {x}u;\n"
+    )
+    .unwrap();
     writeln!(b, "    let vlane = slane & {}u;", x - 1).unwrap();
-    writeln!(
-        b,
-        "    let row = (wid.x + wid.y * ga_params.groups_x) * {rows}u + slot;"
-    )
-    .unwrap();
-    b.push_str("    let live = row < ga_params.n_rows;\n");
-    b.push_str("    let kv = select(0u, ga_params.k_elems >> 3u, live);\n");
-    b.push_str("    let w_base = select(0u, row * (ga_params.w_row_words >> 2u), live);\n");
-    writeln!(b, "    var acc: array<f32, {r}>;").unwrap();
-    writeln!(
-        b,
-        "    for (var j = 0u; j < {r}u; j = j + 1u) {{ acc[j] = 0.0; }}"
-    )
-    .unwrap();
-    writeln!(b, "    for (var j = 0u; j < {r}u; j = j + 1u) {{").unwrap();
-    writeln!(
-        b,
-        "        for (var v = vlane + {x}u * j; v < kv; v = v + {CUDA_WARP_LANES}u) {{"
-    )
-    .unwrap();
-    b.push_str("            let ww = ga_w4[w_base + v];\n");
-    b.push_str("            let xw = ga_x4[v];\n");
-    b.push_str("            for (var c = 0u; c < 4u; c = c + 1u) {\n");
-    b.push_str(
-        "                acc[j] = acc[j] + (bf16_lo(ww[c]) * bf16_lo(xw[c]) + bf16_hi(ww[c]) * bf16_hi(xw[c]));\n",
-    );
-    b.push_str("            }\n        }\n    }\n");
+    write!(b, "    let row = (wid.x + wid.y * ga_params.groups_x) * {rows}u + slot;
+    let live = row < ga_params.n_rows;
+    let kv = select(0u, ga_params.k_elems >> 3u, live);
+    let w_base = select(0u, row * (ga_params.w_row_words >> 2u), live);
+    var acc: array<f32, {r}>;
+    for (var j = 0u; j < {r}u; j = j + 1u) {{ acc[j] = 0.0; }}
+    for (var j = 0u; j < {r}u; j = j + 1u) {{
+        for (var v = vlane + {x}u * j; v < kv; v = v + {CUDA_WARP_LANES}u) {{
+            let ww = ga_w4[w_base + v];
+            let xw = ga_x4[v];
+            for (var c = 0u; c < 4u; c = c + 1u) {{
+                acc[j] = acc[j] + (bf16_lo(ww[c]) * bf16_lo(xw[c]) + bf16_hi(ww[c]) * bf16_hi(xw[c]));
+            }}
+        }}
+    }}\n").unwrap();
     for s in fold {
         let m = s / x;
-        b.push_str("    {\n");
-        writeln!(b, "        var nxt: array<f32, {r}>;").unwrap();
-        writeln!(
+        write!(
             b,
-            "        for (var j = 0u; j < {r}u; j = j + 1u) {{ nxt[j] = acc[j] + acc[j ^ {m}u]; }}"
+            "    {{
+        var nxt: array<f32, {r}>;
+        for (var j = 0u; j < {r}u; j = j + 1u) {{ nxt[j] = acc[j] + acc[j ^ {m}u]; }}
+        acc = nxt;
+    }}\n"
         )
         .unwrap();
-        b.push_str("        acc = nxt;\n    }\n");
     }
     b.push_str("    var a0 = acc[0];\n");
     for s in shuffle {
@@ -814,192 +804,182 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_follows_the_cuda_vector_predicate() {
-        assert_eq!(entry_for(4096), VEC8_ENTRY);
-        assert_eq!(entry_for(8), VEC8_ENTRY);
-        assert_eq!(entry_for(6), SCALAR_ENTRY);
-        assert_eq!(entry_for(4098), SCALAR_ENTRY);
-    }
-
-    #[test]
-    fn wgsl_declares_both_entry_points() {
-        assert!(WGSL.contains(VEC8_ENTRY));
-        assert!(WGSL.contains(SCALAR_ENTRY));
-        assert!(WGSL.contains(V4_TREE_ENTRY));
-        assert!(compose(WGSL).contains("fn bf16_encode("));
-    }
-
-    #[test]
-    fn base_wgsl_stays_free_of_subgroup_extensions() {
-        assert!(!WGSL.contains("subgroup"));
-    }
-
-    #[test]
-    fn sg_source_declares_the_subgroup_entries() {
-        let src = sg_source();
-        assert!(src.contains("subgroupShuffleXor"));
-        for (_, entry, _) in SG_V4_WG {
-            assert!(src.contains(entry), "missing entry {entry}");
+    fn entry_and_rows_per_group_follow_the_cuda_predicate_and_the_workgroup_size() {
+        {
+            assert_eq!(entry_for(4096), VEC8_ENTRY);
+            assert_eq!(entry_for(8), VEC8_ENTRY);
+            assert_eq!(entry_for(6), SCALAR_ENTRY);
+            assert_eq!(entry_for(4098), SCALAR_ENTRY);
         }
-        assert!(src.contains(SG_U32_ENTRY));
-        assert!(src.contains(SG_SCALAR_ENTRY));
-        assert!(src.contains("fn bf16_encode("));
-    }
-
-    #[test]
-    fn the_width_this_adapter_runs_at_is_the_probe_when_it_answered() {
-        assert_eq!(known_subgroup_width(true, 4, 64, Some(32)), Some(32));
-        assert_eq!(known_subgroup_width(true, 4, 64, Some(16)), Some(16));
-        assert_eq!(known_subgroup_width(true, 4, 64, None), None);
-        assert_eq!(known_subgroup_width(true, 32, 32, None), Some(32));
-        assert_eq!(known_subgroup_width(true, 32, 32, Some(64)), Some(64));
-        assert_eq!(known_subgroup_width(false, 32, 32, Some(32)), None);
-    }
-
-    #[test]
-    fn the_advertised_range_alone_never_decides_the_warp32_gate() {
-        assert!(sg32_from(true, 4, 64, Some(LANES_PER_ROW)));
-        assert!(sg32_from(true, LANES_PER_ROW, LANES_PER_ROW, None));
-        assert!(!sg32_from(true, 4, 64, None));
-        assert!(!sg32_from(true, 4, 64, Some(16)));
-        assert!(!sg32_from(true, LANES_PER_ROW, LANES_PER_ROW, Some(64)));
-        assert!(!sg32_from(false, LANES_PER_ROW, LANES_PER_ROW, Some(32)));
-    }
-
-    #[test]
-    fn a_4_to_64_adapter_probing_32_reaches_the_warp32_kernel() {
-        assert_eq!(
-            select_kernel_from(true, 4, 64, Some(32), 4096),
-            GemvKernel::SgV4 { wg: SG_DEFAULT_WG }
-        );
-        assert_eq!(
-            select_kernel_from(true, 4, 64, Some(32), 4098),
-            GemvKernel::SgScalar
-        );
-        assert_eq!(
-            select_kernel_from(true, 4, 64, None, 4096),
-            GemvKernel::TreeVec8
-        );
-        assert_eq!(
-            select_kernel_from(true, 4, 64, None, 4098),
-            GemvKernel::TreeScalar
-        );
-    }
-
-    #[test]
-    fn a_probed_width_other_than_32_never_reaches_a_warp32_kernel() {
-        for probed in [4u32, 8, 16, 64, 128] {
-            for k in [4096usize, 4098] {
-                let picked = select_kernel_from(true, 4, 64, Some(probed), k);
-                assert!(
-                    !matches!(picked, GemvKernel::SgV4 { .. } | GemvKernel::SgScalar),
-                    "probed subgroup width {probed} routed k={k} to {picked:?}, whose body strides \
-                     by {LANES_PER_ROW} lanes and folds a {LANES_PER_ROW}-lane butterfly"
-                );
-            }
+        {
+            assert_eq!(GemvKernel::SgV4 { wg: 64 }.rows_per_group(), 2);
+            assert_eq!(GemvKernel::SgV4 { wg: 512 }.rows_per_group(), 16);
+            assert_eq!(GemvKernel::TreeVec8.rows_per_group(), ROWS_PER_GROUP);
+            assert_eq!(GemvKernel::SgScalar.rows_per_group(), ROWS_PER_GROUP);
+            assert_eq!(
+                GemvKernel::SgV4 { wg: 128 }.entry(),
+                "gemv_bf16_sg_v4_wg128"
+            );
+            assert_eq!(GemvKernel::TreeVec8V4.slots(), (20, 21));
         }
-        assert_eq!(
-            select_kernel_from(true, 4, 64, Some(16), 4096),
-            GemvKernel::SgV4Adaptive {
-                wg: SG_DEFAULT_WG,
-                x: 16
-            }
-        );
-        assert_eq!(
-            select_kernel_from(true, 4, 64, Some(64), 4096),
-            GemvKernel::SgV4Adaptive {
-                wg: SG_DEFAULT_WG,
-                x: 32
-            }
-        );
-        assert_eq!(
-            select_kernel_from(true, 4, 64, Some(4), 4096),
-            GemvKernel::TreeVec8
-        );
     }
 
     #[test]
-    fn the_adaptive_width_never_exceeds_the_width_the_lanes_actually_share() {
-        for (min_size, max_size, probed) in [
-            (4u32, 64u32, Some(8u32)),
-            (4, 64, Some(16)),
-            (4, 64, Some(32)),
-            (4, 64, Some(64)),
-            (8, 32, None),
-            (16, 16, None),
-            (64, 64, None),
-        ] {
-            let real = probed.unwrap_or(min_size);
-            let x = adaptive_width(true, min_size, max_size, probed).unwrap();
-            assert!(
-                x <= real && real.is_multiple_of(x),
-                "adaptive x={x} for advertised {min_size}..{max_size} probe {probed:?} does not \
-                 divide the {real}-lane subgroup its shuffles stay inside"
+    fn every_source_declares_its_entries_and_the_base_stays_subgroup_free() {
+        {
+            assert!(WGSL.contains(VEC8_ENTRY));
+            assert!(WGSL.contains(SCALAR_ENTRY));
+            assert!(WGSL.contains(V4_TREE_ENTRY));
+            assert!(compose(WGSL).contains("fn bf16_encode("));
+        }
+        {
+            assert!(!WGSL.contains("subgroup"));
+        }
+        {
+            let src = sg_source();
+            assert!(src.contains("subgroupShuffleXor"));
+            for (_, entry, _) in SG_V4_WG {
+                assert!(src.contains(entry), "missing entry {entry}");
+            }
+            assert!(src.contains(SG_U32_ENTRY));
+            assert!(src.contains(SG_SCALAR_ENTRY));
+            assert!(src.contains("fn bf16_encode("));
+        }
+        {
+            for entry in [
+                NORMED_ENTRY,
+                ROWQUANT_ENTRY,
+                I8_NORMED_ENTRY,
+                I8_NORMED_MK_ENTRY,
+            ] {
+                assert!(WGSL.contains(entry), "missing entry {entry}");
+            }
+            assert!(compose(WGSL).contains("fn int8_decode("));
+        }
+        {
+            assert!(WGSL.contains("0x3c010204u"));
+            assert_eq!((1.0f32 / 127.0f32).to_bits(), 0x3c01_0204);
+        }
+    }
+
+    #[test]
+    fn only_a_probed_32_wide_subgroup_reaches_the_warp32_kernel() {
+        {
+            assert_eq!(known_subgroup_width(true, 4, 64, Some(32)), Some(32));
+            assert_eq!(known_subgroup_width(true, 4, 64, Some(16)), Some(16));
+            assert_eq!(known_subgroup_width(true, 4, 64, None), None);
+            assert_eq!(known_subgroup_width(true, 32, 32, None), Some(32));
+            assert_eq!(known_subgroup_width(true, 32, 32, Some(64)), Some(64));
+            assert_eq!(known_subgroup_width(false, 32, 32, Some(32)), None);
+        }
+        {
+            assert!(sg32_from(true, 4, 64, Some(LANES_PER_ROW)));
+            assert!(sg32_from(true, LANES_PER_ROW, LANES_PER_ROW, None));
+            assert!(!sg32_from(true, 4, 64, None));
+            assert!(!sg32_from(true, 4, 64, Some(16)));
+            assert!(!sg32_from(true, LANES_PER_ROW, LANES_PER_ROW, Some(64)));
+            assert!(!sg32_from(false, LANES_PER_ROW, LANES_PER_ROW, Some(32)));
+        }
+        {
+            assert_eq!(
+                select_kernel_from(true, 4, 64, Some(32), 4096),
+                GemvKernel::SgV4 { wg: SG_DEFAULT_WG }
+            );
+            assert_eq!(
+                select_kernel_from(true, 4, 64, Some(32), 4098),
+                GemvKernel::SgScalar
+            );
+            assert_eq!(
+                select_kernel_from(true, 4, 64, None, 4096),
+                GemvKernel::TreeVec8
+            );
+            assert_eq!(
+                select_kernel_from(true, 4, 64, None, 4098),
+                GemvKernel::TreeScalar
             );
         }
-        assert_eq!(adaptive_width(true, 4, 64, None), None);
-        assert_eq!(adaptive_width(true, 4, 4, None), None);
-        assert_eq!(adaptive_width(true, 12, 12, None), None);
-        assert_eq!(adaptive_width(true, 32, 16, None), None);
-        assert_eq!(adaptive_width(false, 32, 32, Some(32)), None);
     }
 
     #[test]
-    fn kernel_rows_track_workgroup_size() {
-        assert_eq!(GemvKernel::SgV4 { wg: 64 }.rows_per_group(), 2);
-        assert_eq!(GemvKernel::SgV4 { wg: 512 }.rows_per_group(), 16);
-        assert_eq!(GemvKernel::TreeVec8.rows_per_group(), ROWS_PER_GROUP);
-        assert_eq!(GemvKernel::SgScalar.rows_per_group(), ROWS_PER_GROUP);
-        assert_eq!(
-            GemvKernel::SgV4 { wg: 128 }.entry(),
-            "gemv_bf16_sg_v4_wg128"
-        );
-        assert_eq!(GemvKernel::TreeVec8V4.slots(), (20, 21));
-    }
-
-    #[test]
-    fn u16_word_packing_matches_the_shader_layout() {
-        let src: Vec<u16> = vec![0x1234, 0xabcd, 0x0001, 0xffff];
-        let words = pack_u16(&src);
-        assert_eq!(words, vec![0xabcd_1234u32, 0xffff_0001u32]);
-    }
-
-    #[test]
-    fn wgsl_declares_the_int8_sibling_entry_points() {
-        for entry in [
-            NORMED_ENTRY,
-            ROWQUANT_ENTRY,
-            I8_NORMED_ENTRY,
-            I8_NORMED_MK_ENTRY,
-        ] {
-            assert!(WGSL.contains(entry), "missing entry {entry}");
+    fn a_probed_width_other_than_32_takes_an_adaptive_width_that_divides_the_real_subgroup() {
+        {
+            for probed in [4u32, 8, 16, 64, 128] {
+                for k in [4096usize, 4098] {
+                    let picked = select_kernel_from(true, 4, 64, Some(probed), k);
+                    assert!(
+                        !matches!(picked, GemvKernel::SgV4 { .. } | GemvKernel::SgScalar),
+                        "probed subgroup width {probed} routed k={k} to {picked:?}, whose body strides \
+                         by {LANES_PER_ROW} lanes and folds a {LANES_PER_ROW}-lane butterfly"
+                    );
+                }
+            }
+            assert_eq!(
+                select_kernel_from(true, 4, 64, Some(16), 4096),
+                GemvKernel::SgV4Adaptive {
+                    wg: SG_DEFAULT_WG,
+                    x: 16
+                }
+            );
+            assert_eq!(
+                select_kernel_from(true, 4, 64, Some(64), 4096),
+                GemvKernel::SgV4Adaptive {
+                    wg: SG_DEFAULT_WG,
+                    x: 32
+                }
+            );
+            assert_eq!(
+                select_kernel_from(true, 4, 64, Some(4), 4096),
+                GemvKernel::TreeVec8
+            );
         }
-        assert!(compose(WGSL).contains("fn int8_decode("));
+        {
+            for (min_size, max_size, probed) in [
+                (4u32, 64u32, Some(8u32)),
+                (4, 64, Some(16)),
+                (4, 64, Some(32)),
+                (4, 64, Some(64)),
+                (8, 32, None),
+                (16, 16, None),
+                (64, 64, None),
+            ] {
+                let real = probed.unwrap_or(min_size);
+                let x = adaptive_width(true, min_size, max_size, probed).unwrap();
+                assert!(
+                    x <= real && real.is_multiple_of(x),
+                    "adaptive x={x} for advertised {min_size}..{max_size} probe {probed:?} does not \
+                     divide the {real}-lane subgroup its shuffles stay inside"
+                );
+            }
+            assert_eq!(adaptive_width(true, 4, 64, None), None);
+            assert_eq!(adaptive_width(true, 4, 4, None), None);
+            assert_eq!(adaptive_width(true, 12, 12, None), None);
+            assert_eq!(adaptive_width(true, 32, 16, None), None);
+            assert_eq!(adaptive_width(false, 32, 32, Some(32)), None);
+        }
     }
 
     #[test]
-    fn odd_k_rows_are_padded_to_whole_words() {
-        let src: Vec<u16> = vec![1, 2, 3, 4, 5, 6];
-        let words = pack_u16_rows(&src, 2, 3);
-        assert_eq!(
-            words,
-            vec![0x0002_0001u32, 0x0000_0003, 0x0005_0004, 0x0000_0006]
-        );
-    }
-
-    #[test]
-    fn int8_row_packing_round_trips() {
-        let src: Vec<i8> = vec![1, -2, 3, -4, 5, -128, 127, 0, 9, -9];
-        let words = pack_i8_rows(&src, 2, 5);
-        assert_eq!(words.len(), 4);
-        let mut back = vec![0i8; 10];
-        unpack_i8_rows(&words, &mut back, 2, 5);
-        assert_eq!(back, src);
-    }
-
-    #[test]
-    fn one_over_127_constant_matches_the_shader() {
-        assert!(WGSL.contains("0x3c010204u"));
-        assert_eq!((1.0f32 / 127.0f32).to_bits(), 0x3c01_0204);
+    fn u16_and_i8_row_packing_match_the_shader_layout_and_pad_odd_k() {
+        {
+            let src: Vec<u16> = vec![0x1234, 0xabcd, 0x0001, 0xffff];
+            let words = pack_u16(&src);
+            assert_eq!(words, vec![0xabcd_1234u32, 0xffff_0001u32]);
+        }
+        {
+            let src: Vec<u16> = vec![1, 2, 3, 4, 5, 6];
+            let words = pack_u16_rows(&src, 2, 3);
+            assert_eq!(
+                words,
+                vec![0x0002_0001u32, 0x0000_0003, 0x0005_0004, 0x0000_0006]
+            );
+        }
+        {
+            let src: Vec<i8> = vec![1, -2, 3, -4, 5, -128, 127, 0, 9, -9];
+            let words = pack_i8_rows(&src, 2, 5);
+            assert_eq!(words.len(), 4);
+            let mut back = vec![0i8; 10];
+            unpack_i8_rows(&words, &mut back, 2, 5);
+            assert_eq!(back, src);
+        }
     }
 }

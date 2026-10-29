@@ -102,14 +102,10 @@ mod tests {
     }
 
     #[test]
-    fn srt_one_segment_one_word() {
+    fn srt_and_vtt_render_segments_with_their_separators_and_fmt_ts_clamps_odd_times() {
         let segs = vec![seg(0.0, 1.234, "Hello", vec![w("Hello", 0.0, 1.234)], None)];
         let want = "1\n00:00:00,000 --> 00:00:01,234\nHello\n\n";
         assert_eq!(to_srt(&segs), want);
-    }
-
-    #[test]
-    fn srt_multi_segment() {
         let segs = vec![
             seg(
                 0.0,
@@ -128,34 +124,17 @@ mod tests {
         ];
         let want = "1\n00:00:00,000 --> 00:00:03,500\nHello world\n\n2\n00:00:03,500 --> 00:00:05,200\nHow are you\n\n";
         assert_eq!(to_srt(&segs), want);
-    }
-
-    #[test]
-    fn vtt_header_and_segments() {
-        let segs = vec![seg(
-            0.0,
-            3.5,
-            "Hello world",
-            vec![w("Hello", 0.0, 1.0), w("world", 1.0, 3.5)],
-            None,
-        )];
-        let want = "WEBVTT\n\n00:00:00.000 --> 00:00:03.500\nHello world\n\n";
-        assert_eq!(to_vtt(&segs), want);
-    }
-
-    #[test]
-    fn vtt_multi_segment_uses_dots() {
-        let segs = vec![
-            seg(0.0, 1.5, "a", vec![w("a", 0.0, 1.5)], None),
-            seg(1.5, 3.0, "b", vec![w("b", 1.5, 3.0)], None),
-        ];
         let want =
-            "WEBVTT\n\n00:00:00.000 --> 00:00:01.500\na\n\n00:00:01.500 --> 00:00:03.000\nb\n\n";
-        assert_eq!(to_vtt(&segs), want);
+            "WEBVTT\n\n00:00:00.000 --> 00:00:03.500\nHello world\n\n00:00:03.500 --> 00:00:05.200\nHow are you\n\n";
+        assert_eq!(to_vtt(&segs), want, "vtt carries the header and uses dots");
+        assert_eq!(fmt_ts(3723.456, ','), "01:02:03,456");
+        assert_eq!(fmt_ts(3723.456, '.'), "01:02:03.456");
+        assert_eq!(fmt_ts(-1.0, ','), "00:00:00,000");
+        assert_eq!(fmt_ts(f32::NAN, ','), "00:00:00,000");
     }
 
     #[test]
-    fn diarized_json_omits_speaker_when_none() {
+    fn diarized_json_carries_the_speaker_only_when_present() {
         let segs = vec![seg(0.0, 1.0, "hi", vec![w("hi", 0.0, 1.0)], None)];
         let v = to_diarized_json(&segs);
         let want = json!([{
@@ -165,10 +144,6 @@ mod tests {
             "words": [{"word": "hi", "start": 0.0, "end": 1.0}],
         }]);
         assert_eq!(v, want);
-    }
-
-    #[test]
-    fn diarized_json_includes_speaker_when_some() {
         let segs = vec![
             seg(0.0, 1.0, "hi", vec![w("hi", 0.0, 1.0)], Some("S1")),
             seg(1.0, 2.0, "yo", vec![w("yo", 1.0, 2.0)], Some("S2")),
@@ -193,15 +168,4 @@ mod tests {
         assert_eq!(v, want);
     }
 
-    #[test]
-    fn fmt_ts_handles_large_times() {
-        assert_eq!(fmt_ts(3723.456, ','), "01:02:03,456");
-        assert_eq!(fmt_ts(3723.456, '.'), "01:02:03.456");
-    }
-
-    #[test]
-    fn fmt_ts_handles_negatives_and_nans() {
-        assert_eq!(fmt_ts(-1.0, ','), "00:00:00,000");
-        assert_eq!(fmt_ts(f32::NAN, ','), "00:00:00,000");
-    }
 }

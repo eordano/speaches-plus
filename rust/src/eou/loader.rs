@@ -81,7 +81,6 @@ impl Default for EouConfig {
 impl EouConfig {
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        let legacy_enabled = env_bool(defaults::env::EOU_ENABLED);
 
         if let Some(e) = env_str(defaults::env::EOU_EAGERNESS)
             .as_deref()
@@ -120,13 +119,6 @@ impl EouConfig {
         }
         if let Some(n) = env_parse::<u64>(defaults::env::MIN_SPEECH_FOR_RESPONSE_MS) {
             cfg.min_speech_for_response_ms = n;
-        } else if let Some(n) = env_parse::<u64>(defaults::env::MIN_SPEECH_FOR_COMMIT_MS) {
-            cfg.min_speech_for_response_ms = n;
-            tracing::warn!(
-                "{} is deprecated (v2 name); use {} (v3, §17.4)",
-                defaults::env::MIN_SPEECH_FOR_COMMIT_MS,
-                defaults::env::MIN_SPEECH_FOR_RESPONSE_MS,
-            );
         }
         if let Some(p) = env_unit_f32(defaults::env::EOU_EAGER_P_THRESHOLD) {
             cfg.eager_p_threshold = p;
@@ -142,11 +134,6 @@ impl EouConfig {
             .and_then(EouKind::parse)
         {
             cfg.kind = k;
-        } else if legacy_enabled == Some(true) {
-            cfg.kind = EouKind::Text;
-        }
-        if legacy_enabled == Some(false) {
-            cfg.kind = EouKind::Vad;
         }
         if let Some(n) = env_parse::<u32>(defaults::env::EOU_SILENCE_HARD_CAP_MS) {
             cfg.silence_hard_cap_ms = n;
@@ -224,7 +211,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn eou_config_default_kind_vad() {
+    fn eou_config_defaults_are_vad_gated_fusion_and_eager_on_at_a_sane_threshold() {
         let c = EouConfig::default();
         assert_eq!(c.kind, EouKind::Vad);
         assert!(!c.kind.calls_classifier());
@@ -233,6 +220,24 @@ mod tests {
         assert_eq!(c.max_delay_ms, 3000);
         assert_eq!(c.min_speech_for_response_ms, 600);
         assert_eq!(c.inference_timeout_ms, 250);
+        {
+            assert_eq!(EouConfig::default().eager_max_inflight, 1);
+        }
+        {
+            assert!(!EouConfig::default().eager_periodic_enabled);
+        }
+        {
+            let c = EouConfig::default();
+
+            assert_eq!(c.eager_p_threshold, defaults::eou::EAGER_P_THRESHOLD);
+            assert_eq!(c.eager_p_threshold, 0.5);
+            assert_eq!(c.eager_max_inflight, 1);
+            assert!(!c.eager_periodic_enabled);
+            assert!(!c.eager_disabled());
+        }
+        {
+            assert_eq!(EouConfig::default().fusion_rule, FusionRule::Gated);
+        }
     }
 
     #[test]
@@ -242,46 +247,6 @@ mod tests {
         assert_eq!(c.threshold_for_language(None), 0.5);
         assert_eq!(c.threshold_for_language(Some("en")), 0.5);
         assert_eq!(c.threshold_for_language(Some("fr")), 0.7);
-    }
-
-    #[test]
-    fn backchannel_decision_400ms_suppresses_response() {
-        let cfg = EouConfig::default();
-        let audio_ms: u64 = 400;
-        let suppress = audio_ms < cfg.min_speech_for_response_ms;
-        assert!(suppress);
-        let long_audio: u64 = 2700;
-        assert!(long_audio >= cfg.min_speech_for_response_ms);
-    }
-
-    #[test]
-    fn eager_threshold_eligible_at_or_above() {
-        let mut c = EouConfig::default();
-        c.eager_p_threshold = 0.8;
-        assert!(0.8_f32 >= c.eager_p_threshold && !c.eager_disabled());
-        assert!(0.95_f32 >= c.eager_p_threshold && !c.eager_disabled());
-        assert!(!(0.7_f32 >= c.eager_p_threshold && !c.eager_disabled()));
-    }
-
-    #[test]
-    fn eager_max_inflight_default_one() {
-        assert_eq!(EouConfig::default().eager_max_inflight, 1);
-    }
-
-    #[test]
-    fn eager_periodic_default_off() {
-        assert!(!EouConfig::default().eager_periodic_enabled);
-    }
-
-    #[test]
-    fn eou_config_default_eager_on_at_sane_threshold() {
-        let c = EouConfig::default();
-
-        assert_eq!(c.eager_p_threshold, defaults::eou::EAGER_P_THRESHOLD);
-        assert_eq!(c.eager_p_threshold, 0.5);
-        assert_eq!(c.eager_max_inflight, 1);
-        assert!(!c.eager_periodic_enabled);
-        assert!(!c.eager_disabled());
     }
 
     #[test]
@@ -299,7 +264,12 @@ mod tests {
     }
 
     #[test]
-    fn fusion_default_in_eou_config() {
-        assert_eq!(EouConfig::default().fusion_rule, FusionRule::Gated);
+    fn backchannel_decision_400ms_suppresses_response() {
+        let cfg = EouConfig::default();
+        let audio_ms: u64 = 400;
+        let suppress = audio_ms < cfg.min_speech_for_response_ms;
+        assert!(suppress);
+        let long_audio: u64 = 2700;
+        assert!(long_audio >= cfg.min_speech_for_response_ms);
     }
 }

@@ -13,8 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-
 	"github.com/eordano/speaches-plus-go/internal/conversation"
 	"github.com/eordano/speaches-plus-go/internal/diarization"
 	"github.com/eordano/speaches-plus-go/internal/eou"
@@ -347,27 +345,22 @@ func main() {
 	}
 	modelsHandler := oapi.NewModelsHandler(listing)
 
-	r := chi.NewRouter()
-	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
+	r := http.NewServeMux()
+	r.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	r.Get("/v1/models", modelsHandler)
-	r.Post("/v1/realtime", rt.HandleRealtime)
-	r.Get("/v1/realtime", rt.HandleRealtimeWS)
-	r.Get("/v1/realtime/capabilities", rt.HandleCapabilities)
-	r.Get("/v1/inspect/sessions", rt.HandleInspectListSessions)
-	r.Get("/v1/inspect/sessions/history", rt.HandleInspectListHistory)
-	r.Get("/v1/inspect/sessions/history/{sid}", rt.HandleInspectGetHistory)
-	r.Get("/v1/inspect/sessions/{sid}/audio", rt.HandleInspectGetAudio)
-	r.Get("/v1/inspect/{sid}/stream", rt.HandleInspectStream)
-	r.Get("/v1/inspect/{sid}", rt.HandleInspectStream)
-	r.Post("/v1/audio/transcriptions", transcriptionsHandler.ServeHTTP)
-	r.Post("/v1/audio/speech", speechHandler.ServeHTTP)
+	r.HandleFunc("GET /v1/models", modelsHandler)
+	r.HandleFunc("POST /v1/realtime", rt.HandleRealtime)
+	r.HandleFunc("GET /v1/realtime", rt.HandleRealtimeWS)
+	r.HandleFunc("GET /v1/realtime/capabilities", rt.HandleCapabilities)
+	rt.RegisterInspectRoutes(r)
+	r.HandleFunc("POST /v1/audio/transcriptions", transcriptionsHandler.ServeHTTP)
+	r.HandleFunc("POST /v1/audio/speech", speechHandler.ServeHTTP)
 	if diarSeg != nil && diarEmb != nil {
 		diarHandler := diarization.NewHandler(diarSeg, diarEmb, diarization.DefaultConfig())
-		r.Post("/v1/audio/diarization", diarHandler.ServeHTTP)
+		r.HandleFunc("POST /v1/audio/diarization", diarHandler.ServeHTTP)
 	} else {
-		r.Post("/v1/audio/diarization", func(w http.ResponseWriter, _ *http.Request) {
+		r.HandleFunc("POST /v1/audio/diarization", func(w http.ResponseWriter, _ *http.Request) {
 			oapi.WriteError(w, http.StatusServiceUnavailable,
 				"diarization model not loaded; set --diar-segmentation and --diar-embedding",
 				oapi.TypeServiceUnavail, "", "model_not_loaded")
@@ -375,9 +368,9 @@ func main() {
 	}
 	if diarEmb != nil {
 		embHandler := diarization.NewEmbeddingsHandler(diarEmb)
-		r.Post("/v1/audio/embeddings", embHandler.ServeHTTP)
+		r.HandleFunc("POST /v1/audio/embeddings", embHandler.ServeHTTP)
 	} else {
-		r.Post("/v1/audio/embeddings", func(w http.ResponseWriter, _ *http.Request) {
+		r.HandleFunc("POST /v1/audio/embeddings", func(w http.ResponseWriter, _ *http.Request) {
 			oapi.WriteError(w, http.StatusServiceUnavailable,
 				"embedding model not loaded; set --diar-embedding",
 				oapi.TypeServiceUnavail, "", "model_not_loaded")
@@ -385,23 +378,23 @@ func main() {
 	}
 
 	if piiClassifier != nil {
-		r.Post("/v1/pii/classify", pii.ClassifyHandler(piiClassifier))
-		r.Post("/v1/pii/classify/batch", pii.ClassifyBatchHandler(piiClassifier))
-		r.Post("/v1/pii/redact/analyze", pii.AnalyzeHandler(piiClassifier))
-		r.Post("/v1/pii/redact/render", pii.RenderHandler())
+		r.HandleFunc("POST /v1/pii/classify", pii.ClassifyHandler(piiClassifier))
+		r.HandleFunc("POST /v1/pii/classify/batch", pii.ClassifyBatchHandler(piiClassifier))
+		r.HandleFunc("POST /v1/pii/redact/analyze", pii.AnalyzeHandler(piiClassifier))
+		r.HandleFunc("POST /v1/pii/redact/render", pii.RenderHandler())
 	} else {
-		r.Post("/v1/pii/classify", func(w http.ResponseWriter, _ *http.Request) {
+		r.HandleFunc("POST /v1/pii/classify", func(w http.ResponseWriter, _ *http.Request) {
 			oapi.WriteError(w, http.StatusServiceUnavailable,
 				"PII model not loaded; set --pii-model",
 				oapi.TypeServiceUnavail, "", "model_not_loaded")
 		})
-		r.Post("/v1/pii/classify/batch", func(w http.ResponseWriter, _ *http.Request) {
+		r.HandleFunc("POST /v1/pii/classify/batch", func(w http.ResponseWriter, _ *http.Request) {
 			oapi.WriteError(w, http.StatusServiceUnavailable,
 				"PII model not loaded; set --pii-model",
 				oapi.TypeServiceUnavail, "", "model_not_loaded")
 		})
-		r.Post("/v1/pii/redact/analyze", pii.UnavailableHandler("PII model not loaded; set --pii-model"))
-		r.Post("/v1/pii/redact/render", pii.RenderHandler())
+		r.HandleFunc("POST /v1/pii/redact/analyze", pii.UnavailableHandler("PII model not loaded; set --pii-model"))
+		r.HandleFunc("POST /v1/pii/redact/render", pii.RenderHandler())
 	}
 
 	httpServer := &http.Server{

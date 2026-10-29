@@ -50,8 +50,15 @@ pub fn now_iso() -> String {
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut h = Sha256::new();
-    std::io::copy(&mut f, &mut h)?;
-    Ok(format!("{:x}", h.finalize()))
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex::encode(h.finalize()))
 }
 
 pub fn probe_duration_ms(path: &Path) -> Option<i64> {
@@ -458,7 +465,7 @@ impl Workspace {
         row.artifacts.insert(
             kind.to_string(),
             ArtifactRef {
-                sha256: format!("{:x}", Sha256::digest(&blob)),
+                sha256: hex::encode(Sha256::digest(&blob)),
                 producer: producer(kind).to_string(),
                 bytes: blob.len() as u64,
                 created: now_iso(),

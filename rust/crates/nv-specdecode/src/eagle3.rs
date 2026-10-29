@@ -76,10 +76,6 @@ impl<S: DraftScorer> Eagle3Proposer<S> {
         self.last_tree.as_ref()
     }
 
-    pub fn scorer_mut(&mut self) -> &mut S {
-        &mut self.scorer
-    }
-
     pub fn scorer(&self) -> &S {
         &self.scorer
     }
@@ -190,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn linear_chain_when_branch_factor_is_one() {
+    fn linear_chain_when_branch_factor_is_one_and_top_k_selection_picks_the_highest_logits() {
         let cfg = Eagle3Config {
             max_depth: 5,
             branch_factor: 1,
@@ -213,51 +209,27 @@ mod tests {
         for i in 1..tree.len() {
             assert_eq!(tree.parents[i], Some(i - 1));
         }
-    }
+        {
+            let logits = vec![-10.0, -10.0, 5.0, -10.0, 9.0, 1.0];
+            let cfg = Eagle3Config {
+                max_depth: 1,
+                branch_factor: 3,
+                total_budget: 10,
+                vocab_size: 6,
+            };
+            let mut p = Eagle3Proposer::new(const_scorer(logits.clone()), cfg);
+            let tree = p.expand_tree(&[0]).unwrap();
+            assert_eq!(tree.tokens, vec![4, 2, 5]);
 
-    #[test]
-    fn tree_shape_respects_total_budget() {
-        let cfg = Eagle3Config {
-            max_depth: 6,
-            branch_factor: 4,
-            total_budget: 7,
-            vocab_size: 32,
-        };
-        let mut p = Eagle3Proposer::new(uniform_scorer(32), cfg.clone());
-        let tree = p.expand_tree(&[1, 2, 3]).unwrap();
-        assert!(
-            tree.len() <= cfg.total_budget,
-            "tree size {} exceeded total_budget {}",
-            tree.len(),
-            cfg.total_budget,
-        );
+            assert!(tree.depths.iter().all(|&d| d == 1));
+            assert!(tree.parents.iter().all(|p| p.is_none()));
 
-        for w in tree.depths.windows(2) {
-            assert!(w[0] <= w[1], "depths not in BFS order: {:?}", tree.depths);
+            assert_eq!(crate::util::top_k_indices(&logits, 3), vec![4, 2, 5]);
         }
     }
 
     #[test]
-    fn top_k_selection_picks_highest_logits() {
-        let logits = vec![-10.0, -10.0, 5.0, -10.0, 9.0, 1.0];
-        let cfg = Eagle3Config {
-            max_depth: 1,
-            branch_factor: 3,
-            total_budget: 10,
-            vocab_size: 6,
-        };
-        let mut p = Eagle3Proposer::new(const_scorer(logits.clone()), cfg);
-        let tree = p.expand_tree(&[0]).unwrap();
-        assert_eq!(tree.tokens, vec![4, 2, 5]);
-
-        assert!(tree.depths.iter().all(|&d| d == 1));
-        assert!(tree.parents.iter().all(|p| p.is_none()));
-
-        assert_eq!(crate::util::top_k_indices(&logits, 3), vec![4, 2, 5]);
-    }
-
-    #[test]
-    fn parents_form_a_valid_tree() {
+    fn parents_form_a_valid_bfs_ordered_tree_within_the_total_budget() {
         let cfg = Eagle3Config {
             max_depth: 4,
             branch_factor: 3,
@@ -294,28 +266,24 @@ mod tests {
                 }
             }
         }
-    }
 
-    #[test]
-    fn expand_tree_returns_tokens_in_bfs_order() {
         let cfg = Eagle3Config {
-            max_depth: 3,
-            branch_factor: 2,
-            total_budget: 12,
-            vocab_size: 8,
+            max_depth: 6,
+            branch_factor: 4,
+            total_budget: 7,
+            vocab_size: 32,
         };
-        let mut p = Eagle3Proposer::new(uniform_scorer(8), cfg);
-        let tree = p.expand_tree(&[5]).expect("expand_tree");
-        assert!(!tree.is_empty());
+        let mut p = Eagle3Proposer::new(uniform_scorer(32), cfg.clone());
+        let tree = p.expand_tree(&[1, 2, 3]).unwrap();
+        assert!(
+            tree.len() <= cfg.total_budget,
+            "tree size {} exceeded total_budget {}",
+            tree.len(),
+            cfg.total_budget,
+        );
 
         for w in tree.depths.windows(2) {
-            assert!(w[0] <= w[1]);
-        }
-
-        for i in 0..tree.len() {
-            if let Some(par) = tree.parents[i] {
-                assert!(par < i);
-            }
+            assert!(w[0] <= w[1], "depths not in BFS order: {:?}", tree.depths);
         }
     }
 

@@ -78,7 +78,7 @@ fn main() -> Result<()> {
         max_new_tokens: max_new,
         ..Default::default()
     };
-    if std::env::var("NV_DSOCR_PHASES").is_ok() {
+    if nv_config::env_arm_present_at_all_reread_every_call("NV_DSOCR_PHASES") {
         for path in &images {
             let t = Instant::now();
             let img = load_rgb(path)?;

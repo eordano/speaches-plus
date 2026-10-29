@@ -34,11 +34,28 @@ pub use pipeline::{
 };
 pub use preprocess::{prepare, smart_resize, PixelBudget, PreparedImage};
 pub use regions::{plan_regions, Region, CROP_MAX_PIXELS_ENV, LAYOUT_MAX_PIXELS_ENV};
-pub use tiered::{
-    classify_sub_threshold, SubThresholdClass, TierPolicy, TIERED_ENV, TIERED_MIN_DOWNSCALE_ENV,
-};
+pub use tiered::{classify_sub_threshold, SubThresholdClass, TierPolicy, TIERED_MIN_DOWNSCALE_ENV};
 pub use vision::{DotsVisionConfig, DotsVisionTower};
 #[cfg(feature = "wgpu")]
 pub use vision_wgpu::{DotsVisionTowerWgpu, VisionGemmRoute};
 
 pub use crate::deepseek_ocr::preprocess::RgbImage;
+
+pub fn default_snapshot_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(d) = std::env::var("NV_DOTS_DIR") {
+        let p = PathBuf::from(d);
+        return p.is_dir().then_some(p);
+    }
+    let home = std::env::var("HOME").ok()?;
+    let snaps = PathBuf::from(home)
+        .join(".cache/huggingface/hub/models--rednote-hilab--dots.ocr/snapshots");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&snaps)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    entries.sort();
+    entries.into_iter().next()
+}

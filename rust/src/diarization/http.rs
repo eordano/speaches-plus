@@ -349,12 +349,6 @@ fn speaker_labels(
     }
 }
 
-#[allow(dead_code)]
-pub fn decode_data_url(s: &str) -> anyhow::Result<Vec<u8>> {
-    let (bytes, _mime) = decode_data_url_with_mime(s)?;
-    Ok(bytes)
-}
-
 pub fn decode_data_url_with_mime(s: &str) -> anyhow::Result<(Vec<u8>, Option<String>)> {
     let s = s.trim();
     let rest = s
@@ -389,52 +383,6 @@ pub fn decode_data_url_with_mime(s: &str) -> anyhow::Result<(Vec<u8>, Option<Str
 mod tests {
     use super::*;
     use crate::voices::{stages, Workspace};
-
-    #[tokio::test]
-    #[ignore = "requires DiariZen and WeSpeaker ONNX model paths"]
-    async fn voices_real_diarization_enters_registry() -> anyhow::Result<()> {
-        let seg = Arc::new(super::super::SegmentationModel::load(std::env::var(
-            "NV_TEST_DIAR_MODEL",
-        )?)?);
-        let emb = Arc::new(EmbeddingModel::load(std::env::var(
-            "NV_TEST_EMBEDDING_MODEL",
-        )?)?);
-        let audio = decode_any_to_16k_mono(
-            include_bytes!("../../tests/data/parakeet_fox_16k.wav"),
-            Some("audio/wav"),
-        )?;
-        let mut diarizer = Diarizer::new(seg, emb.clone(), DiarConfig::default());
-        let segments = diarizer.diarize_utterance(&audio, 0)?;
-        assert!(
-            !segments.is_empty(),
-            "real speech must produce diarized segments"
-        );
-        let speakers = speaker_summaries(&segments, &audio, &emb).await?;
-        assert!(speakers
-            .iter()
-            .any(|s| s.seconds >= 1. && s.embedding.len() == 256));
-        let body = diarization_json(
-            audio.len() as f64 / 16_000.,
-            &segments,
-            &speakers,
-            &speaker_labels(&speakers, &[]),
-        );
-        let td = stages::TempDir::new("real-diar")?;
-        let ws = Workspace::new(&td.0);
-        ws.init()?;
-        std::fs::write(
-            ws.recordings_dir().join("real.wav"),
-            include_bytes!("../../tests/data/parakeet_fox_16k.wav"),
-        )?;
-        let mut manifest = ws.load()?;
-        ws.scan(&mut manifest, false)?;
-        let sha = manifest.rows.keys().next().unwrap().clone();
-        ws.put_artifact(&mut manifest, &sha, "diar", &body)?;
-        let registry = stages::identify(&ws, &manifest, 1., &mut |_| {})?;
-        assert!(!registry.speakers.is_empty());
-        assert!(registry.speakers.iter().all(|s| !s.sources.is_empty()));
-        Ok(())
-    }
 
     #[test]
     fn voices_identify_consumes_the_engine_diarization_response() -> anyhow::Result<()> {

@@ -14,7 +14,6 @@ pub(crate) const GPT_OSS_CUDA_PREFILL_CHUNK_IS_SMALL_BECAUSE_EAGER_SCORES_ARE_M_
 const PREFILL_CHUNK: usize = 128;
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_sampling_gpt_oss(
     model: Arc<nv_models::gpt_oss_cuda::GptOssCuda>,
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -146,11 +145,7 @@ pub(crate) async fn run_sampling_gpt_oss(
         }
     }
 
-    let _ = tx
-        .send(ChatEvent::Done {
-            finish_reason,
-            completion_tokens,
-        })
-        .await;
+    let _ =
+        send_stopped_by_then_done(tx, &mut emitter, finish_reason, completion_tokens, None).await;
     Ok(())
 }

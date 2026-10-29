@@ -73,56 +73,38 @@ __global__ void rmsnorm_kernel(const T* __restrict__ x,
     NVK_PDL_EPILOG();
 }
 
-static int g_norm_m1_wide_block_selected_once_at_first_launch_so_the_default_path_pays_no_getenv = -2;
-
 static constexpr int
-    kNormM1WideUnsetResolvesTo256TheBitwiseRungUserSignedOff20260904Because10Point29UsFellTo3Point71UsPerCallSetZeroForTheStockShape =
-        256;
+    kNormM1WideIs256TheBitwiseRungBecause10Point29UsFellTo3Point71UsPerCall = 256;
+
+static int g_norm_m1_wide_block_256_unless_a_test_forces_another_rung =
+    kNormM1WideIs256TheBitwiseRungBecause10Point29UsFellTo3Point71UsPerCall;
 
 extern "C" int nv_kernels_norm_m1_wide_block() {
-    if (g_norm_m1_wide_block_selected_once_at_first_launch_so_the_default_path_pays_no_getenv == -2) {
-        const char* e = getenv("NV_NORM_M1_WIDE");
-        int p = e ? atoi(e)
-                  : kNormM1WideUnsetResolvesTo256TheBitwiseRungUserSignedOff20260904Because10Point29UsFellTo3Point71UsPerCallSetZeroForTheStockShape;
-        g_norm_m1_wide_block_selected_once_at_first_launch_so_the_default_path_pays_no_getenv =
-            (nvk_norm_m1_wide_vpt(p) > 0)
-                ? p
-                : kNormM1WideOffIsTheStock256ThreadSingleCtaPerRowShape;
-    }
-    return g_norm_m1_wide_block_selected_once_at_first_launch_so_the_default_path_pays_no_getenv;
+    return g_norm_m1_wide_block_256_unless_a_test_forces_another_rung;
 }
 
-static const size_t
-    kNormM1WideBatchCapUnsetStaysAtOneBecauseTheMultiRowWideningNegativeWasMeasuredOnLargeBatchNormsNotOnAVerifyBlock =
-        kNormM1ArmsServeBatchOneOnlyBecauseAMultiRowNormAlreadyHasOneCtaPerRowAndWideningItMeasuredPlus12PercentOnGemma4HeadDimNormsAnd2Point6xOnQwen35PrefillNorm;
+static constexpr int
+    kNormM1WideBatchCap8CoversEveryMtpVerifyBlockAndKeepsOneCtaPerRowSoEveryRowRunsTheReductionItRanBefore =
+        8;
 
-static int g_norm_m1_wide_batch_cap_selected_once_at_first_launch_so_the_default_path_pays_no_getenv =
-    -2;
+static int g_norm_m1_wide_batch_cap_8_unless_a_test_forces_another =
+    kNormM1WideBatchCap8CoversEveryMtpVerifyBlockAndKeepsOneCtaPerRowSoEveryRowRunsTheReductionItRanBefore;
 
 extern "C" int nv_kernels_norm_m1_wide_batch_cap() {
-    if (g_norm_m1_wide_batch_cap_selected_once_at_first_launch_so_the_default_path_pays_no_getenv ==
-        -2) {
-        const char* e = getenv("NV_NORM_M1_WIDE_BATCH");
-        int p = e ? atoi(e)
-                  : (int)kNormM1WideBatchCapUnsetStaysAtOneBecauseTheMultiRowWideningNegativeWasMeasuredOnLargeBatchNormsNotOnAVerifyBlock;
-        g_norm_m1_wide_batch_cap_selected_once_at_first_launch_so_the_default_path_pays_no_getenv =
-            (p >= 1) ? p : 1;
-    }
-    return g_norm_m1_wide_batch_cap_selected_once_at_first_launch_so_the_default_path_pays_no_getenv;
+    return g_norm_m1_wide_batch_cap_8_unless_a_test_forces_another;
 }
 
 extern "C" int nv_kernels_norm_m1_wide_batch_cap_force(int rows) {
-    g_norm_m1_wide_batch_cap_selected_once_at_first_launch_so_the_default_path_pays_no_getenv =
-        (rows >= 1) ? rows : 1;
-    return g_norm_m1_wide_batch_cap_selected_once_at_first_launch_so_the_default_path_pays_no_getenv;
+    g_norm_m1_wide_batch_cap_8_unless_a_test_forces_another = (rows >= 1) ? rows : 1;
+    return g_norm_m1_wide_batch_cap_8_unless_a_test_forces_another;
 }
 
 extern "C" int nv_kernels_norm_m1_wide_force(int block) {
-    g_norm_m1_wide_block_selected_once_at_first_launch_so_the_default_path_pays_no_getenv =
+    g_norm_m1_wide_block_256_unless_a_test_forces_another_rung =
         (nvk_norm_m1_wide_vpt(block) > 0)
             ? block
             : kNormM1WideOffIsTheStock256ThreadSingleCtaPerRowShape;
-    return g_norm_m1_wide_block_selected_once_at_first_launch_so_the_default_path_pays_no_getenv;
+    return g_norm_m1_wide_block_256_unless_a_test_forces_another_rung;
 }
 
 static int g_norm_m1_split_ctas_selected_once_at_first_launch_so_the_default_path_pays_no_getenv = -2;

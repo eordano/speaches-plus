@@ -103,16 +103,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trained_params_load() {
+    fn english_and_multilingual_trained_params_load() {
         let p = PunktParameters::english_trained().unwrap();
         assert!(p.ortho_context.len() >= 10_000);
         assert!(p.sent_starters.len() >= 10);
         assert!(!p.collocations.is_empty());
         assert!(p.abbrev_types.len() > CURATED_ABBREVS.len());
-    }
-
-    #[test]
-    fn multilingual_langs_load() {
         for lang in ["german", "spanish", "portuguese", "french"] {
             let p = PunktParameters::trained(lang).unwrap();
             assert!(p.ortho_context.len() >= 1000, "{lang}");
@@ -121,4 +117,5 @@ mod tests {
         let ru = PunktParameters::trained("russian").unwrap();
         assert!(ru.abbrev_types.len() >= 1000);
     }
+
 }

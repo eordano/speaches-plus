@@ -174,6 +174,7 @@ const NV2_SECTION_WARP: u32 = 1u;
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_warp(
+    #def b6
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
@@ -195,6 +196,7 @@ fn gemv_nvfp4_warp(
     }
 
     let total = nv2_bfly(acc);
+    #end
     if (lane == 0u && live) {
         nv2_y[row] = bf16_encode(total * nv2_p.alpha);
     }
@@ -204,6 +206,7 @@ const NV2_SECTION_WARPQ: u32 = 2u;
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_warpq(
+    #def b3
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
@@ -224,6 +227,7 @@ fn gemv_nvfp4_warpq(
         let xa = nv2_x4[2u * q];
         let xc = nv2_x4[2u * q + 1u];
         acc = fma(nv2_ue4m3(byte_at(wsw, 0u)) * nv2_ue4m3(byte_at(xsw, 0u)),
+    #end
             nv2_iblock(wa.x, wa.y, xa.x, xa.y), acc);
         acc = fma(nv2_ue4m3(byte_at(wsw, 1u)) * nv2_ue4m3(byte_at(xsw, 1u)),
             nv2_iblock(wa.z, wa.w, xa.z, xa.w), acc);
@@ -243,26 +247,8 @@ const NV2_SECTION_FDEC: u32 = 3u;
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_fdec(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row = (wid.x + wid.y * nv2_p.groups_x) * NV2_SGS + sgid;
-    let live = row < nv2_p.n_rows;
-    let quads = select(0u, nv2_p.k_blocks >> 2u, live);
-    let w4b = select(0u, row * (nv2_p.k_blocks >> 1u), live);
-    let srow = select(0u, row, live);
-
-    var acc = 0.0;
-    for (var q = lane; q < quads; q = q + NV2_LANES) {
-        let wsi = nvfp4_scale_byte_index(srow, q << 2u, nv2_p.k_tiles);
-        let wsw = nv2_ws[wsi >> 2u];
-        let xsw = nv2_xs[q];
-        let wa = nv2_w4[w4b + 2u * q];
-        let wc = nv2_w4[w4b + 2u * q + 1u];
-        let xa = nv2_x4[2u * q];
-        let xc = nv2_x4[2u * q + 1u];
-        acc = fma(nv2_ue4m3(byte_at(wsw, 0u)) * nv2_ue4m3(byte_at(xsw, 0u)),
+    #def b7
+    #use b3
             nv2_fblock(wa.x, wa.y, xa.x, xa.y), acc);
         acc = fma(nv2_ue4m3(byte_at(wsw, 1u)) * nv2_ue4m3(byte_at(xsw, 1u)),
             nv2_fblock(wa.z, wa.w, xa.z, xa.w), acc);
@@ -273,6 +259,7 @@ fn gemv_nvfp4_fdec(
     }
 
     let total = nv2_bfly(acc);
+    #end
     if (lane == 0u && live) {
         nv2_y[row] = bf16_encode(total * nv2_p.alpha);
     }
@@ -282,6 +269,7 @@ const NV2_SECTION_MROW: u32 = 4u;
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_mrow(
+    #def b1
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
@@ -305,6 +293,9 @@ fn gemv_nvfp4_mrow(
 
     for (var p = lane; p < pairs; p = p + NV2_LANES) {
         let xv = nv2_x4[p];
+    #end
+        #def b4
+        #def b8
         let xm0 = nv2_i8map(xv.x);
         let xm1 = nv2_i8map(xv.x >> 4u);
         let xm2 = nv2_i8map(xv.y);
@@ -317,6 +308,7 @@ fn gemv_nvfp4_mrow(
         let xsw = nv2_xs[b0 >> 2u];
         let xs0 = nv2_ue4m3(byte_at(xsw, b0));
         let xs1 = nv2_ue4m3(byte_at(xsw, b0 + 1u));
+        #end
         for (var m = 0u; m < NV2_MR; m = m + 1u) {
             let wv = nv2_w4[wbase[m] + p];
             let wsi = nvfp4_scale_byte_index(srow[m], b0, nv2_p.k_tiles);
@@ -329,6 +321,7 @@ fn gemv_nvfp4_mrow(
             acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi + 1u)) * xs1, f32(d1) * 0.25, acc[m]);
         }
     }
+        #end
 
     for (var m = 0u; m < NV2_MR; m = m + 1u) {
         let total = nv2_bfly(acc[m]);
@@ -340,54 +333,10 @@ fn gemv_nvfp4_mrow(
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_mrow_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row0 = (wid.x + wid.y * nv2_p.groups_x) * (NV2_SGS * NV2_MR) + sgid * NV2_MR;
-    let pairs = nv2_p.k_blocks >> 1u;
-    let stride = nv2_p.k_blocks >> 1u;
+    #use b1
+        #use b4
 
-    var live: array<u32, NV2_MR>;
-    var wbase: array<u32, NV2_MR>;
-    var srow: array<u32, NV2_MR>;
-    var acc: array<f32, NV2_MR>;
-    for (var m = 0u; m < NV2_MR; m = m + 1u) {
-        let r = row0 + m;
-        let ok = r < nv2_p.n_rows;
-        live[m] = select(0u, 1u, ok);
-        wbase[m] = select(0u, r * stride, ok);
-        srow[m] = select(0u, r, ok);
-        acc[m] = 0.0;
-    }
-
-    for (var p = lane; p < pairs; p = p + NV2_LANES) {
-        let xv = nv2_x4[p];
-        let xm0 = nv2_i8map(xv.x);
-        let xm1 = nv2_i8map(xv.x >> 4u);
-        let xm2 = nv2_i8map(xv.y);
-        let xm3 = nv2_i8map(xv.y >> 4u);
-        let xm4 = nv2_i8map(xv.z);
-        let xm5 = nv2_i8map(xv.z >> 4u);
-        let xm6 = nv2_i8map(xv.w);
-        let xm7 = nv2_i8map(xv.w >> 4u);
-        let b0 = p << 1u;
-        let xsw = nv2_xs[b0 >> 2u];
-        let xs0 = nv2_ue4m3(byte_at(xsw, b0));
-        let xs1 = nv2_ue4m3(byte_at(xsw, b0 + 1u));
-        for (var m = 0u; m < NV2_MR; m = m + 1u) {
-            let wv = nv2_w4[wbase[m] + p];
-            let wsi = nvfp4_scale_byte_index(srow[m], b0, nv2_p.k_tiles);
-            let wsw = nv2_ws[wsi >> 2u];
-            let dd = nv2_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
-                wv, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
-            let d0 = dd.x;
-            let d1 = dd.y;
-            acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi)) * xs0, f32(d0) * 0.25, acc[m]);
-            acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi + 1u)) * xs1, f32(d1) * 0.25, acc[m]);
-        }
-    }
-
+    #def b10
     var tot: array<f32, NV2_MR>;
     for (var m = 0u; m < NV2_MR; m = m + 1u) {
         tot[m] = nv2_bfly(acc[m]);
@@ -400,34 +349,13 @@ fn gemv_nvfp4_mrow_pk(
         }
     }
 }
+    #end
 
 const NV2_SECTION_FMROW: u32 = 5u;
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_fmrow(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row0 = (wid.x + wid.y * nv2_p.groups_x) * (NV2_SGS * NV2_MR) + sgid * NV2_MR;
-    let pairs = nv2_p.k_blocks >> 1u;
-    let stride = nv2_p.k_blocks >> 1u;
-
-    var live: array<u32, NV2_MR>;
-    var wbase: array<u32, NV2_MR>;
-    var srow: array<u32, NV2_MR>;
-    var acc: array<f32, NV2_MR>;
-    for (var m = 0u; m < NV2_MR; m = m + 1u) {
-        let r = row0 + m;
-        let ok = r < nv2_p.n_rows;
-        live[m] = select(0u, 1u, ok);
-        wbase[m] = select(0u, r * stride, ok);
-        srow[m] = select(0u, r, ok);
-        acc[m] = 0.0;
-    }
-
-    for (var p = lane; p < pairs; p = p + NV2_LANES) {
-        let xv = nv2_x4[p];
+    #use b1
         let b0 = p << 1u;
         let xsw = nv2_xs[b0 >> 2u];
         let xs0 = nv2_ue4m3(byte_at(xsw, b0));
@@ -463,29 +391,8 @@ const NV2_SECTION_FMLUT: u32 = 6u;
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_fmlut(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row0 = (wid.x + wid.y * nv2_p.groups_x) * (NV2_SGS * NV2_MR) + sgid * NV2_MR;
-    let pairs = nv2_p.k_blocks >> 1u;
-    let stride = nv2_p.k_blocks >> 1u;
-
-    var live: array<u32, NV2_MR>;
-    var wbase: array<u32, NV2_MR>;
-    var srow: array<u32, NV2_MR>;
-    var acc: array<f32, NV2_MR>;
-    for (var m = 0u; m < NV2_MR; m = m + 1u) {
-        let r = row0 + m;
-        let ok = r < nv2_p.n_rows;
-        live[m] = select(0u, 1u, ok);
-        wbase[m] = select(0u, r * stride, ok);
-        srow[m] = select(0u, r, ok);
-        acc[m] = 0.0;
-    }
-
-    for (var p = lane; p < pairs; p = p + NV2_LANES) {
-        let xv = nv2_x4[p];
+    #def b5
+    #use b1
         let b0 = p << 1u;
         let xsw = nv2_xs[b0 >> 2u];
         let xs0 = nv2_ue4m3(byte_at(xsw, b0)) * 0.25;
@@ -508,6 +415,7 @@ fn gemv_nvfp4_fmlut(
             acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi + 1u)), d1, acc[m]);
         }
     }
+    #end
 
     for (var m = 0u; m < NV2_MR; m = m + 1u) {
         let total = nv2_bfly(acc[m]);
@@ -532,97 +440,14 @@ fn nv2_pk_word(lo_acc: f32, hi_acc: f32, row: u32) -> u32 {
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_fmlut_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row0 = (wid.x + wid.y * nv2_p.groups_x) * (NV2_SGS * NV2_MR) + sgid * NV2_MR;
-    let pairs = nv2_p.k_blocks >> 1u;
-    let stride = nv2_p.k_blocks >> 1u;
+    #use b5
 
-    var live: array<u32, NV2_MR>;
-    var wbase: array<u32, NV2_MR>;
-    var srow: array<u32, NV2_MR>;
-    var acc: array<f32, NV2_MR>;
-    for (var m = 0u; m < NV2_MR; m = m + 1u) {
-        let r = row0 + m;
-        let ok = r < nv2_p.n_rows;
-        live[m] = select(0u, 1u, ok);
-        wbase[m] = select(0u, r * stride, ok);
-        srow[m] = select(0u, r, ok);
-        acc[m] = 0.0;
-    }
-
-    for (var p = lane; p < pairs; p = p + NV2_LANES) {
-        let xv = nv2_x4[p];
-        let b0 = p << 1u;
-        let xsw = nv2_xs[b0 >> 2u];
-        let xs0 = nv2_ue4m3(byte_at(xsw, b0)) * 0.25;
-        let xs1 = nv2_ue4m3(byte_at(xsw, b0 + 1u)) * 0.25;
-        let xe0 = nv2_meven(xv.x) * xs0;
-        let xo0 = nv2_modd(xv.x) * xs0;
-        let xe1 = nv2_meven(xv.y) * xs0;
-        let xo1 = nv2_modd(xv.y) * xs0;
-        let xe2 = nv2_meven(xv.z) * xs1;
-        let xo2 = nv2_modd(xv.z) * xs1;
-        let xe3 = nv2_meven(xv.w) * xs1;
-        let xo3 = nv2_modd(xv.w) * xs1;
-        for (var m = 0u; m < NV2_MR; m = m + 1u) {
-            let wv = nv2_w4[wbase[m] + p];
-            let wsi = nvfp4_scale_byte_index(srow[m], b0, nv2_p.k_tiles);
-            let wsw = nv2_ws[wsi >> 2u];
-            let d0 = nv2_mdot8(wv.y, xe1, xo1, nv2_mdot8(wv.x, xe0, xo0, 0.0));
-            let d1 = nv2_mdot8(wv.w, xe3, xo3, nv2_mdot8(wv.z, xe2, xo2, 0.0));
-            acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi)), d0, acc[m]);
-            acc[m] = fma(nv2_ue4m3(byte_at(wsw, wsi + 1u)), d1, acc[m]);
-        }
-    }
-
-    var tot: array<f32, NV2_MR>;
-    for (var m = 0u; m < NV2_MR; m = m + 1u) {
-        tot[m] = nv2_bfly(acc[m]);
-    }
-    if (lane == 0u) {
-        for (var m = 0u; m < NV2_MR; m = m + 2u) {
-            if (live[m] == 1u) {
-                nv2_y[(row0 + m) >> 1u] = nv2_pk_word(tot[m], tot[m + 1u], row0 + m);
-            }
-        }
-    }
-}
+    #use b10
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_fdec_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row = (wid.x + wid.y * nv2_p.groups_x) * NV2_SGS + sgid;
-    let live = row < nv2_p.n_rows;
-    let quads = select(0u, nv2_p.k_blocks >> 2u, live);
-    let w4b = select(0u, row * (nv2_p.k_blocks >> 1u), live);
-    let srow = select(0u, row, live);
-
-    var acc = 0.0;
-    for (var q = lane; q < quads; q = q + NV2_LANES) {
-        let wsi = nvfp4_scale_byte_index(srow, q << 2u, nv2_p.k_tiles);
-        let wsw = nv2_ws[wsi >> 2u];
-        let xsw = nv2_xs[q];
-        let wa = nv2_w4[w4b + 2u * q];
-        let wc = nv2_w4[w4b + 2u * q + 1u];
-        let xa = nv2_x4[2u * q];
-        let xc = nv2_x4[2u * q + 1u];
-        acc = fma(nv2_ue4m3(byte_at(wsw, 0u)) * nv2_ue4m3(byte_at(xsw, 0u)),
-            nv2_fblock(wa.x, wa.y, xa.x, xa.y), acc);
-        acc = fma(nv2_ue4m3(byte_at(wsw, 1u)) * nv2_ue4m3(byte_at(xsw, 1u)),
-            nv2_fblock(wa.z, wa.w, xa.z, xa.w), acc);
-        acc = fma(nv2_ue4m3(byte_at(wsw, 2u)) * nv2_ue4m3(byte_at(xsw, 2u)),
-            nv2_fblock(wc.x, wc.y, xc.x, xc.y), acc);
-        acc = fma(nv2_ue4m3(byte_at(wsw, 3u)) * nv2_ue4m3(byte_at(xsw, 3u)),
-            nv2_fblock(wc.z, wc.w, xc.z, xc.w), acc);
-    }
-
-    let total = nv2_bfly(acc);
+    #use b7
+    #def b9
     if (lane == 0u) {
         nv2_pk_bits[sgid] = bf16_encode(total * nv2_p.alpha) & 0xffffu;
     }
@@ -635,11 +460,13 @@ fn gemv_nvfp4_fdec_pk(
         nv2_y[row >> 1u] = word;
     }
 }
+    #end
 
 const NV2_SECTION_MROW2: u32 = 8u;
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_mrow2(
+    #def b2
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
@@ -647,6 +474,7 @@ fn gemv_nvfp4_mrow2(
     let row0 = (wid.x + wid.y * nv2_p.groups_x) * (NV2_SGS * 2u) + sgid * 2u;
     let row1 = row0 + 1u;
     let pairs = nv2_p.k_blocks >> 1u;
+    #def b11
     let stride = nv2_p.k_blocks >> 1u;
     let live0 = row0 < nv2_p.n_rows;
     let live1 = row1 < nv2_p.n_rows;
@@ -657,20 +485,10 @@ fn gemv_nvfp4_mrow2(
 
     var acc0 = 0.0;
     var acc1 = 0.0;
+    #end
     for (var p = lane; p < pairs; p = p + NV2_LANES) {
         let xv = nv2_x4[p];
-        let xm0 = nv2_i8map(xv.x);
-        let xm1 = nv2_i8map(xv.x >> 4u);
-        let xm2 = nv2_i8map(xv.y);
-        let xm3 = nv2_i8map(xv.y >> 4u);
-        let xm4 = nv2_i8map(xv.z);
-        let xm5 = nv2_i8map(xv.z >> 4u);
-        let xm6 = nv2_i8map(xv.w);
-        let xm7 = nv2_i8map(xv.w >> 4u);
-        let b0 = p << 1u;
-        let xsw = nv2_xs[b0 >> 2u];
-        let xs0 = nv2_ue4m3(byte_at(xsw, b0));
-        let xs1 = nv2_ue4m3(byte_at(xsw, b0 + 1u));
+        #use b8
 
         let wv0 = nv2_w4[wb0 + p];
         let wsi0 = nvfp4_scale_byte_index(sr0, b0, nv2_p.k_tiles);
@@ -696,6 +514,7 @@ fn gemv_nvfp4_mrow2(
     let t0 = nv2_bfly(acc0);
     let t1 = nv2_bfly(acc1);
     if (lane == 0u && live0) {
+    #end
         nv2_y[row0] = bf16_encode(t0 * nv2_p.alpha);
     }
     if (lane == 0u && live1) {
@@ -705,62 +524,7 @@ fn gemv_nvfp4_mrow2(
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_mrow2_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row0 = (wid.x + wid.y * nv2_p.groups_x) * (NV2_SGS * 2u) + sgid * 2u;
-    let row1 = row0 + 1u;
-    let pairs = nv2_p.k_blocks >> 1u;
-    let stride = nv2_p.k_blocks >> 1u;
-    let live0 = row0 < nv2_p.n_rows;
-    let live1 = row1 < nv2_p.n_rows;
-    let wb0 = select(0u, row0 * stride, live0);
-    let wb1 = select(0u, row1 * stride, live1);
-    let sr0 = select(0u, row0, live0);
-    let sr1 = select(0u, row1, live1);
-
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    for (var p = lane; p < pairs; p = p + NV2_LANES) {
-        let xv = nv2_x4[p];
-        let xm0 = nv2_i8map(xv.x);
-        let xm1 = nv2_i8map(xv.x >> 4u);
-        let xm2 = nv2_i8map(xv.y);
-        let xm3 = nv2_i8map(xv.y >> 4u);
-        let xm4 = nv2_i8map(xv.z);
-        let xm5 = nv2_i8map(xv.z >> 4u);
-        let xm6 = nv2_i8map(xv.w);
-        let xm7 = nv2_i8map(xv.w >> 4u);
-        let b0 = p << 1u;
-        let xsw = nv2_xs[b0 >> 2u];
-        let xs0 = nv2_ue4m3(byte_at(xsw, b0));
-        let xs1 = nv2_ue4m3(byte_at(xsw, b0 + 1u));
-
-        let wv0 = nv2_w4[wb0 + p];
-        let wsi0 = nvfp4_scale_byte_index(sr0, b0, nv2_p.k_tiles);
-        let wsw0 = nv2_ws[wsi0 >> 2u];
-        let dd_a0 = nv2_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
-            wv0, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
-        let a0 = dd_a0.x;
-        let a1 = dd_a0.y;
-        acc0 = fma(nv2_ue4m3(byte_at(wsw0, wsi0)) * xs0, f32(a0) * 0.25, acc0);
-        acc0 = fma(nv2_ue4m3(byte_at(wsw0, wsi0 + 1u)) * xs1, f32(a1) * 0.25, acc0);
-
-        let wv1 = nv2_w4[wb1 + p];
-        let wsi1 = nvfp4_scale_byte_index(sr1, b0, nv2_p.k_tiles);
-        let wsw1 = nv2_ws[wsi1 >> 2u];
-        let dd_b0d = nv2_mrow_dots_in_a_fn_because_msl_unroll_reuses_polyfill_temp_names(
-            wv1, xm0, xm1, xm2, xm3, xm4, xm5, xm6, xm7);
-        let b0d = dd_b0d.x;
-        let b1d = dd_b0d.y;
-        acc1 = fma(nv2_ue4m3(byte_at(wsw1, wsi1)) * xs0, f32(b0d) * 0.25, acc1);
-        acc1 = fma(nv2_ue4m3(byte_at(wsw1, wsi1 + 1u)) * xs1, f32(b1d) * 0.25, acc1);
-    }
-
-    let t0 = nv2_bfly(acc0);
-    let t1 = nv2_bfly(acc1);
-    if (lane == 0u && live0) {
+    #use b2
         nv2_y[row0 >> 1u] = nv2_pk_word(t0, t1, row0);
     }
 }
@@ -776,16 +540,7 @@ fn gemv_nvfp4_mrowq(
     let row0 = (wid.x + wid.y * nv2_p.groups_x) * (NV2_SGS * 2u) + sgid * 2u;
     let row1 = row0 + 1u;
     let quads = nv2_p.k_blocks >> 2u;
-    let stride = nv2_p.k_blocks >> 1u;
-    let live0 = row0 < nv2_p.n_rows;
-    let live1 = row1 < nv2_p.n_rows;
-    let wb0 = select(0u, row0 * stride, live0);
-    let wb1 = select(0u, row1 * stride, live1);
-    let sr0 = select(0u, row0, live0);
-    let sr1 = select(0u, row1, live1);
-
-    var acc0 = 0.0;
-    var acc1 = 0.0;
+    #use b11
     for (var q = lane; q < quads; q = q + NV2_LANES) {
         let xa = nv2_x4[2u * q];
         let xc = nv2_x4[2u * q + 1u];
@@ -856,36 +611,5 @@ fn gemv_nvfp4_mrowq(
 
 @compute @workgroup_size(NV2_WG)
 fn gemv_nvfp4_warp_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(subgroup_id) sgid: u32,
-    @builtin(subgroup_invocation_id) lane: u32
-) {
-    let row = (wid.x + wid.y * nv2_p.groups_x) * NV2_SGS + sgid;
-    let live = row < nv2_p.n_rows;
-    let blocks = select(0u, nv2_p.k_blocks, live);
-    let wb = select(0u, row * nv2_p.k_blocks, live);
-    let srow = select(0u, row, live);
-
-    var acc = 0.0;
-    for (var kb = lane; kb < blocks; kb = kb + NV2_LANES) {
-        let wsi = nvfp4_scale_byte_index(srow, kb, nv2_p.k_tiles);
-        let bs = nv2_ue4m3(byte_at(nv2_ws[wsi >> 2u], wsi))
-            * nv2_ue4m3(byte_at(nv2_xs[kb >> 2u], kb));
-        let wv = nv2_w2[wb + kb];
-        let xv = nv2_x2[kb];
-        acc = fma(bs, nv2_iblock(wv.x, wv.y, xv.x, xv.y), acc);
-    }
-
-    let total = nv2_bfly(acc);
-    if (lane == 0u) {
-        nv2_pk_bits[sgid] = bf16_encode(total * nv2_p.alpha) & 0xffffu;
-    }
-    workgroupBarrier();
-    if ((sgid & 1u) == 0u && lane == 0u && live) {
-        var word = nv2_pk_bits[sgid];
-        if (row + 1u < nv2_p.n_rows) {
-            word = word | (nv2_pk_bits[sgid + 1u] << 16u);
-        }
-        nv2_y[row >> 1u] = word;
-    }
-}
+    #use b6
+    #use b9

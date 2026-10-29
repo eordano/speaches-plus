@@ -219,6 +219,18 @@
   </div>
 </header>
 
+<section class="card" aria-labelledby="evidence-heading">
+  <h2 id="evidence-heading">Recorded experiment evidence</h2>
+  <p>The sections below are a historical design and benchmark record, not live campaign status.
+    Load exported campaign-outcome, dataset-readiness, review-exclusion, training-capacity comparisons, synthetic API adapter-continuation checks, training, paired-inference, base-model thinking trials, incomplete-draft compiler and behavioral-test feedback, tool-adherence observations, native regression, paired native base/adapter repair evaluations, and Laya shadow-decision reports to inspect a recorded experiment.
+    Files stay in this browser; loading a report does not train, deploy or promote an adapter.
+    A completed training job produces an adapter artifact; evaluation determines its quality.
+    Neither proves that live agents use it. This viewer does not query serving hosts.</p>
+  <label for="evidence-files">Experiment report JSON files</label>
+  <input id="evidence-files" type="file" accept=".json,application/json" multiple>
+  <div id="evidence-results" aria-live="polite"><p>No reports loaded. Independent work-order success is unverified; the 50% goal is not established.</p></div>
+</section>
+
 <h2><span class="n">01</span>The loop</h2>
 <p class="lede">
   Every stage is a real, shipped component with its own endpoint or artifact — not a script
@@ -573,6 +585,7 @@
 </footer>
 </main>
 
+<script src="continual-lora-evidence.js"></script>
 <script>
   function toggleTheme() {
     const r = document.documentElement;

@@ -315,34 +315,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bytes_to_words_is_little_endian() {
-        assert_eq!(bytes_to_words(&[0x11, 0x22, 0x33, 0x44]), vec![0x44332211]);
-        assert_eq!(bytes_to_words(&[0xff]), vec![0x000000ff]);
-        assert_eq!(bytes_to_words(&[]), vec![0u32]);
-    }
-
-    #[test]
-    fn dequant_wgsl_declares_the_primitives() {
-        for f in [
-            "fn nvfp4_decode(",
-            "fn ue4m3_decode(",
-            "fn e4m3_decode(",
-            "fn e5m2_decode(",
-            "fn bf16_decode(",
-            "fn bf16_encode(",
-            "fn int4_decode(",
-            "fn nvfp4_value_global(",
-            "fn nvfp4_scale_byte_index(",
-        ] {
-            assert!(DEQUANT_WGSL.contains(f), "missing {f}");
+    fn bytes_pack_little_endian_and_the_composed_prelude_declares_every_primitive_first() {
+        {
+            assert_eq!(bytes_to_words(&[0x11, 0x22, 0x33, 0x44]), vec![0x44332211]);
+            assert_eq!(bytes_to_words(&[0xff]), vec![0x000000ff]);
+            assert_eq!(bytes_to_words(&[]), vec![0u32]);
         }
-    }
-
-    #[test]
-    fn composed_source_keeps_the_prelude_first() {
-        let s = compose("fn body() -> f32 { return 1.0; }");
-        assert!(s.starts_with("const NVFP4_BLOCK_SIZE"));
-        assert!(s.ends_with("\nfn body() -> f32 { return 1.0; }\n"));
-        assert!(s.contains("fn nvfp4_decode("));
+        {
+            for f in [
+                "fn nvfp4_decode(",
+                "fn ue4m3_decode(",
+                "fn e4m3_decode(",
+                "fn e5m2_decode(",
+                "fn bf16_decode(",
+                "fn bf16_encode(",
+                "fn int4_decode(",
+                "fn nvfp4_value_global(",
+                "fn nvfp4_scale_byte_index(",
+            ] {
+                assert!(DEQUANT_WGSL.contains(f), "missing {f}");
+            }
+        }
+        {
+            let s = compose("fn body() -> f32 { return 1.0; }");
+            assert!(s.starts_with("const NVFP4_BLOCK_SIZE"));
+            assert!(s.ends_with("\nfn body() -> f32 { return 1.0; }\n"));
+            assert!(s.contains("fn nvfp4_decode("));
+        }
     }
 }

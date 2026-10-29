@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "packageManager": "pnpm@12.9.0",
   "exports": {
     ".": "./src/index.ts",
     "./realtime": "./src/realtime/index.ts"
@@ -14,7 +15,7 @@
     "typecheck": "tsc -p tsconfig.test.json"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
-    "typescript": "^5.9.2"
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
   }
 }

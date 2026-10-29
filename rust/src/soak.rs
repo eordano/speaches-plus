@@ -226,23 +226,6 @@ impl ResourceTrack {
         }
         longest
     }
-
-    pub fn print_table(&self) {
-        println!(
-            "  {:>8}  {:>10}  {:>10}  {:>6}",
-            "t(s)", "rss(MiB)", "gpu(MiB)", "fds"
-        );
-        for s in &self.samples {
-            let gpu = s
-                .gpu_used_mib
-                .map(|g| g.to_string())
-                .unwrap_or_else(|| "n/a".to_string());
-            println!(
-                "  {:>8.1}  {:>10}  {:>10}  {:>6}",
-                s.t_secs, s.rss_mib, gpu, s.fds
-            );
-        }
-    }
 }
 
 #[derive(Default)]
@@ -384,32 +367,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_rss_bytes_returns_nonzero_under_linux() {
+    fn rss_and_fd_counters_read_under_linux() {
         let rss = read_rss_bytes();
         if cfg!(target_os = "linux") {
             assert!(rss > 0, "expected RSS > 0 on Linux, got {rss}");
         }
-    }
-
-    #[test]
-    fn read_open_fd_count_returns_at_least_three() {
-        let n = read_open_fd_count();
-        if cfg!(target_os = "linux") {
-            assert!(n >= 3, "expected >= 3 fds (stdin/stdout/stderr), got {n}");
+        {
+            let n = read_open_fd_count();
+            if cfg!(target_os = "linux") {
+                assert!(n >= 3, "expected >= 3 fds (stdin/stdout/stderr), got {n}");
+            }
         }
     }
 
     #[test]
-    fn soak_config_default_is_sensible() {
-        let cfg = SoakConfig::default();
-        assert!(cfg.rps > 0.0);
-        assert!(cfg.duration.as_secs() > 0);
-        assert!(cfg.max_error_rate > 0.0);
-        assert!(cfg.max_rss_growth > 0.0);
-    }
-
-    #[test]
-    fn latency_percentiles_are_monotonic_and_correct() {
+    fn latency_percentiles_are_correct_empty_is_safe_and_merge_combines() {
         let mut s = LatencyStats::new();
         for ms in [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0] {
             s.record_ms(ms);
@@ -423,33 +395,29 @@ mod tests {
         assert!(p50 <= p95 && p95 <= p99, "p50={p50} p95={p95} p99={p99}");
         assert!((p50 - 55.0).abs() < 1e-6, "p50 interpolated = {p50}");
         assert!((s.mean() - 55.0).abs() < 1e-9);
+        {
+            let s = LatencyStats::new();
+            assert_eq!(s.count(), 0);
+            assert_eq!(s.percentile(99.0), 0.0);
+            assert_eq!(s.min(), 0.0);
+            assert_eq!(s.max(), 0.0);
+            assert_eq!(s.mean(), 0.0);
+            assert!(s.summary_line("x").contains("no samples"));
+        }
+        {
+            let mut a = LatencyStats::new();
+            a.record_ms(1.0);
+            let mut b = LatencyStats::new();
+            b.record_ms(2.0);
+            b.record_ms(3.0);
+            a.merge(&b);
+            assert_eq!(a.count(), 3);
+            assert!((a.mean() - 2.0).abs() < 1e-9);
+        }
     }
 
     #[test]
-    fn latency_empty_is_safe() {
-        let s = LatencyStats::new();
-        assert_eq!(s.count(), 0);
-        assert_eq!(s.percentile(99.0), 0.0);
-        assert_eq!(s.min(), 0.0);
-        assert_eq!(s.max(), 0.0);
-        assert_eq!(s.mean(), 0.0);
-        assert!(s.summary_line("x").contains("no samples"));
-    }
-
-    #[test]
-    fn latency_merge_combines_samples() {
-        let mut a = LatencyStats::new();
-        a.record_ms(1.0);
-        let mut b = LatencyStats::new();
-        b.record_ms(2.0);
-        b.record_ms(3.0);
-        a.merge(&b);
-        assert_eq!(a.count(), 3);
-        assert!((a.mean() - 2.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn resource_track_growth_and_monotonic_detection() {
+    fn resource_track_growth_monotonic_runs_and_missing_gpu() {
         let mut t = ResourceTrack::default();
         t.samples = vec![
             ResourceSample {
@@ -480,26 +448,33 @@ mod tests {
         assert_eq!(t.rss_growth_mib(), 15);
         assert_eq!(t.gpu_growth_mib(), Some(20));
         assert_eq!(t.monotonic_rss_runs(), 2);
+        {
+            let mut t = ResourceTrack::default();
+            t.samples = vec![
+                ResourceSample {
+                    t_secs: 0.0,
+                    rss_mib: 100,
+                    gpu_used_mib: None,
+                    fds: 10,
+                },
+                ResourceSample {
+                    t_secs: 1.0,
+                    rss_mib: 100,
+                    gpu_used_mib: None,
+                    fds: 10,
+                },
+            ];
+            assert_eq!(t.gpu_growth_mib(), None);
+            assert_eq!(t.rss_growth_mib(), 0);
+        }
     }
 
     #[test]
-    fn resource_track_handles_missing_gpu() {
-        let mut t = ResourceTrack::default();
-        t.samples = vec![
-            ResourceSample {
-                t_secs: 0.0,
-                rss_mib: 100,
-                gpu_used_mib: None,
-                fds: 10,
-            },
-            ResourceSample {
-                t_secs: 1.0,
-                rss_mib: 100,
-                gpu_used_mib: None,
-                fds: 10,
-            },
-        ];
-        assert_eq!(t.gpu_growth_mib(), None);
-        assert_eq!(t.rss_growth_mib(), 0);
+    fn soak_config_default_is_sensible() {
+        let cfg = SoakConfig::default();
+        assert!(cfg.rps > 0.0);
+        assert!(cfg.duration.as_secs() > 0);
+        assert!(cfg.max_error_rate > 0.0);
+        assert!(cfg.max_rss_growth > 0.0);
     }
 }

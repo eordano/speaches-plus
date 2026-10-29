@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 
+use crate::weights::{load_1d, load_2d};
 use nv_layers::attn::{attention, AttnConfig};
 use nv_layers::linear::Linear;
 
@@ -250,7 +251,11 @@ impl VisionBlock {
             softmax_scale: 1.0 / (hd as f32).sqrt(),
             causal: false,
         };
-        let attn_out = attention(&q, &k, &v, &attn_cfg)?;
+        let attn_out = if q.dtype() == DType::F32 && q.device().is_cuda() {
+            attention(&q.to_dtype(DType::BF16)?, &k.to_dtype(DType::BF16)?, &v.to_dtype(DType::BF16)?, &attn_cfg)?.to_dtype(DType::F32)?
+        } else {
+            attention(&q, &k, &v, &attn_cfg)?
+        };
         let attn_out = attn_out
             .reshape((b, t, nh * hd))
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -365,7 +370,7 @@ impl Merger {
             .reshape((b, n_merged, group * h))
             .map_err(|e| anyhow::anyhow!(e))?;
         let y = self.fc1.forward(&regrouped)?;
-        let y = gelu_pytorch_tanh(&y)?;
+        let y = merger_gelu_erf_matching_hf_nn_gelu(&y)?;
         let y = self.fc2.forward(&y)?;
         Ok(y)
     }
@@ -379,6 +384,7 @@ pub struct Qwen3VisionTower {
     blocks: Vec<VisionBlock>,
     merger: Merger,
     device: Device,
+    act_dtype: DType,
 }
 
 impl Qwen3VisionTower {
@@ -418,11 +424,27 @@ impl Qwen3VisionTower {
             blocks,
             merger,
             device: device.clone(),
+            act_dtype: dtype,
         })
     }
 
     pub fn config(&self) -> &Qwen3VisionConfig {
         &self.cfg
+    }
+
+    pub fn load_onto(
+        cfg: Qwen3VisionConfig,
+        weights: &nv_weights::WeightLoader,
+        device: &Device,
+        f32_activations: bool,
+    ) -> Result<Self> {
+        let mut tower = Self::new_empty(cfg, &Device::Cpu)?;
+        tower.device = device.clone();
+        if f32_activations {
+            tower.act_dtype = DType::F32;
+        }
+        tower.load_weights(weights)?;
+        Ok(tower)
     }
 
     pub fn device(&self) -> &Device {
@@ -457,6 +479,7 @@ impl Qwen3VisionTower {
         let out = self.cfg.out_hidden_size;
         let merged = self.cfg.merger_hidden();
         let npos = self.cfg.num_position_embeddings;
+        let no_pretranspose = self.act_dtype != dtype;
 
         self.patch_embed_weight = load_5d(
             weights,
@@ -479,7 +502,7 @@ impl Qwen3VisionTower {
                 bias: load_1d(weights, &format!("{prefix}.norm2.bias"), h, dtype)?,
                 eps: self.cfg.layer_norm_eps,
             };
-            block.qkv = Linear::new(
+            block.qkv = mk_linear(no_pretranspose,
                 load_2d(
                     weights,
                     &format!("{prefix}.attn.qkv.weight"),
@@ -493,7 +516,7 @@ impl Qwen3VisionTower {
                     dtype,
                 )?),
             )?;
-            block.proj = Linear::new(
+            block.proj = mk_linear(no_pretranspose,
                 load_2d(
                     weights,
                     &format!("{prefix}.attn.proj.weight"),
@@ -507,7 +530,7 @@ impl Qwen3VisionTower {
                     dtype,
                 )?),
             )?;
-            block.fc1 = Linear::new(
+            block.fc1 = mk_linear(no_pretranspose,
                 load_2d(
                     weights,
                     &format!("{prefix}.mlp.linear_fc1.weight"),
@@ -521,7 +544,7 @@ impl Qwen3VisionTower {
                     dtype,
                 )?),
             )?;
-            block.fc2 = Linear::new(
+            block.fc2 = mk_linear(no_pretranspose,
                 load_2d(
                     weights,
                     &format!("{prefix}.mlp.linear_fc2.weight"),
@@ -542,7 +565,7 @@ impl Qwen3VisionTower {
             bias: load_1d(weights, "model.visual.merger.norm.bias", h, dtype)?,
             eps: self.cfg.layer_norm_eps,
         };
-        self.merger.fc1 = Linear::new(
+        self.merger.fc1 = mk_linear(no_pretranspose,
             load_2d(
                 weights,
                 "model.visual.merger.linear_fc1.weight",
@@ -556,7 +579,7 @@ impl Qwen3VisionTower {
                 dtype,
             )?),
         )?;
-        self.merger.fc2 = Linear::new(
+        self.merger.fc2 = mk_linear(no_pretranspose,
             load_2d(
                 weights,
                 "model.visual.merger.linear_fc2.weight",
@@ -571,6 +594,27 @@ impl Qwen3VisionTower {
             )?),
         )?;
         Ok(())
+    }
+
+    pub fn forward_frame_group(&self, frames: &Tensor) -> Result<Tensor> {
+        let (t, c, hh, ww) = frames.dims4()?;
+        let tp = self.cfg.temporal_patch_size;
+        if t == 1 {
+            return self.forward(frames);
+        }
+        anyhow::ensure!(
+            t == tp,
+            "a video frame group carries temporal_patch_size={tp} frames, got {t}"
+        );
+        let mut per_c = Vec::with_capacity(c * tp);
+        for ci in 0..c {
+            for ti in 0..tp {
+                per_c.push(frames.i((ti..ti + 1, ci..ci + 1, .., ..))?);
+            }
+        }
+        let refs: Vec<&Tensor> = per_c.iter().collect();
+        let stacked = Tensor::cat(&refs, 1)?.reshape((1, c * tp, hh, ww))?;
+        self.forward_stacked(&stacked.to_dtype(self.act_dtype)?, 1)
     }
 
     pub fn forward(&self, pixel_values: &Tensor) -> Result<Tensor> {
@@ -590,7 +634,7 @@ impl Qwen3VisionTower {
         }
         let tp = self.cfg.temporal_patch_size;
 
-        let x = pixel_values.to_dtype(self.cfg.dtype)?;
+        let x = pixel_values.to_dtype(self.act_dtype)?;
 
         let stacked = if tp == 1 {
             x
@@ -610,16 +654,23 @@ impl Qwen3VisionTower {
             let refs: Vec<&Tensor> = per_c.iter().collect();
             Tensor::cat(&refs, 1)?
         };
+        self.forward_stacked(&stacked, b)
+    }
 
+    fn forward_stacked(&self, stacked: &Tensor, b: usize) -> Result<Tensor> {
+        let p = self.cfg.patch_size;
+        let tp = self.cfg.temporal_patch_size;
         let w = self
             .patch_embed_weight
             .reshape((self.cfg.hidden_size, self.cfg.in_channels * tp, p, p))
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .map_err(|e| anyhow::anyhow!(e))?
+            .to_dtype(self.act_dtype)?;
         let y = stacked
             .conv2d(&w, 0, p, 1, 1)
             .map_err(|e| anyhow::anyhow!(e))?;
         let bias = self
             .patch_embed_bias
+            .to_dtype(self.act_dtype)?
             .reshape((1, self.cfg.hidden_size, 1, 1))
             .map_err(|e| anyhow::anyhow!(e))?;
         let y = y.broadcast_add(&bias).map_err(|e| anyhow::anyhow!(e))?;
@@ -679,7 +730,7 @@ impl Qwen3VisionTower {
             "pos_embed grid must be square: num_position_embeddings {npos} is not a perfect square"
         );
         if gh == side && gw == side {
-            return Ok(self.pos_embed.clone());
+            return Ok(self.pos_embed.to_dtype(self.act_dtype)?);
         }
         let table = self.pos_embed.to_dtype(DType::F32)?;
         let n = gh * gw;
@@ -724,7 +775,7 @@ impl Qwen3VisionTower {
         let acc = (acc + sel(i01, w01)?)?;
         let acc = (acc + sel(i10, w10)?)?;
         let acc = (acc + sel(i11, w11)?)?;
-        Ok(acc.to_dtype(self.cfg.dtype)?)
+        Ok(acc.to_dtype(self.act_dtype)?)
     }
 
     pub fn build_splices(
@@ -780,6 +831,149 @@ impl Qwen3VisionTower {
     }
 }
 
+pub fn smart_resize_matching_hf_qwen2_vl(
+    h: usize,
+    w: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<(usize, usize)> {
+    anyhow::ensure!(h > 0 && w > 0, "smart_resize: zero dimension");
+    let (hf, wf, ff) = (h as f64, w as f64, factor as f64);
+    let ratio = hf.max(wf) / hf.min(wf);
+    anyhow::ensure!(ratio <= 200.0, "smart_resize: aspect ratio {ratio:.1} exceeds 200");
+    let python_round = |x: f64| (x / ff).round_ties_even() as usize * factor;
+    let (mut h_bar, mut w_bar) = (python_round(hf), python_round(wf));
+    if h_bar * w_bar > max_pixels {
+        let beta = ((hf * wf) / max_pixels as f64).sqrt();
+        h_bar = factor.max((hf / beta / ff).floor() as usize * factor);
+        w_bar = factor.max((wf / beta / ff).floor() as usize * factor);
+    } else if h_bar * w_bar < min_pixels {
+        let beta = (min_pixels as f64 / (hf * wf)).sqrt();
+        h_bar = (hf * beta / ff).ceil() as usize * factor;
+        w_bar = (wf * beta / ff).ceil() as usize * factor;
+    }
+    Ok((h_bar, w_bar))
+}
+
+const PIL_PRECISION_BITS_22_IS_32_MINUS_8_MINUS_2: u32 = 22;
+
+fn pil_bicubic_a_minus_half(x: f64) -> f64 {
+    let a = -0.5;
+    let x = x.abs();
+    if x < 1.0 {
+        ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+    } else if x < 2.0 {
+        (((x - 5.0) * x + 8.0) * x - 4.0) * a
+    } else {
+        0.0
+    }
+}
+
+fn pil_coeffs(in_size: usize, out_size: usize) -> (usize, Vec<(usize, usize)>, Vec<i32>) {
+    let scale = in_size as f64 / out_size as f64;
+    let filterscale = scale.max(1.0);
+    let support = 2.0 * filterscale;
+    let ksize = support.ceil() as usize * 2 + 1;
+    let mut bounds = Vec::with_capacity(out_size);
+    let mut kk = vec![0i32; out_size * ksize];
+    for xx in 0..out_size {
+        let center = (xx as f64 + 0.5) * scale;
+        let ss = 1.0 / filterscale;
+        let xmin = ((center - support + 0.5) as i64).max(0) as usize;
+        let xmax = ((center + support + 0.5) as i64).min(in_size as i64) as usize - xmin;
+        let mut k: Vec<f64> = (0..xmax)
+            .map(|x| pil_bicubic_a_minus_half((x as f64 + xmin as f64 - center + 0.5) * ss))
+            .collect();
+        let ww: f64 = k.iter().sum();
+        if ww != 0.0 {
+            k.iter_mut().for_each(|v| *v /= ww);
+        }
+        let one = (1i64 << PIL_PRECISION_BITS_22_IS_32_MINUS_8_MINUS_2) as f64;
+        for (x, v) in k.iter().enumerate() {
+            kk[xx * ksize + x] = if *v < 0.0 { (-0.5 + v * one) as i32 } else { (0.5 + v * one) as i32 };
+        }
+        bounds.push((xmin, xmax));
+    }
+    (ksize, bounds, kk)
+}
+
+fn pil_clip8(v: i32) -> u8 {
+    let p = PIL_PRECISION_BITS_22_IS_32_MINUS_8_MINUS_2;
+    if v >= (1 << p << 8) {
+        255
+    } else if v <= 0 {
+        0
+    } else {
+        (v >> p) as u8
+    }
+}
+
+pub fn resize_rgb8_bicubic_matching_pil(src: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
+    assert_eq!(src.len(), w * h * 3, "resize_rgb8: buffer is not w*h*3");
+    let half = 1i32 << (PIL_PRECISION_BITS_22_IS_32_MINUS_8_MINUS_2 - 1);
+    let (ksv, bv, kv) = pil_coeffs(h, nh);
+    let (y0, y1) = (bv[0].0, bv[nh - 1].0 + bv[nh - 1].1);
+    let tmp_h = if nw != w { y1 - y0 } else { h };
+    let row0 = if nw != w { y0 } else { 0 };
+    let tmp: Vec<u8> = if nw != w {
+        let (ksh, bh, kh) = pil_coeffs(w, nw);
+        let mut t = vec![0u8; nw * tmp_h * 3];
+        for yy in 0..tmp_h {
+            let row = &src[(yy + y0) * w * 3..(yy + y0 + 1) * w * 3];
+            for (xx, &(xmin, xn)) in bh.iter().enumerate() {
+                let k = &kh[xx * ksh..xx * ksh + xn];
+                for c in 0..3 {
+                    let mut ss = half;
+                    for (x, kx) in k.iter().enumerate() {
+                        ss += row[(xmin + x) * 3 + c] as i32 * kx;
+                    }
+                    t[(yy * nw + xx) * 3 + c] = pil_clip8(ss);
+                }
+            }
+        }
+        t
+    } else {
+        src.to_vec()
+    };
+    if nh == h {
+        return tmp;
+    }
+    let mut out = vec![0u8; nw * nh * 3];
+    for (yy, &(ymin, yn)) in bv.iter().enumerate() {
+        let k = &kv[yy * ksv..yy * ksv + yn];
+        let ymin = ymin - row0;
+        for xx in 0..nw {
+            for c in 0..3 {
+                let mut ss = half;
+                for (y, ky) in k.iter().enumerate() {
+                    ss += tmp[((ymin + y) * nw + xx) * 3 + c] as i32 * ky;
+                }
+                out[(yy * nw + xx) * 3 + c] = pil_clip8(ss);
+            }
+        }
+    }
+    out
+}
+
+pub fn rgb8_to_normalized_chw(rgb: &[u8], w: usize, h: usize, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
+    let mut out = vec![0f32; 3 * h * w];
+    for (i, px) in rgb.chunks_exact(3).enumerate() {
+        for c in 0..3 {
+            out[c * h * w + i] = (px[c] as f32 * (1.0 / 255.0) - mean[c]) / std[c];
+        }
+    }
+    out
+}
+
+fn mk_linear(no_pretranspose: bool, w: Tensor, b: Option<Tensor>) -> Result<Linear> {
+    if no_pretranspose {
+        Linear::new_no_pretranspose(w, b)
+    } else {
+        Linear::new(w, b)
+    }
+}
+
 fn linspace_align(side: usize, g: usize) -> Vec<f32> {
     if g <= 1 {
         return vec![0.0];
@@ -807,6 +1001,11 @@ fn merge_order_indices(gh: usize, gw: usize, merge: usize) -> Vec<u32> {
     idx
 }
 
+fn merger_gelu_erf_matching_hf_nn_gelu(x: &Tensor) -> Result<Tensor> {
+    let dtype = x.dtype();
+    Ok(x.to_dtype(DType::F32)?.gelu_erf()?.to_dtype(dtype)?)
+}
+
 fn gelu_pytorch_tanh(x: &Tensor) -> Result<Tensor> {
     let dtype = x.dtype();
     let xf = x.to_dtype(DType::F32)?;
@@ -818,38 +1017,6 @@ fn gelu_pytorch_tanh(x: &Tensor) -> Result<Tensor> {
     let half_x = (&xf * 0.5f64)?;
     let y = half_x.mul(&one_plus_t)?;
     Ok(y.to_dtype(dtype)?)
-}
-
-fn load_1d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    dim: usize,
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("{name}: expected [{}], got {:?}", dim, d);
-    }
-    Ok(w)
-}
-
-fn load_2d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    shape: (usize, usize),
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != shape.0 || d[1] != shape.1 {
-        anyhow::bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
-    }
-    Ok(w)
 }
 
 fn load_5d(
@@ -904,21 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_on_cpu_with_defaults() {
-        let cfg = tiny_cfg();
-        let t = Qwen3VisionTower::new_empty(cfg.clone(), &Device::Cpu).expect("new_empty");
-        assert_eq!(t.config().depth, cfg.depth);
-        assert_eq!(t.blocks.len(), cfg.depth);
-
-        let default = Qwen3VisionConfig::default();
-        assert_eq!(default.hidden_size % default.num_heads, 0);
-        assert_eq!(default.merger_hidden(), 1152 * 4);
-        assert_eq!(default.out_hidden_size, 2048);
-        assert_eq!(default.head_dim(), 72);
-    }
-
-    #[test]
-    fn forward_runs_on_cpu_with_zero_weights() {
+    fn forward_runs_on_zero_weights_at_both_temporal_patch_sizes_and_rejects_wrong_channels() {
         let cfg = tiny_cfg();
         let t = Qwen3VisionTower::new_empty(cfg.clone(), &Device::Cpu).unwrap();
 
@@ -930,30 +1083,18 @@ mod tests {
         assert_eq!(dims[1], cfg.out_hidden_size);
         let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
         assert!(v.iter().all(|x| x.is_finite()));
-    }
-
-    #[test]
-    fn forward_rejects_wrong_channels() {
-        let cfg = tiny_cfg();
-        let t = Qwen3VisionTower::new_empty(cfg, &Device::Cpu).unwrap();
         let bad = Tensor::zeros((1, 4, 16, 16), DType::F32, &Device::Cpu).unwrap();
         let err = t.forward(&bad).unwrap_err();
         assert!(err.to_string().contains("in_channels"));
-    }
-
-    #[test]
-    fn forward_with_temporal_patch_size_2() {
         let mut cfg = tiny_cfg();
         cfg.temporal_patch_size = 2;
         let t = Qwen3VisionTower::new_empty(cfg.clone(), &Device::Cpu).unwrap();
-        let img = Tensor::zeros((1, cfg.in_channels, 16, 16), DType::F32, &Device::Cpu).unwrap();
         let out = t.forward(&img).expect("forward t=2");
-        let dims = out.dims();
-        assert_eq!(dims, &[4, cfg.out_hidden_size]);
+        assert_eq!(out.dims(), &[4, cfg.out_hidden_size]);
     }
 
     #[test]
-    fn merge_order_indices_groups_2x2_blocks_not_1x4_strips() {
+    fn merge_order_groups_2x2_blocks_and_pos_embed_interpolation_is_identity_on_the_native_grid() {
         let (gh, gw, merge) = (4, 4, 2);
         let idx = merge_order_indices(gh, gw, merge);
         assert_eq!(
@@ -965,10 +1106,7 @@ mod tests {
             idx, row_major,
             "2x2 grouping must reorder the row-major strip"
         );
-    }
 
-    #[test]
-    fn interpolated_pos_embed_is_identity_on_native_grid() {
         let mut cfg = tiny_cfg();
         cfg.num_position_embeddings = 64;
         let mut t = Qwen3VisionTower::new_empty(cfg.clone(), &Device::Cpu).unwrap();
@@ -980,15 +1118,14 @@ mod tests {
             })
             .collect();
         t.pos_embed = Tensor::from_vec(vals, (64, cfg.hidden_size), &Device::Cpu).unwrap();
-        let side = 8;
-        let interp = t.interpolated_pos_embed(side, side).unwrap();
+        let interp = t.interpolated_pos_embed(8, 8).unwrap();
         let a: Vec<f32> = interp.flatten_all().unwrap().to_vec1().unwrap();
         let b: Vec<f32> = t.pos_embed.flatten_all().unwrap().to_vec1().unwrap();
-        assert_eq!(a, b);
+        assert_eq!(a, b, "interpolation is the identity on the native grid");
     }
 
     #[test]
-    fn build_splices_locates_image_token_runs() {
+    fn build_splices_locates_image_token_runs_and_rejects_count_or_slot_mismatches() {
         let cfg = tiny_cfg();
         let t = Qwen3VisionTower::new_empty(cfg.clone(), &Device::Cpu).unwrap();
         const IMG: u32 = 248056;
@@ -1003,29 +1140,14 @@ mod tests {
         assert_eq!(splices[0].embedding.dims(), &[3, cfg.out_hidden_size]);
         assert_eq!(splices[1].position, 7);
         assert_eq!(splices[1].embedding.dims(), &[2, cfg.out_hidden_size]);
-    }
-
-    #[test]
-    fn build_splices_rejects_count_mismatch() {
-        let cfg = tiny_cfg();
-        let t = Qwen3VisionTower::new_empty(cfg.clone(), &Device::Cpu).unwrap();
-        const IMG: u32 = 248056;
-        let tokens: Vec<u32> = vec![1, IMG, IMG, 2];
         let emb = Tensor::ones((2, cfg.out_hidden_size), DType::F32, &Device::Cpu).unwrap();
         let err = t
-            .build_splices(&tokens, IMG, &[emb.clone(), emb])
+            .build_splices(&[1, IMG, IMG, 2], IMG, &[emb.clone(), emb])
             .unwrap_err();
-        assert!(err.to_string().contains("image runs"));
+        assert!(err.to_string().contains("image runs"), "count mismatch");
+        let wrong = Tensor::ones((2, cfg.out_hidden_size), DType::F32, &Device::Cpu).unwrap();
+        let err = t.build_splices(&[1, IMG, IMG, IMG, 2], IMG, &[wrong]).unwrap_err();
+        assert!(err.to_string().contains("reserves"), "slot mismatch");
     }
 
-    #[test]
-    fn build_splices_rejects_slot_mismatch() {
-        let cfg = tiny_cfg();
-        let t = Qwen3VisionTower::new_empty(cfg.clone(), &Device::Cpu).unwrap();
-        const IMG: u32 = 248056;
-        let tokens: Vec<u32> = vec![1, IMG, IMG, IMG, 2];
-        let wrong = Tensor::ones((2, cfg.out_hidden_size), DType::F32, &Device::Cpu).unwrap();
-        let err = t.build_splices(&tokens, IMG, &[wrong]).unwrap_err();
-        assert!(err.to_string().contains("reserves"));
-    }
 }

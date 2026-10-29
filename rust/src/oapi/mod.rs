@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 pub static SELF_ADDR: std::sync::OnceLock<std::net::SocketAddr> = std::sync::OnceLock::new();
 
@@ -9,18 +8,18 @@ pub mod backend_select;
 pub mod batch_chat;
 pub mod chat;
 pub mod chat_engine;
-pub mod cold_tier;
 #[cfg(feature = "wgpu")]
 pub mod chat_engine_wgpu;
 pub mod chat_multimodal;
 pub mod chat_multimodal_qwen3;
 pub mod chat_template;
+pub mod cold_tier;
 pub mod completions;
 pub mod deadline;
 pub mod fine_tuning;
 pub mod gate;
 pub mod generation_limits;
-pub mod laguna_capture;
+pub mod capture;
 pub mod lora;
 pub mod lora_runtime;
 pub mod messages;
@@ -31,10 +30,16 @@ pub mod ocr;
 pub mod ocr_batch;
 #[cfg(feature = "cuda")]
 pub mod ocr_batch_n;
+#[cfg(feature = "wgpu")]
+pub mod ocr_lighton;
+pub mod ocr_mistral;
 pub mod ocr_orient;
 pub mod ocr_stream;
 pub mod ocr_suspect;
 pub mod responses;
+pub mod systemone;
+pub mod systemone_clm;
+pub mod systemone_kev;
 pub mod text_embeddings;
 pub mod tool_parse;
 pub mod trajectory;
@@ -66,7 +71,6 @@ pub mod kind {
     pub const NOT_FOUND: &str = "not_found_error";
     pub const SERVER: &str = "internal_server_error";
     pub const SERVICE_UNAVAIL: &str = "service_unavailable_error";
-    pub const RATE_LIMIT: &str = "rate_limit_error";
 }
 
 pub fn constant_time_eq(candidate: &[u8], secret: &[u8]) -> bool {
@@ -256,6 +260,7 @@ pub mod task {
     pub const TOKEN_CLASSIFICATION: &str = "token-classification";
     pub const DIARIZATION: &str = "speaker-diarization";
     pub const SPEAKER_EMBEDDING: &str = "speaker-embedding";
+    pub const SYSTEM_ONE: &str = "system-one";
 }
 
 pub const WHISPER_LANGUAGES: &[&str] = &[
@@ -300,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn model_serializes_with_extras() {
+    fn model_and_list_responses_serialize_with_extras_and_object_tags() {
         let m = Model {
             id: "x".into(),
             created: 1,
@@ -322,13 +327,12 @@ mod tests {
         assert_eq!(s["task"], task::TTS);
         assert_eq!(s["voices"], json!(["a", "b"]));
         assert_eq!(s["sample_rate"], 24000);
+        {
+            let r = ListModelsResponse::new(vec![]);
+            let s = serde_json::to_value(&r).unwrap();
+            assert_eq!(s["object"], "list");
+            assert_eq!(s["data"], json!([]));
+        }
     }
 
-    #[test]
-    fn list_response_has_object_list() {
-        let r = ListModelsResponse::new(vec![]);
-        let s = serde_json::to_value(&r).unwrap();
-        assert_eq!(s["object"], "list");
-        assert_eq!(s["data"], json!([]));
-    }
 }

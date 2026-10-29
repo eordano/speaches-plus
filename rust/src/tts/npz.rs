@@ -33,7 +33,7 @@ pub fn load_voices(path: &Path) -> Result<HashMap<String, Voice>> {
     let mut out = HashMap::new();
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
+        let name = entry.name()?.to_string();
         let Some(stem) = name.strip_suffix(".npy") else {
             continue;
         };

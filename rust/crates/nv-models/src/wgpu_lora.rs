@@ -1,23 +1,26 @@
-use anyhow::Result;
+use anyhow::{anyhow, ensure, Result};
+use half::bf16;
 use std::sync::Arc;
+use wgpu::{BindGroup, Buffer, ComputePipeline};
 
 use nv_kernels::wgpu_backend::dispatch::{self, GpuTensor, GpuUniform};
 use nv_kernels::wgpu_backend::kernels as wk;
 use nv_kernels::wgpu_backend::{compose, WgpuContext};
 
 use crate::gemma4_wgpu_shared::{err, pack_pairs};
+use crate::pod;
 
 #[derive(Clone)]
 pub(crate) struct Pass {
-    pub(crate) pipeline: Arc<wgpu::ComputePipeline>,
-    pub(crate) bind: wgpu::BindGroup,
+    pub(crate) pipeline: Arc<ComputePipeline>,
+    pub(crate) bind: BindGroup,
     pub(crate) grid: (u32, u32, u32),
 
     pub(crate) bound_bytes: u64,
     pub(crate) widest_bytes: u64,
 }
 
-pub(crate) fn bind_bytes<'a>(bufs: impl Iterator<Item = &'a wgpu::Buffer>) -> (u64, u64) {
+pub(crate) fn bind_bytes<'a>(bufs: impl Iterator<Item = &'a Buffer>) -> (u64, u64) {
     let mut sum = 0u64;
     let mut widest = 0u64;
     for b in bufs {
@@ -39,38 +42,36 @@ const LORA_PK_N_CHUNK: usize = 1024;
 const LORA_PK_K_TILE_512_IS_THE_CUDA_LORA_M1_PROVEN_GEOMETRY: usize = 512;
 pub(crate) const LORA_PK_DEST_SLOTS_COVER_THE_WIDEST_Q3D_SITE: usize = 3;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct LoraCvtParams {
-    m: u32,
-    width: u32,
-    pk_row_words: u32,
-    wide_row_elems: u32,
-    wide_col_off: u32,
-    total: u32,
-    pad0: u32,
-    pad1: u32,
-}
+pod! {
+    struct LoraCvtParams {
+        m: u32,
+        width: u32,
+        pk_row_words: u32,
+        wide_row_elems: u32,
+        wide_col_off: u32,
+        total: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct LoraFusedParams {
-    m: u32,
-    rank: u32,
-    k: u32,
-    a_slice_stride: u32,
-    a_d0_stride: u32,
-    y_row_stride: u32,
-    win_off: u32,
-    win_len: u32,
-    scale: f32,
-    off_counts: u32,
-    off_start: u32,
-    off_active: u32,
-    off_slice_n: u32,
-    off_slice_start: u32,
-    off_b_off: u32,
-    off_b_d0: u32,
+    struct LoraFusedParams {
+        m: u32,
+        rank: u32,
+        k: u32,
+        a_slice_stride: u32,
+        a_d0_stride: u32,
+        y_row_stride: u32,
+        win_off: u32,
+        win_len: u32,
+        scale: f32,
+        off_counts: u32,
+        off_start: u32,
+        off_active: u32,
+        off_slice_n: u32,
+        off_slice_start: u32,
+        off_b_off: u32,
+        off_b_d0: u32,
+    }
 }
 
 struct LoraMetaLayout {
@@ -126,11 +127,11 @@ fn build_lora_meta(meta: &wk::lora::LoraMeta, widths: &[usize], rank: usize) -> 
 }
 
 pub(crate) struct LoraPipelines {
-    fused: Arc<wgpu::ComputePipeline>,
-    widen: Arc<wgpu::ComputePipeline>,
-    repack: Arc<wgpu::ComputePipeline>,
-    pk_shrink: Arc<wgpu::ComputePipeline>,
-    pk_expand: Arc<wgpu::ComputePipeline>,
+    fused: Arc<ComputePipeline>,
+    widen: Arc<ComputePipeline>,
+    repack: Arc<ComputePipeline>,
+    pk_shrink: Arc<ComputePipeline>,
+    pk_expand: Arc<ComputePipeline>,
     idle_dest_slots_stay_distinct_because_writable_bindings_must_not_alias:
         [GpuTensor<u32>; LORA_PK_DEST_SLOTS_COVER_THE_WIDEST_Q3D_SITE - 1],
 }
@@ -138,7 +139,7 @@ pub(crate) struct LoraPipelines {
 pub(crate) fn build_lora_pipelines(ctx: &WgpuContext) -> Result<LoraPipelines> {
     let mk = |label: &str, source: &str, entry: &str| {
         dispatch::cached_compute_pipeline(ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}: {e}"))
+            .map_err(|e| anyhow!("pipeline {label}: {e}"))
     };
     let src_fused = compose(wk::lora::FUSED_WGSL);
     let src_cvt = compose(LORA_CVT_WGSL);
@@ -156,17 +157,16 @@ pub(crate) fn build_lora_pipelines(ctx: &WgpuContext) -> Result<LoraPipelines> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_lora_site(
     ctx: &WgpuContext,
     out: &mut Vec<Pass>,
     keep: &mut Vec<Box<dyn std::any::Any + Send>>,
     pl: &LoraPipelines,
-    scratch: &wgpu::Buffer,
+    scratch: &Buffer,
     m: usize,
     site: &LoraSiteGpu,
-    x: &wgpu::Buffer,
-    segs: &[&wgpu::Buffer],
+    x: &Buffer,
+    segs: &[&Buffer],
 ) {
     assert_eq!(
         segs.len(),
@@ -180,12 +180,12 @@ pub(crate) fn emit_lora_site(
         ctx: &WgpuContext,
         out: &mut Vec<Pass>,
         keep: &mut Vec<Box<dyn std::any::Any + Send>>,
-        pipeline: &Arc<wgpu::ComputePipeline>,
-        scratch: &wgpu::Buffer,
+        pipeline: &Arc<ComputePipeline>,
+        scratch: &Buffer,
         m: usize,
         total_w: usize,
         seg_widths: &[usize],
-        segs: &[&wgpu::Buffer],
+        segs: &[&Buffer],
         widen: bool,
     ) {
         let mut off = 0usize;
@@ -205,7 +205,7 @@ pub(crate) fn emit_lora_site(
                 },
             );
             let grid = dispatch::workgroup_count_1d(ctx, total as u64, 256);
-            let binds: [(u32, &wgpu::Buffer); 3] = [(0, buf), (1, scratch), (2, p.raw())];
+            let binds: [(u32, &Buffer); 3] = [(0, buf), (1, scratch), (2, p.raw())];
             let bind = dispatch::bind_group(ctx, pipeline, &binds);
             let (bound_bytes, widest_bytes) = bind_bytes(binds.iter().map(|(_, b)| *b));
             out.push(Pass {
@@ -259,7 +259,7 @@ pub(crate) fn emit_lora_site(
         grid.0 <= limit && grid.1 <= limit && grid.2 <= limit,
         "lora fused grid {grid:?} exceeds device limit {limit}"
     );
-    let binds: [(u32, &wgpu::Buffer); 6] = [
+    let binds: [(u32, &Buffer); 6] = [
         (0, x),
         (1, site.a.raw()),
         (2, site.b.raw()),
@@ -284,29 +284,29 @@ pub(crate) fn emit_lora_site(
     );
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct LoraPkParams {
-    m: u32,
-    rank: u32,
-    k: u32,
-    a_slice_stride: u32,
-    a_d0_stride: u32,
-    scale: f32,
-    k_tile: u32,
-    n_tiles: u32,
-    n_slices: u32,
-    off_counts: u32,
-    off_start: u32,
-    off_active: u32,
-    off_slice_n: u32,
-    off_slice_start: u32,
-    off_b_off: u32,
-    off_b_d0: u32,
-    off_dest_buf: u32,
-    off_dest_col: u32,
-    off_dest_words: u32,
-    pad0: u32,
+pod! {
+    struct LoraPkParams {
+        m: u32,
+        rank: u32,
+        k: u32,
+        a_slice_stride: u32,
+        a_d0_stride: u32,
+        scale: f32,
+        k_tile: u32,
+        n_tiles: u32,
+        n_slices: u32,
+        off_counts: u32,
+        off_start: u32,
+        off_active: u32,
+        off_slice_n: u32,
+        off_slice_start: u32,
+        off_b_off: u32,
+        off_b_d0: u32,
+        off_dest_buf: u32,
+        off_dest_col: u32,
+        off_dest_words: u32,
+        pad0: u32,
+    }
 }
 
 struct LoraPkRouting {
@@ -356,8 +356,8 @@ pub(crate) fn emit_lora_site_pk(
     pl: &LoraPipelines,
     m: usize,
     site: &LoraSiteGpu,
-    x: &wgpu::Buffer,
-    segs: &[&wgpu::Buffer],
+    x: &Buffer,
+    segs: &[&Buffer],
 ) {
     assert_eq!(
         segs.len(),
@@ -436,14 +436,14 @@ pub(crate) fn emit_lora_site_pk(
     let idle = &pl.idle_dest_slots_stay_distinct_because_writable_bindings_must_not_alias;
     let y1 = segs.get(1).copied().unwrap_or_else(|| idle[0].raw());
     let y2 = segs.get(2).copied().unwrap_or_else(|| idle[1].raw());
-    let shrink_binds: [(u32, &wgpu::Buffer); 5] = [
+    let shrink_binds: [(u32, &Buffer); 5] = [
         (0, x),
         (1, site.a.raw()),
         (6, meta_buf.raw()),
         (7, params.raw()),
         (8, partials.raw()),
     ];
-    let expand_binds: [(u32, &wgpu::Buffer); 7] = [
+    let expand_binds: [(u32, &Buffer); 7] = [
         (2, site.b.raw()),
         (3, segs[0]),
         (4, y1),
@@ -476,7 +476,7 @@ pub(crate) fn emit_lora_site_pk(
 }
 
 pub(crate) struct LoraShrinkFold {
-    pub(crate) partials: wgpu::Buffer,
+    pub(crate) partials: Buffer,
     pub(crate) n_tiles: usize,
 }
 
@@ -491,7 +491,7 @@ pub(crate) fn emit_lora_site_pk_shrink_only(
     pl: &LoraPipelines,
     m: usize,
     site: &LoraSiteGpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
 ) -> LoraShrinkFold {
     let meta = wk::lora::LoraMeta::prepare(&vec![0i32; m], 1);
     let ml = build_lora_meta(&meta, &site.widths, site.rank);
@@ -536,7 +536,7 @@ pub(crate) fn emit_lora_site_pk_shrink_only(
         shrink_grid.0 <= limit && shrink_grid.1 <= limit && shrink_grid.2 <= limit,
         "lora pk shrink grid {shrink_grid:?} exceeds device limit {limit}"
     );
-    let shrink_binds: [(u32, &wgpu::Buffer); 5] = [
+    let shrink_binds: [(u32, &Buffer); 5] = [
         (0, x),
         (1, site.a.raw()),
         (6, meta_buf.raw()),
@@ -562,7 +562,6 @@ pub(crate) fn emit_lora_site_pk_shrink_only(
     fold
 }
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn lora_site_probe(
     x_bf16: &[u16],
     a_bf16: &[u16],
@@ -574,7 +573,7 @@ pub fn lora_site_probe(
     rank: usize,
     k: usize,
 ) -> Result<()> {
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+    let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
     let pl = build_lora_pipelines(ctx)?;
     let host = LoraSite {
         a: a_bf16.to_vec(),
@@ -585,19 +584,19 @@ pub fn lora_site_probe(
         rank,
     };
     let site = upload_lora_site(ctx, "e4bw-lora-probe", &host)?;
-    anyhow::ensure!(
+    ensure!(
         x_bf16.len() == m * k,
         "lora probe x is {} elements, want {}",
         x_bf16.len(),
         m * k
     );
-    anyhow::ensure!(y_segments.len() == segs.len(), "lora probe segment count");
+    ensure!(y_segments.len() == segs.len(), "lora probe segment count");
     let x = GpuTensor::upload(ctx, "e4bw-lora-probe-x", &pack_pairs(x_bf16));
     let total_w: usize = segs.iter().sum();
     let scratch = GpuTensor::<u32>::zeroed(ctx, "e4bw-lora-probe-scratch", m * total_w);
     let mut ys = Vec::with_capacity(segs.len());
     for (i, w) in segs.iter().enumerate() {
-        anyhow::ensure!(
+        ensure!(
             y_segments[i].len() == m * w,
             "lora probe segment {i} is {} elements, want {}",
             y_segments[i].len(),
@@ -611,7 +610,7 @@ pub fn lora_site_probe(
     }
     let mut passes: Vec<Pass> = Vec::new();
     let mut keep: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
-    let seg_refs: Vec<&wgpu::Buffer> = ys.iter().map(|t| t.raw()).collect();
+    let seg_refs: Vec<&Buffer> = ys.iter().map(|t| t.raw()).collect();
     emit_lora_site(
         ctx,
         &mut passes,
@@ -644,7 +643,6 @@ pub fn lora_site_probe(
 }
 
 #[doc(hidden)]
-#[allow(clippy::too_many_arguments)]
 pub fn lora_site_probe_pk(
     x_bf16: &[u16],
     a_bf16: &[u16],
@@ -656,7 +654,7 @@ pub fn lora_site_probe_pk(
     rank: usize,
     k: usize,
 ) -> Result<()> {
-    let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+    let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
     let pl = build_lora_pipelines(ctx)?;
     let host = LoraSite {
         a: a_bf16.to_vec(),
@@ -667,12 +665,12 @@ pub fn lora_site_probe_pk(
         rank,
     };
     let site = upload_lora_site(ctx, "q3d-lora-pk-probe", &host)?;
-    anyhow::ensure!(x_bf16.len() == m * k, "pk probe x length");
-    anyhow::ensure!(y_segments.len() == segs.len(), "pk probe segment count");
+    ensure!(x_bf16.len() == m * k, "pk probe x length");
+    ensure!(y_segments.len() == segs.len(), "pk probe segment count");
     let x = GpuTensor::upload(ctx, "q3d-lora-pk-probe-x", &pack_pairs(x_bf16));
     let mut ys = Vec::with_capacity(segs.len());
     for (i, w) in segs.iter().enumerate() {
-        anyhow::ensure!(y_segments[i].len() == m * w, "pk probe segment {i} length");
+        ensure!(y_segments[i].len() == m * w, "pk probe segment {i} length");
         ys.push(GpuTensor::upload(
             ctx,
             "q3d-lora-pk-probe-y",
@@ -681,7 +679,7 @@ pub fn lora_site_probe_pk(
     }
     let mut passes: Vec<Pass> = Vec::new();
     let mut keep: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
-    let seg_refs: Vec<&wgpu::Buffer> = ys.iter().map(|t| t.raw()).collect();
+    let seg_refs: Vec<&Buffer> = ys.iter().map(|t| t.raw()).collect();
     emit_lora_site_pk(
         ctx,
         &mut passes,
@@ -724,36 +722,36 @@ pub struct LoraSite {
 
 impl LoraSite {
     pub(crate) fn validate(&self, label: &str) -> Result<()> {
-        anyhow::ensure!(!self.widths.is_empty(), "{label}: no lora slices");
-        anyhow::ensure!(!self.segs.is_empty(), "{label}: no lora segments");
-        anyhow::ensure!(
+        ensure!(!self.widths.is_empty(), "{label}: no lora slices");
+        ensure!(!self.segs.is_empty(), "{label}: no lora segments");
+        ensure!(
             self.segs.iter().sum::<usize>() == self.widths.iter().sum::<usize>(),
             "{label}: segment widths {:?} do not cover slice widths {:?}",
             self.segs,
             self.widths
         );
-        anyhow::ensure!(self.rank > 0 && self.k > 0, "{label}: zero lora rank/k");
-        anyhow::ensure!(
+        ensure!(self.rank > 0 && self.k > 0, "{label}: zero lora rank/k");
+        ensure!(
             self.rank <= wk::lora::FUSED_MAX_RANK,
             "{label}: rank {} exceeds kernel limit {}",
             self.rank,
             wk::lora::FUSED_MAX_RANK
         );
-        anyhow::ensure!(
+        ensure!(
             self.a.len() == self.widths.len() * self.rank * self.k,
             "{label}: lora_a is {} elements, want {}",
             self.a.len(),
             self.widths.len() * self.rank * self.k
         );
         let want_b: usize = self.widths.iter().map(|w| w * self.rank).sum();
-        anyhow::ensure!(
+        ensure!(
             self.b.len() == want_b,
             "{label}: lora_b is {} elements, want {want_b}",
             self.b.len()
         );
-        anyhow::ensure!(self.k.is_multiple_of(2), "{label}: lora k must be even");
+        ensure!(self.k.is_multiple_of(2), "{label}: lora k must be even");
         for w in self.widths.iter().chain(self.segs.iter()) {
-            anyhow::ensure!(
+            ensure!(
                 w.is_multiple_of(2),
                 "{label}: lora slice width must be even"
             );
@@ -777,15 +775,15 @@ pub(crate) fn build_lora_site(
     let mut widths = Vec::with_capacity(slices.len());
     for (name, width) in slices {
         let stack = LoraSlotStack::new(1, rank, k, *width, DType::BF16, &Device::Cpu)
-            .map_err(|e| anyhow::anyhow!("lora slot stack for {name}: {e}"))?;
+            .map_err(|e| anyhow!("lora slot stack for {name}: {e}"))?;
         if let Some(w) = adapter.loras.get(*name) {
-            anyhow::ensure!(
+            ensure!(
                 !w.is_embedding,
                 "{name}: embedding lora is not supported by the wgpu graph"
             );
             stack
                 .set_lora(0, &w.lora_a, &w.lora_b)
-                .map_err(|e| anyhow::anyhow!("set lora for {name}: {e}"))?;
+                .map_err(|e| anyhow!("set lora for {name}: {e}"))?;
             matched += 1;
         }
         a.extend_from_slice(&bf16_bits_of_tensor(stack.lora_a_stacked())?);
@@ -808,7 +806,7 @@ pub(crate) fn build_lora_site(
 }
 
 fn bf16_bits_of_tensor(t: &candle_core::Tensor) -> Result<Vec<u16>> {
-    let v: Vec<half::bf16> = t.flatten_all()?.to_vec1()?;
+    let v: Vec<bf16> = t.flatten_all()?.to_vec1()?;
     Ok(v.into_iter().map(|x| x.to_bits()).collect())
 }
 

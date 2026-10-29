@@ -1,7 +1,7 @@
 #![cfg(feature = "cuda")]
 
-use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
+use anyhow::{bail, ensure, Context, Result};
+use candle_core::{DType, Device, Storage, Tensor};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::ffi::{c_char, c_void, CStr};
@@ -31,7 +31,7 @@ struct LagunaPrefillPlan {
     stream: usize,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn laguna_prefill_prepare(
         plan: *mut LagunaPrefillPlan,
         q_len: u32,
@@ -80,47 +80,46 @@ impl LagunaPrefillAttention {
         kv_len: usize,
         capacity: usize,
     ) -> Result<Tensor> {
-        anyhow::ensure!(
+        ensure!(
             q_len <= u32::MAX as usize
                 && kv_len <= u32::MAX as usize
                 && capacity <= u32::MAX as usize,
             "Laguna full-prefill attention extents exceed the native ABI"
         );
-        anyhow::ensure!(
+        ensure!(
             q.dtype() == DType::BF16 && k.dtype() == DType::BF16 && v.dtype() == DType::BF16,
             "Laguna full-prefill attention requires BF16 Q/K/V, got {:?}/{:?}/{:?}",
             q.dtype(),
             k.dtype(),
             v.dtype()
         );
-        anyhow::ensure!(
+        ensure!(
             q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
             "Laguna full-prefill attention requires contiguous Q/K/V"
         );
-        anyhow::ensure!(
+        ensure!(
             q.dims() == [1, q_len, NUM_Q_HEADS, HEAD_DIM],
             "Laguna full-prefill attention Q shape mismatch: expected [1,{q_len},{NUM_Q_HEADS},{HEAD_DIM}], got {:?}",
             q.dims()
         );
-        anyhow::ensure!(
+        ensure!(
             k.dims() == [1, capacity, NUM_KV_HEADS, HEAD_DIM]
                 && v.dims() == [1, capacity, NUM_KV_HEADS, HEAD_DIM],
             "Laguna full-prefill attention K/V shape mismatch: expected [1,{capacity},{NUM_KV_HEADS},{HEAD_DIM}], got {:?}/{:?}",
             k.dims(),
             v.dims()
         );
-        anyhow::ensure!(
+        ensure!(
             k.device().same_device(q.device()) && v.device().same_device(q.device()),
             "Laguna full-prefill attention requires Q/K/V on one CUDA device"
         );
-        let dev = match q.device() {
-            Device::Cuda(dev) => dev.clone(),
-            _ => anyhow::bail!("Laguna full-prefill attention requires CUDA Q/K/V"),
+        let Device::Cuda(dev) = q.device().clone() else {
+            bail!("Laguna full-prefill attention requires CUDA Q/K/V")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let raw_stream = stream.cu_stream() as *mut c_void;
         if let Some((_, _, _, planned_stream)) = self.key {
-            anyhow::ensure!(
+            ensure!(
                 planned_stream == raw_stream as usize,
                 "Laguna full-prefill attention cache cannot move between CUDA streams"
             );
@@ -145,7 +144,7 @@ impl LagunaPrefillAttention {
                     error.len(),
                 )
             };
-            anyhow::ensure!(
+            ensure!(
                 rc == 0,
                 "Laguna full-prefill attention prepare failed: {}",
                 adapter_error(&error)
@@ -194,16 +193,16 @@ impl LagunaPrefillAttention {
         let (k_storage, k_layout) = k.storage_and_layout();
         let (v_storage, v_layout) = v.storage_and_layout();
         let q_cuda = match &*q_storage {
-            candle_core::Storage::Cuda(storage) => storage,
-            _ => anyhow::bail!("Laguna full-prefill Q storage is not CUDA"),
+            Storage::Cuda(storage) => storage,
+            _ => bail!("Laguna full-prefill Q storage is not CUDA"),
         };
         let k_cuda = match &*k_storage {
-            candle_core::Storage::Cuda(storage) => storage,
-            _ => anyhow::bail!("Laguna full-prefill K storage is not CUDA"),
+            Storage::Cuda(storage) => storage,
+            _ => bail!("Laguna full-prefill K storage is not CUDA"),
         };
         let v_cuda = match &*v_storage {
-            candle_core::Storage::Cuda(storage) => storage,
-            _ => anyhow::bail!("Laguna full-prefill V storage is not CUDA"),
+            Storage::Cuda(storage) => storage,
+            _ => bail!("Laguna full-prefill V storage is not CUDA"),
         };
         let q_view = q_cuda
             .as_cuda_slice::<bf16>()?
@@ -236,14 +235,14 @@ impl LagunaPrefillAttention {
                 )
             }
         };
-        anyhow::ensure!(
+        ensure!(
             rc == 0,
             "Laguna full-prefill attention launch failed: {}",
             adapter_error(&error)
         );
         let storage = candle_core::CudaStorage::wrap_cuda_slice(output, dev);
         Ok(Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, q_len, NUM_Q_HEADS, HEAD_DIM),
             candle_core::op::BackpropOp::none(),
             false,
@@ -273,7 +272,7 @@ struct LagunaPrefillFp8CacheView {
     v_row_scales: u64,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn laguna_prefill_fp8_prepare(
         plan: *mut LagunaPrefillFp8Plan,
         q_len: u32,
@@ -321,36 +320,35 @@ impl LagunaPrefillFp8Attention {
         kv_len: usize,
         capacity: usize,
     ) -> Result<Tensor> {
-        anyhow::ensure!(
+        ensure!(
             (1..=8192).contains(&q_len)
                 && q_len <= kv_len
                 && kv_len <= capacity
                 && capacity <= 262144,
             "Laguna direct FP8 prefill requires 1<=M<=8192 and M<=S<=capacity<=262144"
         );
-        anyhow::ensure!(
+        ensure!(
             q.dtype() == DType::BF16 && q.is_contiguous() && q.dims() == [1, q_len, NUM_Q_HEADS, HEAD_DIM],
             "Laguna direct FP8 prefill requires contiguous BF16 Q [1,{q_len},{NUM_Q_HEADS},{HEAD_DIM}]"
         );
-        anyhow::ensure!(
+        ensure!(
             q.device().same_device(cache_device)
                 && k.len() == capacity * NUM_KV_HEADS * HEAD_DIM
                 && v.len() == k.len(),
             "Laguna direct FP8 prefill cache allocation/device mismatch"
         );
-        let dev = match cache_device {
-            Device::Cuda(dev) => dev.clone(),
-            _ => anyhow::bail!("Laguna direct FP8 prefill requires CUDA"),
+        let Device::Cuda(dev) = cache_device.clone() else {
+            bail!("Laguna direct FP8 prefill requires CUDA")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
-        anyhow::ensure!(
+        ensure!(
             std::sync::Arc::ptr_eq(k.context(), stream.context())
                 && std::sync::Arc::ptr_eq(v.context(), stream.context()),
             "Laguna direct FP8 prefill cache and launch stream must share one CUDA context"
         );
         let raw_stream = stream.cu_stream() as *mut c_void;
         if let Some((_, _, _, planned_stream)) = self.key {
-            anyhow::ensure!(
+            ensure!(
                 planned_stream == raw_stream as usize,
                 "Laguna direct FP8 prefill cache cannot move between CUDA streams"
             );
@@ -375,7 +373,7 @@ impl LagunaPrefillFp8Attention {
                     error.len(),
                 )
             };
-            anyhow::ensure!(
+            ensure!(
                 rc == 0,
                 "Laguna direct FP8 prefill prepare failed: {}",
                 adapter_error(&error)
@@ -407,8 +405,8 @@ impl LagunaPrefillFp8Attention {
             .context("Laguna direct FP8 prefill scratch missing")?;
         let (storage, layout) = q.storage_and_layout();
         let q_cuda = match &*storage {
-            candle_core::Storage::Cuda(storage) => storage,
-            _ => anyhow::bail!("Laguna direct FP8 prefill Q storage is not CUDA"),
+            Storage::Cuda(storage) => storage,
+            _ => bail!("Laguna direct FP8 prefill Q storage is not CUDA"),
         };
         let q_view = q_cuda
             .as_cuda_slice::<bf16>()?
@@ -444,7 +442,7 @@ impl LagunaPrefillFp8Attention {
                 )
             }
         };
-        anyhow::ensure!(
+        ensure!(
             rc == 0,
             "Laguna direct FP8 prefill launch failed: {}",
             adapter_error(&error)
@@ -457,7 +455,7 @@ impl LagunaPrefillFp8Attention {
             self.last_diagnostic = Some(diagnostic);
         }
         Ok(Tensor::from_storage(
-            candle_core::Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(output, dev)),
+            Storage::Cuda(candle_core::CudaStorage::wrap_cuda_slice(output, dev)),
             (1usize, q_len, NUM_Q_HEADS, HEAD_DIM),
             candle_core::op::BackpropOp::none(),
             false,

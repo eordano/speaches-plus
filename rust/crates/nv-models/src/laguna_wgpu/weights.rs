@@ -1,4 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use half::bf16;
+use nv_weights::WeightLoader;
 
 use super::config::{GateKind, LagunaShapes, LayerShape, LayerType, NVFP4_BLOCK};
 
@@ -255,7 +257,7 @@ pub struct HostWeights {
 
 pub enum WeightSource<'a> {
     Host(&'a HostWeights),
-    Loader(&'a nv_weights::WeightLoader),
+    Loader(&'a WeightLoader),
 }
 
 impl WeightSource<'_> {
@@ -309,7 +311,7 @@ impl WeightSource<'_> {
     pub fn layer(&self, shapes: &LagunaShapes, idx: usize) -> Result<HostLayer> {
         match self {
             Self::Host(h) => {
-                anyhow::ensure!(
+                ensure!(
                     idx < h.layers.len(),
                     "host weights have {} layers, want {idx}",
                     h.layers.len()
@@ -343,25 +345,21 @@ impl WeightSource<'_> {
     }
 }
 
-pub fn load_bf16_named(
-    w: &nv_weights::WeightLoader,
-    names: &[&str],
-    shape: &[usize],
-) -> Result<Vec<u16>> {
+pub fn load_bf16_named(w: &WeightLoader, names: &[&str], shape: &[usize]) -> Result<Vec<u16>> {
     for n in names {
         if w.has(n) {
             let t = w
                 .get(n, candle_core::DType::BF16)
                 .with_context(|| format!("load {n}"))?;
-            anyhow::ensure!(t.dims() == shape, "{n}: shape {:?} != {shape:?}", t.dims());
-            let v: Vec<half::bf16> = t.flatten_all()?.to_vec1()?;
+            ensure!(t.dims() == shape, "{n}: shape {:?} != {shape:?}", t.dims());
+            let v: Vec<bf16> = t.flatten_all()?.to_vec1()?;
             return Ok(v.into_iter().map(|x| x.to_bits()).collect());
         }
     }
-    anyhow::bail!("none of {names:?} found")
+    bail!("none of {names:?} found")
 }
 
-fn scalar_f32(w: &nv_weights::WeightLoader, name: &str) -> Result<f32> {
+fn scalar_f32(w: &WeightLoader, name: &str) -> Result<f32> {
     let t = w
         .get(name, candle_core::DType::F32)
         .with_context(|| format!("load {name}"))?;
@@ -369,28 +367,23 @@ fn scalar_f32(w: &nv_weights::WeightLoader, name: &str) -> Result<f32> {
     Ok(*v.first().unwrap_or(&1.0))
 }
 
-fn load_nvfp4(
-    w: &nv_weights::WeightLoader,
-    module: &str,
-    n: usize,
-    k: usize,
-) -> Result<HostNvfp4Lin> {
-    anyhow::ensure!(
+fn load_nvfp4(w: &WeightLoader, module: &str, n: usize, k: usize) -> Result<HostNvfp4Lin> {
+    ensure!(
         k.is_multiple_of(NVFP4_BLOCK),
         "{module}: k {k} not a multiple of {NVFP4_BLOCK}"
     );
     let packed_name = names::nvfp4_packed(module);
     let shape = w
         .shape_of(&packed_name)
-        .ok_or_else(|| anyhow::anyhow!("missing {packed_name}"))?;
-    anyhow::ensure!(
+        .ok_or_else(|| anyhow!("missing {packed_name}"))?;
+    ensure!(
         shape.len() == 2 && shape[0] == n && shape[1] == k / 2,
         "{module}: weight_packed shape {shape:?}, want [{n}, {}]",
         k / 2
     );
     let packed = w.raw_bytes(&packed_name)?.to_vec();
     let scale_raw = w.raw_bytes(&names::nvfp4_weight_scale(module))?.to_vec();
-    anyhow::ensure!(
+    ensure!(
         scale_raw.len() == n * k / NVFP4_BLOCK,
         "{module}: weight_scale {} bytes, want {}",
         scale_raw.len(),
@@ -422,7 +415,7 @@ fn load_nvfp4(
 }
 
 pub fn load_lin(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     module: &str,
     n_out_rows: usize,
     k_in_cols: usize,
@@ -440,12 +433,12 @@ pub fn load_lin(
 }
 
 pub fn load_expert_stack(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     modules: &[String],
     n_out_rows: usize,
     k_in_cols: usize,
 ) -> Result<HostExperts> {
-    anyhow::ensure!(
+    ensure!(
         !modules.is_empty(),
         "expert stack needs at least one module"
     );
@@ -458,7 +451,7 @@ pub fn load_expert_stack(
         }
     }
     if !bf16.is_empty() && !nvfp4.is_empty() {
-        anyhow::bail!(
+        bail!(
             "expert stack {}..: mixed bf16/nvfp4 experts ({} bf16, {} nvfp4)",
             modules[0],
             bf16.len(),
@@ -473,7 +466,7 @@ pub fn load_expert_stack(
 }
 
 pub fn load_attention(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     shapes: &LagunaShapes,
     layer: &LayerShape,
 ) -> Result<HostAttention> {
@@ -495,7 +488,7 @@ pub fn load_attention(
 }
 
 pub fn load_dense_mlp(
-    w: &nv_weights::WeightLoader,
+    w: &WeightLoader,
     shapes: &LagunaShapes,
     layer: &LayerShape,
 ) -> Result<HostDenseMlp> {
@@ -509,15 +502,11 @@ pub fn load_dense_mlp(
     })
 }
 
-pub fn load_moe(
-    w: &nv_weights::WeightLoader,
-    shapes: &LagunaShapes,
-    layer: &LayerShape,
-) -> Result<HostMoe> {
+pub fn load_moe(w: &WeightLoader, shapes: &LagunaShapes, layer: &LayerShape) -> Result<HostMoe> {
     let hidden = shapes.hidden_size;
     let idx = layer.idx;
     let n_e = shapes.num_experts;
-    anyhow::ensure!(n_e > 0, "layer {idx} is MoE but num_experts is 0");
+    ensure!(n_e > 0, "layer {idx} is MoE but num_experts is 0");
     let inter = shapes.moe_intermediate_size;
     let sinter = shapes.shared_expert_intermediate_size;
 
@@ -532,7 +521,7 @@ pub fn load_moe(
             .get(&bias_name, candle_core::DType::F32)
             .with_context(|| format!("load {bias_name}"))?;
         let v: Vec<f32> = t.flatten_all()?.to_vec1()?;
-        anyhow::ensure!(
+        ensure!(
             v.len() == n_e,
             "{bias_name}: {} values, want {n_e}",
             v.len()
@@ -559,7 +548,7 @@ pub fn load_moe(
 }
 
 pub fn bf16_bits(x: f32) -> u16 {
-    half::bf16::from_f32(x).to_bits()
+    bf16::from_f32(x).to_bits()
 }
 
 pub fn bf16_val(b: u16) -> f32 {

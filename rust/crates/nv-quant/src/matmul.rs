@@ -79,7 +79,6 @@ mod cuda {
             self.bf16_matmul_row_major_offs(stream, a, 0, b, 0, c, m, n, k, alpha, beta)
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn bf16_matmul_row_major_offs(
             &self,
             stream: &Arc<CudaStream>,
@@ -137,7 +136,6 @@ mod cuda {
             self.bf16_matmul_row_major_bt_offs(stream, a, 0, w, 0, c, m, n, k, alpha, beta)
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn bf16_matmul_row_major_bt_off(
             &self,
             stream: &Arc<CudaStream>,
@@ -154,7 +152,6 @@ mod cuda {
             self.bf16_matmul_row_major_bt_offs(stream, a, 0, w, w_off, c, m, n, k, alpha, beta)
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn bf16_matmul_row_major_bt_offs(
             &self,
             stream: &Arc<CudaStream>,
@@ -221,11 +218,10 @@ mod cuda {
                 k,
                 alpha,
                 beta,
-                splitk_enabled(),
+                true,
             )
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn bf16_matmul_row_major_bt_det_offs(
             &self,
             stream: &Arc<CudaStream>,
@@ -252,11 +248,10 @@ mod cuda {
                 k,
                 alpha,
                 beta,
-                splitk_enabled(),
+                true,
             )
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn bf16_matmul_row_major_bt_det_nosplit(
             &self,
             stream: &Arc<CudaStream>,
@@ -272,7 +267,6 @@ mod cuda {
             det_bt_matmul(stream, a, 0, w, 0, c, m, n, k, alpha, beta, false)
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn bf16_matmul_row_major_bt_det_splitk(
             &self,
             stream: &Arc<CudaStream>,
@@ -292,18 +286,6 @@ mod cuda {
     fn bf16_algo_pins() -> &'static HashMap<(u64, u64, u64), usize> {
         static PINS: OnceLock<HashMap<(u64, u64, u64), usize>> = OnceLock::new();
         PINS.get_or_init(|| crate::algo_pin::pin_map_from_env("NV_BF16_ALGO_PIN"))
-    }
-
-    pub fn nondeterministic_reduction_was_explicitly_allowed() -> bool {
-        nv_config::env_arm_opt_in_eq_some_1_cached_first_read_wins!(
-            "NV_BF16_ALLOW_NONDET_REDUCTION"
-        )
-    }
-
-    pub fn splitk_enabled() -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins!(
-            "NV_BF16_SPLITK"
-        )
     }
 
     pub fn deterministic_mode() -> bool {
@@ -373,7 +355,6 @@ mod cuda {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn det_bt_matmul(
         stream: &Arc<CudaStream>,
         a: &CudaSlice<bf16>,
@@ -409,7 +390,6 @@ mod cuda {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn bf16_bt_matmul_det_raw(
         stream: &Arc<CudaStream>,
         ap: *const c_void,
@@ -422,105 +402,107 @@ mod cuda {
         beta: f32,
         splitk: bool,
     ) -> Result<()> {
-        ensure_det_handle(stream)?;
-        let cache = DET_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let key = crate::stream_cache_key(stream);
-        let mut guard = cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("det gemm handle cache poisoned: {e}"))?;
-        let det = guard.get_mut(&key).expect("ensured above");
+        unsafe {
+            ensure_det_handle(stream)?;
+            let cache = DET_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let key = crate::stream_cache_key(stream);
+            let mut guard = cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("det gemm handle cache poisoned: {e}"))?;
+            let det = guard.get_mut(&key).expect("ensured above");
 
-        {
-            let bf = lt_sys::cudaDataType_t::CUDA_R_16BF;
+            {
+                let bf = lt_sys::cudaDataType_t::CUDA_R_16BF;
 
-            let a_layout = lt_result::create_matrix_layout(bf, k, n, k as i64)
-                .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
-            let b_layout = lt_result::create_matrix_layout(bf, k, m, k as i64)
-                .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
-            let d_layout = lt_result::create_matrix_layout(bf, n, m, n as i64)
-                .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
-            let desc = lt_result::create_matmul_desc(
-                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                lt_sys::cudaDataType_t::CUDA_R_32F,
-            )
-            .map_err(|e| anyhow::anyhow!("desc: {e:?}"))?;
-            let t = cublasOperation_t::CUBLAS_OP_T;
-            let nn = cublasOperation_t::CUBLAS_OP_N;
-            lt_result::set_matmul_desc_attribute(
-                desc,
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-                &t as *const _ as *const c_void,
-                mem::size_of::<cublasOperation_t>(),
-            )
-            .map_err(|e| anyhow::anyhow!("transa: {e:?}"))?;
-            lt_result::set_matmul_desc_attribute(
-                desc,
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-                &nn as *const _ as *const c_void,
-                mem::size_of::<cublasOperation_t>(),
-            )
-            .map_err(|e| anyhow::anyhow!("transb: {e:?}"))?;
-
-            let (wsp, _gws) = det.workspace.device_ptr_mut(stream);
-
-            let lt_handle = det.handle;
-            let ws_bytes = det.workspace_bytes;
-            let algo = if super::splitk_timing_selection_enabled(splitk, deterministic_mode()) {
-                match splitk_algo_for(
-                    lt_handle,
-                    ws_bytes,
-                    stream,
+                let a_layout = lt_result::create_matrix_layout(bf, k, n, k as i64)
+                    .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+                let b_layout = lt_result::create_matrix_layout(bf, k, m, k as i64)
+                    .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+                let d_layout = lt_result::create_matrix_layout(bf, n, m, n as i64)
+                    .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+                let desc = lt_result::create_matmul_desc(
+                    lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    lt_sys::cudaDataType_t::CUDA_R_32F,
+                )
+                .map_err(|e| anyhow::anyhow!("desc: {e:?}"))?;
+                let t = cublasOperation_t::CUBLAS_OP_T;
+                let nn = cublasOperation_t::CUBLAS_OP_N;
+                lt_result::set_matmul_desc_attribute(
                     desc,
-                    a_layout,
-                    b_layout,
-                    d_layout,
-                    (m, n, k),
-                    wp,
-                    ap,
-                    cp,
-                    wsp as *mut c_void,
-                    alpha,
-                    beta,
-                ) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        eprintln!("[bf16-splitk] selection failed for {m}x{n}x{k}, falling back to no-split heuristic: {e}");
-                        legacy_det_algo(lt_handle, ws_bytes, desc, a_layout, b_layout, d_layout)?
-                    }
-                }
-            } else {
-                legacy_det_algo(lt_handle, ws_bytes, desc, a_layout, b_layout, d_layout)?
-            };
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                    &t as *const _ as *const c_void,
+                    mem::size_of::<cublasOperation_t>(),
+                )
+                .map_err(|e| anyhow::anyhow!("transa: {e:?}"))?;
+                lt_result::set_matmul_desc_attribute(
+                    desc,
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                    &nn as *const _ as *const c_void,
+                    mem::size_of::<cublasOperation_t>(),
+                )
+                .map_err(|e| anyhow::anyhow!("transb: {e:?}"))?;
 
-            let rc = lt_result::matmul(
-                det.handle,
-                desc,
-                &alpha as *const _ as *const c_void,
-                &beta as *const _ as *const c_void,
-                wp,
-                a_layout,
-                ap,
-                b_layout,
-                cp as *const c_void,
-                d_layout,
-                cp,
-                d_layout,
-                &algo as *const _,
-                wsp as *mut c_void,
-                det.workspace_bytes,
-                stream.cu_stream() as lt_sys::cudaStream_t,
-            );
-            let desc_rc = lt_result::destroy_matmul_desc(desc);
-            let a_rc = lt_result::destroy_matrix_layout(a_layout);
-            let b_rc = lt_result::destroy_matrix_layout(b_layout);
-            let d_rc = lt_result::destroy_matrix_layout(d_layout);
-            rc.map_err(|e| anyhow::anyhow!("cublasLtMatmul det bf16: {e:?}"))?;
-            desc_rc.map_err(|e| anyhow::anyhow!("desc free: {e:?}"))?;
-            a_rc.map_err(|e| anyhow::anyhow!("layout free: {e:?}"))?;
-            b_rc.map_err(|e| anyhow::anyhow!("layout free: {e:?}"))?;
-            d_rc.map_err(|e| anyhow::anyhow!("layout free: {e:?}"))?;
+                let (wsp, _gws) = det.workspace.device_ptr_mut(stream);
+
+                let lt_handle = det.handle;
+                let ws_bytes = det.workspace_bytes;
+                let algo = if super::splitk_timing_selection_enabled(splitk, deterministic_mode()) {
+                    match splitk_algo_for(
+                        lt_handle,
+                        ws_bytes,
+                        stream,
+                        desc,
+                        a_layout,
+                        b_layout,
+                        d_layout,
+                        (m, n, k),
+                        wp,
+                        ap,
+                        cp,
+                        wsp as *mut c_void,
+                        alpha,
+                        beta,
+                    ) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            eprintln!("[bf16-splitk] selection failed for {m}x{n}x{k}, falling back to no-split heuristic: {e}");
+                            legacy_det_algo(lt_handle, ws_bytes, desc, a_layout, b_layout, d_layout)?
+                        }
+                    }
+                } else {
+                    legacy_det_algo(lt_handle, ws_bytes, desc, a_layout, b_layout, d_layout)?
+                };
+
+                let rc = lt_result::matmul(
+                    det.handle,
+                    desc,
+                    &alpha as *const _ as *const c_void,
+                    &beta as *const _ as *const c_void,
+                    wp,
+                    a_layout,
+                    ap,
+                    b_layout,
+                    cp as *const c_void,
+                    d_layout,
+                    cp,
+                    d_layout,
+                    &algo as *const _,
+                    wsp as *mut c_void,
+                    det.workspace_bytes,
+                    stream.cu_stream() as lt_sys::cudaStream_t,
+                );
+                let desc_rc = lt_result::destroy_matmul_desc(desc);
+                let a_rc = lt_result::destroy_matrix_layout(a_layout);
+                let b_rc = lt_result::destroy_matrix_layout(b_layout);
+                let d_rc = lt_result::destroy_matrix_layout(d_layout);
+                rc.map_err(|e| anyhow::anyhow!("cublasLtMatmul det bf16: {e:?}"))?;
+                desc_rc.map_err(|e| anyhow::anyhow!("desc free: {e:?}"))?;
+                a_rc.map_err(|e| anyhow::anyhow!("layout free: {e:?}"))?;
+                b_rc.map_err(|e| anyhow::anyhow!("layout free: {e:?}"))?;
+                d_rc.map_err(|e| anyhow::anyhow!("layout free: {e:?}"))?;
+            }
+            Ok(())
         }
-        Ok(())
     }
 
     struct F32OutBatchedPlan {
@@ -537,7 +519,6 @@ mod cuda {
         Mutex<HashMap<(u64, u64, u64, i32, i64, i64, i64, bool), F32OutBatchedPlan>>,
     > = OnceLock::new();
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn f32_out_batched_plan(
         handle: lt_sys::cublasLtHandle_t,
         ws_bytes: usize,
@@ -550,73 +531,75 @@ mod cuda {
         stride_c: i64,
         b_is_n_by_k_row_major: bool,
     ) -> Result<F32OutBatchedPlan> {
-        let bf = lt_sys::cudaDataType_t::CUDA_R_16BF;
-        let f32t = lt_sys::cudaDataType_t::CUDA_R_32F;
-        let (a_layout, transa) = if b_is_n_by_k_row_major {
-            (
-                lt_result::create_matrix_layout(bf, k, n, k as i64)
-                    .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?,
-                cublasOperation_t::CUBLAS_OP_T,
+        unsafe {
+            let bf = lt_sys::cudaDataType_t::CUDA_R_16BF;
+            let f32t = lt_sys::cudaDataType_t::CUDA_R_32F;
+            let (a_layout, transa) = if b_is_n_by_k_row_major {
+                (
+                    lt_result::create_matrix_layout(bf, k, n, k as i64)
+                        .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?,
+                    cublasOperation_t::CUBLAS_OP_T,
+                )
+            } else {
+                (
+                    lt_result::create_matrix_layout(bf, n, k, n as i64)
+                        .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?,
+                    cublasOperation_t::CUBLAS_OP_N,
+                )
+            };
+            let b_layout = lt_result::create_matrix_layout(bf, k, m, k as i64)
+                .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+            let d_layout = lt_result::create_matrix_layout(f32t, n, m, n as i64)
+                .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+            for (layout, stride) in [
+                (a_layout, stride_b),
+                (b_layout, stride_a),
+                (d_layout, stride_c),
+            ] {
+                lt_result::set_matrix_layout_attribute(
+                    layout,
+                    lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                    &batch as *const _ as *const c_void,
+                    mem::size_of::<i32>(),
+                )
+                .map_err(|e| anyhow::anyhow!("batch count: {e:?}"))?;
+                lt_result::set_matrix_layout_attribute(
+                    layout,
+                    lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                    &stride as *const _ as *const c_void,
+                    mem::size_of::<i64>(),
+                )
+                .map_err(|e| anyhow::anyhow!("batch stride: {e:?}"))?;
+            }
+            let desc = lt_result::create_matmul_desc(
+                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                lt_sys::cudaDataType_t::CUDA_R_32F,
             )
-        } else {
-            (
-                lt_result::create_matrix_layout(bf, n, k, n as i64)
-                    .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?,
-                cublasOperation_t::CUBLAS_OP_N,
+            .map_err(|e| anyhow::anyhow!("desc: {e:?}"))?;
+            let nn = cublasOperation_t::CUBLAS_OP_N;
+            lt_result::set_matmul_desc_attribute(
+                desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                &transa as *const _ as *const c_void,
+                mem::size_of::<cublasOperation_t>(),
             )
-        };
-        let b_layout = lt_result::create_matrix_layout(bf, k, m, k as i64)
-            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
-        let d_layout = lt_result::create_matrix_layout(f32t, n, m, n as i64)
-            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
-        for (layout, stride) in [
-            (a_layout, stride_b),
-            (b_layout, stride_a),
-            (d_layout, stride_c),
-        ] {
-            lt_result::set_matrix_layout_attribute(
-                layout,
-                lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
-                &batch as *const _ as *const c_void,
-                mem::size_of::<i32>(),
+            .map_err(|e| anyhow::anyhow!("transa: {e:?}"))?;
+            lt_result::set_matmul_desc_attribute(
+                desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                &nn as *const _ as *const c_void,
+                mem::size_of::<cublasOperation_t>(),
             )
-            .map_err(|e| anyhow::anyhow!("batch count: {e:?}"))?;
-            lt_result::set_matrix_layout_attribute(
-                layout,
-                lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                &stride as *const _ as *const c_void,
-                mem::size_of::<i64>(),
-            )
-            .map_err(|e| anyhow::anyhow!("batch stride: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("transb: {e:?}"))?;
+            let algo = legacy_det_algo(handle, ws_bytes, desc, a_layout, b_layout, d_layout)?;
+            Ok(F32OutBatchedPlan {
+                desc,
+                a_layout,
+                b_layout,
+                d_layout,
+                algo,
+            })
         }
-        let desc = lt_result::create_matmul_desc(
-            lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            lt_sys::cudaDataType_t::CUDA_R_32F,
-        )
-        .map_err(|e| anyhow::anyhow!("desc: {e:?}"))?;
-        let nn = cublasOperation_t::CUBLAS_OP_N;
-        lt_result::set_matmul_desc_attribute(
-            desc,
-            lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-            &transa as *const _ as *const c_void,
-            mem::size_of::<cublasOperation_t>(),
-        )
-        .map_err(|e| anyhow::anyhow!("transa: {e:?}"))?;
-        lt_result::set_matmul_desc_attribute(
-            desc,
-            lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-            &nn as *const _ as *const c_void,
-            mem::size_of::<cublasOperation_t>(),
-        )
-        .map_err(|e| anyhow::anyhow!("transb: {e:?}"))?;
-        let algo = legacy_det_algo(handle, ws_bytes, desc, a_layout, b_layout, d_layout)?;
-        Ok(F32OutBatchedPlan {
-            desc,
-            a_layout,
-            b_layout,
-            d_layout,
-            algo,
-        })
     }
 
     static E4M3_F32_OUT_BATCHED_PLAN_PER_SHAPE_LIKE_THE_BF16_PLAN_CACHE: OnceLock<
@@ -634,66 +617,67 @@ mod cuda {
         stride_b: i64,
         stride_c: i64,
     ) -> Result<F32OutBatchedPlan> {
-        let e4m3 = lt_sys::cudaDataType_t::CUDA_R_8F_E4M3;
-        let f32t = lt_sys::cudaDataType_t::CUDA_R_32F;
-        let a_layout = lt_result::create_matrix_layout(e4m3, k, n, k as i64)
-            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
-        let b_layout = lt_result::create_matrix_layout(e4m3, k, m, k as i64)
-            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
-        let d_layout = lt_result::create_matrix_layout(f32t, n, m, n as i64)
-            .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
-        for (layout, stride) in [
-            (a_layout, stride_b),
-            (b_layout, stride_a),
-            (d_layout, stride_c),
-        ] {
-            lt_result::set_matrix_layout_attribute(
-                layout,
-                lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
-                &batch as *const _ as *const c_void,
-                mem::size_of::<i32>(),
+        unsafe {
+            let e4m3 = lt_sys::cudaDataType_t::CUDA_R_8F_E4M3;
+            let f32t = lt_sys::cudaDataType_t::CUDA_R_32F;
+            let a_layout = lt_result::create_matrix_layout(e4m3, k, n, k as i64)
+                .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+            let b_layout = lt_result::create_matrix_layout(e4m3, k, m, k as i64)
+                .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+            let d_layout = lt_result::create_matrix_layout(f32t, n, m, n as i64)
+                .map_err(|e| anyhow::anyhow!("layout: {e:?}"))?;
+            for (layout, stride) in [
+                (a_layout, stride_b),
+                (b_layout, stride_a),
+                (d_layout, stride_c),
+            ] {
+                lt_result::set_matrix_layout_attribute(
+                    layout,
+                    lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                    &batch as *const _ as *const c_void,
+                    mem::size_of::<i32>(),
+                )
+                .map_err(|e| anyhow::anyhow!("batch count: {e:?}"))?;
+                lt_result::set_matrix_layout_attribute(
+                    layout,
+                    lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
+                    &stride as *const _ as *const c_void,
+                    mem::size_of::<i64>(),
+                )
+                .map_err(|e| anyhow::anyhow!("batch stride: {e:?}"))?;
+            }
+            let desc = lt_result::create_matmul_desc(
+                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                lt_sys::cudaDataType_t::CUDA_R_32F,
             )
-            .map_err(|e| anyhow::anyhow!("batch count: {e:?}"))?;
-            lt_result::set_matrix_layout_attribute(
-                layout,
-                lt_sys::cublasLtMatrixLayoutAttribute_t::CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,
-                &stride as *const _ as *const c_void,
-                mem::size_of::<i64>(),
+            .map_err(|e| anyhow::anyhow!("desc: {e:?}"))?;
+            let transa = cublasOperation_t::CUBLAS_OP_T;
+            let nn = cublasOperation_t::CUBLAS_OP_N;
+            lt_result::set_matmul_desc_attribute(
+                desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                &transa as *const _ as *const c_void,
+                mem::size_of::<cublasOperation_t>(),
             )
-            .map_err(|e| anyhow::anyhow!("batch stride: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("transa: {e:?}"))?;
+            lt_result::set_matmul_desc_attribute(
+                desc,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                &nn as *const _ as *const c_void,
+                mem::size_of::<cublasOperation_t>(),
+            )
+            .map_err(|e| anyhow::anyhow!("transb: {e:?}"))?;
+            let algo = legacy_det_algo(handle, ws_bytes, desc, a_layout, b_layout, d_layout)?;
+            Ok(F32OutBatchedPlan {
+                desc,
+                a_layout,
+                b_layout,
+                d_layout,
+                algo,
+            })
         }
-        let desc = lt_result::create_matmul_desc(
-            lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            lt_sys::cudaDataType_t::CUDA_R_32F,
-        )
-        .map_err(|e| anyhow::anyhow!("desc: {e:?}"))?;
-        let transa = cublasOperation_t::CUBLAS_OP_T;
-        let nn = cublasOperation_t::CUBLAS_OP_N;
-        lt_result::set_matmul_desc_attribute(
-            desc,
-            lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-            &transa as *const _ as *const c_void,
-            mem::size_of::<cublasOperation_t>(),
-        )
-        .map_err(|e| anyhow::anyhow!("transa: {e:?}"))?;
-        lt_result::set_matmul_desc_attribute(
-            desc,
-            lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-            &nn as *const _ as *const c_void,
-            mem::size_of::<cublasOperation_t>(),
-        )
-        .map_err(|e| anyhow::anyhow!("transb: {e:?}"))?;
-        let algo = legacy_det_algo(handle, ws_bytes, desc, a_layout, b_layout, d_layout)?;
-        Ok(F32OutBatchedPlan {
-            desc,
-            a_layout,
-            b_layout,
-            d_layout,
-            algo,
-        })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn e4m3_gemm_f32_out_strided_batched_raw(
         stream: &Arc<CudaStream>,
         ap: *const c_void,
@@ -710,76 +694,77 @@ mod cuda {
         b_scale_dev: *const f32,
         beta: f32,
     ) -> Result<()> {
-        ensure_det_handle(stream)?;
-        let cache = DET_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let key = crate::stream_cache_key(stream);
-        let mut guard = cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("det gemm handle cache poisoned: {e}"))?;
-        let det = guard.get_mut(&key).expect("ensured above");
-        let plans = E4M3_F32_OUT_BATCHED_PLAN_PER_SHAPE_LIKE_THE_BF16_PLAN_CACHE
-            .get_or_init(|| Mutex::new(HashMap::new()));
-        let mut plans = plans
-            .lock()
-            .map_err(|e| anyhow::anyhow!("e4m3 f32-out plan cache poisoned: {e}"))?;
-        let plan = match plans.entry((m, n, k, batch, stride_a, stride_b, stride_c)) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => v.insert(e4m3_f32_out_batched_plan(
+        unsafe {
+            ensure_det_handle(stream)?;
+            let cache = DET_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let key = crate::stream_cache_key(stream);
+            let mut guard = cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("det gemm handle cache poisoned: {e}"))?;
+            let det = guard.get_mut(&key).expect("ensured above");
+            let plans = E4M3_F32_OUT_BATCHED_PLAN_PER_SHAPE_LIKE_THE_BF16_PLAN_CACHE
+                .get_or_init(|| Mutex::new(HashMap::new()));
+            let mut plans = plans
+                .lock()
+                .map_err(|e| anyhow::anyhow!("e4m3 f32-out plan cache poisoned: {e}"))?;
+            let plan = match plans.entry((m, n, k, batch, stride_a, stride_b, stride_c)) {
+                Entry::Occupied(o) => o.into_mut(),
+                Entry::Vacant(v) => v.insert(e4m3_f32_out_batched_plan(
+                    det.handle,
+                    det.workspace_bytes,
+                    m,
+                    n,
+                    k,
+                    batch,
+                    stride_a,
+                    stride_b,
+                    stride_c,
+                )?),
+            };
+            for (attr, ptr) in [
+                (
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                    b_scale_dev,
+                ),
+                (
+                    lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                    a_scale_dev,
+                ),
+            ] {
+                lt_result::set_matmul_desc_attribute(
+                    plan.desc,
+                    attr,
+                    &ptr as *const _ as *const c_void,
+                    mem::size_of::<*const f32>(),
+                )
+                .map_err(|e| anyhow::anyhow!("e4m3 scale pointer: {e:?}"))?;
+            }
+            let (wsp, _gws) = det.workspace.device_ptr_mut(stream);
+            let alpha: f32 = 1.0;
+            lt_result::matmul(
                 det.handle,
-                det.workspace_bytes,
-                m,
-                n,
-                k,
-                batch,
-                stride_a,
-                stride_b,
-                stride_c,
-            )?),
-        };
-        for (attr, ptr) in [
-            (
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-                b_scale_dev,
-            ),
-            (
-                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-                a_scale_dev,
-            ),
-        ] {
-            lt_result::set_matmul_desc_attribute(
                 plan.desc,
-                attr,
-                &ptr as *const _ as *const c_void,
-                mem::size_of::<*const f32>(),
+                &alpha as *const _ as *const c_void,
+                &beta as *const _ as *const c_void,
+                bp,
+                plan.a_layout,
+                ap,
+                plan.b_layout,
+                cp as *const c_void,
+                plan.d_layout,
+                cp,
+                plan.d_layout,
+                &plan.algo as *const _,
+                wsp as *mut c_void,
+                det.workspace_bytes,
+                stream.cu_stream() as lt_sys::cudaStream_t,
             )
-            .map_err(|e| anyhow::anyhow!("e4m3 scale pointer: {e:?}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("cublasLtMatmul e4m3 f32-out batched {m}x{n}x{k}x{batch}: {e:?}")
+            })
         }
-        let (wsp, _gws) = det.workspace.device_ptr_mut(stream);
-        let alpha: f32 = 1.0;
-        lt_result::matmul(
-            det.handle,
-            plan.desc,
-            &alpha as *const _ as *const c_void,
-            &beta as *const _ as *const c_void,
-            bp,
-            plan.a_layout,
-            ap,
-            plan.b_layout,
-            cp as *const c_void,
-            plan.d_layout,
-            cp,
-            plan.d_layout,
-            &plan.algo as *const _,
-            wsp as *mut c_void,
-            det.workspace_bytes,
-            stream.cu_stream() as lt_sys::cudaStream_t,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!("cublasLtMatmul e4m3 f32-out batched {m}x{n}x{k}x{batch}: {e:?}")
-        })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn bf16_gemm_f32_out_strided_batched_raw(
         stream: &Arc<CudaStream>,
         ap: *const c_void,
@@ -795,32 +780,20 @@ mod cuda {
         b_is_n_by_k_row_major: bool,
         beta: f32,
     ) -> Result<()> {
-        ensure_det_handle(stream)?;
-        let cache = DET_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let key = crate::stream_cache_key(stream);
-        let mut guard = cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("det gemm handle cache poisoned: {e}"))?;
-        let det = guard.get_mut(&key).expect("ensured above");
-        let plans = F32_OUT_BATCHED_PLAN_PER_SHAPE_BECAUSE_DESCRIPTOR_CHURN_PLUS_THE_HEURISTIC_QUERY_COST_MORE_CPU_THAN_A_2K_TILE_GEMM_TAKES_ON_THE_GPU
-            .get_or_init(|| Mutex::new(HashMap::new()));
-        let mut plans = plans
-            .lock()
-            .map_err(|e| anyhow::anyhow!("f32-out plan cache poisoned: {e}"))?;
-        let plan = match plans.entry((
-            m,
-            n,
-            k,
-            batch,
-            stride_a,
-            stride_b,
-            stride_c,
-            b_is_n_by_k_row_major,
-        )) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(v) => v.insert(f32_out_batched_plan(
-                det.handle,
-                det.workspace_bytes,
+        unsafe {
+            ensure_det_handle(stream)?;
+            let cache = DET_HANDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let key = crate::stream_cache_key(stream);
+            let mut guard = cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("det gemm handle cache poisoned: {e}"))?;
+            let det = guard.get_mut(&key).expect("ensured above");
+            let plans = F32_OUT_BATCHED_PLAN_PER_SHAPE_BECAUSE_DESCRIPTOR_CHURN_PLUS_THE_HEURISTIC_QUERY_COST_MORE_CPU_THAN_A_2K_TILE_GEMM_TAKES_ON_THE_GPU
+                .get_or_init(|| Mutex::new(HashMap::new()));
+            let mut plans = plans
+                .lock()
+                .map_err(|e| anyhow::anyhow!("f32-out plan cache poisoned: {e}"))?;
+            let plan = match plans.entry((
                 m,
                 n,
                 k,
@@ -829,31 +802,45 @@ mod cuda {
                 stride_b,
                 stride_c,
                 b_is_n_by_k_row_major,
-            )?),
-        };
-        let (wsp, _gws) = det.workspace.device_ptr_mut(stream);
-        let alpha: f32 = 1.0;
-        lt_result::matmul(
-            det.handle,
-            plan.desc,
-            &alpha as *const _ as *const c_void,
-            &beta as *const _ as *const c_void,
-            bp,
-            plan.a_layout,
-            ap,
-            plan.b_layout,
-            cp as *const c_void,
-            plan.d_layout,
-            cp,
-            plan.d_layout,
-            &plan.algo as *const _,
-            wsp as *mut c_void,
-            det.workspace_bytes,
-            stream.cu_stream() as lt_sys::cudaStream_t,
-        )
-        .map_err(|e| {
-            anyhow::anyhow!("cublasLtMatmul bf16 f32-out batched {m}x{n}x{k}x{batch}: {e:?}")
-        })
+            )) {
+                Entry::Occupied(o) => o.into_mut(),
+                Entry::Vacant(v) => v.insert(f32_out_batched_plan(
+                    det.handle,
+                    det.workspace_bytes,
+                    m,
+                    n,
+                    k,
+                    batch,
+                    stride_a,
+                    stride_b,
+                    stride_c,
+                    b_is_n_by_k_row_major,
+                )?),
+            };
+            let (wsp, _gws) = det.workspace.device_ptr_mut(stream);
+            let alpha: f32 = 1.0;
+            lt_result::matmul(
+                det.handle,
+                plan.desc,
+                &alpha as *const _ as *const c_void,
+                &beta as *const _ as *const c_void,
+                bp,
+                plan.a_layout,
+                ap,
+                plan.b_layout,
+                cp as *const c_void,
+                plan.d_layout,
+                cp,
+                plan.d_layout,
+                &plan.algo as *const _,
+                wsp as *mut c_void,
+                det.workspace_bytes,
+                stream.cu_stream() as lt_sys::cudaStream_t,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("cublasLtMatmul bf16 f32-out batched {m}x{n}x{k}x{batch}: {e:?}")
+            })
+        }
     }
 
     unsafe fn legacy_det_algo(
@@ -864,31 +851,32 @@ mod cuda {
         b_layout: lt_sys::cublasLtMatrixLayout_t,
         d_layout: lt_sys::cublasLtMatrixLayout_t,
     ) -> Result<lt_sys::cublasLtMatmulAlgo_t> {
-        let pref = lt_result::create_matmul_pref().map_err(|e| anyhow::anyhow!("pref: {e:?}"))?;
-        lt_result::set_matmul_pref_attribute(
-            pref,
-            lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-            &ws_bytes as *const _ as *const c_void,
-            mem::size_of::<usize>(),
-        )
-        .map_err(|e| anyhow::anyhow!("pref ws: {e:?}"))?;
-        let mask: u32 = 0;
-        lt_result::set_matmul_pref_attribute(
-            pref,
-            lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
-            &mask as *const _ as *const c_void,
-            mem::size_of::<u32>(),
-        )
-        .map_err(|e| anyhow::anyhow!("pref mask: {e:?}"))?;
-        let heur = lt_result::get_matmul_algo_heuristic(
-            handle, desc, a_layout, b_layout, d_layout, d_layout, pref,
-        )
-        .map_err(|e| anyhow::anyhow!("heuristic: {e:?}"))?;
-        lt_result::destroy_matmul_pref(pref).map_err(|e| anyhow::anyhow!("pref free: {e:?}"))?;
-        Ok(heur.algo)
+        unsafe {
+            let pref = lt_result::create_matmul_pref().map_err(|e| anyhow::anyhow!("pref: {e:?}"))?;
+            lt_result::set_matmul_pref_attribute(
+                pref,
+                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws_bytes as *const _ as *const c_void,
+                mem::size_of::<usize>(),
+            )
+            .map_err(|e| anyhow::anyhow!("pref ws: {e:?}"))?;
+            let mask: u32 = 0;
+            lt_result::set_matmul_pref_attribute(
+                pref,
+                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                &mask as *const _ as *const c_void,
+                mem::size_of::<u32>(),
+            )
+            .map_err(|e| anyhow::anyhow!("pref mask: {e:?}"))?;
+            let heur = lt_result::get_matmul_algo_heuristic(
+                handle, desc, a_layout, b_layout, d_layout, d_layout, pref,
+            )
+            .map_err(|e| anyhow::anyhow!("heuristic: {e:?}"))?;
+            lt_result::destroy_matmul_pref(pref).map_err(|e| anyhow::anyhow!("pref free: {e:?}"))?;
+            Ok(heur.algo)
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe fn splitk_algo_for(
         handle: lt_sys::cublasLtHandle_t,
         ws_bytes: usize,
@@ -905,26 +893,26 @@ mod cuda {
         alpha: f32,
         beta: f32,
     ) -> Result<lt_sys::cublasLtMatmulAlgo_t> {
-        let cache = SPLITK_ALGO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(a) = cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("splitk algo cache poisoned: {e}"))?
-            .get(&shape)
-            .copied()
-        {
-            return Ok(a);
-        }
-        let (m, n, k) = shape;
+        unsafe {
+            let cache = SPLITK_ALGO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            if let Some(a) = cache
+                .lock()
+                .map_err(|e| anyhow::anyhow!("splitk algo cache poisoned: {e}"))?
+                .get(&shape)
+                .copied()
+            {
+                return Ok(a);
+            }
+            let (m, n, k) = shape;
 
-        let pref = lt_result::create_matmul_pref().map_err(|e| anyhow::anyhow!("pref: {e:?}"))?;
-        lt_result::set_matmul_pref_attribute(
-            pref,
-            lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-            &ws_bytes as *const _ as *const c_void,
-            mem::size_of::<usize>(),
-        )
-        .map_err(|e| anyhow::anyhow!("pref ws: {e:?}"))?;
-        if !nondeterministic_reduction_was_explicitly_allowed() {
+            let pref = lt_result::create_matmul_pref().map_err(|e| anyhow::anyhow!("pref: {e:?}"))?;
+            lt_result::set_matmul_pref_attribute(
+                pref,
+                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws_bytes as *const _ as *const c_void,
+                mem::size_of::<usize>(),
+            )
+            .map_err(|e| anyhow::anyhow!("pref ws: {e:?}"))?;
             let mask: u32 = 0x6;
             lt_result::set_matmul_pref_attribute(
                 pref,
@@ -933,147 +921,147 @@ mod cuda {
                 mem::size_of::<u32>(),
             )
             .map_err(|e| anyhow::anyhow!("pref scheme mask: {e:?}"))?;
-        }
 
-        const MAX_CANDS: usize = 16;
-        let mut results: [lt_sys::cublasLtMatmulHeuristicResult_t; MAX_CANDS] = mem::zeroed();
-        let mut returned: i32 = 0;
-        let st = lt_sys::cublasLtMatmulAlgoGetHeuristic(
-            handle,
-            desc,
-            a_layout,
-            b_layout,
-            d_layout,
-            d_layout,
-            pref,
-            MAX_CANDS as i32,
-            results.as_mut_ptr(),
-            &mut returned,
-        );
-        lt_result::destroy_matmul_pref(pref).map_err(|e| anyhow::anyhow!("pref free: {e:?}"))?;
-        anyhow::ensure!(
-            st == lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS && returned > 0,
-            "cublasLtMatmulAlgoGetHeuristic: {st:?} returned={returned}"
-        );
-        let cands: Vec<&lt_sys::cublasLtMatmulHeuristicResult_t> = results[..returned as usize]
-            .iter()
-            .filter(|r| r.state == lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS)
-            .collect();
-        anyhow::ensure!(!cands.is_empty(), "no valid heuristic candidates");
-
-        if let Some(&pin) = bf16_algo_pins().get(&shape) {
-            let idx = if pin < cands.len() {
-                pin
-            } else {
-                eprintln!(
-                    "[bf16-splitk] pin idx {pin} out of range for {m}x{n}x{k} ({} cands); using 0",
-                    cands.len()
-                );
-                0
-            };
-            eprintln!(
-                "[bf16-splitk] shape {m}x{n}x{k}: pinned cand {idx}/{} ({})",
-                cands.len(),
-                crate::nvfp4::algo_config_summary(&cands[idx].algo),
+            const MAX_CANDS: usize = 16;
+            let mut results: [lt_sys::cublasLtMatmulHeuristicResult_t; MAX_CANDS] = mem::zeroed();
+            let mut returned: i32 = 0;
+            let st = lt_sys::cublasLtMatmulAlgoGetHeuristic(
+                handle,
+                desc,
+                a_layout,
+                b_layout,
+                d_layout,
+                d_layout,
+                pref,
+                MAX_CANDS as i32,
+                results.as_mut_ptr(),
+                &mut returned,
             );
-            let algo = cands[idx].algo;
+            lt_result::destroy_matmul_pref(pref).map_err(|e| anyhow::anyhow!("pref free: {e:?}"))?;
+            anyhow::ensure!(
+                st == lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS && returned > 0,
+                "cublasLtMatmulAlgoGetHeuristic: {st:?} returned={returned}"
+            );
+            let cands: Vec<&lt_sys::cublasLtMatmulHeuristicResult_t> = results[..returned as usize]
+                .iter()
+                .filter(|r| r.state == lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS)
+                .collect();
+            anyhow::ensure!(!cands.is_empty(), "no valid heuristic candidates");
+
+            if let Some(&pin) = bf16_algo_pins().get(&shape) {
+                let idx = if pin < cands.len() {
+                    pin
+                } else {
+                    eprintln!(
+                        "[bf16-splitk] pin idx {pin} out of range for {m}x{n}x{k} ({} cands); using 0",
+                        cands.len()
+                    );
+                    0
+                };
+                eprintln!(
+                    "[bf16-splitk] shape {m}x{n}x{k}: pinned cand {idx}/{} ({})",
+                    cands.len(),
+                    crate::nvfp4::algo_config_summary(&cands[idx].algo),
+                );
+                let algo = cands[idx].algo;
+                cache
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("splitk algo cache poisoned: {e}"))?
+                    .insert(shape, algo);
+                return Ok(algo);
+            }
+
+            let run_once = |algo: &lt_sys::cublasLtMatmulAlgo_t| -> Result<()> {
+                lt_result::matmul(
+                    handle,
+                    desc,
+                    &alpha as *const _ as *const c_void,
+                    &beta as *const _ as *const c_void,
+                    wp,
+                    a_layout,
+                    ap,
+                    b_layout,
+                    cp as *const c_void,
+                    d_layout,
+                    cp,
+                    d_layout,
+                    algo as *const _,
+                    wsp,
+                    ws_bytes,
+                    stream.cu_stream() as lt_sys::cudaStream_t,
+                )
+                .map_err(|e| anyhow::anyhow!("cand matmul: {e:?}"))
+            };
+
+            let chosen_idx = if stream_is_capturing(stream) || cands.len() == 1 {
+                if stream_is_capturing(stream) {
+                    eprintln!(
+                        "[bf16-splitk] WARN: first sight of shape {m}x{n}x{k} during graph capture; using heuristic[0] untimed"
+                    );
+                }
+                0usize
+            } else {
+                let ctx = stream.context().clone();
+                stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+                let flags = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+                let mut times = vec![f64::INFINITY; cands.len()];
+                for _pass in 0..2 {
+                    for (i, cand) in cands.iter().enumerate() {
+                        if run_once(&cand.algo).is_err() {
+                            continue;
+                        }
+                        if run_once(&cand.algo).is_err() {
+                            continue;
+                        }
+                        let e0 = ctx.new_event(flags).map_err(|e| anyhow::anyhow!(e))?;
+                        let e1 = ctx.new_event(flags).map_err(|e| anyhow::anyhow!(e))?;
+                        e0.record(stream).map_err(|e| anyhow::anyhow!(e))?;
+                        let mut bad = false;
+                        for _ in 0..10 {
+                            if run_once(&cand.algo).is_err() {
+                                bad = true;
+                                break;
+                            }
+                        }
+                        e1.record(stream).map_err(|e| anyhow::anyhow!(e))?;
+                        stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
+                        if bad {
+                            continue;
+                        }
+                        let t = e0.elapsed_ms(&e1).map_err(|e| anyhow::anyhow!(e))? as f64 / 10.0;
+                        if t < times[i] {
+                            times[i] = t;
+                        }
+                    }
+                }
+                let best = times.iter().cloned().fold(f64::INFINITY, f64::min);
+                anyhow::ensure!(best.is_finite(), "all heuristic candidates failed to run");
+                let idx = times.iter().position(|&t| t <= best * 1.05).unwrap_or(0);
+                let hex: String = cands[idx]
+                    .algo
+                    .data
+                    .iter()
+                    .map(|w| format!("{w:016x}"))
+                    .collect();
+                eprintln!(
+                    "[bf16-splitk] shape {m}x{n}x{k}: cands={} times_ms={:?} chosen={} t={:.4}ms (heur0 {:.4}ms) algo={}",
+                    cands.len(),
+                    times.iter().map(|t| (t * 1e4).round() / 1e4).collect::<Vec<_>>(),
+                    idx,
+                    times[idx],
+                    times[0],
+                    hex
+                );
+                idx
+            };
+
+            let algo = cands[chosen_idx].algo;
             cache
                 .lock()
                 .map_err(|e| anyhow::anyhow!("splitk algo cache poisoned: {e}"))?
                 .insert(shape, algo);
-            return Ok(algo);
+            Ok(algo)
         }
-
-        let run_once = |algo: &lt_sys::cublasLtMatmulAlgo_t| -> Result<()> {
-            lt_result::matmul(
-                handle,
-                desc,
-                &alpha as *const _ as *const c_void,
-                &beta as *const _ as *const c_void,
-                wp,
-                a_layout,
-                ap,
-                b_layout,
-                cp as *const c_void,
-                d_layout,
-                cp,
-                d_layout,
-                algo as *const _,
-                wsp,
-                ws_bytes,
-                stream.cu_stream() as lt_sys::cudaStream_t,
-            )
-            .map_err(|e| anyhow::anyhow!("cand matmul: {e:?}"))
-        };
-
-        let chosen_idx = if stream_is_capturing(stream) || cands.len() == 1 {
-            if stream_is_capturing(stream) {
-                eprintln!(
-                    "[bf16-splitk] WARN: first sight of shape {m}x{n}x{k} during graph capture; using heuristic[0] untimed"
-                );
-            }
-            0usize
-        } else {
-            let ctx = stream.context().clone();
-            stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
-            let flags = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
-            let mut times = vec![f64::INFINITY; cands.len()];
-            for _pass in 0..2 {
-                for (i, cand) in cands.iter().enumerate() {
-                    if run_once(&cand.algo).is_err() {
-                        continue;
-                    }
-                    if run_once(&cand.algo).is_err() {
-                        continue;
-                    }
-                    let e0 = ctx.new_event(flags).map_err(|e| anyhow::anyhow!(e))?;
-                    let e1 = ctx.new_event(flags).map_err(|e| anyhow::anyhow!(e))?;
-                    e0.record(stream).map_err(|e| anyhow::anyhow!(e))?;
-                    let mut bad = false;
-                    for _ in 0..10 {
-                        if run_once(&cand.algo).is_err() {
-                            bad = true;
-                            break;
-                        }
-                    }
-                    e1.record(stream).map_err(|e| anyhow::anyhow!(e))?;
-                    stream.synchronize().map_err(|e| anyhow::anyhow!(e))?;
-                    if bad {
-                        continue;
-                    }
-                    let t = e0.elapsed_ms(&e1).map_err(|e| anyhow::anyhow!(e))? as f64 / 10.0;
-                    if t < times[i] {
-                        times[i] = t;
-                    }
-                }
-            }
-            let best = times.iter().cloned().fold(f64::INFINITY, f64::min);
-            anyhow::ensure!(best.is_finite(), "all heuristic candidates failed to run");
-            let idx = times.iter().position(|&t| t <= best * 1.05).unwrap_or(0);
-            let hex: String = cands[idx]
-                .algo
-                .data
-                .iter()
-                .map(|w| format!("{w:016x}"))
-                .collect();
-            eprintln!(
-                "[bf16-splitk] shape {m}x{n}x{k}: cands={} times_ms={:?} chosen={} t={:.4}ms (heur0 {:.4}ms) algo={}",
-                cands.len(),
-                times.iter().map(|t| (t * 1e4).round() / 1e4).collect::<Vec<_>>(),
-                idx,
-                times[idx],
-                times[0],
-                hex
-            );
-            idx
-        };
-
-        let algo = cands[chosen_idx].algo;
-        cache
-            .lock()
-            .map_err(|e| anyhow::anyhow!("splitk algo cache poisoned: {e}"))?
-            .insert(shape, algo);
-        Ok(algo)
     }
 
     pub fn cpu_bf16_matmul_row_major(
@@ -1105,7 +1093,7 @@ mod deterministic_mode_tests {
     use super::{deterministic_mode_from, splitk_timing_selection_enabled};
 
     #[test]
-    fn only_the_literal_one_enables_deterministic_mode() {
+    fn only_the_literal_one_enables_deterministic_mode_which_bypasses_timed_splitk_selection() {
         assert!(deterministic_mode_from(Some("1")));
         assert!(!deterministic_mode_from(None));
         assert!(!deterministic_mode_from(Some("0")));
@@ -1114,10 +1102,6 @@ mod deterministic_mode_tests {
         assert!(!deterministic_mode_from(Some("yes")));
         assert!(!deterministic_mode_from(Some(" 1")));
         assert!(!deterministic_mode_from(Some("2")));
-    }
-
-    #[test]
-    fn deterministic_mode_bypasses_timed_splitk_algo_selection() {
         assert!(splitk_timing_selection_enabled(true, false));
         assert!(!splitk_timing_selection_enabled(true, true));
         assert!(!splitk_timing_selection_enabled(false, false));

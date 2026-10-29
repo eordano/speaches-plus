@@ -1,11 +1,9 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::dequant::bytes_to_words;
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::pack_u16_odd_tail_zeroed_min_one_word as pack_bf16;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
-pub const WGSL: &str = include_str!("../../../wgsl/attn_decode_small_m.wgsl");
+pub const WGSL: &str = crate::wgsl!("../../../wgsl/attn_decode_small_m.wgsl");
 
 pub const WORKGROUP_SIZE: u32 = 128;
 pub const MAX_PER_THREAD: usize = 4;
@@ -463,95 +461,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn m_rows_out_of_range_is_rejected() {
-        assert!(check_m_rows(0).is_err());
-        assert!(check_m_rows(10).is_err());
-        for m in 1..=9 {
-            assert!(check_m_rows(m).is_ok());
+    fn geometry_m_rows_entries_and_staging_helpers_follow_the_shader_contract() {
+        {
+            assert!(check_m_rows(0).is_err());
+            assert!(check_m_rows(10).is_err());
+            for m in 1..=9 {
+                assert!(check_m_rows(m).is_ok());
+            }
+        }
+        {
+            assert!(matches!(
+                check_geometry(6, 4, 64).unwrap_err(),
+                WgpuError::Shape(_)
+            ));
+            assert!(matches!(
+                check_geometry(8, 4, MAX_HEAD_DIM + 1).unwrap_err(),
+                WgpuError::Unsupported(_)
+            ));
+        }
+        {
+            assert!(check_total(4, 3).is_err());
+            assert!(check_total(4, 4).is_ok());
+        }
+        {
+            assert_eq!(pack_bf16(&[1, 2, 3]), vec![0x0002_0001, 3]);
+            assert_eq!(pack_bf16(&[]), vec![0]);
+        }
+        {
+            assert_eq!(widen_u16(&[0x3f80, 0xbf00]), vec![0x3f80u32, 0xbf00u32]);
+            assert_eq!(widen_u16(&[]), vec![0]);
+            assert_eq!(bytes_to_words(&[1, 2, 3, 4]), vec![0x04030201u32]);
+            assert_eq!(bytes_to_words(&[]), vec![0]);
+        }
+        {
+            assert_eq!(bf16_bits_from_f32(1.0), 0x3f80);
+            assert_eq!(bf16_bits_from_f32(-2.0), 0xc000);
+            assert_eq!(bf16_bits_from_f32(f32::NAN), 0x7fc0);
+            assert_eq!(bf16_bits_from_f32(f32::from_bits(0x3f80_8000)), 0x3f80);
+            assert_eq!(bf16_bits_from_f32(f32::from_bits(0x3f81_8000)), 0x3f82);
+            assert_eq!(bf16_bits_from_f32(f32::from_bits(0x3f80_8001)), 0x3f81);
+        }
+        {
+            assert_eq!(fp8_entry_for(64).unwrap(), "attn_decode_small_m_fp8_hd64");
+            assert_eq!(fp8_entry_for(128).unwrap(), "attn_decode_small_m_fp8_hd128");
+            assert_eq!(fp8_entry_for(256).unwrap(), "attn_decode_small_m_fp8_hd256");
+            assert_eq!(fp8_entry_for(512).unwrap(), "attn_decode_small_m_fp8_hd512");
+            assert!(fp8_entry_for(96).is_err());
+            assert!(fp8_entry_for(1024).is_err());
+        }
+        {
+            for hd in FP8_SUPPORTED_HEAD_DIMS {
+                assert!(WGSL.contains(fp8_entry_for(hd).unwrap()));
+            }
+            assert!(crate::wgpu_backend::compose(WGSL).contains("fn e4m3_decode("));
         }
     }
 
     #[test]
-    fn geometry_rejects_ragged_head_groups() {
-        assert!(matches!(
-            check_geometry(6, 4, 64).unwrap_err(),
-            WgpuError::Shape(_)
-        ));
-        assert!(matches!(
-            check_geometry(8, 4, MAX_HEAD_DIM + 1).unwrap_err(),
-            WgpuError::Unsupported(_)
-        ));
-    }
-
-    #[test]
-    fn total_below_m_rows_is_rejected() {
-        assert!(check_total(4, 3).is_err());
-        assert!(check_total(4, 4).is_ok());
-    }
-
-    #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert_eq!(std::mem::size_of::<SmParams>() % 16, 0);
-    }
-
-    #[test]
-    fn bf16_pack_handles_odd_lengths() {
-        assert_eq!(pack_bf16(&[1, 2, 3]), vec![0x0002_0001, 3]);
-        assert_eq!(pack_bf16(&[]), vec![0]);
-    }
-
-    #[test]
     #[allow(clippy::assertions_on_constants)]
-    fn scratch_bytes_fit_a_32kb_threadgroup() {
-        assert!(
-            SCRATCH_BYTES <= 32768,
-            "scratch {SCRATCH_BYTES} exceeds 32KB"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn fp8_scratch_bytes_fit_a_32kb_threadgroup() {
-        assert_eq!(FP8_SCRATCH_BYTES, 20608);
-        assert!(
-            FP8_SCRATCH_BYTES <= 32768,
-            "fp8 scratch {FP8_SCRATCH_BYTES} exceeds 32KB"
-        );
-    }
-
-    #[test]
-    fn fp8_head_dim_selects_the_matching_entry_point() {
-        assert_eq!(fp8_entry_for(64).unwrap(), "attn_decode_small_m_fp8_hd64");
-        assert_eq!(fp8_entry_for(128).unwrap(), "attn_decode_small_m_fp8_hd128");
-        assert_eq!(fp8_entry_for(256).unwrap(), "attn_decode_small_m_fp8_hd256");
-        assert_eq!(fp8_entry_for(512).unwrap(), "attn_decode_small_m_fp8_hd512");
-        assert!(fp8_entry_for(96).is_err());
-        assert!(fp8_entry_for(1024).is_err());
-    }
-
-    #[test]
-    fn wgsl_declares_every_fp8_entry_point() {
-        for hd in FP8_SUPPORTED_HEAD_DIMS {
-            assert!(WGSL.contains(fp8_entry_for(hd).unwrap()));
+    fn params_are_uniform_sized_and_both_scratches_fit_a_32kb_threadgroup() {
+        {
+            assert_eq!(std::mem::size_of::<SmParams>() % 16, 0);
         }
-        assert!(crate::wgpu_backend::compose(WGSL).contains("fn e4m3_decode("));
-    }
-
-    #[test]
-    fn fp8_staging_helpers_round_trip() {
-        assert_eq!(widen_u16(&[0x3f80, 0xbf00]), vec![0x3f80u32, 0xbf00u32]);
-        assert_eq!(widen_u16(&[]), vec![0]);
-        assert_eq!(bytes_to_words(&[1, 2, 3, 4]), vec![0x04030201u32]);
-        assert_eq!(bytes_to_words(&[]), vec![0]);
-    }
-
-    #[test]
-    fn bf16_bits_round_to_nearest_even_like_the_wgsl_encoder() {
-        assert_eq!(bf16_bits_from_f32(1.0), 0x3f80);
-        assert_eq!(bf16_bits_from_f32(-2.0), 0xc000);
-        assert_eq!(bf16_bits_from_f32(f32::NAN), 0x7fc0);
-        assert_eq!(bf16_bits_from_f32(f32::from_bits(0x3f80_8000)), 0x3f80);
-        assert_eq!(bf16_bits_from_f32(f32::from_bits(0x3f81_8000)), 0x3f82);
-        assert_eq!(bf16_bits_from_f32(f32::from_bits(0x3f80_8001)), 0x3f81);
+        {
+            assert!(
+                SCRATCH_BYTES <= 32768,
+                "scratch {SCRATCH_BYTES} exceeds 32KB"
+            );
+        }
+        {
+            assert_eq!(FP8_SCRATCH_BYTES, 20608);
+            assert!(
+                FP8_SCRATCH_BYTES <= 32768,
+                "fp8 scratch {FP8_SCRATCH_BYTES} exceeds 32KB"
+            );
+        }
     }
 }

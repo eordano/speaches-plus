@@ -290,28 +290,20 @@ mod qat_q4_default_tests {
     use super::*;
 
     #[test]
-    fn without_the_opt_in_a_verified_gguf_is_still_not_served() {
+    fn the_qat_q4_decision_serves_the_gguf_only_when_opted_in_with_a_verified_candidate_and_the_env_override_short_circuits_discovery(
+    ) {
         assert_eq!(
             qat_q4_weights_decision(false, Some(PathBuf::from("/x/q4.gguf"))),
             None
         );
-    }
 
-    #[test]
-    fn opted_in_with_no_verified_candidate_serves_the_given_weights() {
         assert_eq!(qat_q4_weights_decision(true, None), None);
-    }
 
-    #[test]
-    fn opted_in_with_a_verified_candidate_serves_the_gguf() {
         assert_eq!(
             qat_q4_weights_decision(true, Some(PathBuf::from("/x/q4.gguf"))),
             Some(PathBuf::from("/x/q4.gguf"))
         );
-    }
 
-    #[test]
-    fn env_override_short_circuits_every_other_candidate() {
         let prev = std::env::var_os(G4MOE_QAT_GGUF_ENV);
         unsafe { std::env::set_var(G4MOE_QAT_GGUF_ENV, "/override/only.gguf") };
         let cands = qat_q4_gguf_candidates();

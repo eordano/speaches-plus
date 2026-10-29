@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use nv_layers::linear::Linear;
 use nv_layers::norm::RmsNorm;
@@ -95,25 +95,24 @@ impl Gemma4Config {
     nv_weights::hf_json_from_file!(from_hf_json_file, from_hf_json_str);
 
     pub fn from_hf_json_str(s: &str) -> Result<Self> {
-        let mut v: serde_json::Value =
-            serde_json::from_str(s).context("parse gemma4 config json")?;
+        let mut v: Value = serde_json::from_str(s).context("parse gemma4 config json")?;
 
         let root = v.as_object_mut().context("gemma4 config not an object")?;
         let tie = root
             .get("tie_word_embeddings")
             .cloned()
-            .unwrap_or(serde_json::Value::Bool(true));
+            .unwrap_or(Value::Bool(true));
         let mut text_obj = match root.remove("text_config") {
-            Some(serde_json::Value::Object(o)) => o,
-            Some(_) => anyhow::bail!("text_config must be an object"),
+            Some(Value::Object(o)) => o,
+            Some(_) => bail!("text_config must be an object"),
             None => root.clone(),
         };
         text_obj.insert("tie_word_embeddings".into(), tie);
-        let merged = serde_json::Value::Object(text_obj);
+        let merged = Value::Object(text_obj);
         let cfg: Gemma4Config =
             serde_json::from_value(merged).context("deserialize gemma4 text_config")?;
         if cfg.layer_types.len() != cfg.num_hidden_layers {
-            anyhow::bail!(
+            bail!(
                 "layer_types len {} != num_hidden_layers {}",
                 cfg.layer_types.len(),
                 cfg.num_hidden_layers
@@ -206,7 +205,7 @@ fn megakernel_fuse1_enabled() -> bool {
     use std::sync::OnceLock;
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
-        std::env::var("NV_MEGAKERNEL_FUSE1")
+        env::var("NV_MEGAKERNEL_FUSE1")
             .map(|v| v == "1")
             .unwrap_or(false)
     })
@@ -220,7 +219,7 @@ fn input_layernorm_rides_the_qkv_gemv_env_nv_norm_gemv_fused() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
         NORM_GEMV_FUSED_ARM_DEFAULT_OFF_BECAUSE_EVERY_PUBLISHED_GEMMA4_DECODE_NUMBER_WAS_MEASURED_ON_THE_INPUT_LAYERNORM_AS_ITS_OWN_GRAPH_NODE
-            || std::env::var("NV_NORM_GEMV_FUSED")
+            || env::var("NV_NORM_GEMV_FUSED")
                 .ok()
                 .and_then(|v| v.trim().parse::<i32>().ok())
                 .is_some_and(|rows_per_warp_rung| rows_per_warp_rung > 0)
@@ -267,7 +266,7 @@ impl Gemma4Attention {
             };
 
             #[cfg(feature = "cuda")]
-            if matches!(fused.device(), Device::Cuda(_)) {
+            if fused.device().is_cuda() {
                 let mut parts = vec![(0usize, self.q_dim), (self.q_dim, self.kv_dim)];
                 if self.has_v {
                     parts.push((self.q_dim + self.kv_dim, self.kv_dim));
@@ -320,7 +319,7 @@ impl Gemma4Attention {
 
             if !qkv_bf16
                 && proj.prenorm_nvfp4_eligible()
-                && matches!(x_pre.device(), Device::Cuda(_))
+                && x_pre.device().is_cuda()
             {
                 let fused =
                     proj.forward_prenorm_nvfp4(x_pre, norm.weight_bf16(), norm.eps() as f32)?;
@@ -371,13 +370,7 @@ pub struct Gemma4 {
     lm_head: Linear,
 
     #[cfg(feature = "cuda")]
-    lm_head_i8: Option<(
-        cudarc::driver::CudaSlice<i8>,
-        cudarc::driver::CudaSlice<f32>,
-    )>,
-
-    #[cfg(feature = "cuda")]
-    i8_verify_head_skipped_so_the_armed_epilogue_falls_back_to_bf16_instead_of_bailing: bool,
+    lm_head_i8: Option<(CudaSlice<i8>, CudaSlice<f32>)>,
 
     sliding_rope: Rope,
 
@@ -404,7 +397,7 @@ impl Gemma4 {
         weights: &WeightLoader,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_loader_inner(config, weights, None, false, device)
+        Self::from_loader_inner(config, weights, None, device)
     }
 
     #[cfg(feature = "cuda")]
@@ -417,20 +410,7 @@ impl Gemma4 {
         if matches!(qconfig.scheme, QuantScheme::None) {
             return Self::from_loader(config, weights, device);
         }
-        Self::from_loader_inner(config, weights, Some(qconfig), false, device)
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn from_loader_quantized_without_the_i8_verify_head_because_adapter_serving_engines_never_verify(
-        config: Gemma4Config,
-        weights: &WeightLoader,
-        qconfig: &QuantizationConfig,
-        device: &Device,
-    ) -> Result<Self> {
-        if matches!(qconfig.scheme, QuantScheme::None) {
-            return Self::from_loader_inner(config, weights, None, true, device);
-        }
-        Self::from_loader_inner(config, weights, Some(qconfig), true, device)
+        Self::from_loader_inner(config, weights, Some(qconfig), device)
     }
 
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
@@ -439,17 +419,16 @@ impl Gemma4 {
         weights: &WeightLoader,
         #[cfg(feature = "cuda")] qconfig: Option<&QuantizationConfig>,
         #[cfg(not(feature = "cuda"))] _qconfig: Option<&()>,
-        skip_the_i8_verify_head_because_this_engine_never_verifies: bool,
         device: &Device,
     ) -> Result<Self> {
-        anyhow::ensure!(
+        ensure!(
             !config.has_per_layer_embeddings(),
             "gemma4::Gemma4 is the dense decoder and has no per-layer-embedding stack, but this \
              config sets hidden_size_per_layer_input={}: it is an E4B/MatFormer checkpoint. \
              Load it with nv_models::gemma4_e4b::Gemma4E4b instead.",
             config.hidden_size_per_layer_input
         );
-        anyhow::ensure!(
+        ensure!(
             config.num_kv_shared_layers == 0,
             "gemma4::Gemma4 does not implement per-layer KV sharing, but this config sets \
              num_kv_shared_layers={} (layers {}..{} would reuse a source layer's KV). \
@@ -461,24 +440,22 @@ impl Gemma4 {
         let dtype = DType::BF16;
 
         #[cfg(feature = "cuda")]
-        let nvfp4_runner: Option<Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>> = match qconfig {
+        let nvfp4_runner: Option<Arc<Mutex<Nvfp4GemmRunner>>> = match qconfig {
             Some(q) if matches!(q.scheme, QuantScheme::Nvfp4) => match device {
                 Device::Cuda(d) => {
                     let stream = d.cuda_stream();
-                    Some(Arc::new(Mutex::new(nv_quant::nvfp4::Nvfp4GemmRunner::new(
-                        stream.clone(),
-                    )?)))
+                    Some(Arc::new(Mutex::new(Nvfp4GemmRunner::new(stream.clone())?)))
                 }
-                _ => anyhow::bail!("NVFP4 requires a CUDA device"),
+                _ => bail!("NVFP4 requires a CUDA device"),
             },
             _ => None,
         };
 
         #[cfg(feature = "cuda")]
-        let fp8_attn_runner: Option<Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>> =
+        let fp8_attn_runner: Option<Arc<Mutex<Fp8GemmRunner>>> =
             match (&nvfp4_runner, attn_proj_scheme(), device) {
                 (Some(_), AttnProjScheme::Fp8E4m3, Device::Cuda(d)) => Some(Arc::new(Mutex::new(
-                    nv_quant::fp8::Fp8GemmRunner::new(d.cuda_stream().clone())?,
+                    Fp8GemmRunner::new(d.cuda_stream().clone())?,
                 ))),
                 _ => None,
             };
@@ -492,7 +469,7 @@ impl Gemma4 {
             || embed_dims[0] != config.vocab_size
             || embed_dims[1] != config.hidden_size
         {
-            anyhow::bail!(
+            bail!(
                 "gemma4 embed: expected [{}, {}], got {:?}",
                 config.vocab_size,
                 config.hidden_size,
@@ -535,17 +512,11 @@ impl Gemma4 {
                 .get("lm_head.weight", dtype)
                 .with_context(|| "load lm_head.weight")?
         };
-        let mut lm_head = Linear::new(lm_head_weight.clone(), None)?;
-
-        if std::env::var("NV_LMHEAD_PRETRANSPOSED").is_ok_and(|v| v != "0") {
-            lm_head.ensure_pretransposed()?;
-            eprintln!("[gemma4] lm_head: resident pre-transposed copy enabled (NN GEMM path)");
-        }
+        let lm_head = Linear::new(lm_head_weight.clone(), None)?;
 
         #[cfg(feature = "cuda")]
-        let lm_head_i8 = if !skip_the_i8_verify_head_because_this_engine_never_verifies
-            && std::env::var("NV_VERIFY_LMHEAD_INT8").as_deref() != Ok("0")
-            && matches!(device, Device::Cuda(_))
+        let lm_head_i8 = if env::var("NV_VERIFY_LMHEAD_INT8").as_deref() != Ok("0")
+            && device.is_cuda()
         {
             Some(nv_layers::lm_head_resident_quant::rowquant_i8_dev(
                 &lm_head_weight,
@@ -566,9 +537,6 @@ impl Gemma4 {
             lm_head,
             #[cfg(feature = "cuda")]
             lm_head_i8,
-            #[cfg(feature = "cuda")]
-            i8_verify_head_skipped_so_the_armed_epilogue_falls_back_to_bf16_instead_of_bailing:
-                skip_the_i8_verify_head_because_this_engine_never_verifies,
             sliding_rope,
             full_rope,
             embed_scale,
@@ -595,10 +563,7 @@ impl Gemma4 {
     #[cfg(feature = "cuda")]
     pub fn lm_head_i8_quantized_copy_absent_when_nv_verify_lmhead_int8_is_0(
         &self,
-    ) -> Option<&(
-        cudarc::driver::CudaSlice<i8>,
-        cudarc::driver::CudaSlice<f32>,
-    )> {
+    ) -> Option<&(CudaSlice<i8>, CudaSlice<f32>)> {
         self.lm_head_i8.as_ref()
     }
     pub fn sliding_rope(&self) -> &Rope {
@@ -625,11 +590,11 @@ impl Gemma4 {
     pub fn forward(&self, tokens: &Tensor, positions: &Tensor) -> Result<Tensor> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!("Gemma4.forward: tokens must be [1, seq], got {:?}", dims);
+            bail!("Gemma4.forward: tokens must be [1, seq], got {:?}", dims);
         }
         let seq = dims[1];
         #[cfg(feature = "cuda")]
-        if std::env::var("NV_GEMMA4_FP8_KV").is_ok() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_GEMMA4_FP8_KV") {
             let mut cache = self.new_kv_cache_fp8(seq.max(1))?;
             return self.forward_with_cache(tokens, positions, &mut cache);
         }
@@ -709,7 +674,7 @@ impl Gemma4 {
         tokens: &Tensor,
         positions: &Tensor,
         cache: &mut C,
-        out_logits: &mut cudarc::driver::CudaSlice<f32>,
+        out_logits: &mut CudaSlice<f32>,
     ) -> Result<()> {
         let logits = self.forward_with_cache_body(tokens, positions, cache)?;
         tanh_softcap_bf16_to_f32_into_op(
@@ -750,7 +715,6 @@ impl Gemma4 {
         self.forward_with_cache_body_rows(tokens, positions, cache, hook, attn_mask, None, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn forward_with_cache_body_rows<C: Gemma4Cache>(
         &self,
         tokens: &Tensor,
@@ -763,11 +727,11 @@ impl Gemma4 {
     ) -> Result<Tensor> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!("Gemma4.forward: tokens must be [1, seq], got {:?}", dims);
+            bail!("Gemma4.forward: tokens must be [1, seq], got {:?}", dims);
         }
         let seq = dims[1];
         if positions.dims() != [seq] {
-            anyhow::bail!(
+            bail!(
                 "Gemma4.forward: positions must be [{}], got {:?}",
                 seq,
                 positions.dims()
@@ -775,7 +739,7 @@ impl Gemma4 {
         }
         if let Some(m) = attn_mask {
             if m.dims() != [seq, seq] {
-                anyhow::bail!(
+                bail!(
                     "Gemma4.forward: attn_mask must be [{seq},{seq}], got {:?}",
                     m.dims()
                 );
@@ -792,7 +756,7 @@ impl Gemma4 {
                 scale_bf16_op(&x, self.embed_scale, &self.device)?
             }
             Some(e) => {
-                anyhow::ensure!(
+                ensure!(
                     e.dims() == [seq, self.config.hidden_size],
                     "Gemma4.forward: embeds override must be [{seq}, {}] pre-scaled rows, got {:?}",
                     self.config.hidden_size,
@@ -823,6 +787,42 @@ impl Gemma4 {
         self.final_norm_then_lm_head_rows(&hidden_lr)
     }
 
+    pub fn residual_rows_after_layer<C: Gemma4Cache>(
+        &self,
+        tokens: &Tensor,
+        positions: &Tensor,
+        cache: &mut C,
+        layer: usize,
+    ) -> Result<Tensor> {
+        ensure!(
+            layer < self.layers.len(),
+            "capture layer {layer} out of range for {} blocks",
+            self.layers.len()
+        );
+        let dims = tokens.dims();
+        ensure!(
+            dims.len() == 2 && dims[0] == 1,
+            "Gemma4 capture: tokens must be [1, seq], got {dims:?}"
+        );
+        let seq = dims[1];
+        let tokens_flat = tokens.flatten_all()?.to_dtype(DType::U32)?;
+        let x = embed_lookup_bf16_op(&self.embed_weight, &tokens_flat, &self.device)?
+            .reshape((1usize, seq, self.config.hidden_size))?
+            .to_dtype(self.dtype)?;
+        let mut hidden = scale_bf16_op(&x, self.embed_scale, &self.device)?;
+        let write_start = cache.current_len();
+        let new_total = write_start + seq;
+        cache.prepare_for_decode(write_start, new_total)?;
+        for li in 0..=layer {
+            hidden =
+                self.layer_forward_masked(li, &hidden, positions, cache, seq, new_total, None)?;
+        }
+        cache.advance(seq);
+        Ok(hidden
+            .reshape((seq, self.config.hidden_size))?
+            .to_dtype(DType::F32)?)
+    }
+
     fn final_norm_then_lm_head_rows(&self, hidden_lr: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if decode_lmhead_i8_arm_enabled_env_nv_g4_lmhead_i8_shared_with_the_batch_graph_step_arm() {
@@ -843,18 +843,13 @@ impl Gemma4 {
         hidden_lr: &Tensor,
     ) -> Result<Option<Tensor>> {
         let dims = hidden_lr.dims();
-        anyhow::ensure!(
+        ensure!(
             dims.len() == 3 && dims[0] == 1 && dims[2] == self.config.hidden_size,
             "lm_head epilogue expects [1, rows, hidden], got {dims:?}"
         );
         let rows = dims[1];
         let Some((wq, rs)) = self.lm_head_i8.as_ref() else {
-            if self
-                .i8_verify_head_skipped_so_the_armed_epilogue_falls_back_to_bf16_instead_of_bailing
-            {
-                return Ok(None);
-            }
-            anyhow::bail!(
+            bail!(
                 "NV_G4_LMHEAD_I8=1 needs the i8 lm_head copy; it is absent because \
                  NV_VERIFY_LMHEAD_INT8=0 disabled building it"
             );
@@ -862,9 +857,8 @@ impl Gemma4 {
         if rows > lm_head_i8_rows_per_call(self.config.hidden_size) {
             return Ok(None);
         }
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("lm_head_i8 epilogue requires a CUDA device"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("lm_head_i8 epilogue requires a CUDA device")
         };
         let hflat = hidden_lr.reshape((rows, self.config.hidden_size))?;
         let rstd = crate::gemma4_e4b::rstd_op(&hflat, self.config.rms_norm_eps as f32)?;
@@ -880,14 +874,14 @@ impl Gemma4 {
         &self,
         tokens: &[u32],
         positions: &[usize],
-        caches: &mut [&mut crate::paged_fp8::PagedGemma4Cache],
+        caches: &mut [&mut PagedGemma4Cache],
     ) -> Result<Tensor> {
         let b = tokens.len();
         if b == 0 {
-            anyhow::bail!("forward_decode_batched: empty batch");
+            bail!("forward_decode_batched: empty batch");
         }
         if positions.len() != b || caches.len() != b {
-            anyhow::bail!(
+            bail!(
                 "forward_decode_batched: ragged batch tokens={} positions={} caches={}",
                 b,
                 positions.len(),
@@ -906,7 +900,7 @@ impl Gemma4 {
         for (i, cache) in caches.iter_mut().enumerate() {
             let len = cache.current_len();
             if len != positions[i] {
-                anyhow::bail!(
+                bail!(
                     "forward_decode_batched: seq {i} cache len {len} != position {}",
                     positions[i]
                 );
@@ -942,7 +936,7 @@ impl Gemma4 {
         idx: usize,
         x: &Tensor,
         positions: &Tensor,
-        caches: &mut [&mut crate::paged_fp8::PagedGemma4Cache],
+        caches: &mut [&mut PagedGemma4Cache],
         b: usize,
     ) -> Result<Tensor> {
         let layer = &self.layers[idx];
@@ -981,7 +975,7 @@ impl Gemma4 {
         layer_idx: usize,
         x: &Tensor,
         positions: &Tensor,
-        caches: &mut [&mut crate::paged_fp8::PagedGemma4Cache],
+        caches: &mut [&mut PagedGemma4Cache],
         b: usize,
     ) -> Result<Tensor> {
         let layer = &self.layers[layer_idx];
@@ -1076,12 +1070,12 @@ impl Gemma4 {
     ) -> Result<(Tensor, Vec<Tensor>)> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!("Gemma4.forward: tokens must be [1, seq], got {:?}", dims);
+            bail!("Gemma4.forward: tokens must be [1, seq], got {:?}", dims);
         }
         let seq = dims[1];
         for &li in layers {
             if li >= self.layers.len() {
-                anyhow::bail!(
+                bail!(
                     "forward_with_aux_hidden_masked: layer index {} out of range (have {} layers)",
                     li,
                     self.layers.len()
@@ -1111,12 +1105,12 @@ impl Gemma4 {
     ) -> Result<(Tensor, Vec<Tensor>)> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!("Gemma4.forward: tokens must be [1, seq], got {:?}", dims);
+            bail!("Gemma4.forward: tokens must be [1, seq], got {:?}", dims);
         }
         let seq = dims[1];
         for &li in layers {
             if li >= self.layers.len() {
-                anyhow::bail!(
+                bail!(
                     "forward_with_aux_hidden: layer index {} out of range (have {} layers)",
                     li,
                     self.layers.len()
@@ -1125,7 +1119,7 @@ impl Gemma4 {
         }
         let mut collector = Gemma4HiddenCollector::new(layers);
         #[cfg(feature = "cuda")]
-        let logits = if std::env::var("NV_GEMMA4_FP8_KV").is_ok() {
+        let logits = if nv_config::env_arm_present_at_all_reread_every_call("NV_GEMMA4_FP8_KV") {
             let mut cache = self.new_kv_cache_fp8(seq.max(1))?;
             let raw = self.forward_with_cache_body_hooked(
                 tokens,
@@ -1159,7 +1153,6 @@ impl Gemma4 {
         Ok((logits, hidden_states))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn layer_forward_masked<C: Gemma4Cache>(
         &self,
         idx: usize,
@@ -1227,7 +1220,6 @@ impl Gemma4 {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn attention_forward_masked<C: Gemma4Cache>(
         &self,
         layer_idx: usize,
@@ -1341,13 +1333,13 @@ pub trait Gemma4LayerHook {
 
 fn det_debug_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NV_DEBUG_DETERMINISM").is_some())
+    *ON.get_or_init(|| nv_config::env_arm_present_at_all_reread_every_call("NV_DEBUG_DETERMINISM"))
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn batch_rowdiff_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("NV_BATCH_ROWDIFF").is_some())
+    *ON.get_or_init(|| nv_config::env_arm_present_at_all_reread_every_call("NV_BATCH_ROWDIFF"))
 }
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -1393,15 +1385,13 @@ fn rowdiff_rows(tag: &str, layer: usize, t: &Tensor, dim: usize, b: usize) {
     }
 }
 
-#[allow(clippy::type_complexity)]
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn rowdiff_slot(tag: &str, layer: usize, slot: usize, t: &Tensor) {
     if !batch_rowdiff_enabled() || ROWDIFF_TRIPPED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    static SEEN: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (usize, u64)>>,
-    > = std::sync::OnceLock::new();
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, (usize, u64)>>> =
+        std::sync::OnceLock::new();
     let m = SEEN.get_or_init(Default::default);
     let h = match rowdiff_hash(t) {
         Ok(h) => h,
@@ -1464,7 +1454,7 @@ impl Gemma4HiddenCollector {
             })?;
             let dims = t.dims();
             if dims != [1, seq, hidden] {
-                anyhow::bail!(
+                bail!(
                     "Gemma4HiddenCollector: layer {} hidden has dims {:?}, expected [1,{seq},{hidden}]",
                     li,
                     dims
@@ -1625,7 +1615,7 @@ pub fn check_kv_window(what: &str, write_pos: usize, t: usize, max_seq_len: usiz
         .checked_add(t)
         .ok_or_else(|| anyhow::anyhow!("{what}: write_pos {write_pos} + {t} overflows usize"))?;
     if end > max_seq_len {
-        anyhow::bail!(
+        bail!(
             "{what}: write of {t} token(s) at position {write_pos} ends at {end}, past max_seq_len {max_seq_len}"
         );
     }
@@ -1664,10 +1654,8 @@ impl Gemma4KvCache {
             let head_dim = config.head_dim_for(*kind);
             let n_kv = config.num_kv_heads_for(*kind);
 
-            let force_full = std::env::var_os("NV_KV_NO_SLIDING").is_some();
             let (cap, window) = match kind {
                 LayerType::FullAttention => (max_seq_len, None),
-                LayerType::SlidingAttention if force_full => (max_seq_len, None),
                 LayerType::SlidingAttention => {
                     let w = config.sliding_window.max(1);
                     (max_seq_len.min(w + SLIDING_COMPACT_SLACK), Some(w))
@@ -1723,13 +1711,13 @@ impl Gemma4KvCache {
         let (n_kv, head_dim) = self.layer_shapes[layer];
         let dims = k_new.dims();
         if dims.len() != 4 || dims[0] != 1 || dims[2] != n_kv || dims[3] != head_dim {
-            anyhow::bail!(
+            bail!(
                 "Gemma4KvCache.write_at layer {layer}: expected [1, t, {n_kv}, {head_dim}], got {:?}",
                 dims
             );
         }
         if v_new.dims() != dims {
-            anyhow::bail!(
+            bail!(
                 "Gemma4KvCache.write_at: k/v shape mismatch k={:?} v={:?}",
                 dims,
                 v_new.dims()
@@ -1754,7 +1742,7 @@ impl Gemma4KvCache {
                 self.layer_stored[layer] = stored;
             }
             if stored + t > cap {
-                anyhow::bail!(
+                bail!(
                     "Gemma4KvCache.write_at: sliding layer {layer} write of {t} tokens exceeds \
                      capacity {cap} (window+slack); prompts longer than the window need chunked \
                      prefill"
@@ -1764,7 +1752,7 @@ impl Gemma4KvCache {
         } else {
             let end = start + t;
             if end > self.max_seq_len {
-                anyhow::bail!(
+                bail!(
                     "Gemma4KvCache.write_at: end {} exceeds max_seq_len {}",
                     end,
                     self.max_seq_len
@@ -1784,7 +1772,7 @@ impl Gemma4KvCache {
 
     pub fn view(&self, layer: usize, _len: usize) -> Result<(Tensor, Tensor)> {
         if layer >= self.layers.len() {
-            anyhow::bail!("Gemma4KvCache.view: layer {layer} out of range");
+            bail!("Gemma4KvCache.view: layer {layer} out of range");
         }
 
         let stored = self.layer_stored[layer];
@@ -1856,26 +1844,26 @@ pub struct Gemma4KvCacheFp8 {
     device: Device,
 
     #[cfg(feature = "cuda")]
-    write_pos_dev: cudarc::driver::CudaSlice<i32>,
+    write_pos_dev: CudaSlice<i32>,
     #[cfg(feature = "cuda")]
-    n_total_dev: cudarc::driver::CudaSlice<i32>,
+    n_total_dev: CudaSlice<i32>,
     #[cfg(feature = "cuda")]
     host_write_pos: Box<[i32; 1]>,
     #[cfg(feature = "cuda")]
     host_n_total: Box<[i32; 1]>,
 
     #[cfg(feature = "cuda")]
-    flash_scratch: cudarc::driver::CudaSlice<f32>,
+    flash_scratch: CudaSlice<f32>,
     #[cfg(feature = "cuda")]
-    flash_fan_in: cudarc::driver::CudaSlice<u32>,
+    flash_fan_in: CudaSlice<u32>,
 }
 
 #[cfg(feature = "cuda")]
 struct Gemma4KvCacheFp8Layer {
-    k_fp8: cudarc::driver::CudaSlice<u8>,
-    v_fp8: cudarc::driver::CudaSlice<u8>,
-    k_scales: cudarc::driver::CudaSlice<f32>,
-    v_scales: cudarc::driver::CudaSlice<f32>,
+    k_fp8: CudaSlice<u8>,
+    v_fp8: CudaSlice<u8>,
+    k_scales: CudaSlice<f32>,
+    v_scales: CudaSlice<f32>,
 }
 
 pub fn kv_fp8_ring_slots(sliding_window: usize) -> usize {
@@ -2013,9 +2001,8 @@ impl Gemma4KvCacheFp8 {
         device: &Device,
         windowed: bool,
     ) -> Result<Self> {
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("Gemma4KvCacheFp8 requires a CUDA device"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("Gemma4KvCacheFp8 requires a CUDA device")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -2039,18 +2026,10 @@ impl Gemma4KvCacheFp8 {
             layer_windows.push(window);
             let elem_count = slots * n_kv * head_dim;
             let scale_count = slots * n_kv;
-            let k_fp8 = stream
-                .alloc_zeros::<u8>(elem_count)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let v_fp8 = stream
-                .alloc_zeros::<u8>(elem_count)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let k_scales = stream
-                .alloc_zeros::<f32>(scale_count)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let v_scales = stream
-                .alloc_zeros::<f32>(scale_count)
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let k_fp8 = stream.alloc_zeros::<u8>(elem_count)?;
+            let v_fp8 = stream.alloc_zeros::<u8>(elem_count)?;
+            let k_scales = stream.alloc_zeros::<f32>(scale_count)?;
+            let v_scales = stream.alloc_zeros::<f32>(scale_count)?;
             layers.push(Gemma4KvCacheFp8Layer {
                 k_fp8,
                 v_fp8,
@@ -2059,26 +2038,18 @@ impl Gemma4KvCacheFp8 {
             });
             layer_shapes.push((n_kv, head_dim));
         }
-        let write_pos_dev = stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let n_total_dev = stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let write_pos_dev = stream.alloc_zeros::<i32>(1)?;
+        let n_total_dev = stream.alloc_zeros::<i32>(1)?;
 
         let n_q = config.num_attention_heads;
         let hd_max = layer_shapes.iter().map(|&(_, hd)| hd).max().unwrap_or(0);
         let scratch_elems = nv_kernels::cuda::flash_splitk_scratch_elems(n_q as i32, hd_max as i32);
-        anyhow::ensure!(
+        ensure!(
             scratch_elems > 0,
             "Gemma4KvCacheFp8: bad flash scratch size for n_q={n_q} hd_max={hd_max}"
         );
-        let flash_scratch = stream
-            .alloc_zeros::<f32>(scratch_elems as usize)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let flash_fan_in = stream
-            .alloc_zeros::<u32>(n_q.max(1))
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let flash_scratch = stream.alloc_zeros::<f32>(scratch_elems as usize)?;
+        let flash_fan_in = stream.alloc_zeros::<u32>(n_q.max(1))?;
 
         Ok(Self {
             layers,
@@ -2099,9 +2070,6 @@ impl Gemma4KvCacheFp8 {
 
     pub fn current_len(&self) -> usize {
         self.current_len
-    }
-    pub fn max_total_for_attn(&self) -> i32 {
-        self.max_seq_len as i32
     }
     pub fn max_seq_len(&self) -> usize {
         self.max_seq_len
@@ -2127,7 +2095,7 @@ impl Gemma4KvCacheFp8 {
             self.max_seq_len,
         )?;
         if n_total > self.max_seq_len {
-            anyhow::bail!(
+            bail!(
                 "Gemma4KvCacheFp8.set_pending_pos: n_total {} exceeds max_seq_len {}",
                 n_total,
                 self.max_seq_len
@@ -2146,7 +2114,7 @@ impl Gemma4KvCacheFp8 {
             self.max_seq_len,
         )?;
         if n_total > self.max_seq_len {
-            anyhow::bail!(
+            bail!(
                 "Gemma4KvCacheFp8.prepare_for_decode: n_total {} exceeds max_seq_len {}",
                 n_total,
                 self.max_seq_len
@@ -2154,9 +2122,8 @@ impl Gemma4KvCacheFp8 {
         }
         self.host_write_pos[0] = write_pos as i32;
         self.host_n_total[0] = n_total as i32;
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         stream
@@ -2174,7 +2141,7 @@ impl Gemma4KvCacheFp8 {
         use std::ffi::c_void;
 
         if layer >= self.layer_shapes.len() {
-            anyhow::bail!(
+            bail!(
                 "Gemma4KvCacheFp8.write_at: layer {layer} out of range ({} layers)",
                 self.layer_shapes.len()
             );
@@ -2182,13 +2149,13 @@ impl Gemma4KvCacheFp8 {
         let (n_kv, head_dim) = self.layer_shapes[layer];
         let dims = k_new.dims();
         if dims.len() != 4 || dims[0] != 1 || dims[2] != n_kv || dims[3] != head_dim {
-            anyhow::bail!(
+            bail!(
                 "Gemma4KvCacheFp8.write_at layer {layer}: expected [1, t, {n_kv}, {head_dim}], got {:?}",
                 dims
             );
         }
         if v_new.dims() != dims {
-            anyhow::bail!(
+            bail!(
                 "Gemma4KvCacheFp8.write_at: k/v shape mismatch k={:?} v={:?}",
                 dims,
                 v_new.dims()
@@ -2205,15 +2172,14 @@ impl Gemma4KvCacheFp8 {
         let ring = self.layer_rings[layer];
         if ring > 0 {
             let window = self.layer_windows[layer];
-            anyhow::ensure!(
+            ensure!(
                 t <= ring - window + 1,
                 "Gemma4KvCacheFp8.write_at: single append of {t} rows exceeds ring \
                  capacity {ring} for window {window}; chunk the prefill"
             );
         }
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
 
@@ -2223,12 +2189,12 @@ impl Gemma4KvCacheFp8 {
         let (k_storage, kl) = k_new.storage_and_layout();
         let (v_storage, vl) = v_new.storage_and_layout();
         let k_cuda = match &*k_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("k_new must be on the CUDA device"),
+            Storage::Cuda(s) => s,
+            _ => bail!("k_new must be on the CUDA device"),
         };
         let v_cuda = match &*v_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("v_new must be on the CUDA device"),
+            Storage::Cuda(s) => s,
+            _ => bail!("v_new must be on the CUDA device"),
         };
         let k_slice = k_cuda.as_cuda_slice::<bf16>()?;
         let v_slice = v_cuda.as_cuda_slice::<bf16>()?;
@@ -2257,7 +2223,7 @@ impl Gemma4KvCacheFp8 {
             )
         };
         if rc_k != 0 {
-            anyhow::bail!("quantize_kv_fp8(k) rc={rc_k}");
+            bail!("quantize_kv_fp8(k) rc={rc_k}");
         }
         let rc_v = unsafe {
             nv_kernels::cuda::quantize_kv_fp8(
@@ -2273,7 +2239,7 @@ impl Gemma4KvCacheFp8 {
             )
         };
         if rc_v != 0 {
-            anyhow::bail!("quantize_kv_fp8(v) rc={rc_v}");
+            bail!("quantize_kv_fp8(v) rc={rc_v}");
         }
         Ok(())
     }
@@ -2285,7 +2251,7 @@ impl Gemma4KvCacheFp8 {
 
         let (n_kv, head_dim) = self.layer_shapes[layer];
         if len > self.max_seq_len {
-            anyhow::bail!(
+            bail!(
                 "Gemma4KvCacheFp8.view_bf16: len {len} > max_seq_len {}",
                 self.max_seq_len
             );
@@ -2297,15 +2263,14 @@ impl Gemma4KvCacheFp8 {
         } else {
             (0usize, len)
         };
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let need = eff * n_kv * head_dim;
 
-        let mut k_out = unsafe { stream.alloc::<bf16>(need).map_err(|e| anyhow::anyhow!(e))? };
-        let mut v_out = unsafe { stream.alloc::<bf16>(need).map_err(|e| anyhow::anyhow!(e))? };
+        let mut k_out = unsafe { stream.alloc::<bf16>(need)? };
+        let mut v_out = unsafe { stream.alloc::<bf16>(need)? };
 
         let layer_ref = &self.layers[layer];
         {
@@ -2330,7 +2295,7 @@ impl Gemma4KvCacheFp8 {
                 )
             };
             if rc_k != 0 {
-                anyhow::bail!("dequantize_kv_fp8(k) rc={rc_k}");
+                bail!("dequantize_kv_fp8(k) rc={rc_k}");
             }
             let rc_v = unsafe {
                 nv_kernels::cuda::dequantize_kv_fp8(
@@ -2346,22 +2311,22 @@ impl Gemma4KvCacheFp8 {
                 )
             };
             if rc_v != 0 {
-                anyhow::bail!("dequantize_kv_fp8(v) rc={rc_v}");
+                bail!("dequantize_kv_fp8(v) rc={rc_v}");
             }
         }
 
-        let k_storage = candle_core::CudaStorage::wrap_cuda_slice(k_out, dev.clone());
-        let v_storage = candle_core::CudaStorage::wrap_cuda_slice(v_out, dev);
+        let k_storage = CudaStorage::wrap_cuda_slice(k_out, dev.clone());
+        let v_storage = CudaStorage::wrap_cuda_slice(v_out, dev);
         let k = candle_core::Tensor::from_storage(
-            candle_core::Storage::Cuda(k_storage),
+            Storage::Cuda(k_storage),
             (1usize, eff, n_kv, head_dim),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         let v = candle_core::Tensor::from_storage(
-            candle_core::Storage::Cuda(v_storage),
+            Storage::Cuda(v_storage),
             (1usize, eff, n_kv, head_dim),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         Ok((k, v))
@@ -2385,28 +2350,23 @@ impl Gemma4KvCacheFp8 {
         let expected = n_q * head_dim;
         let total: usize = dims.iter().product();
         if total != expected {
-            anyhow::bail!(
+            bail!(
                 "decode_attention_fp8 layer {layer}: expected total {expected}, got dims {:?}",
                 dims
             );
         }
-        let dev = match self.device.clone() {
-            Device::Cuda(d) => d,
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
 
-        let mut out = unsafe {
-            stream
-                .alloc::<bf16>(expected)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut out = unsafe { stream.alloc::<bf16>(expected)? };
 
         let q_c = q_rot.contiguous()?;
         let (q_storage, _ql) = q_c.storage_and_layout();
         let q_cuda = match &*q_storage {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("q_rot must be on CUDA"),
+            Storage::Cuda(s) => s,
+            _ => bail!("q_rot must be on CUDA"),
         };
         let q_slice = q_cuda.as_cuda_slice::<bf16>()?;
 
@@ -2424,7 +2384,7 @@ impl Gemma4KvCacheFp8 {
 
         let sw_i32 = sliding_window.map(|w| w as i32).unwrap_or(0);
         let ring_i32 = self.layer_rings[layer] as i32;
-        anyhow::ensure!(
+        ensure!(
             ring_i32 == 0 || sw_i32 > 0,
             "decode_attention_fp8: ring layer {layer} requires a sliding window"
         );
@@ -2451,7 +2411,7 @@ impl Gemma4KvCacheFp8 {
             )
         };
         if rc != 0 {
-            anyhow::bail!("flash_decode_fused_fp8kv rc={rc}");
+            bail!("flash_decode_fused_fp8kv rc={rc}");
         }
 
         drop(_go);
@@ -2465,11 +2425,11 @@ impl Gemma4KvCacheFp8 {
         drop(_gnt);
         drop(q_storage);
 
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev);
+        let storage = CudaStorage::wrap_cuda_slice(out, dev);
         let tensor = candle_core::Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, 1usize, n_q, head_dim),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         );
         Ok(tensor)
@@ -2484,8 +2444,8 @@ impl Gemma4Layer {
         kind: LayerType,
         weights: &WeightLoader,
         qconfig: Option<&QuantizationConfig>,
-        nvfp4_runner: Option<Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>>,
-        fp8_attn_runner: Option<Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>>,
+        nvfp4_runner: Option<Arc<Mutex<Nvfp4GemmRunner>>>,
+        fp8_attn_runner: Option<Arc<Mutex<Fp8GemmRunner>>>,
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
@@ -2531,7 +2491,7 @@ impl Gemma4Layer {
             .get(&format!("{prefix}.layer_scalar"), dtype)
             .with_context(|| format!("load {prefix}.layer_scalar"))?;
         if layer_scalar.dims() != [1] {
-            anyhow::bail!(
+            bail!(
                 "{prefix}.layer_scalar expected [1], got {:?}",
                 layer_scalar.dims()
             );
@@ -2783,9 +2743,7 @@ impl Gemma4Layer {
 
 impl CausalLm for Gemma4 {
     fn forward(&mut self, _tokens: &[u32], _positions: &[u32]) -> Result<Vec<f32>> {
-        anyhow::bail!(
-            "Gemma4 CausalLm shim not wired; call Gemma4::forward(&Tensor, &Tensor) directly"
-        )
+        bail!("Gemma4 CausalLm shim not wired; call Gemma4::forward(&Tensor, &Tensor) directly")
     }
     fn vocab_size(&self) -> usize {
         self.config.vocab_size
@@ -2840,41 +2798,35 @@ fn build_full_rope(config: &Gemma4Config, device: &Device) -> Result<Rope> {
 
 #[cfg(feature = "cuda")]
 pub enum VerifyKvStore {
-    Bf16 {
-        k: Vec<cudarc::driver::CudaSlice<half::bf16>>,
-        v: Vec<cudarc::driver::CudaSlice<half::bf16>>,
-        scratch_k: cudarc::driver::CudaSlice<half::bf16>,
-        scratch_v: cudarc::driver::CudaSlice<half::bf16>,
-    },
     Fp8 {
-        k: Vec<cudarc::driver::CudaSlice<u8>>,
-        v: Vec<cudarc::driver::CudaSlice<u8>>,
-        k_scale: Vec<cudarc::driver::CudaSlice<f32>>,
-        v_scale: Vec<cudarc::driver::CudaSlice<f32>>,
-        scratch_k: cudarc::driver::CudaSlice<u8>,
-        scratch_v: cudarc::driver::CudaSlice<u8>,
-        scratch_ks: cudarc::driver::CudaSlice<f32>,
-        scratch_vs: cudarc::driver::CudaSlice<f32>,
+        k: Vec<CudaSlice<u8>>,
+        v: Vec<CudaSlice<u8>>,
+        k_scale: Vec<CudaSlice<f32>>,
+        v_scale: Vec<CudaSlice<f32>>,
+        scratch_k: CudaSlice<u8>,
+        scratch_v: CudaSlice<u8>,
+        scratch_ks: CudaSlice<f32>,
+        scratch_vs: CudaSlice<f32>,
     },
 }
 
 #[cfg(feature = "cuda")]
 pub struct Gemma4VerifyCache {
     store: VerifyKvStore,
-    n_committed: cudarc::driver::CudaSlice<i32>,
+    n_committed: CudaSlice<i32>,
 
     row_stride: Vec<usize>,
     head_dims: Vec<usize>,
     ring: Vec<usize>,
 
     scratch_rows: usize,
-    path_dev: cudarc::driver::CudaSlice<i32>,
+    path_dev: CudaSlice<i32>,
     max_seq: usize,
     device: candle_core::CudaDevice,
-    mk_scratch: Option<cudarc::driver::CudaSlice<f32>>,
-    mk_fan_in: Option<cudarc::driver::CudaSlice<u32>>,
-    gqa512_scratch: Option<cudarc::driver::CudaSlice<f32>>,
-    prefill_shadow: std::collections::HashMap<usize, (Tensor, Tensor)>,
+    mk_scratch: Option<CudaSlice<f32>>,
+    mk_fan_in: Option<CudaSlice<u32>>,
+    gqa512_scratch: Option<CudaSlice<f32>>,
+    prefill_shadow: HashMap<usize, (Tensor, Tensor)>,
     prefill_shadow_disabled: bool,
 }
 
@@ -2883,8 +2835,8 @@ pub fn mk_verify_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         mk_verify_gate(
-            std::env::var("NV_EAGLE3_MK_VERIFY").ok().as_deref(),
-            std::env::var("NV_EAGLE3_TREE").ok().as_deref(),
+            env::var("NV_EAGLE3_MK_VERIFY").ok().as_deref(),
+            env::var("NV_EAGLE3_TREE").ok().as_deref(),
         )
     })
 }
@@ -2893,23 +2845,14 @@ pub fn mk_verify_gate(mk_raw: Option<&str>, tree_raw: Option<&str>) -> bool {
     mk_raw == Some("1") && tree_raw.is_none()
 }
 
-pub fn mk_verify_hd512_from(raw: Option<&str>) -> bool {
-    raw != Some("0")
-}
-
-pub fn mk_verify_hd512_gate(hd512_raw: Option<&str>, tree_raw: Option<&str>) -> bool {
-    mk_verify_hd512_from(hd512_raw) && tree_raw.is_none()
+pub fn mk_verify_hd512_gate(tree_raw: Option<&str>) -> bool {
+    tree_raw.is_none()
 }
 
 #[cfg(feature = "cuda")]
 fn mk_verify_hd512_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        mk_verify_hd512_gate(
-            std::env::var("NV_MK_VERIFY_HD512").ok().as_deref(),
-            std::env::var("NV_EAGLE3_TREE").ok().as_deref(),
-        )
-    })
+    *ON.get_or_init(|| mk_verify_hd512_gate(env::var("NV_EAGLE3_TREE").ok().as_deref()))
 }
 
 pub fn gqa512_verify_geometry(n_q: usize, n_kv_full: usize, hd_full: usize) -> bool {
@@ -2918,7 +2861,7 @@ pub fn gqa512_verify_geometry(n_q: usize, n_kv_full: usize, hd_full: usize) -> b
 
 #[cfg(feature = "cuda")]
 fn gqa512_verify_scratch_elems_for(config: &Gemma4Config) -> Option<usize> {
-    if !(verify_kv_use_fp8() && mk_verify_hd512_enabled()) {
+    if !mk_verify_hd512_enabled() {
         return None;
     }
     let n_q = config.num_attention_heads;
@@ -2946,8 +2889,8 @@ const GQA512_VERIFY_SPLITS: i32 = 64;
 
 #[cfg(feature = "cuda")]
 fn gqa512_dispatch_note(site: &str, idx: usize, k: usize, n_q: usize, n_kv: usize, hd: usize) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    if std::env::var("NV_PROF_CHAT").is_err() {
+    static ONCE: Once = Once::new();
+    if !nv_config::env_arm_present_at_all_reread_every_call("NV_PROF_CHAT") {
         return;
     }
     ONCE.call_once(|| {
@@ -2964,25 +2907,13 @@ pub fn verify_mask_is_chain(mask: &[u8], k: usize) -> bool {
         && (0..k).all(|i| (0..k).all(|j| (mask[i * k + j] != 0) == (j <= i)))
 }
 
-pub const LM_HEAD_I8_LEGACY_CHUNK_ROWS_PREDATING_THE_MK_M16_LAUNCHER: usize = 4;
-
-pub fn lm_head_i8_rows_per_call_gate(
-    legacy_chunk4_raw: Option<&str>,
-    kernel_ceiling_m: usize,
-) -> usize {
-    if legacy_chunk4_raw == Some("1") {
-        LM_HEAD_I8_LEGACY_CHUNK_ROWS_PREDATING_THE_MK_M16_LAUNCHER
-    } else {
-        kernel_ceiling_m.max(1)
-    }
+pub fn lm_head_i8_rows_per_call_gate(kernel_ceiling_m: usize) -> usize {
+    kernel_ceiling_m.max(1)
 }
 
 #[cfg(feature = "cuda")]
 fn lm_head_i8_rows_per_call(hidden: usize) -> usize {
-    static LEGACY_CHUNK4_ENV: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    let raw = LEGACY_CHUNK4_ENV.get_or_init(|| std::env::var("NV_VERIFY_LMHEAD_I8_CHUNK4").ok());
     lm_head_i8_rows_per_call_gate(
-        raw.as_deref(),
         nv_kernels::cuda::gemv_i8_normed_mk_max_m(hidden as i32).max(0) as usize,
     )
 }
@@ -3018,55 +2949,8 @@ pub fn verify_qkv_fused_from(raw: Option<&str>) -> bool {
     raw == Some("1")
 }
 
-pub fn verify_norm_fused_from(raw: Option<&str>) -> bool {
-    raw != Some("0")
-}
-
-pub fn spec_prefill_flash_from(deterministic: bool, raw: Option<&str>) -> bool {
-    !deterministic && raw != Some("0")
-}
-
-pub const NV_SPEC_PREFILL_HD512_BF16_ENV_OPT_IN_1_ROUTES_THE_FULL_ATTENTION_HD512_PREFILL_SHADOW_OFF_THE_DEFAULT_CANDLE_FLASH_WHOSE_SM120_HDIM512_FORWARD_CANDLE_011_FIXED_ONTO_CHUNKED_BF16_TENSOR_CORE_QK_PV_GEMMS_WITH_FUSED_SOFTMAX_THE_BATTLE_TESTED_RECOVERY_ROUTE_FLASH_BEATS_1_06X_AT_1200_TO_1_21X_AT_32K_ON_THE_HD512_FLASHVSBF16_ROWS:
-    &str = "NV_SPEC_PREFILL_HD512_BF16";
-
-pub const NV_SPEC_PREFILL_HD512_EAGER_ENV_OPT_IN_1_ROUTES_THE_FULL_ATTENTION_HD512_PREFILL_SHADOW_ONTO_CHUNKED_EAGER_F32_THE_REFERENCE_ROUTE_WHICH_WINS_OVER_THE_BF16_ESCAPE_WHEN_BOTH_ARE_SET_AND_PAYS_THE_2_4X_AT_32K_WALL_THE_HD512_FLASHVSBF16_ROWS_MEASURED:
-    &str = "NV_SPEC_PREFILL_HD512_EAGER";
-
-pub fn spec_prefill_flash_head_dim_from(
-    head_dim: usize,
-    bf16_raw: Option<&str>,
-    eager_raw: Option<&str>,
-) -> bool {
-    head_dim < 512 || (bf16_raw != Some("1") && eager_raw != Some("1"))
-}
-
-pub fn spec_prefill_hd512_bf16_from(bf16_raw: Option<&str>, eager_raw: Option<&str>) -> bool {
-    bf16_raw == Some("1") && eager_raw != Some("1")
-}
-
-#[cfg(feature = "cuda")]
-fn spec_prefill_hd512_bf16_raw() -> Option<&'static str> {
-    static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    RAW.get_or_init(|| {
-        std::env::var(NV_SPEC_PREFILL_HD512_BF16_ENV_OPT_IN_1_ROUTES_THE_FULL_ATTENTION_HD512_PREFILL_SHADOW_OFF_THE_DEFAULT_CANDLE_FLASH_WHOSE_SM120_HDIM512_FORWARD_CANDLE_011_FIXED_ONTO_CHUNKED_BF16_TENSOR_CORE_QK_PV_GEMMS_WITH_FUSED_SOFTMAX_THE_BATTLE_TESTED_RECOVERY_ROUTE_FLASH_BEATS_1_06X_AT_1200_TO_1_21X_AT_32K_ON_THE_HD512_FLASHVSBF16_ROWS).ok()
-    }).as_deref()
-}
-
-#[cfg(feature = "cuda")]
-fn spec_prefill_hd512_eager_raw() -> Option<&'static str> {
-    static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    RAW.get_or_init(|| {
-        std::env::var(NV_SPEC_PREFILL_HD512_EAGER_ENV_OPT_IN_1_ROUTES_THE_FULL_ATTENTION_HD512_PREFILL_SHADOW_ONTO_CHUNKED_EAGER_F32_THE_REFERENCE_ROUTE_WHICH_WINS_OVER_THE_BF16_ESCAPE_WHEN_BOTH_ARE_SET_AND_PAYS_THE_2_4X_AT_32K_WALL_THE_HD512_FLASHVSBF16_ROWS_MEASURED).ok()
-    }).as_deref()
-}
-
-#[cfg(feature = "cuda")]
-fn spec_prefill_flash_allows_head_dim(head_dim: usize) -> bool {
-    spec_prefill_flash_head_dim_from(
-        head_dim,
-        spec_prefill_hd512_bf16_raw(),
-        spec_prefill_hd512_eager_raw(),
-    )
+pub fn spec_prefill_flash_from(deterministic: bool) -> bool {
+    !deterministic
 }
 
 pub const SHADOW_JIT_WARM_AT_CACHE_CREATION_BECAUSE_FIRST_USE_PTX_JIT_OF_THE_CANDLE_CAST_CMP_AFFINE_REDUCE_MODULES_MEASURED_5_9S_ON_THE_FIRST_PREFILL_SHADOW_CALL_WHEN_THE_DRIVER_JIT_CACHE_CANNOT_PERSIST_AND_MUST_NOT_LAND_ON_FIRST_DEEP_PROMPT_TTFT:
@@ -3074,13 +2958,12 @@ pub const SHADOW_JIT_WARM_AT_CACHE_CREATION_BECAUSE_FIRST_USE_PTX_JIT_OF_THE_CAN
 
 #[cfg(feature = "cuda")]
 fn shadow_route_jit_warm_once_at_cache_creation(dev: &Device) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
+    static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let s = SHADOW_JIT_WARM_AT_CACHE_CREATION_BECAUSE_FIRST_USE_PTX_JIT_OF_THE_CANDLE_CAST_CMP_AFFINE_REDUCE_MODULES_MEASURED_5_9S_ON_THE_FIRST_PREFILL_SHADOW_CALL_WHEN_THE_DRIVER_JIT_CACHE_CANNOT_PERSIST_AND_MUST_NOT_LAND_ON_FIRST_DEEP_PROMPT_TTFT;
         let warm = (|| -> Result<()> {
             let q = Tensor::zeros((1usize, s, s, 8), DType::BF16, dev)?;
             let kv = Tensor::zeros((1usize, s, 1, 8), DType::BF16, dev)?;
-            causal_attention_chunked_bf16(&q, &kv, &kv, s, 1, 8, s, 0)?;
             causal_attention_chunked(&q, &kv, &kv, s, 1, 8, s, 0)?;
             Ok(())
         })();
@@ -3089,29 +2972,16 @@ fn shadow_route_jit_warm_once_at_cache_creation(dev: &Device) {
 }
 
 #[cfg(feature = "cuda")]
-fn spec_prefill_hd512_bf16_enabled() -> bool {
-    spec_prefill_hd512_bf16_from(
-        spec_prefill_hd512_bf16_raw(),
-        spec_prefill_hd512_eager_raw(),
-    )
-}
-
-#[cfg(feature = "cuda")]
-fn spec_prefill_tree_forced() -> bool {
-    std::env::var("NV_SPEC_PREFILL_TREE").as_deref() == Ok("1")
-}
-
-#[cfg(feature = "cuda")]
 fn verify_qkv_fused_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| verify_qkv_fused_from(std::env::var("NV_VERIFY_QKV_FUSED").ok().as_deref()))
+    *ON.get_or_init(|| verify_qkv_fused_from(env::var("NV_VERIFY_QKV_FUSED").ok().as_deref()))
 }
 
 #[cfg(feature = "cuda")]
 fn verify_qkv_fused_layer_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("NV_VERIFY_QKV_FUSED_LAYERS")
+        env::var("NV_VERIFY_QKV_FUSED_LAYERS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(usize::MAX)
@@ -3119,16 +2989,8 @@ fn verify_qkv_fused_layer_cap() -> usize {
 }
 
 #[cfg(feature = "cuda")]
-fn verify_norm_fused_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        verify_norm_fused_from(std::env::var("NV_VERIFY_NORM_FUSED").ok().as_deref())
-    })
-}
-
-#[cfg(feature = "cuda")]
 fn prefill_shadow_fallback_warn(reason: &str) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
+    static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         eprintln!(
             "[gemma4] spec prefill GEMM shadow unavailable ({reason}); \
@@ -3181,20 +3043,7 @@ pub fn sliding_shadow_extend(
 fn spec_prefill_flash_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        spec_prefill_flash_from(
-            nv_quant::matmul::deterministic_mode(),
-            std::env::var("NV_SPEC_PREFILL_FLASH").ok().as_deref(),
-        )
-    })
-}
-
-#[cfg(feature = "cuda")]
-pub fn verify_kv_use_fp8() -> bool {
-    static FP8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FP8.get_or_init(|| match std::env::var("NV_VERIFY_KV").as_deref() {
-        Ok("bf16") => false,
-        Ok("fp8") => true,
-        _ => true,
+        spec_prefill_flash_from(nv_quant::matmul::deterministic_mode())
     })
 }
 
@@ -3208,7 +3057,7 @@ const VERIFY_RING_HEADROOM: usize = 128;
 #[cfg(feature = "cuda")]
 pub fn kv_ring_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NV_KV_RING").as_deref() != Ok("0"))
+    *ON.get_or_init(|| env::var("NV_KV_RING").as_deref() != Ok("0"))
 }
 
 #[cfg(feature = "cuda")]
@@ -3221,20 +3070,12 @@ fn verify_ring_slots(sliding_window: usize) -> Option<usize> {
 
 #[cfg(feature = "cuda")]
 impl Gemma4VerifyCache {
-    pub fn n_committed_mut(&mut self) -> &mut cudarc::driver::CudaSlice<i32> {
+    pub fn n_committed_mut(&mut self) -> &mut CudaSlice<i32> {
         &mut self.n_committed
     }
 
     pub fn max_seq(&self) -> usize {
         self.max_seq
-    }
-
-    pub fn is_fp8(&self) -> bool {
-        matches!(self.store, VerifyKvStore::Fp8 { .. })
-    }
-
-    pub fn layer_ring(&self, layer: usize) -> usize {
-        self.ring[layer]
     }
 
     pub fn end_prefill(&mut self) {
@@ -3248,47 +3089,19 @@ impl Gemma4VerifyCache {
         if a == 0 {
             return Ok(());
         }
-        anyhow::ensure!(
+        ensure!(
             a <= self.scratch_rows,
             "compact_path: {a} rows exceeds compact scratch capacity {}",
             self.scratch_rows
         );
         let stream = nv_layers::cuda_stream::current_stream(&self.device);
         let path_i32: Vec<i32> = path.iter().map(|&p| p as i32).collect();
-        stream
-            .memcpy_htod(&path_i32, &mut self.path_dev.slice_mut(0..a))
-            .map_err(|e| anyhow::anyhow!(e))?;
+        stream.memcpy_htod(&path_i32, &mut self.path_dev.slice_mut(0..a))?;
         let n_layers = self.row_stride.len();
         for idx in 0..n_layers {
             let stride = self.row_stride[idx];
             let ring = self.ring[idx];
             let rc = match &mut self.store {
-                VerifyKvStore::Bf16 {
-                    k,
-                    v,
-                    scratch_k,
-                    scratch_v,
-                } => {
-                    anyhow::ensure!(ring == 0, "bf16 verify store does not support ring layers");
-                    let (pp, _a) = self.path_dev.device_ptr(&stream);
-                    let (kp, _b) = k[idx].device_ptr_mut(&stream);
-                    let (vp, _c) = v[idx].device_ptr_mut(&stream);
-                    let (skp, _d) = scratch_k.device_ptr_mut(&stream);
-                    let (svp, _e) = scratch_v.device_ptr_mut(&stream);
-                    unsafe {
-                        nv_kernels::cuda::kv_compact_bf16(
-                            stream.cu_stream() as *mut _,
-                            kp as *mut u16,
-                            vp as *mut u16,
-                            skp as *mut u16,
-                            svp as *mut u16,
-                            pp as *const i32,
-                            base as i32,
-                            a as i32,
-                            stride as i32,
-                        )
-                    }
-                }
                 VerifyKvStore::Fp8 {
                     k,
                     v,
@@ -3331,7 +3144,7 @@ impl Gemma4VerifyCache {
                     }
                 }
             };
-            anyhow::ensure!(rc == 0, "kv_compact returned {rc}");
+            ensure!(rc == 0, "kv_compact returned {rc}");
         }
         Ok(())
     }
@@ -3340,13 +3153,11 @@ impl Gemma4VerifyCache {
 #[cfg(feature = "cuda")]
 impl Gemma4 {
     pub fn new_verify_cache(&self, max_seq: usize) -> Result<Gemma4VerifyCache> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("verify cache requires cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("verify cache requires cuda")
         };
         shadow_route_jit_warm_once_at_cache_creation(&self.device);
         let stream = nv_layers::cuda_stream::current_stream(&dev);
-        let use_fp8 = verify_kv_use_fp8();
         let mut row_stride = Vec::with_capacity(self.layers.len());
         let mut head_dims = Vec::with_capacity(self.layers.len());
         let mut ring = Vec::with_capacity(self.layers.len());
@@ -3357,7 +3168,7 @@ impl Gemma4 {
             row_stride.push(nkv * hd);
             head_dims.push(hd);
 
-            let layer_slots = if use_fp8 && matches!(layer.kind, LayerType::SlidingAttention) {
+            let layer_slots = if matches!(layer.kind, LayerType::SlidingAttention) {
                 match verify_ring_slots(self.config.sliding_window) {
                     Some(r) if max_seq > r => {
                         ring.push(r);
@@ -3377,7 +3188,7 @@ impl Gemma4 {
         let max_row_stride = row_stride.iter().copied().max().unwrap_or(0);
         let scratch_rows = max_seq.min(VERIFY_COMPACT_MAX_ROWS);
         let scratch_elems = scratch_rows * max_row_stride;
-        let store = if use_fp8 {
+        let store = {
             let mut k = Vec::with_capacity(self.layers.len());
             let mut v = Vec::with_capacity(self.layers.len());
             let mut k_scale = Vec::with_capacity(self.layers.len());
@@ -3385,26 +3196,10 @@ impl Gemma4 {
             for (i, stride) in row_stride.iter().enumerate() {
                 let elems = slots[i] * stride;
                 let scale_elems = slots[i] * (stride / head_dims[i]);
-                k.push(
-                    stream
-                        .alloc_zeros::<u8>(elems)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                );
-                v.push(
-                    stream
-                        .alloc_zeros::<u8>(elems)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                );
-                k_scale.push(
-                    stream
-                        .alloc_zeros::<f32>(scale_elems)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                );
-                v_scale.push(
-                    stream
-                        .alloc_zeros::<f32>(scale_elems)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                );
+                k.push(stream.alloc_zeros::<u8>(elems)?);
+                v.push(stream.alloc_zeros::<u8>(elems)?);
+                k_scale.push(stream.alloc_zeros::<f32>(scale_elems)?);
+                v_scale.push(stream.alloc_zeros::<f32>(scale_elems)?);
             }
             let max_nkv = row_stride
                 .iter()
@@ -3417,77 +3212,27 @@ impl Gemma4 {
                 v,
                 k_scale,
                 v_scale,
-                scratch_k: stream
-                    .alloc_zeros::<u8>(scratch_elems)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                scratch_v: stream
-                    .alloc_zeros::<u8>(scratch_elems)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                scratch_ks: stream
-                    .alloc_zeros::<f32>(scratch_rows * max_nkv)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                scratch_vs: stream
-                    .alloc_zeros::<f32>(scratch_rows * max_nkv)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-            }
-        } else {
-            let mut k = Vec::with_capacity(self.layers.len());
-            let mut v = Vec::with_capacity(self.layers.len());
-            for (i, stride) in row_stride.iter().enumerate() {
-                let elems = slots[i] * stride;
-                k.push(
-                    stream
-                        .alloc_zeros::<half::bf16>(elems)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                );
-                v.push(
-                    stream
-                        .alloc_zeros::<half::bf16>(elems)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                );
-            }
-            VerifyKvStore::Bf16 {
-                k,
-                v,
-                scratch_k: stream
-                    .alloc_zeros::<half::bf16>(scratch_elems)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-                scratch_v: stream
-                    .alloc_zeros::<half::bf16>(scratch_elems)
-                    .map_err(|e| anyhow::anyhow!(e))?,
+                scratch_k: stream.alloc_zeros::<u8>(scratch_elems)?,
+                scratch_v: stream.alloc_zeros::<u8>(scratch_elems)?,
+                scratch_ks: stream.alloc_zeros::<f32>(scratch_rows * max_nkv)?,
+                scratch_vs: stream.alloc_zeros::<f32>(scratch_rows * max_nkv)?,
             }
         };
-        let n_committed = stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let path_dev = stream
-            .alloc_zeros::<i32>(scratch_rows)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let (mk_scratch, mk_fan_in) = if use_fp8 && mk_verify_enabled() {
+        let n_committed = stream.alloc_zeros::<i32>(1)?;
+        let path_dev = stream.alloc_zeros::<i32>(scratch_rows)?;
+        let (mk_scratch, mk_fan_in) = if mk_verify_enabled() {
             let n_q = self.config.num_attention_heads;
             let max_hd = head_dims.iter().copied().max().unwrap_or(0);
             let elems = n_q * 8 * 32 * (max_hd + 2);
             (
-                Some(
-                    stream
-                        .alloc_zeros::<f32>(elems)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                ),
-                Some(
-                    stream
-                        .alloc_zeros::<u32>(n_q)
-                        .map_err(|e| anyhow::anyhow!(e))?,
-                ),
+                Some(stream.alloc_zeros::<f32>(elems)?),
+                Some(stream.alloc_zeros::<u32>(n_q)?),
             )
         } else {
             (None, None)
         };
         let gqa512_scratch = match gqa512_verify_scratch_elems_for(&self.config) {
-            Some(elems) => Some(
-                stream
-                    .alloc_zeros::<f32>(elems)
-                    .map_err(|e| anyhow::anyhow!(e))?,
-            ),
+            Some(elems) => Some(stream.alloc_zeros::<f32>(elems)?),
             None => None,
         };
         Ok(Gemma4VerifyCache {
@@ -3503,7 +3248,7 @@ impl Gemma4 {
             mk_scratch,
             mk_fan_in,
             gqa512_scratch,
-            prefill_shadow: std::collections::HashMap::new(),
+            prefill_shadow: HashMap::new(),
             prefill_shadow_disabled: false,
         })
     }
@@ -3513,20 +3258,19 @@ impl Gemma4 {
         idx: usize,
         x: &Tensor,
         positions: &Tensor,
-        mask_dev: &cudarc::driver::CudaSlice<u8>,
+        mask_dev: &CudaSlice<u8>,
         k: usize,
         cache: &mut Gemma4VerifyCache,
     ) -> Result<Tensor> {
         self.attention_tree_impl(idx, x, positions, mask_dev, k, cache, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn attention_tree_impl(
         &self,
         idx: usize,
         x: &Tensor,
         positions: &Tensor,
-        mask_dev: &cudarc::driver::CudaSlice<u8>,
+        mask_dev: &CudaSlice<u8>,
         k: usize,
         cache: &mut Gemma4VerifyCache,
         prefill: Option<usize>,
@@ -3547,12 +3291,12 @@ impl Gemma4 {
         let window: i32 = tree_layer_window(kind, self.config.sliding_window);
 
         let pos_flat = positions.flatten_all()?;
-        anyhow::ensure!(
+        ensure!(
             pos_flat.dtype() == candle_core::DType::I32,
             "attention_tree: positions must be i32 (got {:?})",
             pos_flat.dtype()
         );
-        anyhow::ensure!(
+        ensure!(
             pos_flat.dims() == [k],
             "attention_tree: positions must have {k} entries (got {:?})",
             pos_flat.dims()
@@ -3586,8 +3330,7 @@ impl Gemma4 {
         let gemm_out: Option<Tensor> = match prefill {
             Some(committed)
                 if matches!(kind, LayerType::FullAttention)
-                    && !cache.prefill_shadow_disabled
-                    && matches!(cache.store, VerifyKvStore::Fp8 { .. }) =>
+                    && !cache.prefill_shadow_disabled =>
             {
                 let attempt = (|| -> Result<Option<Tensor>> {
                     let k4 = k_rot.reshape((1usize, k, n_kv, hd))?;
@@ -3597,12 +3340,8 @@ impl Gemma4 {
                         return Ok(None);
                     };
                     let q4 = q_rot.reshape((1usize, k, n_q, hd))?;
-                    let out = if spec_prefill_flash_enabled()
-                        && spec_prefill_flash_allows_head_dim(hd)
-                    {
+                    let out = if spec_prefill_flash_enabled() {
                         flash_attention(&q4, &ks, &vs, n_q, n_kv, hd, k, None)?
-                    } else if spec_prefill_flash_enabled() && spec_prefill_hd512_bf16_enabled() {
-                        causal_attention_chunked_bf16(&q4, &ks, &vs, n_q, n_kv, hd, k, committed)?
                     } else {
                         causal_attention_chunked(&q4, &ks, &vs, n_q, n_kv, hd, k, committed)?
                     };
@@ -3626,8 +3365,7 @@ impl Gemma4 {
             Some(committed)
                 if matches!(kind, LayerType::SlidingAttention)
                     && spec_prefill_flash_enabled()
-                    && !cache.prefill_shadow_disabled
-                    && matches!(cache.store, VerifyKvStore::Fp8 { .. }) =>
+                    && !cache.prefill_shadow_disabled =>
             {
                 let attempt = (|| -> Result<Option<Tensor>> {
                     let keep = self.config.sliding_window.saturating_sub(1);
@@ -3667,17 +3405,12 @@ impl Gemma4 {
         };
         let use_gemm = gemm_out.is_some();
 
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("cuda")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
         let out_elems = if use_gemm { 1 } else { k * n_q * hd };
-        let mut out_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-            stream
-                .alloc::<bf16>(out_elems)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut out_dev: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(out_elems)? };
 
         let rc = {
             let (qs, _ql) = q_rot.storage_and_layout();
@@ -3685,20 +3418,20 @@ impl Gemma4 {
             let (vs, _vl) = vv.storage_and_layout();
             let (ps, _pl) = pos_c.storage_and_layout();
             let qc = match &*qs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("q not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("q not cuda"),
             };
             let kc = match &*ks {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("k not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("k not cuda"),
             };
             let vc = match &*vs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("v not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("v not cuda"),
             };
             let pc = match &*ps {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("positions not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("positions not cuda"),
             };
             let qsl = qc.as_cuda_slice::<bf16>()?;
             let ksl = kc.as_cuda_slice::<bf16>()?;
@@ -3713,7 +3446,7 @@ impl Gemma4 {
             let (op, _h) = out_dev.device_ptr_mut(&stream);
             let ring = cache.ring[idx] as i32;
             if ring > 0 {
-                anyhow::ensure!(
+                ensure!(
                     (k as i32) <= ring - window + 1,
                     "attention_tree: single append of {k} rows exceeds ring capacity \
                      {ring} for window {window}; prefill must be chunked to at most \
@@ -3721,45 +3454,6 @@ impl Gemma4 {
                 );
             }
             match &mut cache.store {
-                VerifyKvStore::Bf16 { k: kb, v: vb, .. } => {
-                    anyhow::ensure!(ring == 0, "bf16 verify store does not support ring layers");
-                    let (kcp, _d) = kb[idx].device_ptr_mut(&stream);
-                    let (vcp, _e) = vb[idx].device_ptr_mut(&stream);
-                    let rc1 = unsafe {
-                        nv_kernels::cuda::kv_append_bf16(
-                            stream.cu_stream() as *mut _,
-                            knp as *const u16,
-                            vnp as *const u16,
-                            kcp as *mut u16,
-                            vcp as *mut u16,
-                            ncp as *const i32,
-                            k as i32,
-                            n_kv as i32,
-                            hd as i32,
-                        )
-                    };
-                    if rc1 != 0 {
-                        rc1
-                    } else {
-                        unsafe {
-                            nv_kernels::cuda::tree_verify_attn_bf16(
-                                stream.cu_stream() as *mut _,
-                                qp as *const u16,
-                                kcp as *const u16,
-                                vcp as *const u16,
-                                ncp as *const i32,
-                                mp as *const u8,
-                                pp as *const i32,
-                                op as *mut u16,
-                                n_q as i32,
-                                n_kv as i32,
-                                hd as i32,
-                                k as i32,
-                                window,
-                            )
-                        }
-                    }
-                }
                 VerifyKvStore::Fp8 {
                     k: kf,
                     v: vf,
@@ -3878,31 +3572,25 @@ impl Gemma4 {
                 }
             }
         };
-        anyhow::ensure!(rc == 0, "tree attn kernels returned {rc}");
+        ensure!(rc == 0, "tree attn kernels returned {rc}");
 
         if let Some(out) = gemm_out {
             let attn_out = out.reshape((k, n_q * hd))?.contiguous()?;
             return attn.o_forward(&attn_out);
         }
 
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(out_dev, dev.clone());
-        let storage = candle_core::Storage::Cuda(storage);
-        let attn_out = Tensor::from_storage(
-            storage,
-            (k, n_q * hd),
-            candle_core::op::BackpropOp::none(),
-            false,
-        );
+        let storage = CudaStorage::wrap_cuda_slice(out_dev, dev.clone());
+        let storage = Storage::Cuda(storage);
+        let attn_out = Tensor::from_storage(storage, (k, n_q * hd), BackpropOp::none(), false);
         attn.o_forward(&attn_out)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn attention_tree_fused_impl(
         &self,
         idx: usize,
         x: &Tensor,
         pos_c: &Tensor,
-        mask_dev: &cudarc::driver::CudaSlice<u8>,
+        mask_dev: &CudaSlice<u8>,
         k: usize,
         cache: &mut Gemma4VerifyCache,
     ) -> Result<Option<Tensor>> {
@@ -3920,9 +3608,6 @@ impl Gemma4 {
         if attn.q_dim != n_q * hd || attn.kv_dim != n_kv * hd {
             return Ok(None);
         }
-        if !matches!(cache.store, VerifyKvStore::Fp8 { .. }) {
-            return Ok(None);
-        }
         let eps = attn.q_norm.eps();
         if attn.k_norm.eps() != eps || attn.v_norm.eps() != eps {
             return Ok(None);
@@ -3938,14 +3623,13 @@ impl Gemma4 {
         if rope.cos().dtype() != DType::F32 || rope.sin().dtype() != DType::F32 {
             return Ok(None);
         }
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => return Ok(None),
+        let Device::Cuda(dev) = self.device.clone() else {
+            return Ok(None);
         };
         let window: i32 = tree_layer_window(kind, self.config.sliding_window);
         let ring = cache.ring[idx] as i32;
         if ring > 0 {
-            anyhow::ensure!(
+            ensure!(
                 (k as i32) <= ring - window + 1,
                 "attention_tree: single append of {k} rows exceeds ring capacity \
                  {ring} for window {window}"
@@ -3979,16 +3663,8 @@ impl Gemma4 {
         let sin_c = rope.sin().contiguous()?;
 
         let stream = nv_layers::cuda_stream::current_stream(&dev);
-        let mut q_out: cudarc::driver::CudaSlice<bf16> = unsafe {
-            stream
-                .alloc::<bf16>(k * n_q * hd)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
-        let mut out_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-            stream
-                .alloc::<bf16>(k * n_q * hd)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut q_out: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(k * n_q * hd)? };
+        let mut out_dev: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(k * n_q * hd)? };
 
         let use_mk = cache.mk_scratch.is_some() && k <= 8 && hd <= 512 && window == 0 && ring == 0;
         let rc = {
@@ -4003,32 +3679,32 @@ impl Gemma4 {
             let (kws, _kwl) = kw_t.storage_and_layout();
             let (vws, _vwl) = vw_t.storage_and_layout();
             let fc = match &*fs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("qkv not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("qkv not cuda"),
             };
             let cc = match &*cs {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("cos not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("cos not cuda"),
             };
             let sc = match &*ss {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("sin not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("sin not cuda"),
             };
             let pc = match &*ps {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("positions not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("positions not cuda"),
             };
             let qwc = match &*qws {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("q_norm weight not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("q_norm weight not cuda"),
             };
             let kwc = match &*kws {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("k_norm weight not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("k_norm weight not cuda"),
             };
             let vwc = match &*vws {
-                candle_core::Storage::Cuda(s) => s,
-                _ => anyhow::bail!("v_norm weight not cuda"),
+                Storage::Cuda(s) => s,
+                _ => bail!("v_norm weight not cuda"),
             };
             let fsl = fc.as_cuda_slice::<bf16>()?;
             let f_view = fsl.slice(fl.start_offset()..);
@@ -4171,28 +3847,21 @@ impl Gemma4 {
                         }
                     }
                 }
-                _ => unreachable!(),
             }
         };
-        anyhow::ensure!(rc == 0, "verify_qkv_prep/attention kernels returned {rc}");
+        ensure!(rc == 0, "verify_qkv_prep/attention kernels returned {rc}");
 
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(out_dev, dev.clone());
-        let storage = candle_core::Storage::Cuda(storage);
-        let attn_out = Tensor::from_storage(
-            storage,
-            (k, n_q * hd),
-            candle_core::op::BackpropOp::none(),
-            false,
-        );
+        let storage = CudaStorage::wrap_cuda_slice(out_dev, dev.clone());
+        let storage = Storage::Cuda(storage);
+        let attn_out = Tensor::from_storage(storage, (k, n_q * hd), BackpropOp::none(), false);
         Ok(Some(attn.o_proj.forward(&attn_out)?))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_verify(
         &self,
         ids: &[u32],
         positions: &[i32],
-        mask_dev: &cudarc::driver::CudaSlice<u8>,
+        mask_dev: &CudaSlice<u8>,
         committed: usize,
         aux_layers: &[usize],
         cache: &mut Gemma4VerifyCache,
@@ -4203,22 +3872,20 @@ impl Gemma4 {
         Ok((logits.expect("logit_rows == k always yields logits"), aux))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_verify_tail(
         &self,
         ids: &[u32],
         positions: &[i32],
-        mask_dev: &cudarc::driver::CudaSlice<u8>,
+        mask_dev: &CudaSlice<u8>,
         committed: usize,
         aux_layers: &[usize],
         cache: &mut Gemma4VerifyCache,
         logit_rows: usize,
     ) -> Result<(Option<Tensor>, Vec<Tensor>)> {
         let k = ids.len();
-        anyhow::ensure!(positions.len() == k, "positions len mismatch");
-        anyhow::ensure!(committed + k <= cache.max_seq, "verify cache overflow");
+        ensure!(positions.len() == k, "positions len mismatch");
+        ensure!(committed + k <= cache.max_seq, "verify cache overflow");
         let prefill = if logit_rows < k
-            && !spec_prefill_tree_forced()
             && positions.first().copied() == Some(committed as i32)
             && positions.windows(2).all(|w| w[1] == w[0] + 1)
         {
@@ -4226,14 +3893,11 @@ impl Gemma4 {
         } else {
             None
         };
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("cuda"),
+        let Device::Cuda(dev) = self.device.clone() else {
+            bail!("cuda")
         };
         let stream = nv_layers::cuda_stream::current_stream(&dev);
-        stream
-            .memcpy_htod(&[committed as i32], &mut cache.n_committed)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        stream.memcpy_htod(&[committed as i32], &mut cache.n_committed)?;
         let tokens = Tensor::from_vec(ids.to_vec(), (1usize, k), &self.device)?;
         let pos_t = Tensor::from_vec(positions.to_vec(), (1usize, k), &self.device)?;
         self.forward_verify_dev_rows(
@@ -4241,40 +3905,11 @@ impl Gemma4 {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_verify_last(
-        &self,
-        ids: &[u32],
-        positions: &[i32],
-        mask_dev: &cudarc::driver::CudaSlice<u8>,
-        committed: usize,
-        aux_layers: &[usize],
-        cache: &mut Gemma4VerifyCache,
-    ) -> Result<(Tensor, Vec<Tensor>)> {
-        let k = ids.len();
-        anyhow::ensure!(positions.len() == k, "positions len mismatch");
-        anyhow::ensure!(committed + k <= cache.max_seq, "verify cache overflow");
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("cuda"),
-        };
-        let stream = nv_layers::cuda_stream::current_stream(&dev);
-        stream
-            .memcpy_htod(&[committed as i32], &mut cache.n_committed)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let tokens = Tensor::from_vec(ids.to_vec(), (1usize, k), &self.device)?;
-        let pos_t = Tensor::from_vec(positions.to_vec(), (1usize, k), &self.device)?;
-        let (logits, aux) =
-            self.forward_verify_dev_rows(&tokens, &pos_t, mask_dev, k, aux_layers, cache, 1, None)?;
-        Ok((logits.expect("logit_rows == 1 always yields logits"), aux))
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub fn forward_verify_dev(
         &self,
         ids_t: &Tensor,
         pos_t: &Tensor,
-        mask_dev: &cudarc::driver::CudaSlice<u8>,
+        mask_dev: &CudaSlice<u8>,
         k: usize,
         aux_layers: &[usize],
         cache: &mut Gemma4VerifyCache,
@@ -4284,19 +3919,18 @@ impl Gemma4 {
         Ok((logits.expect("logit_rows == k always yields logits"), aux))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn forward_verify_dev_rows(
         &self,
         ids_t: &Tensor,
         pos_t: &Tensor,
-        mask_dev: &cudarc::driver::CudaSlice<u8>,
+        mask_dev: &CudaSlice<u8>,
         k: usize,
         aux_layers: &[usize],
         cache: &mut Gemma4VerifyCache,
         logit_rows: usize,
         prefill: Option<usize>,
     ) -> Result<(Option<Tensor>, Vec<Tensor>)> {
-        anyhow::ensure!(logit_rows <= k, "logit_rows {logit_rows} > rows {k}");
+        ensure!(logit_rows <= k, "logit_rows {logit_rows} > rows {k}");
 
         nv_layers::linear::with_dense_bf16(|| {
             let hidden_size = self.config.hidden_size;
@@ -4357,9 +3991,8 @@ impl Gemma4 {
                 {
                     match &self.lm_head_i8 {
                         Some((wq, rs)) => {
-                            let dev = match &self.device {
-                                Device::Cuda(d) => d.clone(),
-                                _ => anyhow::bail!("cuda"),
+                            let Device::Cuda(dev) = self.device.clone() else {
+                                bail!("cuda")
                             };
                             let hflat = hidden.reshape((rows, hidden_size))?;
                             let rstd = crate::gemma4_e4b::rstd_op(
@@ -4374,7 +4007,7 @@ impl Gemma4 {
                                     wq, rs, &hflat, wn, &rstd, rows, &dev,
                                 )?
                             } else {
-                                anyhow::ensure!(
+                                ensure!(
                                     !current_stream_is_mid_graph_capture(&dev),
                                     "lm_head_i8 rows={rows} exceeds the mk single-call ceiling \
                                      {max_m} and the chunked fallback concatenates via candle \
@@ -4431,7 +4064,7 @@ fn decode_norm_fused_enabled_env_nv_g4_decode_norm_fused_rides_the_post_norm_on_
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         DECODE_NORM_FUSED_ARM_DEFAULT_OFF_BECAUSE_EVERY_PUBLISHED_GEMMA4_DECODE_NUMBER_WAS_MEASURED_ON_THE_THREE_LAUNCH_NORM_CHAIN
-            || std::env::var("NV_G4_DECODE_NORM_FUSED").as_deref() == Ok("1")
+            || env::var("NV_G4_DECODE_NORM_FUSED").as_deref() == Ok("1")
     })
 }
 
@@ -4448,7 +4081,7 @@ fn decode_post_attn_pre_ff(
         && residual.dtype() == DType::BF16
         && attn_out.dims() == residual.dims()
         && post_ln.eps() == pre_ln.eps()
-        && matches!(device, Device::Cuda(_))
+        && device.is_cuda()
     {
         if let Some(out) = rmsnorm2_residual_op(post_ln, pre_ln, attn_out, residual, device)? {
             return Ok(out);
@@ -4482,7 +4115,7 @@ fn decode_post_ff_residual(
         && mlp_out.dtype() == DType::BF16
         && after_attn.dtype() == DType::BF16
         && mlp_out.dims() == after_attn.dims()
-        && matches!(device, Device::Cuda(_))
+        && device.is_cuda()
     {
         if let Some(t) = rmsnorm_residual_scale_op(post_ln, mlp_out, after_attn, scale, device)? {
             return Ok(t);
@@ -4512,12 +4145,11 @@ pub(crate) fn verify_post_attn_pre_ff(
     residual: &Tensor,
     device: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    if verify_norm_fused_enabled()
-        && attn_out.dtype() == DType::BF16
+    if attn_out.dtype() == DType::BF16
         && residual.dtype() == DType::BF16
         && attn_out.dims() == residual.dims()
         && post_ln.eps() == pre_ln.eps()
-        && matches!(device, Device::Cuda(_))
+        && device.is_cuda()
     {
         if let Some(out) = rmsnorm2_residual_op(post_ln, pre_ln, attn_out, residual, device)? {
             return Ok(out);
@@ -4537,9 +4169,8 @@ fn rmsnorm2_residual_op(
 ) -> Result<Option<(Tensor, Tensor)>> {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = device.clone() else {
+        return Ok(None);
     };
     let x_c = x.contiguous()?;
     let res_c = residual.contiguous()?;
@@ -4552,36 +4183,28 @@ fn rmsnorm2_residual_op(
         return Ok(None);
     }
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut sum_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(batch * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
-    let mut normed_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(batch * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut sum_dev: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(batch * hidden)? };
+    let mut normed_dev: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(batch * hidden)? };
     let rc = {
         let (xs, xl) = x_c.storage_and_layout();
         let (rs, rl) = res_c.storage_and_layout();
         let (w1s, _w1l) = w1.storage_and_layout();
         let (w2s, _w2l) = w2.storage_and_layout();
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("x not cuda"),
         };
         let rc_ = match &*rs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("residual not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("residual not cuda"),
         };
         let w1c = match &*w1s {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w1 not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("w1 not cuda"),
         };
         let w2c = match &*w2s {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w2 not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("w2 not cuda"),
         };
         let xsl = xc.as_cuda_slice::<bf16>()?;
         let x_view = xsl.slice(xl.start_offset()..);
@@ -4610,20 +4233,20 @@ fn rmsnorm2_residual_op(
             )
         }
     };
-    anyhow::ensure!(rc == 0, "rmsnorm2_residual_bf16 returned {rc}");
-    let shape: candle_core::Shape = dims.into();
-    let sum_storage = candle_core::CudaStorage::wrap_cuda_slice(sum_dev, dev.clone());
+    ensure!(rc == 0, "rmsnorm2_residual_bf16 returned {rc}");
+    let shape: Shape = dims.into();
+    let sum_storage = CudaStorage::wrap_cuda_slice(sum_dev, dev.clone());
     let sum_t = Tensor::from_storage(
-        candle_core::Storage::Cuda(sum_storage),
+        Storage::Cuda(sum_storage),
         shape.clone(),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     );
-    let norm_storage = candle_core::CudaStorage::wrap_cuda_slice(normed_dev, dev);
+    let norm_storage = CudaStorage::wrap_cuda_slice(normed_dev, dev);
     let norm_t = Tensor::from_storage(
-        candle_core::Storage::Cuda(norm_storage),
+        Storage::Cuda(norm_storage),
         shape,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     );
     Ok(Some((norm_t, sum_t)))
@@ -4637,11 +4260,10 @@ pub(crate) fn verify_post_ff_residual(
     scale: f32,
     device: &Device,
 ) -> Result<Tensor> {
-    if verify_norm_fused_enabled()
-        && mlp_out.dtype() == DType::BF16
+    if mlp_out.dtype() == DType::BF16
         && after_attn.dtype() == DType::BF16
         && mlp_out.dims() == after_attn.dims()
-        && matches!(device, Device::Cuda(_))
+        && device.is_cuda()
     {
         if let Some(t) = rmsnorm_residual_scale_op(post_ln, mlp_out, after_attn, scale, device)? {
             return Ok(t);
@@ -4661,9 +4283,8 @@ fn rmsnorm_residual_scale_op(
 ) -> Result<Option<Tensor>> {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => return Ok(None),
+    let Device::Cuda(dev) = device.clone() else {
+        return Ok(None);
     };
     let x_c = x.contiguous()?;
     let res_c = residual.contiguous()?;
@@ -4675,26 +4296,22 @@ fn rmsnorm_residual_scale_op(
         return Ok(None);
     }
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut out_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(batch * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut out_dev: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(batch * hidden)? };
     let rc = {
         let (xs, xl) = x_c.storage_and_layout();
         let (rs, rl) = res_c.storage_and_layout();
         let (ws, _wl) = w.storage_and_layout();
         let xc = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("x not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("x not cuda"),
         };
         let rc_ = match &*rs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("residual not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("residual not cuda"),
         };
         let wc = match &*ws {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("w not cuda"),
+            Storage::Cuda(s) => s,
+            _ => bail!("w not cuda"),
         };
         let xsl = xc.as_cuda_slice::<bf16>()?;
         let x_view = xsl.slice(xl.start_offset()..);
@@ -4719,13 +4336,13 @@ fn rmsnorm_residual_scale_op(
             )
         }
     };
-    anyhow::ensure!(rc == 0, "rmsnorm_residual_scale_bf16 returned {rc}");
-    let shape: candle_core::Shape = dims.into();
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(out_dev, dev);
+    ensure!(rc == 0, "rmsnorm_residual_scale_bf16 returned {rc}");
+    let shape: Shape = dims.into();
+    let storage = CudaStorage::wrap_cuda_slice(out_dev, dev);
     Ok(Some(Tensor::from_storage(
-        candle_core::Storage::Cuda(storage),
+        Storage::Cuda(storage),
         shape,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     )))
 }
@@ -4735,7 +4352,7 @@ pub fn mlp_forward(mlp: &Gemma4Mlp, x: &Tensor) -> Result<Tensor> {
 
     #[cfg(feature = "cuda")]
     {
-        if fused.dtype() == DType::BF16 && matches!(fused.device(), Device::Cuda(_)) {
+        if fused.dtype() == DType::BF16 && fused.device().is_cuda() {
             let act = gelu_tanh_mul_fused_cuda_bf16(&fused)?;
             return mlp.down_proj.forward(&act);
         }
@@ -4751,14 +4368,14 @@ pub fn mlp_forward(mlp: &Gemma4Mlp, x: &Tensor) -> Result<Tensor> {
 
 fn gelu_tanh_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     if gate.dims() != up.dims() {
-        anyhow::bail!(
+        bail!(
             "gelu_tanh_mul: gate dims {:?} != up dims {:?}",
             gate.dims(),
             up.dims()
         );
     }
     #[cfg(feature = "cuda")]
-    if matches!(gate.device(), Device::Cuda(_))
+    if gate.device().is_cuda()
         && gate.dtype() == DType::BF16
         && up.dtype() == DType::BF16
     {
@@ -4777,25 +4394,22 @@ fn gelu_tanh_mul_cuda_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     let up_c = up.contiguous()?;
     let dims = gate_c.dims().to_vec();
     let n: usize = dims.iter().product();
-    let dev = match gate_c.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => unreachable!(),
+    let Device::Cuda(dev) = gate_c.device().clone() else {
+        unreachable!()
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut y_dev: cudarc::driver::CudaSlice<bf16> = stream
-        .alloc_zeros::<bf16>(n)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut y_dev: CudaSlice<bf16> = stream.alloc_zeros::<bf16>(n)?;
 
     let rc = {
         let (gs, _gl) = gate_c.storage_and_layout();
         let (us, _ul) = up_c.storage_and_layout();
         let g_cuda = match &*gs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("expected cuda storage"),
+            Storage::Cuda(s) => s,
+            _ => bail!("expected cuda storage"),
         };
         let u_cuda = match &*us {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("expected cuda storage"),
+            Storage::Cuda(s) => s,
+            _ => bail!("expected cuda storage"),
         };
         let g_slice = g_cuda.as_cuda_slice::<bf16>()?;
         let u_slice = u_cuda.as_cuda_slice::<bf16>()?;
@@ -4813,15 +4427,15 @@ fn gelu_tanh_mul_cuda_bf16(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         }
     };
     if rc != 0 {
-        anyhow::bail!("gelu_tanh_mul_bf16 kernel returned {rc}");
+        bail!("gelu_tanh_mul_bf16 kernel returned {rc}");
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev);
-    let storage = candle_core::Storage::Cuda(storage);
-    let shape: candle_core::Shape = dims.into();
+    let storage = CudaStorage::wrap_cuda_slice(y_dev, dev);
+    let storage = Storage::Cuda(storage);
+    let shape: Shape = dims.into();
     Ok(candle_core::Tensor::from_storage(
         storage,
         shape,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
@@ -4836,7 +4450,7 @@ fn gelu_tanh_mul_fused_cuda_bf16(fused: &Tensor) -> Result<Tensor> {
     let last = dims.len() - 1;
     let two_inter = dims[last];
     if !two_inter.is_multiple_of(2) {
-        anyhow::bail!(
+        bail!(
             "gelu_tanh_mul_fused_cuda_bf16: last dim must be even, got {:?}",
             dims
         );
@@ -4845,22 +4459,17 @@ fn gelu_tanh_mul_fused_cuda_bf16(fused: &Tensor) -> Result<Tensor> {
     let leading: usize = dims[..last].iter().product();
     let tot_pairs = leading * inter;
 
-    let dev = match fused.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => unreachable!(),
+    let Device::Cuda(dev) = fused.device().clone() else {
+        unreachable!()
     };
     let fused_c = fused.contiguous()?;
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut y_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(tot_pairs)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut y_dev: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(tot_pairs)? };
     let rc = {
         let (fs, _fl) = fused_c.storage_and_layout();
         let f_cuda = match &*fs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("expected cuda storage for fused"),
+            Storage::Cuda(s) => s,
+            _ => bail!("expected cuda storage for fused"),
         };
         let f_slice = f_cuda.as_cuda_slice::<bf16>()?;
         let (pf, _) = f_slice.device_ptr(&stream);
@@ -4876,17 +4485,17 @@ fn gelu_tanh_mul_fused_cuda_bf16(fused: &Tensor) -> Result<Tensor> {
         }
     };
     if rc != 0 {
-        anyhow::bail!("gelu_tanh_mul_fused_bf16 kernel returned {rc}");
+        bail!("gelu_tanh_mul_fused_bf16 kernel returned {rc}");
     }
     let mut out_dims = dims[..last].to_vec();
     out_dims.push(inter);
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev);
-    let storage = candle_core::Storage::Cuda(storage);
-    let shape: candle_core::Shape = out_dims.into();
+    let storage = CudaStorage::wrap_cuda_slice(y_dev, dev);
+    let storage = Storage::Cuda(storage);
+    let shape: Shape = out_dims.into();
     Ok(candle_core::Tensor::from_storage(
         storage,
         shape,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
@@ -4901,15 +4510,14 @@ pub(crate) fn residual_add_scale_bf16_op(
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
 
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("residual_add_scale_bf16_op requires CUDA"),
+    let Device::Cuda(dev) = device.clone() else {
+        bail!("residual_add_scale_bf16_op requires CUDA")
     };
     let a_c = a.contiguous()?;
     let b_c = b.contiguous()?;
     let dims = a_c.dims().to_vec();
     if dims != b_c.dims() {
-        anyhow::bail!(
+        bail!(
             "residual_add_scale_bf16_op: shape mismatch a={:?} b={:?}",
             dims,
             b_c.dims()
@@ -4917,18 +4525,17 @@ pub(crate) fn residual_add_scale_bf16_op(
     }
     let n: usize = dims.iter().product();
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut y_dev: cudarc::driver::CudaSlice<bf16> =
-        unsafe { stream.alloc::<bf16>(n).map_err(|e| anyhow::anyhow!(e))? };
+    let mut y_dev: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(n)? };
     let rc = {
         let (a_st, _al) = a_c.storage_and_layout();
         let (b_st, _bl) = b_c.storage_and_layout();
         let a_cuda = match &*a_st {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("expected cuda storage for a"),
+            Storage::Cuda(s) => s,
+            _ => bail!("expected cuda storage for a"),
         };
         let b_cuda = match &*b_st {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("expected cuda storage for b"),
+            Storage::Cuda(s) => s,
+            _ => bail!("expected cuda storage for b"),
         };
         let a_slice = a_cuda.as_cuda_slice::<bf16>()?;
         let b_slice = b_cuda.as_cuda_slice::<bf16>()?;
@@ -4947,15 +4554,15 @@ pub(crate) fn residual_add_scale_bf16_op(
         }
     };
     if rc != 0 {
-        anyhow::bail!("residual_add_scale_bf16 kernel returned {rc}");
+        bail!("residual_add_scale_bf16 kernel returned {rc}");
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev);
-    let storage = candle_core::Storage::Cuda(storage);
-    let shape: candle_core::Shape = dims.into();
+    let storage = CudaStorage::wrap_cuda_slice(y_dev, dev);
+    let storage = Storage::Cuda(storage);
+    let shape: Shape = dims.into();
     Ok(candle_core::Tensor::from_storage(
         storage,
         shape,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
@@ -4980,13 +4587,12 @@ pub(crate) fn embed_lookup_bf16_op(
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
 
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("embed_lookup_bf16_op requires CUDA"),
+    let Device::Cuda(dev) = device.clone() else {
+        bail!("embed_lookup_bf16_op requires CUDA")
     };
     let weight_dims = embed_weight.dims();
     if weight_dims.len() != 2 {
-        anyhow::bail!(
+        bail!(
             "embed_lookup_bf16_op: embed_weight must be 2-D, got {:?}",
             weight_dims
         );
@@ -4996,34 +4602,30 @@ pub(crate) fn embed_lookup_bf16_op(
     let tokens_c = tokens.flatten_all()?.contiguous()?;
     let n_tokens = tokens_c.dims()[0];
     if tokens_c.dtype() != DType::U32 {
-        anyhow::bail!(
+        bail!(
             "embed_lookup_bf16_op: tokens dtype must be U32, got {:?}",
             tokens_c.dtype()
         );
     }
     let embed_c = embed_weight.contiguous()?;
     if embed_c.dtype() != DType::BF16 {
-        anyhow::bail!(
+        bail!(
             "embed_lookup_bf16_op: embed_weight dtype must be BF16, got {:?}",
             embed_c.dtype()
         );
     }
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut y_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
-        stream
-            .alloc::<bf16>(n_tokens * hidden)
-            .map_err(|e| anyhow::anyhow!(e))?
-    };
+    let mut y_dev: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(n_tokens * hidden)? };
     let rc = {
         let (ts, _tl) = tokens_c.storage_and_layout();
         let (es, _el) = embed_c.storage_and_layout();
         let t_cuda = match &*ts {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("expected cuda storage for tokens"),
+            Storage::Cuda(s) => s,
+            _ => bail!("expected cuda storage for tokens"),
         };
         let e_cuda = match &*es {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("expected cuda storage for embed_weight"),
+            Storage::Cuda(s) => s,
+            _ => bail!("expected cuda storage for embed_weight"),
         };
         let t_slice = t_cuda.as_cuda_slice::<u32>()?;
         let e_slice = e_cuda.as_cuda_slice::<bf16>()?;
@@ -5043,14 +4645,14 @@ pub(crate) fn embed_lookup_bf16_op(
         }
     };
     if rc != 0 {
-        anyhow::bail!("gather_rows_bf16 kernel returned {rc}");
+        bail!("gather_rows_bf16 kernel returned {rc}");
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev);
-    let storage = candle_core::Storage::Cuda(storage);
+    let storage = CudaStorage::wrap_cuda_slice(y_dev, dev);
+    let storage = Storage::Cuda(storage);
     Ok(candle_core::Tensor::from_storage(
         storage,
         (n_tokens, hidden),
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
@@ -5070,21 +4672,19 @@ pub(crate) fn scale_bf16_op(x: &Tensor, scale: f32, device: &Device) -> Result<T
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
 
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("scale_bf16_op requires CUDA"),
+    let Device::Cuda(dev) = device.clone() else {
+        bail!("scale_bf16_op requires CUDA")
     };
     let x_c = x.contiguous()?;
     let dims = x_c.dims().to_vec();
     let n: usize = dims.iter().product();
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut y_dev: cudarc::driver::CudaSlice<bf16> =
-        unsafe { stream.alloc::<bf16>(n).map_err(|e| anyhow::anyhow!(e))? };
+    let mut y_dev: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(n)? };
     let rc = {
         let (xs, _xl) = x_c.storage_and_layout();
         let x_cuda = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("expected cuda storage for x"),
+            Storage::Cuda(s) => s,
+            _ => bail!("expected cuda storage for x"),
         };
         let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
         let (px, _) = x_slice.device_ptr(&stream);
@@ -5100,15 +4700,15 @@ pub(crate) fn scale_bf16_op(x: &Tensor, scale: f32, device: &Device) -> Result<T
         }
     };
     if rc != 0 {
-        anyhow::bail!("scale_out_bf16 kernel returned {rc}");
+        bail!("scale_out_bf16 kernel returned {rc}");
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev);
-    let storage = candle_core::Storage::Cuda(storage);
-    let shape: candle_core::Shape = dims.into();
+    let storage = CudaStorage::wrap_cuda_slice(y_dev, dev);
+    let storage = Storage::Cuda(storage);
+    let shape: Shape = dims.into();
     Ok(candle_core::Tensor::from_storage(
         storage,
         shape,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
@@ -5123,25 +4723,24 @@ pub(crate) fn scale_bf16_op(x: &Tensor, scale: f32, _device: &Device) -> Result<
 fn tanh_softcap_bf16_to_f32_into_op(
     logits: &Tensor,
     cap: f32,
-    out_buf: &mut cudarc::driver::CudaSlice<f32>,
+    out_buf: &mut CudaSlice<f32>,
     device: &Device,
 ) -> Result<()> {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("tanh_softcap_bf16_to_f32_into_op requires CUDA"),
+    let Device::Cuda(dev) = device.clone() else {
+        bail!("tanh_softcap_bf16_to_f32_into_op requires CUDA")
     };
     let logits_c = logits.contiguous()?;
     if logits_c.dtype() != DType::BF16 {
-        anyhow::bail!(
+        bail!(
             "tanh_softcap_bf16_to_f32_into_op: logits dtype must be BF16, got {:?}",
             logits_c.dtype()
         );
     }
     let dims = logits_c.dims().to_vec();
     let n: usize = dims.iter().product();
-    anyhow::ensure!(
+    ensure!(
         out_buf.len() >= n,
         "tanh_softcap_bf16_to_f32_into_op: out_buf len {} < required {}",
         out_buf.len(),
@@ -5150,8 +4749,8 @@ fn tanh_softcap_bf16_to_f32_into_op(
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let (xs, _xl) = logits_c.storage_and_layout();
     let x_cuda = match &*xs {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("expected cuda storage for logits"),
+        Storage::Cuda(s) => s,
+        _ => bail!("expected cuda storage for logits"),
     };
     let x_slice = x_cuda.as_cuda_slice::<half::bf16>()?;
     let (px, _) = x_slice.device_ptr(&stream);
@@ -5166,7 +4765,7 @@ fn tanh_softcap_bf16_to_f32_into_op(
         )
     };
     if rc != 0 {
-        anyhow::bail!("tanh_softcap_bf16_to_f32 kernel returned {rc}");
+        bail!("tanh_softcap_bf16_to_f32 kernel returned {rc}");
     }
     Ok(())
 }
@@ -5179,13 +4778,12 @@ pub(crate) fn tanh_softcap_bf16_to_f32_op(
 ) -> Result<Tensor> {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-    let dev = match device {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("tanh_softcap_bf16_to_f32_op requires CUDA"),
+    let Device::Cuda(dev) = device.clone() else {
+        bail!("tanh_softcap_bf16_to_f32_op requires CUDA")
     };
     let logits_c = logits.contiguous()?;
     if logits_c.dtype() != DType::BF16 {
-        anyhow::bail!(
+        bail!(
             "tanh_softcap_bf16_to_f32_op: logits dtype must be BF16, got {:?}",
             logits_c.dtype()
         );
@@ -5193,13 +4791,12 @@ pub(crate) fn tanh_softcap_bf16_to_f32_op(
     let dims = logits_c.dims().to_vec();
     let n: usize = dims.iter().product();
     let stream = nv_layers::cuda_stream::current_stream(&dev);
-    let mut y_dev: cudarc::driver::CudaSlice<f32> =
-        unsafe { stream.alloc::<f32>(n).map_err(|e| anyhow::anyhow!(e))? };
+    let mut y_dev: CudaSlice<f32> = unsafe { stream.alloc::<f32>(n)? };
     let rc = {
         let (xs, _xl) = logits_c.storage_and_layout();
         let x_cuda = match &*xs {
-            candle_core::Storage::Cuda(s) => s,
-            _ => anyhow::bail!("expected cuda storage for logits"),
+            Storage::Cuda(s) => s,
+            _ => bail!("expected cuda storage for logits"),
         };
         let x_slice = x_cuda.as_cuda_slice::<half::bf16>()?;
         let (px, _) = x_slice.device_ptr(&stream);
@@ -5215,15 +4812,15 @@ pub(crate) fn tanh_softcap_bf16_to_f32_op(
         }
     };
     if rc != 0 {
-        anyhow::bail!("tanh_softcap_bf16_to_f32 kernel returned {rc}");
+        bail!("tanh_softcap_bf16_to_f32 kernel returned {rc}");
     }
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(y_dev, dev);
-    let storage = candle_core::Storage::Cuda(storage);
-    let shape: candle_core::Shape = dims.into();
+    let storage = CudaStorage::wrap_cuda_slice(y_dev, dev);
+    let storage = Storage::Cuda(storage);
+    let shape: Shape = dims.into();
     Ok(candle_core::Tensor::from_storage(
         storage,
         shape,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
@@ -5262,92 +4859,6 @@ fn gelu_tanh_mul_candle(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     Ok(gelu_b.mul(up)?)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn causal_attention_chunked_bf16(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    n_q: usize,
-    n_kv: usize,
-    head_dim: usize,
-    seq: usize,
-    offset: usize,
-) -> Result<Tensor> {
-    let dev = q.device().clone();
-    let out_dtype = q.dtype();
-    let group = n_q / n_kv;
-    anyhow::ensure!(group * n_kv == n_q, "GQA group must divide n_q");
-    let total = k.dims()[1];
-    anyhow::ensure!(
-        total == offset + seq,
-        "causal_attention_chunked_bf16: keys {total} != offset {offset} + seq {seq}"
-    );
-
-    let q_t = q
-        .to_dtype(DType::BF16)?
-        .permute((0, 2, 1, 3))?
-        .reshape((n_q, seq, head_dim))?
-        .contiguous()?;
-    let k_perm = k
-        .to_dtype(DType::BF16)?
-        .permute((0, 2, 3, 1))?
-        .reshape((n_kv, head_dim, total))?
-        .contiguous()?;
-    let v_t = v
-        .to_dtype(DType::BF16)?
-        .permute((0, 2, 1, 3))?
-        .reshape((n_kv, total, head_dim))?
-        .contiguous()?;
-    let js = Tensor::arange(0f32, total as f32, &dev)?.reshape((1usize, total))?;
-
-    let budget_rows = ((1usize << 28) / (2 * n_q * total.max(1))).max(16);
-    let qchunk = budget_rows.min(512).min(seq).max(1);
-
-    let mut chunks: Vec<Tensor> = Vec::with_capacity(seq.div_ceil(qchunk));
-    let mut start = 0usize;
-    while start < seq {
-        let len = qchunk.min(seq - start);
-
-        let q_chunk = q_t
-            .reshape((n_kv, group, seq, head_dim))?
-            .narrow(2, start, len)?
-            .reshape((n_kv, group * len, head_dim))?
-            .contiguous()?;
-        let scores = q_chunk.matmul(&k_perm)?;
-
-        let vis_lo = (offset + start + 1) as f32;
-        let vis = Tensor::arange(vis_lo, vis_lo + len as f32, &dev)?.reshape((len, 1usize))?;
-        let bias = js
-            .broadcast_lt(&vis)?
-            .to_dtype(DType::F32)?
-            .affine(1.0e30, -1.0e30)?
-            .to_dtype(DType::BF16)?
-            .reshape((1usize, 1usize, len, total))?;
-
-        let scores = scores
-            .reshape((n_kv, group, len, total))?
-            .broadcast_add(&bias)?;
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = probs.reshape((n_kv, group * len, total))?.matmul(&v_t)?;
-
-        let out = out
-            .reshape((n_q, len, head_dim))?
-            .permute((1, 0, 2))?
-            .contiguous()?
-            .reshape((1usize, len, n_q, head_dim))?;
-        chunks.push(out);
-        start += len;
-    }
-
-    let full = if chunks.len() == 1 {
-        chunks.pop().unwrap()
-    } else {
-        Tensor::cat(&chunks.iter().collect::<Vec<_>>()[..], 1)?
-    };
-    Ok(full.to_dtype(out_dtype)?)
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn causal_attention_chunked(
     q: &Tensor,
     k: &Tensor,
@@ -5361,9 +4872,9 @@ pub fn causal_attention_chunked(
     let dev = q.device().clone();
     let out_dtype = q.dtype();
     let group = n_q / n_kv;
-    anyhow::ensure!(group * n_kv == n_q, "GQA group must divide n_q");
+    ensure!(group * n_kv == n_q, "GQA group must divide n_q");
     let total = k.dims()[1];
-    anyhow::ensure!(
+    ensure!(
         total == offset + seq,
         "causal_attention_chunked: keys {total} != offset {offset} + seq {seq}"
     );
@@ -5438,7 +4949,6 @@ pub fn causal_attention_chunked(
     Ok(full.to_dtype(out_dtype)?)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn sdpa_with_mask(
     q: &Tensor,
     k: &Tensor,
@@ -5453,11 +4963,11 @@ fn sdpa_with_mask(
     let qd = q.dims();
     let kd = k.dims();
     if qd.len() != 4 || qd[2] != n_q || qd[3] != head_dim {
-        anyhow::bail!("sdpa_with_mask: bad q dims {:?}", qd);
+        bail!("sdpa_with_mask: bad q dims {:?}", qd);
     }
     let seq_k = kd[1];
     if attn_mask.dims() != [seq_q, seq_k] {
-        anyhow::bail!(
+        bail!(
             "sdpa_with_mask: attn_mask must be [{seq_q},{seq_k}], got {:?}",
             attn_mask.dims()
         );
@@ -5529,7 +5039,6 @@ fn sdpa_with_mask(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn flash_attention(
     q: &Tensor,
     k: &Tensor,
@@ -5555,7 +5064,29 @@ fn flash_attention(
     Ok(out)
 }
 
+#[cfg(feature = "cuda")]
+use crate::paged_fp8::PagedGemma4Cache;
+#[cfg(feature = "cuda")]
+use candle_core::op::BackpropOp;
+#[cfg(feature = "cuda")]
+use candle_core::CudaStorage;
+#[cfg(feature = "cuda")]
+use candle_core::Shape;
+#[cfg(feature = "cuda")]
+use candle_core::Storage;
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
+#[cfg(feature = "cuda")]
+use nv_quant::fp8::Fp8GemmRunner;
+#[cfg(feature = "cuda")]
+use nv_quant::nvfp4::Nvfp4GemmRunner;
+#[cfg(feature = "cuda")]
+use nv_quant::nvfp4::MIN_TILE;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::env;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::Once;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XattnScore {
@@ -5588,83 +5119,25 @@ static XATTN_THRESH_OVR: AtomicU64 = AtomicU64::new(0);
 static XATTN_KEPT: AtomicU64 = AtomicU64::new(0);
 static XATTN_CAND: AtomicU64 = AtomicU64::new(0);
 
-pub fn xattn_set_override(v: Option<bool>) {
-    XATTN_OVERRIDE.store(
-        match v {
-            None => 0,
-            Some(true) => 1,
-            Some(false) => 2,
-        },
-        Ordering::Relaxed,
-    );
-}
-
-pub fn xattn_set_score(v: Option<XattnScore>) {
-    XATTN_SCORE_OVR.store(
-        match v {
-            None => 0,
-            Some(XattnScore::Raw) => 1,
-            Some(XattnScore::Mass) => 2,
-        },
-        Ordering::Relaxed,
-    );
-}
-
-pub fn xattn_set_headcomb(v: Option<XattnHeadComb>) {
-    XATTN_COMB_OVR.store(
-        match v {
-            None => 0,
-            Some(XattnHeadComb::Max) => 1,
-            Some(XattnHeadComb::Mean) => 2,
-        },
-        Ordering::Relaxed,
-    );
-}
-
-pub fn xattn_set_thresh(v: Option<f32>) {
-    let enc = match v {
-        None => 0u64,
-        Some(t) => ((t.to_bits() as u64) << 1) | 1,
-    };
-    XATTN_THRESH_OVR.store(enc, Ordering::Relaxed);
-}
-
-pub fn xattn_stats_take() -> (u64, u64) {
-    (
-        XATTN_KEPT.swap(0, Ordering::Relaxed),
-        XATTN_CAND.swap(0, Ordering::Relaxed),
-    )
-}
-
 pub fn xattn_stats_enabled() -> bool {
-    std::env::var_os("NV_XATTN_STATS").is_some()
+    nv_config::env_arm_present_at_all_reread_every_call("NV_XATTN_STATS")
 }
 
 pub fn xattn_cfg() -> Option<XattnCfg> {
     let on = match XATTN_OVERRIDE.load(Ordering::Relaxed) {
         1 => true,
         2 => false,
-        _ => std::env::var_os("NV_XATTN_PREFILL").is_some(),
+        _ => nv_config::env_arm_present_at_all_reread_every_call("NV_XATTN_PREFILL"),
     };
     if !on {
         return None;
     }
-    let getu = |k: &str, d: usize| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
-    };
-    let getf = |k: &str, d: f32| {
-        std::env::var(k)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d)
-    };
+    let getu = |k: &str, d: usize| env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let getf = |k: &str, d: f32| env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
     let score = match XATTN_SCORE_OVR.load(Ordering::Relaxed) {
         1 => XattnScore::Raw,
         2 => XattnScore::Mass,
-        _ => match std::env::var("NV_XATTN_SCORE").ok().as_deref() {
+        _ => match env::var("NV_XATTN_SCORE").ok().as_deref() {
             Some("mass") => XattnScore::Mass,
             _ => XattnScore::Raw,
         },
@@ -5672,7 +5145,7 @@ pub fn xattn_cfg() -> Option<XattnCfg> {
     let headcomb = match XATTN_COMB_OVR.load(Ordering::Relaxed) {
         1 => XattnHeadComb::Max,
         2 => XattnHeadComb::Mean,
-        _ => match std::env::var("NV_XATTN_HEADCOMB").ok().as_deref() {
+        _ => match env::var("NV_XATTN_HEADCOMB").ok().as_deref() {
             Some("mean") => XattnHeadComb::Mean,
             _ => XattnHeadComb::Max,
         },
@@ -5953,23 +5426,22 @@ fn split_cols_bf16_raw(fused: &Tensor, parts: &[(usize, usize)]) -> Result<Vec<T
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use half::bf16;
 
-    anyhow::ensure!(
+    ensure!(
         fused.dtype() == DType::BF16,
         "split_cols_bf16_raw: bf16 only"
     );
     let dims = fused.dims().to_vec();
     let n_total = *dims.last().unwrap();
     let m: usize = dims[..dims.len() - 1].iter().product();
-    let dev = match fused.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("split_cols_bf16_raw: cuda only"),
+    let Device::Cuda(dev) = fused.device().clone() else {
+        bail!("split_cols_bf16_raw: cuda only")
     };
     let stream = nv_layers::cuda_stream::current_stream(&dev);
     let f_c = fused.contiguous()?;
     let (fs, fl) = f_c.storage_and_layout();
     let f_cuda = match &*fs {
-        candle_core::Storage::Cuda(s) => s,
-        _ => anyhow::bail!("expected cuda storage"),
+        Storage::Cuda(s) => s,
+        _ => bail!("expected cuda storage"),
     };
     let f_slice = f_cuda.as_cuda_slice::<bf16>()?;
     let f_view = f_slice.slice(fl.start_offset()..);
@@ -5978,13 +5450,9 @@ fn split_cols_bf16_raw(fused: &Tensor, parts: &[(usize, usize)]) -> Result<Vec<T
     let elt = std::mem::size_of::<bf16>();
     let mut outs = Vec::with_capacity(parts.len());
     for &(off, w) in parts {
-        anyhow::ensure!(off + w <= n_total, "split_cols_bf16_raw: part out of range");
+        ensure!(off + w <= n_total, "split_cols_bf16_raw: part out of range");
 
-        let mut out: cudarc::driver::CudaSlice<bf16> = unsafe {
-            stream
-                .alloc::<bf16>(m * w)
-                .map_err(|e| anyhow::anyhow!(e))?
-        };
+        let mut out: CudaSlice<bf16> = unsafe { stream.alloc::<bf16>(m * w)? };
         {
             let (op, _go) = out.device_ptr_mut(&stream);
             let cfg = cu_sys::CUDA_MEMCPY2D_st {
@@ -6006,18 +5474,18 @@ fn split_cols_bf16_raw(fused: &Tensor, parts: &[(usize, usize)]) -> Result<Vec<T
                 Height: m,
             };
             let rc = unsafe { cu_sys::cuMemcpy2DAsync_v2(&cfg, stream.cu_stream()) };
-            anyhow::ensure!(
+            ensure!(
                 rc == cu_sys::CUresult::CUDA_SUCCESS,
                 "cuMemcpy2DAsync_v2 failed: {rc:?}"
             );
         }
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev.clone());
+        let storage = CudaStorage::wrap_cuda_slice(out, dev.clone());
         let mut out_dims = dims[..dims.len() - 1].to_vec();
         out_dims.push(w);
         outs.push(candle_core::Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
-            candle_core::Shape::from(out_dims),
-            candle_core::op::BackpropOp::none(),
+            Storage::Cuda(storage),
+            Shape::from(out_dims),
+            BackpropOp::none(),
             false,
         ));
     }
@@ -6039,7 +5507,7 @@ fn load_qkv_fused(
             .with_context(|| format!("load {name}"))?;
         let d = w.dims();
         if d.len() != 2 || d[0] != out || d[1] != hidden {
-            anyhow::bail!("linear {name}: expected [{}, {}], got {:?}", out, hidden, d);
+            bail!("linear {name}: expected [{}, {}], got {:?}", out, hidden, d);
         }
         Ok(w)
     };
@@ -6070,7 +5538,7 @@ fn load_attn_proj_tensor(
         .with_context(|| format!("load {name}"))?;
     let d = w.dims();
     if d.len() != 2 || d[0] != out_features || d[1] != in_features {
-        anyhow::bail!(
+        bail!(
             "linear {name}: expected [{}, {}], got {:?}",
             out_features,
             in_features,
@@ -6097,7 +5565,7 @@ pub fn attn_pretranspose_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         matches!(
-            std::env::var("NV_ATTN_PRETRANSPOSE").ok().as_deref(),
+            env::var("NV_ATTN_PRETRANSPOSE").ok().as_deref(),
             Some("1") | Some("on") | Some("true")
         )
     })
@@ -6121,25 +5589,6 @@ fn load_attn_proj_lean(
 pub const PREFILL_W4A4_MIN_M: usize = 256;
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub fn prefill_w4a4_env(raw: Option<&str>) -> bool {
-    !matches!(raw, Some("0") | Some("off") | Some("bf16"))
-}
-
-#[cfg(feature = "cuda")]
-fn prefill_w4a4_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = prefill_w4a4_env(std::env::var("NV_PREFILL_W4A4").ok().as_deref());
-        eprintln!(
-            "[gemma4] W4A4 prefill {} (NV_PREFILL_W4A4=0/off/bf16 to disable; engages at m>={})",
-            if on { "ON" } else { "off" },
-            PREFILL_W4A4_MIN_M
-        );
-        on
-    })
-}
-
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn prefill_w4a4_selects(m: usize) -> bool {
     m >= PREFILL_W4A4_MIN_M
 }
@@ -6147,12 +5596,9 @@ fn prefill_w4a4_selects(m: usize) -> bool {
 #[cfg(feature = "cuda")]
 fn prefill_fp4_copy(
     lin: &Linear,
-    runner: Option<&Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>>,
+    runner: Option<&Arc<Mutex<Nvfp4GemmRunner>>>,
     device: &Device,
 ) -> Result<Option<Linear>> {
-    if !prefill_w4a4_enabled() {
-        return Ok(None);
-    }
     let Some(runner) = runner else {
         return Ok(None);
     };
@@ -6162,8 +5608,8 @@ fn prefill_fp4_copy(
     let dims = weight.dims();
     if dims.len() != 2
         || dims[1] % nv_quant::nvfp4::BLOCK_SIZE != 0
-        || dims[0] < nv_quant::nvfp4::MIN_TILE
-        || dims[1] < nv_quant::nvfp4::MIN_TILE
+        || dims[0] < MIN_TILE
+        || dims[1] < MIN_TILE
     {
         return Ok(None);
     }
@@ -6241,7 +5687,7 @@ fn attn_proj_quant_from(scheme_ok: bool, raw: Option<&str>) -> (bool, bool) {
 
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn attn_proj_quant_warn_unknown(raw: &str) {
-    static WARN: std::sync::Once = std::sync::Once::new();
+    static WARN: Once = Once::new();
     let raw = raw.to_string();
     WARN.call_once(move || {
         let lower = raw.to_ascii_lowercase();
@@ -6265,21 +5711,18 @@ fn attn_proj_quant_mode(qconfig: Option<&QuantizationConfig>) -> (bool, bool) {
     let scheme_ok = qconfig
         .map(|q| matches!(q.scheme, QuantScheme::Nvfp4))
         .unwrap_or(false);
-    attn_proj_quant_from(
-        scheme_ok,
-        std::env::var("NV_ATTN_PROJ_QUANT").ok().as_deref(),
-    )
+    attn_proj_quant_from(scheme_ok, env::var("NV_ATTN_PROJ_QUANT").ok().as_deref())
 }
 
 #[cfg(feature = "cuda")]
 fn attn_proj_scheme() -> AttnProjScheme {
-    attn_proj_scheme_from(std::env::var("NV_ATTN_PROJ_QUANT").ok().as_deref())
+    attn_proj_scheme_from(env::var("NV_ATTN_PROJ_QUANT").ok().as_deref())
 }
 
 #[cfg(feature = "cuda")]
 fn quantize_attn_proj_nvfp4(
     lin: Linear,
-    runner: Option<&Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>>,
+    runner: Option<&Arc<Mutex<Nvfp4GemmRunner>>>,
     device: &Device,
 ) -> Result<Linear> {
     let Some(runner) = runner else {
@@ -6291,8 +5734,8 @@ fn quantize_attn_proj_nvfp4(
     let dims = weight.dims();
     if dims.len() != 2
         || dims[1] % nv_quant::nvfp4::BLOCK_SIZE != 0
-        || dims[0] < nv_quant::nvfp4::MIN_TILE
-        || dims[1] < nv_quant::nvfp4::MIN_TILE
+        || dims[0] < MIN_TILE
+        || dims[1] < MIN_TILE
     {
         return Ok(lin);
     }
@@ -6303,7 +5746,7 @@ fn quantize_attn_proj_nvfp4(
 #[cfg(feature = "cuda")]
 fn quantize_attn_proj_fp8(
     lin: Linear,
-    runner: Option<&Arc<Mutex<nv_quant::fp8::Fp8GemmRunner>>>,
+    runner: Option<&Arc<Mutex<Fp8GemmRunner>>>,
     device: &Device,
 ) -> Result<Linear> {
     let Some(runner) = runner else {
@@ -6328,7 +5771,7 @@ fn load_mlp_proj(
     in_features: usize,
     dtype: DType,
     qconfig: Option<&QuantizationConfig>,
-    nvfp4_runner: Option<Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>>,
+    nvfp4_runner: Option<Arc<Mutex<Nvfp4GemmRunner>>>,
     device: &Device,
 ) -> Result<Linear> {
     let ignored = qconfig.map(|q| q.is_module_ignored(module)).unwrap_or(true);
@@ -6346,7 +5789,7 @@ fn load_mlp_proj(
     if !weights.has(&packed_name) || !weights.has(&scale2_name) {
         return load_attn_proj(weights, &bf16_name, out_features, in_features, dtype);
     }
-    if in_features < nv_quant::nvfp4::MIN_TILE || out_features < nv_quant::nvfp4::MIN_TILE {
+    if in_features < MIN_TILE || out_features < MIN_TILE {
         return load_attn_proj(weights, &bf16_name, out_features, in_features, dtype);
     }
     let runner =
@@ -6371,7 +5814,7 @@ fn load_mlp_proj_fused_pair(
     in_features: usize,
     dtype: DType,
     qconfig: Option<&QuantizationConfig>,
-    nvfp4_runner: Option<Arc<Mutex<nv_quant::nvfp4::Nvfp4GemmRunner>>>,
+    nvfp4_runner: Option<Arc<Mutex<Nvfp4GemmRunner>>>,
     device: &Device,
 ) -> Result<Linear> {
     let ignored = qconfig
@@ -6390,8 +5833,7 @@ fn load_mlp_proj_fused_pair(
         && weights.has(&scale2_a)
         && weights.has(&packed_b)
         && weights.has(&scale2_b);
-    let small_tile =
-        in_features < nv_quant::nvfp4::MIN_TILE || out_features_each < nv_quant::nvfp4::MIN_TILE;
+    let small_tile = in_features < MIN_TILE || out_features_each < MIN_TILE;
     if ignored
         || qconfig.is_none()
         || !matches!(scheme, QuantScheme::Nvfp4)
@@ -6419,7 +5861,6 @@ fn load_mlp_proj_fused_pair(
 
 #[cfg(not(feature = "cuda"))]
 #[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
 fn load_mlp_proj(
     _weights: &WeightLoader,
     _module: &str,
@@ -6430,7 +5871,7 @@ fn load_mlp_proj(
     _nvfp4_runner: Option<()>,
     _device: &Device,
 ) -> Result<Linear> {
-    anyhow::bail!("gemma4 NVFP4 path requires the `cuda` feature")
+    bail!("gemma4 NVFP4 path requires the `cuda` feature")
 }
 
 #[cfg(test)]
@@ -6566,106 +6007,30 @@ mod boxed_prefill_dispatch_tests {
 
 #[cfg(test)]
 mod falsified_knob_default_pin_tests {
-    use super::{
-        mk_verify_hd512_from, spec_prefill_flash_from, verify_norm_fused_from,
-        verify_qkv_fused_from,
-    };
+    use super::{spec_prefill_flash_from, verify_qkv_fused_from};
 
     #[test]
-    fn mk_verify_hd512_ships_default_on_and_zero_opts_out() {
-        assert!(mk_verify_hd512_from(None));
-        assert!(!mk_verify_hd512_from(Some("0")));
-        assert!(mk_verify_hd512_from(Some("1")));
-        assert!(mk_verify_hd512_from(Some("")));
-    }
-
-    #[test]
-    fn lm_head_i8_rows_per_call_defaults_to_kernel_ceiling_and_chunk4_env_restores_legacy() {
-        use super::{
-            lm_head_i8_rows_per_call_gate,
-            LM_HEAD_I8_LEGACY_CHUNK_ROWS_PREDATING_THE_MK_M16_LAUNCHER,
-        };
-        assert_eq!(lm_head_i8_rows_per_call_gate(None, 8), 8);
-        assert_eq!(lm_head_i8_rows_per_call_gate(None, 16), 16);
-        assert_eq!(lm_head_i8_rows_per_call_gate(None, 0), 1);
-        assert_eq!(
-            lm_head_i8_rows_per_call_gate(Some("1"), 8),
-            LM_HEAD_I8_LEGACY_CHUNK_ROWS_PREDATING_THE_MK_M16_LAUNCHER
-        );
-        assert_eq!(lm_head_i8_rows_per_call_gate(Some("0"), 8), 8);
+    fn lm_head_i8_rows_default_to_the_kernel_ceiling_verify_qkv_fused_ships_off_and_deterministic_mode_disables_spec_prefill_flash(
+    ) {
+        use super::lm_head_i8_rows_per_call_gate;
+        assert_eq!(lm_head_i8_rows_per_call_gate(8), 8);
+        assert_eq!(lm_head_i8_rows_per_call_gate(16), 16);
+        assert_eq!(lm_head_i8_rows_per_call_gate(0), 1);
         let gemma4_31b_dflash_default_k = 8usize;
         assert!(
-            lm_head_i8_rows_per_call_gate(None, 8) >= gemma4_31b_dflash_default_k,
+            lm_head_i8_rows_per_call_gate(8) >= gemma4_31b_dflash_default_k,
             "the default gate must keep the k=8 dflash verify body single-call, or the chunked \
              candle cat escapes the forked verify capture and replays freed memory"
         );
-    }
 
-    #[test]
-    fn verify_qkv_fused_ships_default_off_and_only_the_literal_one_enables() {
         assert!(!verify_qkv_fused_from(None));
         assert!(!verify_qkv_fused_from(Some("0")));
         assert!(!verify_qkv_fused_from(Some("true")));
         assert!(!verify_qkv_fused_from(Some("")));
         assert!(verify_qkv_fused_from(Some("1")));
-    }
 
-    #[test]
-    fn verify_norm_fused_ships_default_on_and_zero_disables() {
-        assert!(verify_norm_fused_from(None));
-        assert!(!verify_norm_fused_from(Some("0")));
-        assert!(verify_norm_fused_from(Some("1")));
-        assert!(verify_norm_fused_from(Some("")));
-    }
-
-    #[test]
-    fn deterministic_mode_disables_spec_prefill_flash_regardless_of_env() {
-        assert!(!spec_prefill_flash_from(true, None));
-        assert!(!spec_prefill_flash_from(true, Some("1")));
-        assert!(!spec_prefill_flash_from(true, Some("0")));
-    }
-
-    #[test]
-    fn spec_prefill_flash_defaults_on_outside_deterministic_mode() {
-        assert!(spec_prefill_flash_from(false, None));
-        assert!(spec_prefill_flash_from(false, Some("1")));
-        assert!(!spec_prefill_flash_from(false, Some("0")));
-    }
-
-    #[test]
-    fn spec_prefill_flash_covers_hd512_by_default_and_either_escape_reroutes_it() {
-        use super::spec_prefill_flash_head_dim_from;
-        assert!(
-            spec_prefill_flash_head_dim_from(512, None, None),
-            "hd512 flash is the shipped default: candle 0.11 fixed the sm120 hdim512 forward \
-             and the hd512 flashvsbf16 decision rows show flash ahead at every depth"
-        );
-        assert!(spec_prefill_flash_head_dim_from(512, Some(""), Some("")));
-        assert!(spec_prefill_flash_head_dim_from(512, Some("0"), Some("0")));
-        assert!(spec_prefill_flash_head_dim_from(512, Some("true"), None));
-        assert!(!spec_prefill_flash_head_dim_from(512, Some("1"), None));
-        assert!(!spec_prefill_flash_head_dim_from(512, None, Some("1")));
-        assert!(!spec_prefill_flash_head_dim_from(512, Some("1"), Some("1")));
-        assert!(spec_prefill_flash_head_dim_from(256, Some("1"), Some("1")));
-        assert!(spec_prefill_flash_head_dim_from(576, None, None));
-        assert!(!spec_prefill_flash_head_dim_from(576, Some("1"), None));
-    }
-
-    #[test]
-    fn hd512_escapes_are_exact_opt_in_and_eager_wins_when_both_are_set() {
-        use super::spec_prefill_hd512_bf16_from;
-        assert!(!spec_prefill_hd512_bf16_from(None, None));
-        assert!(spec_prefill_hd512_bf16_from(Some("1"), None));
-        assert!(spec_prefill_hd512_bf16_from(Some("1"), Some("0")));
-        assert!(
-            !spec_prefill_hd512_bf16_from(Some("1"), Some("1")),
-            "with both hd512 escapes set the shadow takes chunked eager f32: the reference \
-             route outranks the bf16 recovery route"
-        );
-        assert!(!spec_prefill_hd512_bf16_from(Some(""), None));
-        assert!(!spec_prefill_hd512_bf16_from(Some("0"), None));
-        assert!(!spec_prefill_hd512_bf16_from(Some("true"), None));
-        assert!(!spec_prefill_hd512_bf16_from(None, Some("1")));
+        assert!(!spec_prefill_flash_from(true));
+        assert!(spec_prefill_flash_from(false));
     }
 }
 
@@ -6676,7 +6041,8 @@ mod mk_verify_gate_tests {
     };
 
     #[test]
-    fn mk_requires_exact_opt_in_and_no_tree_mode() {
+    fn mk_requires_exact_opt_in_outside_tree_mode_hd512_defaults_on_without_sharing_that_default_and_its_geometry_needs_8x_gqa(
+    ) {
         assert!(mk_verify_gate(Some("1"), None));
         assert!(!mk_verify_gate(None, None));
         assert!(!mk_verify_gate(Some("0"), None));
@@ -6685,28 +6051,15 @@ mod mk_verify_gate_tests {
         assert!(!mk_verify_gate(Some("1"), Some("0")));
         assert!(!mk_verify_gate(Some("1"), Some("")));
         assert!(!mk_verify_gate(None, Some("1")));
-    }
 
-    #[test]
-    fn hd512_is_default_on_and_opt_out_and_no_tree_mode() {
-        assert!(mk_verify_hd512_gate(Some("1"), None));
-        assert!(mk_verify_hd512_gate(None, None));
-        assert!(mk_verify_hd512_gate(Some("true"), None));
-        assert!(!mk_verify_hd512_gate(Some("0"), None));
-        assert!(!mk_verify_hd512_gate(Some("1"), Some("1")));
-        assert!(!mk_verify_hd512_gate(Some("1"), Some("0")));
-        assert!(!mk_verify_hd512_gate(Some("1"), Some("")));
-        assert!(!mk_verify_hd512_gate(None, Some("1")));
-    }
+        assert!(mk_verify_hd512_gate(None));
+        assert!(!mk_verify_hd512_gate(Some("1")));
+        assert!(!mk_verify_hd512_gate(Some("0")));
+        assert!(!mk_verify_hd512_gate(Some("")));
 
-    #[test]
-    fn hd512_and_mk_verify_do_not_share_a_default() {
         assert!(!mk_verify_gate(None, None));
-        assert!(mk_verify_hd512_gate(None, None));
-    }
+        assert!(mk_verify_hd512_gate(None));
 
-    #[test]
-    fn hd512_geometry_requires_hd512_with_8x_gqa() {
         assert!(gqa512_verify_geometry(32, 4, 512));
         assert!(gqa512_verify_geometry(8, 1, 512));
         assert!(!gqa512_verify_geometry(32, 4, 256));
@@ -6727,14 +6080,11 @@ mod mk_verify_gate_tests {
     }
 
     #[test]
-    fn chain_predicate_accepts_lower_triangular_masks() {
+    fn chain_predicate_accepts_lower_triangular_masks_and_rejects_every_other_shape() {
         for k in 1..=8 {
             assert!(verify_mask_is_chain(&lower_tri(k), k), "k={k}");
         }
-    }
 
-    #[test]
-    fn chain_predicate_rejects_non_chain_masks() {
         assert!(!verify_mask_is_chain(&[], 0));
         assert!(!verify_mask_is_chain(&lower_tri(3), 4));
         assert!(!verify_mask_is_chain(&[1u8; 9], 3));
@@ -6757,7 +6107,8 @@ mod attn_proj_quant_tests {
     };
 
     #[test]
-    fn non_nvfp4_checkpoints_never_quantize_attn_projections() {
+    fn attn_proj_quant_env_grammar_selects_qkv_o_both_fp8_or_neither_and_never_quantizes_a_non_nvfp4_checkpoint(
+    ) {
         for raw in [None, Some("1"), Some("qkv"), Some("o"), Some("off")] {
             assert_eq!(
                 attn_proj_quant_from(false, raw),
@@ -6765,10 +6116,7 @@ mod attn_proj_quant_tests {
                 "raw={raw:?}"
             );
         }
-    }
 
-    #[test]
-    fn env_selects_qkv_o_both_or_neither() {
         assert_eq!(attn_proj_quant_from(true, Some("off")), (false, false));
         assert_eq!(attn_proj_quant_from(true, Some("0")), (false, false));
         assert_eq!(attn_proj_quant_from(true, Some("bf16")), (false, false));
@@ -6777,12 +6125,45 @@ mod attn_proj_quant_tests {
         assert_eq!(attn_proj_quant_from(true, Some("oproj")), (false, true));
         assert_eq!(attn_proj_quant_from(true, Some("1")), (true, true));
         assert_eq!(attn_proj_quant_from(true, Some("nvfp4")), (true, true));
-    }
 
-    #[test]
-    fn unset_env_follows_the_shipped_default() {
         let d = ATTN_PROJ_QUANT_DEFAULT_ON;
         assert_eq!(attn_proj_quant_from(true, None), (d, d));
+
+        for raw in ["fp8", "e4m3", "fp8_e4m3", "fp8-e4m3", "FP8", "E4M3"] {
+            assert_eq!(
+                attn_proj_quant_from(true, Some(raw)),
+                (true, true),
+                "NV_ATTN_PROJ_QUANT={raw} should select both projections"
+            );
+            assert_eq!(
+                attn_proj_scheme_from(Some(raw)),
+                AttnProjScheme::Fp8E4m3,
+                "NV_ATTN_PROJ_QUANT={raw} should pick the fp8-e4m3 scheme"
+            );
+        }
+
+        assert_eq!(attn_proj_quant_from(false, Some("fp8")), (false, false));
+
+        assert_eq!(attn_proj_quant_from(true, Some("e5m2")), (false, false));
+
+        assert_eq!(attn_proj_scheme_from(Some("nvfp4")), AttnProjScheme::Nvfp4);
+        assert_eq!(attn_proj_scheme_from(None), AttnProjScheme::Nvfp4);
+
+        for raw in ["yolo", "int8", "w4a4", "2", "nvfp4-ish", ""] {
+            assert_eq!(
+                attn_proj_quant_from(true, Some(raw)),
+                (false, false),
+                "raw={raw:?}"
+            );
+        }
+
+        for raw in ["1", "on", "true", "yes", "all", "nvfp4", "fp4", "qkv+o"] {
+            assert_eq!(
+                attn_proj_quant_from(true, Some(raw)),
+                (true, true),
+                "raw={raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -6803,56 +6184,11 @@ mod attn_proj_quant_tests {
         assert_eq!(attn_proj_quant_from(true, None), (false, false));
         assert_eq!(attn_proj_quant_from(true, Some("nvfp4")), (true, true));
     }
-
-    #[test]
-    fn fp8_selects_both_projections_with_the_fp8_scheme() {
-        for raw in ["fp8", "e4m3", "fp8_e4m3", "fp8-e4m3", "FP8", "E4M3"] {
-            assert_eq!(
-                attn_proj_quant_from(true, Some(raw)),
-                (true, true),
-                "NV_ATTN_PROJ_QUANT={raw} should select both projections"
-            );
-            assert_eq!(
-                attn_proj_scheme_from(Some(raw)),
-                AttnProjScheme::Fp8E4m3,
-                "NV_ATTN_PROJ_QUANT={raw} should pick the fp8-e4m3 scheme"
-            );
-        }
-
-        assert_eq!(attn_proj_quant_from(false, Some("fp8")), (false, false));
-
-        assert_eq!(attn_proj_quant_from(true, Some("e5m2")), (false, false));
-
-        assert_eq!(attn_proj_scheme_from(Some("nvfp4")), AttnProjScheme::Nvfp4);
-        assert_eq!(attn_proj_scheme_from(None), AttnProjScheme::Nvfp4);
-    }
-
-    #[test]
-    fn unrecognized_values_fall_back_to_bf16_not_to_on() {
-        for raw in ["yolo", "int8", "w4a4", "2", "nvfp4-ish", ""] {
-            assert_eq!(
-                attn_proj_quant_from(true, Some(raw)),
-                (false, false),
-                "raw={raw:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn recognized_on_aliases_all_enable_both_projections() {
-        for raw in ["1", "on", "true", "yes", "all", "nvfp4", "fp4", "qkv+o"] {
-            assert_eq!(
-                attn_proj_quant_from(true, Some(raw)),
-                (true, true),
-                "raw={raw:?}"
-            );
-        }
-    }
 }
 
 #[cfg(test)]
 mod prefill_w4a4_tests {
-    use super::{prefill_w4a4_env, prefill_w4a4_selects, PREFILL_W4A4_MIN_M};
+    use super::{prefill_w4a4_selects, PREFILL_W4A4_MIN_M};
 
     #[test]
     #[allow(clippy::assertions_on_constants)]
@@ -6871,17 +6207,6 @@ mod prefill_w4a4_tests {
         }
         assert!(PREFILL_W4A4_MIN_M > 128);
     }
-
-    #[test]
-    fn env_gate_defaults_on_and_parses() {
-        assert!(prefill_w4a4_env(None));
-        assert!(!prefill_w4a4_env(Some("0")));
-        assert!(!prefill_w4a4_env(Some("off")));
-        assert!(!prefill_w4a4_env(Some("bf16")));
-        assert!(prefill_w4a4_env(Some("1")));
-        assert!(prefill_w4a4_env(Some("on")));
-        assert!(prefill_w4a4_env(Some("w4a4")));
-    }
 }
 
 #[cfg(test)]
@@ -6890,13 +6215,10 @@ mod kv_window_tests {
     use super::{tree_layer_window, tree_window_attends, LayerType};
 
     #[test]
-    fn tree_layer_window_maps_layer_kinds() {
+    fn tree_window_maps_layer_kinds_matches_the_sdpa_mask_and_bounds_the_prefill_shape() {
         assert_eq!(tree_layer_window(LayerType::SlidingAttention, 1024), 1024);
         assert_eq!(tree_layer_window(LayerType::FullAttention, 1024), 0);
-    }
 
-    #[test]
-    fn tree_window_semantics_match_sdpa_mask() {
         let w = 1024i64;
         assert!(tree_window_attends(2000, 2000, w));
         assert!(tree_window_attends(2000, 977, w));
@@ -6912,10 +6234,7 @@ mod kv_window_tests {
 
         assert!(tree_window_attends(7, 7, 1));
         assert!(!tree_window_attends(7, 6, 1));
-    }
 
-    #[test]
-    fn tree_window_prefill_shape() {
         let w = 4i64;
         let prompt = 13i64;
         for qi in 0..prompt {
@@ -6927,19 +6246,14 @@ mod kv_window_tests {
     }
 
     #[test]
-    fn accepts_writes_that_fit() {
+    fn kv_window_check_accepts_writes_that_fit_and_rejects_writes_past_the_end_or_overflowing_positions(
+    ) {
         assert!(check_kv_window("t", 0, 128, 128).is_ok());
         assert!(check_kv_window("t", 127, 1, 128).is_ok());
-    }
 
-    #[test]
-    fn rejects_writes_past_the_end() {
         assert!(check_kv_window("t", 128, 1, 128).is_err());
         assert!(check_kv_window("t", 120, 9, 128).is_err());
-    }
 
-    #[test]
-    fn rejects_overflowing_positions() {
         assert!(check_kv_window("t", usize::MAX, 2, usize::MAX).is_err());
     }
 }
@@ -6982,7 +6296,8 @@ mod config_tests {
     }
 
     #[test]
-    fn kv_budget_hybrid_formula_matches_geometry() {
+    fn kv_budget_hybrid_formula_matches_geometry_the_cap_shrinks_only_the_drafter_term_and_the_paged_pool_agrees(
+    ) {
         let cfg = Gemma4Config::from_hf_json_str(&base_text()).unwrap();
 
         let b = super::kv_budget(&cfg, 4096, true, true, 128);
@@ -7002,10 +6317,7 @@ mod config_tests {
 
         let flat = super::kv_budget(&cfg, 4096, true, false, 0);
         assert_eq!(flat.verify_sliding_bytes, 3 * 4096 * 1040);
-    }
 
-    #[test]
-    fn kv_budget_capped_shrinks_only_the_drafter_term() {
         let cfg = Gemma4Config::from_hf_json_str(&base_text()).unwrap();
         let kv_max = 4096usize;
         let elems = 128usize;
@@ -7033,10 +6345,7 @@ mod config_tests {
             capped.worst_total() + (kv_max - rows) * elems * 4,
             uncapped.worst_total()
         );
-    }
 
-    #[test]
-    fn paged_hybrid_geometry_and_bytes() {
         let cfg = Gemma4Config::from_hf_json_str(&base_text()).unwrap();
         let p = crate::paged_fp8::PagedPoolConfig::from_gemma4_hybrid(&cfg, 100, 16, 4);
         let rb: usize = (512 + super::VERIFY_PREFILL_CHUNK + 128).div_ceil(16);
@@ -7057,7 +6366,8 @@ mod config_tests {
     }
 
     #[test]
-    fn e4b_style_null_softcap_and_null_global_kv_parse() {
+    fn nested_and_flat_configs_parse_null_softcap_and_null_global_kv_and_an_explicit_softcap_is_preserved(
+    ) {
         let nested = serde_json::json!({
             "tie_word_embeddings": true,
             "text_config": serde_json::from_str::<serde_json::Value>(&base_text()).unwrap()
@@ -7068,10 +6378,7 @@ mod config_tests {
         assert_eq!(cfg.num_global_key_value_heads, None);
         assert_eq!(cfg.num_kv_shared_layers, 4);
         assert!(cfg.is_kv_shared_layer(3));
-    }
 
-    #[test]
-    fn flat_config_without_text_config_parses() {
         let flat = serde_json::json!({
             "tie_word_embeddings": true,
             "hidden_size": 256,
@@ -7100,10 +6407,7 @@ mod config_tests {
         let cfg = Gemma4Config::from_hf_json_str(&flat).expect("flat config parses");
         assert_eq!(cfg.final_logit_softcapping, 0.0);
         assert_eq!(cfg.num_global_key_value_heads, None);
-    }
 
-    #[test]
-    fn explicit_softcap_value_preserved() {
         let with_cap = serde_json::json!({
             "tie_word_embeddings": true,
             "text_config": {
@@ -7199,7 +6503,6 @@ mod config_tests {
 
 #[cfg(test)]
 mod paper_validation_attention_masks {
-
     use super::sdpa_with_mask;
     use candle_core::{Device, Tensor};
 
@@ -7219,7 +6522,8 @@ mod paper_validation_attention_masks {
     }
 
     #[test]
-    fn sliding_window_admits_exactly_w_keys_including_current() {
+    fn sliding_window_admits_exactly_w_keys_masks_distance_w_and_composes_conjunctively_with_the_user_mask(
+    ) {
         let (seq_q, seq_k, w) = (4usize, 6usize, 2usize);
         let offset = seq_k - seq_q;
         let probs = probs_for(seq_q, seq_k, Some(w), &vec![1.0; seq_q * seq_k]);
@@ -7244,19 +6548,13 @@ mod paper_validation_attention_masks {
                 }
             }
         }
-    }
 
-    #[test]
-    fn window_edge_distance_w_is_masked_distance_w_minus_1_attends() {
         let (seq_q, seq_k, w) = (1usize, 6usize, 3usize);
         let probs = probs_for(seq_q, seq_k, Some(w), &vec![1.0; seq_q * seq_k]);
         assert!(probs[2].abs() < 1e-6, "distance W must be masked");
         assert!(probs[3] > 0.3, "distance W-1 must attend");
         assert!(probs[5] > 0.3, "current token must attend");
-    }
 
-    #[test]
-    fn user_mask_and_window_compose_conjunctively() {
         let (seq_q, seq_k, w) = (4usize, 6usize, 3usize);
         let offset = seq_k - seq_q;
         let mut user = vec![1.0f32; seq_q * seq_k];
@@ -7295,7 +6593,8 @@ mod prefill_shadow_tests {
     }
 
     #[test]
-    fn shadow_bookkeeping_shapes() {
+    fn shadow_and_sliding_shadow_bookkeeping_extend_keep_the_tail_and_fall_back_on_a_position_mismatch(
+    ) {
         let dev = Device::Cpu;
         let c1 = mk(0.0, 4, 2, 8, &dev);
         let s = prefill_shadow_extend(None, &c1, &c1, 0).unwrap().unwrap();
@@ -7312,10 +6611,13 @@ mod prefill_shadow_tests {
             .unwrap()
             .unwrap();
         assert_eq!(stale.0.dims(), [1, 5, 2, 8]);
-    }
 
-    #[test]
-    fn sliding_shadow_tail_bookkeeping() {
+        let dev = Device::Cpu;
+        let c = mk(0.0, 4, 2, 8, &dev);
+        let s = prefill_shadow_extend(None, &c, &c, 0).unwrap().unwrap();
+        assert!(prefill_shadow_extend(Some(s), &c, &c, 5).unwrap().is_none());
+        assert!(prefill_shadow_extend(None, &c, &c, 4).unwrap().is_none());
+
         use super::sliding_shadow_extend;
         let dev = Device::Cpu;
         let keep = 5usize;
@@ -7352,11 +6654,7 @@ mod prefill_shadow_tests {
             format!("{got_tail:?}"),
             "tail must be the last keep rows of prior context"
         );
-    }
 
-    #[test]
-    fn sliding_shadow_short_prompt_and_mismatch() {
-        use super::sliding_shadow_extend;
         let dev = Device::Cpu;
         let keep = 5usize;
         let c1 = mk(0.0, 3, 2, 8, &dev);
@@ -7383,15 +6681,6 @@ mod prefill_shadow_tests {
             .unwrap()
             .unwrap();
         assert_eq!(kz.dims(), [1, 2, 2, 8]);
-    }
-
-    #[test]
-    fn shadow_mismatch_falls_back() {
-        let dev = Device::Cpu;
-        let c = mk(0.0, 4, 2, 8, &dev);
-        let s = prefill_shadow_extend(None, &c, &c, 0).unwrap().unwrap();
-        assert!(prefill_shadow_extend(Some(s), &c, &c, 5).unwrap().is_none());
-        assert!(prefill_shadow_extend(None, &c, &c, 4).unwrap().is_none());
     }
 
     #[test]
@@ -7440,335 +6729,5 @@ mod prefill_shadow_tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(d < 1e-5, "max diff {d}");
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore]
-    fn flash_full_attn_prefill_matches_naive_gpu() {
-        use candle_core::DType;
-        let dev = Device::new_cuda(0).unwrap();
-        let (n_q, n_kv, hd) = (8usize, 4usize, 64usize);
-        for &(committed, len) in &[(0usize, 33usize), (128, 64), (500, 24)] {
-            let total = committed + len;
-            let q = mk(0.1, len, n_q, hd, &dev).to_dtype(DType::BF16).unwrap();
-            let ks = mk(0.2, total, n_kv, hd, &dev)
-                .to_dtype(DType::BF16)
-                .unwrap();
-            let vs = mk(0.3, total, n_kv, hd, &dev)
-                .to_dtype(DType::BF16)
-                .unwrap();
-            let flash = super::flash_attention(&q, &ks, &vs, n_q, n_kv, hd, len, None).unwrap();
-            let naive =
-                causal_attention_chunked(&q, &ks, &vs, n_q, n_kv, hd, len, committed).unwrap();
-            let d = (flash.to_dtype(DType::F32).unwrap() - naive.to_dtype(DType::F32).unwrap())
-                .unwrap()
-                .abs()
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .max(0)
-                .unwrap()
-                .to_scalar::<f32>()
-                .unwrap();
-            assert!(
-                d < 2.5e-2,
-                "flash vs naive max diff {d} at committed={committed} len={len}"
-            );
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore]
-    fn hd512_flash_vs_chunked_probe_across_the_real_shadow_geometries() {
-        use candle_core::DType;
-        let dev = Device::new_cuda(0).unwrap();
-        let (n_q, n_kv) = (32usize, 4usize);
-        for &hd in &[256usize, 512] {
-            for &(committed, len) in &[
-                (0usize, 64usize),
-                (0, 128),
-                (0, 176),
-                (0, 512),
-                (0, 1024),
-                (512, 512),
-                (1024, 176),
-            ] {
-                let total = committed + len;
-                let q = mk(0.1, len, n_q, hd, &dev).to_dtype(DType::BF16).unwrap();
-                let ks = mk(0.2, total, n_kv, hd, &dev)
-                    .to_dtype(DType::BF16)
-                    .unwrap();
-                let vs = mk(0.3, total, n_kv, hd, &dev)
-                    .to_dtype(DType::BF16)
-                    .unwrap();
-                let flash = super::flash_attention(&q, &ks, &vs, n_q, n_kv, hd, len, None).unwrap();
-                let naive =
-                    causal_attention_chunked(&q, &ks, &vs, n_q, n_kv, hd, len, committed).unwrap();
-                let d = (flash.to_dtype(DType::F32).unwrap() - naive.to_dtype(DType::F32).unwrap())
-                    .unwrap()
-                    .abs()
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .max(0)
-                    .unwrap()
-                    .to_scalar::<f32>()
-                    .unwrap();
-                eprintln!(
-                    "hd512-probe hd={hd} committed={committed} len={len} \
-                     flash_vs_chunked_max_abs={d:.6}"
-                );
-                if hd == 256 {
-                    assert!(
-                        d < 2.5e-2,
-                        "hd256 flash vs chunked diverged {d} at committed={committed} len={len}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    const HD512_BF16_PROBE_TOL_5E2_SEPARATES_BF16_GEMM_ROUNDING_FROM_THE_ORDER_ONE_HD512_FLASH_DEFECT:
-        f32 = 5e-2;
-
-    #[cfg(feature = "cuda")]
-    const HD512_BF16_PROBE_QK_AMPLITUDE_0_5_PUTS_HD512_LOGITS_IN_THE_TENS_REGIME_OF_TRAINED_ATTENTION_WHERE_BF16_SCORE_QUANTA_STAY_SUB_0_1_MATCHING_THE_E4B_MASK_TRANSFER_PRECEDENT_WHILE_AMPLITUDE_1_SYNTHETIC_LOGITS_NEAR_50_QUANTIZE_AT_0_25:
-        f64 = 0.5;
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore]
-    fn hd512_bf16_route_vs_chunked_eager_probe_across_the_real_shadow_geometries() {
-        use super::causal_attention_chunked_bf16;
-        use candle_core::DType;
-        let dev = Device::new_cuda(0).unwrap();
-        let amp = HD512_BF16_PROBE_QK_AMPLITUDE_0_5_PUTS_HD512_LOGITS_IN_THE_TENS_REGIME_OF_TRAINED_ATTENTION_WHERE_BF16_SCORE_QUANTA_STAY_SUB_0_1_MATCHING_THE_E4B_MASK_TRANSFER_PRECEDENT_WHILE_AMPLITUDE_1_SYNTHETIC_LOGITS_NEAR_50_QUANTIZE_AT_0_25;
-        let (n_q, n_kv, hd) = (32usize, 4usize, 512usize);
-        for &(committed, len) in &[
-            (0usize, 64usize),
-            (0, 128),
-            (0, 176),
-            (0, 512),
-            (0, 1024),
-            (512, 64),
-            (512, 512),
-            (512, 1024),
-            (1024, 176),
-            (1024, 1024),
-        ] {
-            let total = committed + len;
-            let q = (mk(0.1, len, n_q, hd, &dev) * amp)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap();
-            let ks = (mk(0.2, total, n_kv, hd, &dev) * amp)
-                .unwrap()
-                .to_dtype(DType::BF16)
-                .unwrap();
-            let vs = mk(0.3, total, n_kv, hd, &dev)
-                .to_dtype(DType::BF16)
-                .unwrap();
-            let fast =
-                causal_attention_chunked_bf16(&q, &ks, &vs, n_q, n_kv, hd, len, committed).unwrap();
-            let naive =
-                causal_attention_chunked(&q, &ks, &vs, n_q, n_kv, hd, len, committed).unwrap();
-            let d = (fast.to_dtype(DType::F32).unwrap() - naive.to_dtype(DType::F32).unwrap())
-                .unwrap()
-                .abs()
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .max(0)
-                .unwrap()
-                .to_scalar::<f32>()
-                .unwrap();
-            eprintln!(
-                "hd512-bf16-probe committed={committed} len={len} bf16_vs_eager_max_abs={d:.6}"
-            );
-            assert!(
-                d < HD512_BF16_PROBE_TOL_5E2_SEPARATES_BF16_GEMM_ROUNDING_FROM_THE_ORDER_ONE_HD512_FLASH_DEFECT,
-                "hd512 bf16 route diverged {d} from chunked eager at committed={committed} len={len}"
-            );
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore]
-    fn hd512_shadow_route_walltime_probe_isolates_the_attention_call_from_the_serve_loop() {
-        use super::causal_attention_chunked_bf16;
-        use candle_core::DType;
-        let dev = Device::new_cuda(0).unwrap();
-        let (n_q, n_kv, hd) = (32usize, 4usize, 512usize);
-        for &(committed, len) in &[(0usize, 1024usize), (7168, 1024)] {
-            let total = committed + len;
-            let q = mk(0.1, len, n_q, hd, &dev).to_dtype(DType::BF16).unwrap();
-            let ks = mk(0.2, total, n_kv, hd, &dev)
-                .to_dtype(DType::BF16)
-                .unwrap();
-            let vs = mk(0.3, total, n_kv, hd, &dev)
-                .to_dtype(DType::BF16)
-                .unwrap();
-            let time_it = |name: &str, f: &dyn Fn() -> super::Result<Tensor>| {
-                f().unwrap();
-                dev.synchronize().unwrap();
-                let t0 = std::time::Instant::now();
-                for _ in 0..3 {
-                    f().unwrap();
-                }
-                dev.synchronize().unwrap();
-                eprintln!(
-                    "hd512-walltime committed={committed} len={len} {name}_ms_per_call={:.2}",
-                    t0.elapsed().as_secs_f64() * 1000.0 / 3.0
-                );
-            };
-            time_it("flash", &|| {
-                super::flash_attention(&q, &ks, &vs, n_q, n_kv, hd, len, None)
-            });
-            time_it("eager_f32", &|| {
-                causal_attention_chunked(&q, &ks, &vs, n_q, n_kv, hd, len, committed)
-            });
-            time_it("bf16_tc", &|| {
-                causal_attention_chunked_bf16(&q, &ks, &vs, n_q, n_kv, hd, len, committed)
-            });
-        }
-    }
-}
-
-#[cfg(all(test, feature = "cuda"))]
-mod spec_prefill_gemm_gpu_tests {
-    use super::{Gemma4, Gemma4Config, VERIFY_PREFILL_CHUNK};
-    use candle_core::{DType, Device};
-    use nv_weights::{QuantizationConfig, WeightLoader};
-    use std::path::PathBuf;
-
-    fn spec_prefill_gemm_snapshot_dir() -> PathBuf {
-        PathBuf::from(std::env::var("NV_G4_SPEC_PREFILL_SNAPSHOT").unwrap_or_else(|_| {
-            format!(
-                "{}/.cache/huggingface/hub/models--nvidia--Gemma-4-31B-IT-NVFP4/snapshots/1365cf7aa2de42546878b8d2e4a425019a0be514",
-                std::env::var("HOME").unwrap_or_default()
-            )
-        }))
-    }
-
-    fn argmax(row: &[f32]) -> usize {
-        let mut b = 0usize;
-        let mut bv = f32::NEG_INFINITY;
-        for (i, &x) in row.iter().enumerate() {
-            if x > bv {
-                bv = x;
-                b = i;
-            }
-        }
-        b
-    }
-
-    fn run_prefill(model: &Gemma4, device: &Device, prompt: &[u32], rows: usize) -> Vec<f32> {
-        let mut cache = model
-            .new_verify_cache(prompt.len() + 8)
-            .expect("verify cache");
-        let stream_dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
-        };
-        let stream = nv_layers::cuda_stream::current_stream(&stream_dev);
-        let aux_layers: Vec<usize> = vec![1, 29, 56];
-        let n = prompt.len();
-        let mut committed = 0usize;
-        let mut out: Vec<f32> = Vec::new();
-        while committed < n {
-            let len = VERIFY_PREFILL_CHUNK.min(n - committed);
-            let last = committed + len == n;
-            let mut mask = vec![0u8; len * len];
-            for i in 0..len {
-                for j in 0..=i {
-                    mask[i * len + j] = 1;
-                }
-            }
-            let mask_d = stream.clone_htod(&mask).unwrap();
-            let ppos: Vec<i32> = (committed as i32..(committed + len) as i32).collect();
-            let logit_rows = if last { rows.min(len - 1).max(1) } else { 0 };
-            let (lg, _aux) = model
-                .forward_verify_tail(
-                    &prompt[committed..committed + len],
-                    &ppos,
-                    &mask_d,
-                    committed,
-                    &aux_layers,
-                    &mut cache,
-                    logit_rows,
-                )
-                .expect("prefill chunk");
-            if let Some(lg) = lg {
-                out = lg
-                    .to_dtype(DType::F32)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1()
-                    .unwrap();
-            }
-            committed += len;
-        }
-        out
-    }
-
-    #[test]
-    #[ignore]
-    fn spec_prefill_gemm_matches_tree() {
-        let dir = spec_prefill_gemm_snapshot_dir();
-        if !dir.is_dir() {
-            eprintln!("skip: snapshot dir missing");
-            return;
-        }
-        let Ok(device) = Device::new_cuda(0) else {
-            eprintln!("skip: no cuda");
-            return;
-        };
-        let raw_cfg = std::fs::read_to_string(dir.join("config.json")).expect("cfg");
-        let cfg = Gemma4Config::from_hf_json_str(&raw_cfg).expect("parse cfg");
-        let qcfg = QuantizationConfig::from_hf_json_str(&raw_cfg).expect("parse qcfg");
-        let weights = WeightLoader::open_dir(dir, &device).expect("weights");
-        let model =
-            Gemma4::from_loader_quantized(cfg.clone(), &weights, &qcfg, &device).expect("model");
-        let vocab = cfg.vocab_size;
-
-        let prompt: Vec<u32> = (0..2600u32).map(|i| 2000 + (i * 97) % 4000).collect();
-        let rows = 64usize;
-
-        std::env::remove_var("NV_SPEC_PREFILL_TREE");
-        let gemm = run_prefill(&model, &device, &prompt, rows);
-        std::env::set_var("NV_SPEC_PREFILL_TREE", "1");
-        let tree = run_prefill(&model, &device, &prompt, rows);
-        std::env::remove_var("NV_SPEC_PREFILL_TREE");
-
-        assert_eq!(gemm.len(), tree.len());
-        let nrows = gemm.len() / vocab;
-        let mut agree = 0usize;
-        let mut max_diff = 0f32;
-        for r in 0..nrows {
-            let a = &gemm[r * vocab..(r + 1) * vocab];
-            let b = &tree[r * vocab..(r + 1) * vocab];
-            if argmax(a) == argmax(b) {
-                agree += 1;
-            }
-            for i in 0..vocab {
-                max_diff = max_diff.max((a[i] - b[i]).abs());
-            }
-        }
-        eprintln!(
-            "spec_prefill gemm-vs-tree: rows={nrows} argmax_agree={agree} max_abs_diff={max_diff}"
-        );
-        let seed_a = &gemm[(nrows - 1) * vocab..nrows * vocab];
-        let seed_b = &tree[(nrows - 1) * vocab..nrows * vocab];
-        assert_eq!(argmax(seed_a), argmax(seed_b), "seed argmax must match");
-        assert!(max_diff < 2.0, "max abs diff {max_diff} too large");
-        assert!(
-            agree * 10 >= nrows * 9,
-            "argmax agreement {agree}/{nrows} too low"
-        );
     }
 }

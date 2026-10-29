@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{ensure, Result};
 
 pub use crate::gemma4::LayerType;
 pub use crate::laguna::{
@@ -108,24 +108,24 @@ pub struct LagunaShapes {
 
 impl LagunaShapes {
     pub fn derive(config: &LagunaConfig, max_seq_tokens: usize) -> Result<Self> {
-        anyhow::ensure!(max_seq_tokens > 0, "max_seq_tokens must be positive");
-        anyhow::ensure!(
+        ensure!(max_seq_tokens > 0, "max_seq_tokens must be positive");
+        ensure!(
             config.layer_types.len() == config.num_hidden_layers,
             "layer_types has {} entries for {} layers",
             config.layer_types.len(),
             config.num_hidden_layers
         );
-        anyhow::ensure!(
+        ensure!(
             config.head_dim <= MAX_HEAD_DIM && config.head_dim.is_multiple_of(2),
             "head_dim {} must be even and <= {MAX_HEAD_DIM}",
             config.head_dim
         );
-        anyhow::ensure!(
+        ensure!(
             config.hidden_size.is_multiple_of(2),
             "hidden_size {} must be even (bf16 word packing)",
             config.hidden_size
         );
-        anyhow::ensure!(
+        ensure!(
             config.num_experts_per_tok <= MAX_TOPK,
             "num_experts_per_tok {} exceeds {MAX_TOPK}",
             config.num_experts_per_tok
@@ -141,7 +141,7 @@ impl LagunaShapes {
         for idx in 0..config.num_hidden_layers {
             let attn_kind = config.layer_kind(idx);
             let num_q_heads = config.num_heads_for_layer(idx);
-            anyhow::ensure!(
+            ensure!(
                 num_q_heads > 0 && num_q_heads.is_multiple_of(config.num_key_value_heads),
                 "layer {idx} q heads {num_q_heads} not a multiple of kv heads {}",
                 config.num_key_value_heads
@@ -155,7 +155,7 @@ impl LagunaShapes {
                 LayerType::SlidingAttention => (rotary_dim_sliding, 1.0f32),
                 LayerType::FullAttention => (rotary_dim_full, full_attn_factor),
             };
-            anyhow::ensure!(
+            ensure!(
                 rotary_dim % 2 == 0 && rotary_dim <= config.head_dim,
                 "layer {idx} rotary_dim {rotary_dim} invalid for head_dim {}",
                 config.head_dim
@@ -252,26 +252,26 @@ impl LagunaShapes {
 
     pub fn validate_nvfp4_alignment(&self) -> Result<()> {
         let block = NVFP4_BLOCK;
-        anyhow::ensure!(
+        ensure!(
             self.hidden_size.is_multiple_of(4 * block),
             "hidden_size {} must be a multiple of {}",
             self.hidden_size,
             4 * block
         );
-        anyhow::ensure!(
+        ensure!(
             self.moe_intermediate_size.is_multiple_of(4 * block),
             "moe_intermediate_size {} must be a multiple of {}",
             self.moe_intermediate_size,
             4 * block
         );
-        anyhow::ensure!(
+        ensure!(
             self.shared_expert_intermediate_size
                 .is_multiple_of(4 * block),
             "shared_expert_intermediate_size {} must be a multiple of {}",
             self.shared_expert_intermediate_size,
             4 * block
         );
-        anyhow::ensure!(
+        ensure!(
             self.dense_intermediate_size.is_multiple_of(4 * block),
             "intermediate_size {} must be a multiple of {}",
             self.dense_intermediate_size,

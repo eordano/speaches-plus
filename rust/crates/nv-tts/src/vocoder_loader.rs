@@ -169,51 +169,15 @@ pub fn load_from_qwen3_tts(
 mod tests {
     use super::*;
 
-    fn cached_snapshot_dir() -> Option<PathBuf> {
-        crate::tokenizer::qwen3_tts_cache_dir()
-    }
-
     #[test]
-    fn shard_path_is_relative_join() {
-        let dir = PathBuf::from("/tmp/fake-snapshot");
-        let s = vocoder_shard_path(&dir);
-        assert_eq!(s, dir.join("speech_tokenizer/model.safetensors"));
-    }
-
-    #[test]
-    fn scan_errors_when_shard_missing() {
-        let dir = PathBuf::from("/tmp/__definitely_does_not_exist_qwen3");
-        let err = scan_vocoder_dir(&dir).expect_err("must fail on missing shard");
-        let msg = format!("{err}");
-        assert!(msg.contains("vocoder shard not found"), "{msg}");
-    }
-
-    #[test]
-    #[ignore = "inspection-only: prints pre_transformer.layers.0 keys + shapes"]
-    fn inspect_pre_transformer_layer0() {
-        let Some(dir) = cached_snapshot_dir() else {
-            eprintln!("skip inspect: cache absent");
-            return;
-        };
-        let shard = vocoder_shard_path(&dir);
-        let device = Device::Cpu;
-        let weights = WeightLoader::open_file(&shard, &device).expect("open");
-        let mut names = weights.names();
-        names.sort();
-        for n in &names {
-            if n.starts_with("decoder.pre_transformer.") {
-                let shape = weights.shape_of(n).unwrap_or_default();
-                let dt = weights.dtype_of(n);
-                eprintln!("{n} {shape:?} {dt:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn scan_real_cache_detects_decoder_structure() {
-        let Some(dir) =
-            crate::model_gate::require("vocoder_loader::scan_real_cache_detects_decoder_structure")
-        else {
+    fn scan_errors_when_the_shard_is_missing_and_detects_the_real_decoder_structure() {
+        let missing = PathBuf::from("/tmp/__definitely_does_not_exist_qwen3");
+        assert_eq!(vocoder_shard_path(&missing), missing.join("speech_tokenizer/model.safetensors"));
+        let err = scan_vocoder_dir(&missing).expect_err("must fail on missing shard");
+        assert!(format!("{err}").contains("vocoder shard not found"), "{err}");
+        let Some(dir) = crate::model_gate::require(
+            "vocoder_loader::scan_errors_when_the_shard_is_missing_and_detects_the_real_decoder_structure",
+        ) else {
             return;
         };
         let inv = scan_vocoder_dir(&dir).expect("scan cached vocoder shard");

@@ -455,39 +455,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn safe_name_accepts_alnum_dash_underscore_dot() {
+    fn safe_name_accepts_alnum_dash_underscore_dot_and_rejects_traversal() {
         assert!(is_safe_name("alice"));
         assert!(is_safe_name("v1.0-spk_42"));
+        {
+            assert!(!is_safe_name(""));
+            assert!(!is_safe_name(".hidden"));
+            assert!(!is_safe_name("a/b"));
+            assert!(!is_safe_name("../etc/passwd"));
+            assert!(!is_safe_name("name with space"));
+        }
     }
 
     #[test]
-    fn safe_name_rejects_path_traversal_and_leading_dot() {
-        assert!(!is_safe_name(""));
-        assert!(!is_safe_name(".hidden"));
-        assert!(!is_safe_name("a/b"));
-        assert!(!is_safe_name("../etc/passwd"));
-        assert!(!is_safe_name("name with space"));
-    }
-
-    #[test]
-    fn not_found_is_detected_by_io_error_kind() {
+    fn not_found_is_detected_by_io_error_kind_only() {
         let raw = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
         assert!(is_not_found(&raw));
         let wrapped = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
             .context("read voice profile");
         assert!(is_not_found(&wrapped));
+        {
+            let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            assert!(!is_not_found(&denied));
+            let lookalike = anyhow::anyhow!("No such file or directory (os error 2)");
+            assert!(!is_not_found(&lookalike));
+        }
     }
 
     #[test]
-    fn other_io_kinds_and_message_lookalikes_are_not_not_found() {
-        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        assert!(!is_not_found(&denied));
-        let lookalike = anyhow::anyhow!("No such file or directory (os error 2)");
-        assert!(!is_not_found(&lookalike));
-    }
-
-    #[test]
-    fn response_marks_zero_embedding_as_no_encoder() {
+    fn response_marks_embedding_state_by_whether_it_is_all_zero() {
         let p = VoiceProfile {
             schema_version: 1,
             name: "n".into(),
@@ -497,17 +493,16 @@ mod tests {
         let r = VoiceProfileResponse::from(&p);
         assert_eq!(r.embedding_state, "no_encoder");
         assert_eq!(r.embedding_dim, 8);
+        {
+            let p = VoiceProfile {
+                schema_version: 1,
+                name: "n".into(),
+                embedding: vec![0.0, 0.1, 0.0],
+                design_params: None,
+            };
+            let r = VoiceProfileResponse::from(&p);
+            assert_eq!(r.embedding_state, "encoded");
+        }
     }
 
-    #[test]
-    fn response_marks_nonzero_embedding_as_encoded() {
-        let p = VoiceProfile {
-            schema_version: 1,
-            name: "n".into(),
-            embedding: vec![0.0, 0.1, 0.0],
-            design_params: None,
-        };
-        let r = VoiceProfileResponse::from(&p);
-        assert_eq!(r.embedding_state, "encoded");
-    }
 }

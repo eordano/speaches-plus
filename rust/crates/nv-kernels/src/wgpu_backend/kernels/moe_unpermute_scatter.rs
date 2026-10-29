@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::pack_u16_odd_tail_zeroed_min_one_word as pack_bf16;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
@@ -132,32 +130,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn packing_handles_odd_lengths() {
-        let src: Vec<u16> = vec![1, 2, 3];
-        let words = pack_bf16(&src);
-        assert_eq!(words.len(), 2);
-        assert_eq!(words[0], 1 | (2 << 16));
-        assert_eq!(words[1], 3);
-    }
-
-    #[test]
-    fn shape_mismatch_is_reported() {
-        let e = check_shapes(64, 7, 8, 16, 4, 2, 4, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn stride_below_hidden_is_reported() {
-        let e = check_shapes(64, 8, 8, 16, 4, 2, 4, 2).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn out_of_range_row_is_reported() {
-        let e = check_rows(&[0, 9], 16, 4, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-        let e = check_rows(&[-1], 16, 4, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-        assert!(check_rows(&[0, 3], 16, 4, 4).is_ok());
+    fn packing_and_shape_checks_follow_the_shader_contract() {
+        {
+            let src: Vec<u16> = vec![1, 2, 3];
+            let words = pack_bf16(&src);
+            assert_eq!(words.len(), 2);
+            assert_eq!(words[0], 1 | (2 << 16));
+            assert_eq!(words[1], 3);
+        }
+        {
+            let e = check_shapes(64, 7, 8, 16, 4, 2, 4, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            let e = check_shapes(64, 8, 8, 16, 4, 2, 4, 2).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            let e = check_rows(&[0, 9], 16, 4, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+            let e = check_rows(&[-1], 16, 4, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+            assert!(check_rows(&[0, 3], 16, 4, 4).is_ok());
+        }
     }
 }

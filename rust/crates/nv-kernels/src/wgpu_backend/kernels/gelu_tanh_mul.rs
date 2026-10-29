@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
 use crate::wgpu_backend::{compose, Result, WgpuError};
@@ -140,21 +138,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn word_packing_round_trips() {
-        let v: Vec<u16> = (0..7u16).map(|i| i.wrapping_mul(4097)).collect();
-        let w = u16s_to_words(&v);
-        assert_eq!(w.len(), 4);
-        let mut back = vec![0u16; v.len()];
-        words_to_u16s(&w, &mut back);
-        assert_eq!(back, v);
-    }
-
-    #[test]
-    fn wgsl_declares_the_entry_points() {
-        for e in [ENTRY_SPLIT, ENTRY_FUSED_EVEN, ENTRY_FUSED_GENERAL] {
-            assert!(WGSL.contains(&format!("fn {e}(")), "missing entry {e}");
+    fn word_packing_round_trips_and_wgsl_declares_the_entry_points() {
+        {
+            let v: Vec<u16> = (0..7u16).map(|i| i.wrapping_mul(4097)).collect();
+            let w = u16s_to_words(&v);
+            assert_eq!(w.len(), 4);
+            let mut back = vec![0u16; v.len()];
+            words_to_u16s(&w, &mut back);
+            assert_eq!(back, v);
         }
-        assert!(WGSL.contains("0.7978845608028654"));
-        assert!(WGSL.contains("0.044715"));
+        {
+            for e in [ENTRY_SPLIT, ENTRY_FUSED_EVEN, ENTRY_FUSED_GENERAL] {
+                assert!(WGSL.contains(&format!("fn {e}(")), "missing entry {e}");
+            }
+            assert!(WGSL.contains("0.7978845608028654"));
+            assert!(WGSL.contains("0.044715"));
+        }
     }
 }

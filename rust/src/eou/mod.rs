@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use crate::defaults;
 
@@ -8,7 +7,6 @@ pub mod byte_map;
 pub mod chat_template;
 pub mod fusion;
 pub mod heuristic;
-pub mod integrated;
 pub mod loader;
 pub mod onnx;
 pub mod special_trie;
@@ -20,7 +18,6 @@ pub use fusion::{
     GatedFusionFeatures, GatedFusionWeights, DEFAULT_GATED_FUSION_WEIGHTS,
 };
 pub use heuristic::HeuristicEouModel;
-pub use integrated::{FakeIntegratedBackend, IntegratedEouBackend, IntegratedVerdict};
 pub use loader::EouConfig;
 
 pub trait EouModel: Send + Sync {
@@ -259,45 +256,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sigmoid_lerp_at_threshold_returns_max() {
+    fn sigmoid_lerp_spans_max_to_min_monotonically() {
         let d = sigmoid_lerp(0.5, 0.5, 1.0, 1500, 100);
         assert!((d as i64 - 1500).abs() <= 1, "expected ~1500, got {d}");
+        {
+            let d = sigmoid_lerp(1.0, 0.5, 1.0, 1500, 100);
+            assert!((d as i64 - 100).abs() <= 1, "expected ~100, got {d}");
+        }
+        {
+            let d = sigmoid_lerp(0.2, 0.5, 1.0, 1500, 100);
+            assert_eq!(d, 1500);
+        }
+        {
+            let d_low = sigmoid_lerp(0.6, 0.5, 1.0, 1500, 100);
+            let d_mid = sigmoid_lerp(0.75, 0.5, 1.0, 1500, 100);
+            let d_high = sigmoid_lerp(0.9, 0.5, 1.0, 1500, 100);
+            assert!(d_low > d_mid, "{d_low} > {d_mid}");
+            assert!(d_mid > d_high, "{d_mid} > {d_high}");
+        }
     }
 
     #[test]
-    fn sigmoid_lerp_at_p_max_returns_min() {
-        let d = sigmoid_lerp(1.0, 0.5, 1.0, 1500, 100);
-        assert!((d as i64 - 100).abs() <= 1, "expected ~100, got {d}");
-    }
-
-    #[test]
-    fn sigmoid_lerp_below_threshold_returns_max() {
-        let d = sigmoid_lerp(0.2, 0.5, 1.0, 1500, 100);
-        assert_eq!(d, 1500);
-    }
-
-    #[test]
-    fn sigmoid_lerp_monotonic_decreasing() {
-        let d_low = sigmoid_lerp(0.6, 0.5, 1.0, 1500, 100);
-        let d_mid = sigmoid_lerp(0.75, 0.5, 1.0, 1500, 100);
-        let d_high = sigmoid_lerp(0.9, 0.5, 1.0, 1500, 100);
-        assert!(d_low > d_mid, "{d_low} > {d_mid}");
-        assert!(d_mid > d_high, "{d_mid} > {d_high}");
-    }
-
-    #[test]
-    fn stub_eou_model_returns_one() {
-        let m = StubEouModel;
-        assert_eq!(m.score("anything"), 1.0);
-        assert_eq!(m.score(""), 1.0);
-    }
-
-    #[test]
-    fn missing_audio_model_scores_are_obviously_invalid() {
+    fn stub_scores_one_and_missing_audio_scores_are_obviously_invalid() {
         let m = MissingAudioEouModel;
         assert!(m.score("anything").is_nan());
         assert!(m.score_with_audio("anything", &[0.0; 16], 16_000).is_nan());
         assert!(fusion::is_garbage_prob(m.score("anything")));
+        {
+            let m = StubEouModel;
+            assert_eq!(m.score("anything"), 1.0);
+            assert_eq!(m.score(""), 1.0);
+        }
     }
 
     #[test]
@@ -335,30 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_eou_required_parses_like_the_other_required_flags() {
-        assert!(!audio_eou_required(None));
-        assert!(!audio_eou_required(Some("")));
-        assert!(!audio_eou_required(Some("0")));
-        assert!(!audio_eou_required(Some("false")));
-        assert!(audio_eou_required(Some("1")));
-    }
-
-    #[test]
-    fn audio_eou_wanted_only_for_the_kinds_that_score_audio() {
-        assert!(audio_eou_wanted(EouKind::Audio));
-        assert!(audio_eou_wanted(EouKind::Fusion));
-        for k in [
-            EouKind::Vad,
-            EouKind::Text,
-            EouKind::Heuristic,
-            EouKind::Integrated,
-        ] {
-            assert!(!audio_eou_wanted(k), "{}", k.as_str());
-        }
-    }
-
-    #[test]
-    fn audio_eou_gate_matrix() {
+    fn audio_eou_gate_matrix_with_its_required_and_wanted_inputs() {
         assert_eq!(audio_eou_gate(false, false, true), AudioEouGate::NotWanted);
         assert_eq!(audio_eou_gate(false, true, false), AudioEouGate::NotWanted);
         assert_eq!(audio_eou_gate(true, true, false), AudioEouGate::Present);
@@ -371,6 +337,25 @@ mod tests {
             audio_eou_gate(true, false, true),
             AudioEouGate::RequiredFail
         );
+        {
+            assert!(!audio_eou_required(None));
+            assert!(!audio_eou_required(Some("")));
+            assert!(!audio_eou_required(Some("0")));
+            assert!(!audio_eou_required(Some("false")));
+            assert!(audio_eou_required(Some("1")));
+        }
+        {
+            assert!(audio_eou_wanted(EouKind::Audio));
+            assert!(audio_eou_wanted(EouKind::Fusion));
+            for k in [
+                EouKind::Vad,
+                EouKind::Text,
+                EouKind::Heuristic,
+                EouKind::Integrated,
+            ] {
+                assert!(!audio_eou_wanted(k), "{}", k.as_str());
+            }
+        }
     }
 
     #[test]
@@ -388,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn eagerness_parse_case_insensitive() {
+    fn eagerness_parses_case_insensitively_and_maps_to_its_triples() {
         assert_eq!(Eagerness::parse("low"), Some(Eagerness::Low));
         assert_eq!(Eagerness::parse("LOW"), Some(Eagerness::Low));
         assert_eq!(Eagerness::parse(" High "), Some(Eagerness::High));
@@ -396,14 +381,12 @@ mod tests {
         assert_eq!(Eagerness::parse("MED"), Some(Eagerness::Medium));
         assert_eq!(Eagerness::parse("auto"), Some(Eagerness::Auto));
         assert_eq!(Eagerness::parse("nope"), None);
-    }
-
-    #[test]
-    fn eagerness_triples() {
-        assert_eq!(Eagerness::Low.triple(), (0.7, 800, 3000));
-        assert_eq!(Eagerness::Medium.triple(), (0.5, 500, 2500));
-        assert_eq!(Eagerness::High.triple(), (0.4, 300, 1500));
-        assert_eq!(Eagerness::Auto.triple(), Eagerness::Medium.triple());
+        {
+            assert_eq!(Eagerness::Low.triple(), (0.7, 800, 3000));
+            assert_eq!(Eagerness::Medium.triple(), (0.5, 500, 2500));
+            assert_eq!(Eagerness::High.triple(), (0.4, 300, 1500));
+            assert_eq!(Eagerness::Auto.triple(), Eagerness::Medium.triple());
+        }
     }
 
     #[tokio::test(start_paused = true)]

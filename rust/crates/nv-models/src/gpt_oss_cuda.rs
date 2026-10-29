@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use nv_layers::attn::{sdpa_with_sinks, AttnConfig};
 use nv_layers::linear::Linear;
@@ -82,7 +82,7 @@ impl GptOssKvCache {
     ) -> Result<()> {
         let t = k_new.dims()[1];
         let end = start + t;
-        anyhow::ensure!(
+        ensure!(
             end <= self.max_seq_len,
             "GptOssKvCache: write end {end} exceeds max_seq_len {}",
             self.max_seq_len
@@ -117,13 +117,13 @@ impl GptOssCudaExperts {
         let e = gate_up.e;
         let hidden = gate_up.k;
         let inter = down.k;
-        anyhow::ensure!(
+        ensure!(
             gate_up.n == 2 * inter,
             "gate_up rows {} != 2*intermediate {}",
             gate_up.n,
             2 * inter
         );
-        anyhow::ensure!(
+        ensure!(
             down.n == hidden && down.e == e,
             "down stack [{}, {}, {}] does not pair with gate_up hidden {hidden} experts {e}",
             down.e,
@@ -183,7 +183,7 @@ impl GptOssCudaExperts {
         swiglu_limit: f32,
     ) -> Result<Tensor> {
         let (n_tokens, hidden) = x_flat.dims2()?;
-        anyhow::ensure!(hidden == self.hidden_size, "moe hidden {hidden} mismatch");
+        ensure!(hidden == self.hidden_size, "moe hidden {hidden} mismatch");
         let device = x_flat.device().clone();
 
         let mut rows_per_expert: Vec<Vec<u32>> = vec![Vec::new(); self.num_experts];
@@ -332,7 +332,7 @@ impl GptOssCuda {
     {
         let _ = GPT_OSS_CUDA_ATTENTION_IS_EAGER_BECAUSE_FLASH_CANNOT_CARRY_SINKS;
         let hidden = config.hidden_size;
-        anyhow::ensure!(
+        ensure!(
             config.layer_types.len() == config.num_hidden_layers,
             "layer_types has {} entries for {} layers",
             config.layer_types.len(),
@@ -351,7 +351,7 @@ impl GptOssCuda {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let hl = layer_at(i)?;
-            anyhow::ensure!(
+            ensure!(
                 hl.attn.sinks.len() == config.num_attention_heads,
                 "layer {i}: {} sinks for {} heads",
                 hl.attn.sinks.len(),
@@ -450,14 +450,14 @@ impl GptOssCuda {
         cache: &mut GptOssKvCache,
     ) -> Result<Tensor> {
         let seq = tokens.len();
-        anyhow::ensure!(seq > 0, "GptOssCuda: empty token chunk");
-        anyhow::ensure!(
+        ensure!(seq > 0, "GptOssCuda: empty token chunk");
+        ensure!(
             positions.len() == seq,
             "GptOssCuda: {} positions for {seq} tokens",
             positions.len()
         );
         let write_start = cache.current_len();
-        anyhow::ensure!(
+        ensure!(
             write_start + seq <= cache.max_seq_len(),
             "GptOssCuda: chunk of {seq} at {write_start} overruns the {}-token KV window",
             cache.max_seq_len()

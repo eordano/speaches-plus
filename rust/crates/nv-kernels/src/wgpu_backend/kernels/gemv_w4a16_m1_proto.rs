@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::pack_u16_pairs as pack_u16;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
@@ -186,52 +184,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn variant_table_matches_the_cuda_switch() {
-        assert_eq!(
-            variant_for(0).unwrap(),
-            Variant {
-                warps: 8,
-                split: 1,
-                stream: true
-            }
-        );
-        assert_eq!(
-            variant_for(1).unwrap(),
-            Variant {
-                warps: 8,
-                split: 1,
-                stream: false
-            }
-        );
-        assert_eq!(
-            variant_for(7).unwrap(),
-            Variant {
-                warps: 16,
-                split: 4,
-                stream: true
-            }
-        );
-        assert!(variant_for(8).is_err());
-    }
-
-    #[test]
-    fn entry_points_cover_every_warp_count() {
-        for v in VARIANTS {
-            assert!(WGSL.contains(entry_for(v.warps).unwrap()));
+    fn variant_table_entries_max_v_and_params_match_the_cuda_switch() {
+        {
+            assert_eq!(
+                variant_for(0).unwrap(),
+                Variant {
+                    warps: 8,
+                    split: 1,
+                    stream: true
+                }
+            );
+            assert_eq!(
+                variant_for(1).unwrap(),
+                Variant {
+                    warps: 8,
+                    split: 1,
+                    stream: false
+                }
+            );
+            assert_eq!(
+                variant_for(7).unwrap(),
+                Variant {
+                    warps: 16,
+                    split: 4,
+                    stream: true
+                }
+            );
+            assert!(variant_for(8).is_err());
         }
-    }
-
-    #[test]
-    fn max_v_rounds_up_to_the_cuda_template_steps() {
-        assert_eq!(max_v_for(32, 1).unwrap(), 1);
-        assert_eq!(max_v_for(33, 1).unwrap(), 2);
-        assert_eq!(max_v_for(320, 1).unwrap(), 10);
-        assert_eq!(max_v_for(320, 4).unwrap(), 3);
-        assert!(max_v_for(321, 1).is_err());
-    }
-
-    #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert_eq!(std::mem::size_of::<ProtoParams>() % 16, 0);
+        {
+            for v in VARIANTS {
+                assert!(WGSL.contains(entry_for(v.warps).unwrap()));
+            }
+        }
+        {
+            assert_eq!(max_v_for(32, 1).unwrap(), 1);
+            assert_eq!(max_v_for(33, 1).unwrap(), 2);
+            assert_eq!(max_v_for(320, 1).unwrap(), 10);
+            assert_eq!(max_v_for(320, 4).unwrap(), 3);
+            assert!(max_v_for(321, 1).is_err());
+        }
+        {
+            assert_eq!(std::mem::size_of::<ProtoParams>() % 16, 0);
+        }
     }
 }

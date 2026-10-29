@@ -16,7 +16,7 @@ use nv_ocr::{DeepSeekMode, DotsOcrMode, OcrEngine, ResolutionHint};
 
 use super::gate::SurfaceGate;
 use super::ocr::{
-    backend_name, bad_request, configured_default_backend, elapsed_ms, configured_backends,
+    backend_emits_layout, backend_name, bad_request, configured_backends, configured_default_backend, elapsed_ms,
     parse_backend, parse_max_new_tokens, pick_default_backend, Backend, OcrRuntime,
 };
 use super::{kind, openai_error};
@@ -178,21 +178,31 @@ pub(super) async fn handle_ocr_stream(
     };
 
     let mode = mode.unwrap_or(match backend {
-        Backend::Dots => StreamMode::Layout,
+        Backend::Dots | Backend::LightOn => StreamMode::Layout,
         _ => StreamMode::Plain,
     });
-    if matches!(mode, StreamMode::Layout | StreamMode::LayoutOnly) && backend != Backend::Dots {
+    if matches!(mode, StreamMode::Layout | StreamMode::LayoutOnly) && !backend_emits_layout(backend) {
         return bad_request(
-            "mode=layout requires backend=dots; only dots.ocr emits layout boxes".into(),
+            "mode=layout requires backend=dots or backend=lighton; only they emit layout boxes".into(),
             "mode",
         );
     }
 
     let (configured, engine) = match backend {
         Backend::Tesseract => (rt.app.tesseract.is_some(), rt.app.tesseract.clone()),
-        Backend::DeepSeek => (rt.app.deepseek.is_some(), super::ocr::demand(&rt.app.deepseek).await),
-        Backend::Dots => (rt.app.dots.is_some(), super::ocr::demand(&rt.app.dots).await),
+        Backend::DeepSeek => (
+            rt.app.deepseek.is_some(),
+            super::ocr::demand(&rt.app.deepseek).await,
+        ),
+        Backend::Dots => (
+            rt.app.dots.is_some(),
+            super::ocr::demand(&rt.app.dots).await,
+        ),
         Backend::Got => (rt.app.got.is_some(), super::ocr::demand(&rt.app.got).await),
+        Backend::LightOn => (
+            rt.app.lighton.is_some(),
+            super::ocr::demand(&rt.app.lighton).await,
+        ),
     };
     if configured && engine.is_none() {
         return super::ocr::load_failed_response(backend);
@@ -239,7 +249,6 @@ pub(super) async fn handle_ocr_stream(
         .into_response()
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_stream(
     tx: mpsc::Sender<Event>,
     engine: Arc<OcrEngine>,
@@ -329,7 +338,7 @@ async fn run_stream(
     let mut job = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         match backend {
-            Backend::Dots => StreamOutcome::Dots(engine.recognize_dots_layout_budgeted(
+            Backend::Dots | Backend::LightOn => StreamOutcome::Dots(engine.recognize_dots_layout_budgeted(
                 &image_bytes,
                 dots_mode(mode),
                 max_new_override,

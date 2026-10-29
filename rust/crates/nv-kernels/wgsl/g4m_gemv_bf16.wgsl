@@ -23,6 +23,7 @@ var<workgroup> g4b_red: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn g4m_gemv_bf16(
+    #def b3
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -34,6 +35,7 @@ fn g4m_gemv_bf16(
     let live = row < g4b_p.n_rows;
     let wbase = select(0u, row * g4b_p.w_row_words, live);
     let kw = select(0u, g4b_p.k_words, live);
+    #end
 
     var acc = 0.0;
     if (g4b_p.wide == 1u) {
@@ -42,6 +44,7 @@ fn g4m_gemv_bf16(
         let kv = kw >> 2u;
         for (var v = lane; v < kv; v = v + 128u) {
             let ww = g4b_w[wv + v];
+            #def b2
             let xw = g4b_x[xv + v];
             acc = fma(bf16_lo(ww.x), bf16_lo(xw.x), acc);
             acc = fma(bf16_hi(ww.x), bf16_hi(xw.x), acc);
@@ -56,6 +59,7 @@ fn g4m_gemv_bf16(
         for (var i = lane; i < kw; i = i + 128u) {
             let wi = wbase + i;
             let xi = g4b_p.x_off_words + i;
+            #end
             let ww = g4b_w[wi >> 2u][wi & 3u];
             let xw = g4b_x[xi >> 2u][xi & 3u];
             acc = fma(bf16_lo(ww), bf16_lo(xw), acc);
@@ -63,8 +67,10 @@ fn g4m_gemv_bf16(
         }
     }
     g4b_red[tid] = acc;
+    #def b1
     workgroupBarrier();
     for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
+        #def b4
         if (lane < stride) {
             g4b_red[tid] = g4b_red[tid] + g4b_red[tid + stride];
         }
@@ -75,6 +81,7 @@ fn g4m_gemv_bf16(
         if (lane == 0u && live) {
             g4b_y[g4b_p.y_off_words + row] = bitcast<u32>(g4b_red[tid] * g4b_p.alpha);
         }
+        #end
     } else if (tid == 0u) {
         let lo = g4b_red[0] * g4b_p.alpha;
         var hi = 0.0;
@@ -84,6 +91,7 @@ fn g4m_gemv_bf16(
         g4b_y[g4b_p.y_off_words + (row >> 1u)] = bf16_pack(lo, hi);
     }
 }
+    #end
 
 @group(0) @binding(4) var<storage, read> g4b_w2: array<vec4<u32>>;
 
@@ -110,20 +118,7 @@ fn g4b_dot_row(row: u32, live: bool, lane: u32, from_w2: bool) -> f32 {
             } else {
                 ww = g4b_w[wv + v];
             }
-            let xw = g4b_x[xv + v];
-            acc = fma(bf16_lo(ww.x), bf16_lo(xw.x), acc);
-            acc = fma(bf16_hi(ww.x), bf16_hi(xw.x), acc);
-            acc = fma(bf16_lo(ww.y), bf16_lo(xw.y), acc);
-            acc = fma(bf16_hi(ww.y), bf16_hi(xw.y), acc);
-            acc = fma(bf16_lo(ww.z), bf16_lo(xw.z), acc);
-            acc = fma(bf16_hi(ww.z), bf16_hi(xw.z), acc);
-            acc = fma(bf16_lo(ww.w), bf16_lo(xw.w), acc);
-            acc = fma(bf16_hi(ww.w), bf16_hi(xw.w), acc);
-        }
-    } else {
-        for (var i = lane; i < kw; i = i + 128u) {
-            let wi = wbase + i;
-            let xi = g4b_p.x_off_words + i;
+            #use b2
             var ww: u32;
             if (from_w2) {
                 ww = g4b_w2[wi >> 2u][wi & 3u];
@@ -218,16 +213,7 @@ fn g4m_gemv_bf16_r8(
     g4b_red[tid] = acc;
     workgroupBarrier();
     for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            g4b_red[tid] = g4b_red[tid] + g4b_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-
-    if (g4b_p.out_f32 == 1u) {
-        if (lane == 0u && live) {
-            g4b_y[g4b_p.y_off_words + row] = bitcast<u32>(g4b_red[tid] * g4b_p.alpha);
-        }
+        #use b4
     } else if (lane == 0u && (sub & 1u) == 0u && live) {
         let lo = g4b_red[tid] * g4b_p.alpha;
         var hi = 0.0;
@@ -392,17 +378,7 @@ fn g4m_gemv_bf16_gu_gelu_fusedx(
 
 @compute @workgroup_size(256)
 fn g4m_gemv_bf16_acc4_ilp_reorders_the_wide_dot_sum(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let half = tid >> 7u;
-    let lane = tid & 127u;
-    let pair = wid.x + wid.y * g4b_p.groups_x;
-    let row = pair * 2u + half;
-    let live = row < g4b_p.n_rows;
-    let wbase = select(0u, row * g4b_p.w_row_words, live);
-    let kw = select(0u, g4b_p.k_words, live);
+    #use b3
 
     var a0 = 0.0;
     var a1 = 0.0;
@@ -424,24 +400,4 @@ fn g4m_gemv_bf16_acc4_ilp_reorders_the_wide_dot_sum(
         a3 = fma(bf16_hi(ww.w), bf16_hi(xw.w), a3);
     }
     g4b_red[tid] = (a0 + a1) + (a2 + a3);
-    workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            g4b_red[tid] = g4b_red[tid] + g4b_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-
-    if (g4b_p.out_f32 == 1u) {
-        if (lane == 0u && live) {
-            g4b_y[g4b_p.y_off_words + row] = bitcast<u32>(g4b_red[tid] * g4b_p.alpha);
-        }
-    } else if (tid == 0u) {
-        let lo = g4b_red[0] * g4b_p.alpha;
-        var hi = 0.0;
-        if (row + 1u < g4b_p.n_rows) {
-            hi = g4b_red[128] * g4b_p.alpha;
-        }
-        g4b_y[g4b_p.y_off_words + (row >> 1u)] = bf16_pack(lo, hi);
-    }
-}
+    #use b1

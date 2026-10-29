@@ -35,15 +35,11 @@ mod tests {
     use super::parse_pin_spec;
 
     #[test]
-    fn parses_multiple_entries_and_skips_malformed() {
+    fn parses_multiple_entries_skips_malformed_and_an_empty_spec_is_empty() {
         let m = parse_pin_spec("128x5376x8192=3; 128x5376x16384=1;bogus;4x5=2;;");
         assert_eq!(m.len(), 2);
         assert_eq!(m[&(128, 5376, 8192)], 3);
         assert_eq!(m[&(128, 5376, 16384)], 1);
-    }
-
-    #[test]
-    fn empty_spec_is_empty() {
         assert!(parse_pin_spec("").is_empty());
         assert!(parse_pin_spec("  ").is_empty());
     }

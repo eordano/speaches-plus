@@ -3,27 +3,10 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use candle_core::Device;
+use nv_models::dots_ocr::default_snapshot_dir as default_dir;
 use nv_models::dots_ocr::{
     DotsMode, DotsOcrPipeline, GenerateOptions, PixelBudget, PromptStyle, RgbImage,
 };
-
-fn default_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("NV_DOTS_DIR") {
-        let p = PathBuf::from(d);
-        return p.is_dir().then_some(p);
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--rednote-hilab--dots.ocr/snapshots");
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&snaps)
-        .ok()?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    entries.sort();
-    entries.into_iter().next()
-}
 
 fn load_rgb(path: &Path) -> Result<RgbImage> {
     RgbImage::decode_file(path)

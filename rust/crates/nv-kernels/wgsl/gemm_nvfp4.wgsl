@@ -1,3 +1,4 @@
+#def b1
 struct GemmParams {
     alpha: f32,
     m: u32,
@@ -29,6 +30,7 @@ fn gemm_b_elem(row: u32, kk: u32) -> f32 {
     let sb = byte_at(gemm_b_sf[si >> 2u], si);
     return nvfp4_decode(nvfp4_nibble(w, kk)) * ue4m3_decode(sb);
 }
+#end
 
 const GEMM_SCALAR_WG: u32 = 64u;
 
@@ -58,37 +60,7 @@ fn gemm_nvfp4_scalar(
 
 const NVFP4_GEMM_SECTION_SPLIT: u32 = 1u;
 
-struct GemmParams {
-    alpha: f32,
-    m: u32,
-    n: u32,
-    k: u32,
-    row_words: u32,
-    k_tiles: u32,
-    tiles_n: u32,
-    groups_x: u32,
-};
-
-@group(0) @binding(0) var<storage, read> gemm_a: array<u32>;
-@group(0) @binding(1) var<storage, read> gemm_a_sf: array<u32>;
-@group(0) @binding(2) var<storage, read> gemm_b: array<u32>;
-@group(0) @binding(3) var<storage, read> gemm_b_sf: array<u32>;
-@group(0) @binding(4) var<uniform> gemm_params: GemmParams;
-@group(0) @binding(5) var<storage, read_write> gemm_d: array<u32>;
-
-fn gemm_a_elem(row: u32, kk: u32) -> f32 {
-    let w = gemm_a[row * gemm_params.row_words + (kk >> 3u)];
-    let si = nvfp4_scale_byte_index(row, kk / NVFP4_BLOCK_SIZE, gemm_params.k_tiles);
-    let sb = byte_at(gemm_a_sf[si >> 2u], si);
-    return nvfp4_decode(nvfp4_nibble(w, kk)) * ue4m3_decode(sb);
-}
-
-fn gemm_b_elem(row: u32, kk: u32) -> f32 {
-    let w = gemm_b[row * gemm_params.row_words + (kk >> 3u)];
-    let si = nvfp4_scale_byte_index(row, kk / NVFP4_BLOCK_SIZE, gemm_params.k_tiles);
-    let sb = byte_at(gemm_b_sf[si >> 2u], si);
-    return nvfp4_decode(nvfp4_nibble(w, kk)) * ue4m3_decode(sb);
-}
+#use b1
 
 alias CoopA = coop_mat16x16<f16, A>;
 alias CoopB = coop_mat16x16<f16, B>;

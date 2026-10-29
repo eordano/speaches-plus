@@ -5,16 +5,22 @@ RUST_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT_DIR="${OCR_WEB_OUT:-$RUST_DIR/../../portal/static/ocr-web}"
 LANE="${NVK_LANE:-ocr-web}"
 
+devenv_paths_exist() {
+  for p in $(grep -oE "/nix/store/[a-z0-9]{32}-[A-Za-z0-9._+/@~-]*" "$1" | grep -v '\.drv$' | sort -u); do
+    [ -e "$p" ] || return 1
+  done
+}
+
 DEVENV=""
 for c in "$HOME/.cache/cargo-tmp/devenv-__cuda.sh" \
   "$HOME/.cache/cargo-tmp/devenv-__default.sh" \
   "$HOME/.cache/cargo-tmp/devenv-__cuda_no_models.sh" \
   "$HOME/.cache/cargo-tmp/devenv-__no_models.sh"; do
-  if [ -f "$c" ] && grep -oE '/nix/store/[^/ ]+-source/[^ "]*cmake-install-shim.sh' "$c" | head -1 | xargs -r test -e; then
+  if [ -f "$c" ] && devenv_paths_exist "$c"; then
     DEVENV="$c"
     break
   elif [ -f "$c" ]; then
-    echo "build-ocr-web: $c bakes a source path that no longer exists; trying the next cached devenv" >&2
+    echo "build-ocr-web: $c names a store path that no longer exists; trying the next cached devenv" >&2
   fi
 done
 if [ -z "$DEVENV" ]; then

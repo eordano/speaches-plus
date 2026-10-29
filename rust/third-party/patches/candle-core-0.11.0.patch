@@ -201,9 +201,51 @@ diff -ruN a/benches/benchmarks/where_cond.rs b/benches/benchmarks/where_cond.rs
 diff -ruN a/Cargo.toml b/Cargo.toml
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -271,6 +271,6 @@
- optional = true
+@@ -35,7 +35,6 @@
+ cuda = [
+     "cudarc",
+     "dep:candle-kernels",
+-    "candle-ug?/cuda",
+ ]
+ cudnn = [
+     "cuda",
+@@ -46,7 +45,6 @@
+     "dep:objc2-metal",
+     "dep:objc2-foundation",
+     "dep:candle-metal-kernels",
+-    "candle-ug?/metal",
+ ]
+ metal-debug-labels = [
+     "metal",
+@@ -57,7 +55,10 @@
+     "cuda",
+     "cudarc/nccl",
+ ]
+-ug = ["dep:candle-ug"]
++
++[lints.rust.unexpected_cfgs]
++level = "warn"
++check-cfg = ['cfg(feature, values("ug"))']
  
+ [lib]
+ name = "candle_core"
+@@ -251,7 +252,7 @@
+ version = "0.8"
+ 
+ [dependencies.zip]
+-version = "8.6.0"
++version = "9.0.5"
+ default-features = false
+ 
+ [dev-dependencies.anyhow]
+@@ -266,11 +267,7 @@
+ version = "0.8"
+ default-features = false
+ 
+-[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies.candle-ug]
+-version = "0.11.0"
+-optional = true
+-
  [target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokenizers]
 -version = "0.22.0"
 +version = "0.23.1"
@@ -980,6 +1022,18 @@ diff -ruN a/src/backprop.rs b/src/backprop.rs
      /// Get the gradient tensor associated with the given tensor, or, if it does not exist,
      /// insert a tensor of zeroes, with the same shape and type as the given tensors and return it
      fn or_insert(&mut self, tensor: &Tensor) -> Result<&mut Tensor> {
+diff -ruN a/src/cpu/erf.rs b/src/cpu/erf.rs
+--- a/src/cpu/erf.rs
++++ b/src/cpu/erf.rs
+@@ -23,8 +23,6 @@
+         }
+     }
+ }
+-use std::f64;
+-
+ /// `erf` calculates the error function at `x`.
+ pub fn erf_f64(x: f64) -> f64 {
+     libm::erf(x)
 diff -ruN a/src/cpu/neon.rs b/src/cpu/neon.rs
 --- a/src/cpu/neon.rs
 +++ b/src/cpu/neon.rs
@@ -1238,6 +1292,45 @@ diff -ruN a/src/metal_backend/device.rs b/src/metal_backend/device.rs
      /// Returns a builder for buffer allocation. See `BufferBuilder`.
      pub fn new_buffer_builder(&self) -> BufferBuilder<'_> {
          BufferBuilder::new(self)
+diff -ruN a/src/npy.rs b/src/npy.rs
+--- a/src/npy.rs
++++ b/src/npy.rs
+@@ -286,8 +286,8 @@
+         for i in 0..zip.len() {
+             let mut reader = zip.by_index(i)?;
+             let name = {
+-                let name = reader.name();
+-                name.strip_suffix(NPY_SUFFIX).unwrap_or(name).to_owned()
++                let name = reader.name()?;
++                name.strip_suffix(NPY_SUFFIX).unwrap_or(&name).to_owned()
+             };
+             let header = read_header(&mut reader)?;
+             let header = Header::parse(&header)?;
+@@ -383,8 +383,8 @@
+         for i in 0..zip.len() {
+             let file = zip.by_index(i)?;
+             let name = {
+-                let name = file.name();
+-                name.strip_suffix(NPY_SUFFIX).unwrap_or(name).to_owned()
++                let name = file.name()?;
++                name.strip_suffix(NPY_SUFFIX).unwrap_or(&name).to_owned()
+             };
+             index_per_name.insert(name, i);
+         }
+diff -ruN a/src/pickle.rs b/src/pickle.rs
+--- a/src/pickle.rs
++++ b/src/pickle.rs
+@@ -677,8 +677,8 @@
+     let mut zip = zip::ZipArchive::new(zip_reader)?;
+     let zip_file_names = zip
+         .file_names()
+-        .map(|f| f.to_string())
+-        .collect::<Vec<String>>();
++        .map(|f| f.map(|f| f.to_string()))
++        .collect::<std::result::Result<Vec<String>, _>>()?;
+ 
+     let mut tensor_infos = vec![];
+     for file_name in zip_file_names.iter() {
 diff -ruN a/src/quantized/k_quants.rs b/src/quantized/k_quants.rs
 --- a/src/quantized/k_quants.rs
 +++ b/src/quantized/k_quants.rs

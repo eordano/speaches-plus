@@ -123,20 +123,20 @@ fn plain_entry(@builtin(global_invocation_id) gid: vec3<u32>) {\n\
 }\n";
 
     #[test]
-    fn subgroup_fns_drop_with_their_attributes_and_the_rest_survives() {
-        let out = strip_subgroup_fns(MIXED);
-        assert!(!out.contains("subgroup"));
-        assert!(!out.contains("sg_entry"));
-        assert!(out.contains("struct P"));
-        assert!(out.contains("var<storage, read> w"));
-        assert!(out.contains("fn helper"));
-        assert!(out.contains("fn plain_entry"));
-        assert!(out.contains("@compute @workgroup_size(64)"));
-    }
-
-    #[test]
-    fn a_subgroup_free_source_passes_through_with_every_item_intact() {
-        let clean = "const A: u32 = 1u;\nfn f() -> u32 {\n    return A;\n}\n";
-        assert_eq!(strip_subgroup_fns(clean), clean);
+    fn subgroup_fns_drop_with_their_attributes_and_a_subgroup_free_source_passes_through_intact() {
+        {
+            let out = strip_subgroup_fns(MIXED);
+            assert!(!out.contains("subgroup"));
+            assert!(!out.contains("sg_entry"));
+            assert!(out.contains("struct P"));
+            assert!(out.contains("var<storage, read> w"));
+            assert!(out.contains("fn helper"));
+            assert!(out.contains("fn plain_entry"));
+            assert!(out.contains("@compute @workgroup_size(64)"));
+        }
+        {
+            let clean = "const A: u32 = 1u;\nfn f() -> u32 {\n    return A;\n}\n";
+            assert_eq!(strip_subgroup_fns(clean), clean);
+        }
     }
 }

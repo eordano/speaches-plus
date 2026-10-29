@@ -109,26 +109,6 @@ fn q3w_attn_norm_rope(
 }
 
 @compute @workgroup_size(128)
-fn q3w_attn_norm_rope_f32(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let hd = ar_p.head_dim;
-    let e0 = 2u * lid.x;
-    var v = vec2<f32>(0.0, 0.0);
-    if (e0 < hd) {
-        v = ar_load(ar_p.src_off + wid.x * ar_p.src_stride + e0);
-    }
-    let o = ar_norm_rope(v.x, v.y, ar_p.w_off, lid.x);
-    if (e0 < hd) {
-        let i = wid.x * hd + e0;
-        ar_out[i >> 1u] = bf16_pack(o.x, o.y);
-        ar_outf[i] = bf16_decode(bf16_encode(o.x));
-        ar_outf[i + 1u] = bf16_decode(bf16_encode(o.y));
-    }
-}
-
-@compute @workgroup_size(128)
 fn q3w_attn_norm_rope_qk(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>

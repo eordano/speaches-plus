@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor, Var, D};
 use candle_nn::ops::{log_softmax, softmax_last_dim};
 use nv_layers::linear::Linear;
@@ -78,7 +78,7 @@ impl DenseTrainModel {
             .to_device(device)?;
         let embed_dims = embed_weight.dims();
         if embed_dims != [config.vocab_size, config.hidden_size] {
-            anyhow::bail!(
+            bail!(
                 "dense-gemma4 embed: expected [{}, {}], got {:?}",
                 config.vocab_size,
                 config.hidden_size,
@@ -144,12 +144,12 @@ impl DenseTrainModel {
     pub fn forward_logits(&self, tokens: &Tensor, positions: &Tensor) -> Result<Tensor> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] == 0 {
-            anyhow::bail!("dense forward: tokens must be [batch, seq], got {:?}", dims);
+            bail!("dense forward: tokens must be [batch, seq], got {:?}", dims);
         }
         let bsz = dims[0];
         let seq = dims[1];
         if positions.dims() != [seq] {
-            anyhow::bail!(
+            bail!(
                 "dense forward: positions must be [{}] shared by every same-length row, got {:?}",
                 seq,
                 positions.dims()
@@ -339,7 +339,6 @@ impl DenseTrainModel {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn naive_sdpa(
     q: &Tensor,
     k: &Tensor,
@@ -451,7 +450,7 @@ fn load_dense_layer<S: TensorSource>(
         .get(&format!("{prefix}.layer_scalar"), dtype)
         .with_context(|| format!("load {prefix}.layer_scalar"))?;
     if layer_scalar.dims() != [1] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.layer_scalar expected [1], got {:?}",
             layer_scalar.dims()
         );
@@ -470,7 +469,7 @@ fn load_dense_layer<S: TensorSource>(
             .get(&format!("{prefix}.self_attn.{name}.weight"), dtype)
             .with_context(|| format!("load {prefix}.self_attn.{name}.weight"))?;
         if t.dims() != [out_f, in_f] {
-            anyhow::bail!(
+            bail!(
                 "{prefix}.self_attn.{name}: expected [{out_f}, {in_f}], got {:?}",
                 t.dims()
             );
@@ -538,7 +537,7 @@ fn load_dense_layer<S: TensorSource>(
     let gate_w = weights.get(&format!("{prefix}.mlp.gate_proj.weight"), dtype)?;
     let up_w = weights.get(&format!("{prefix}.mlp.up_proj.weight"), dtype)?;
     if gate_w.dims() != [inter, hidden] || up_w.dims() != [inter, hidden] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.mlp gate/up: expected [{inter}, {hidden}], got {:?} / {:?}",
             gate_w.dims(),
             up_w.dims()
@@ -546,7 +545,7 @@ fn load_dense_layer<S: TensorSource>(
     }
     let down_w = weights.get(&format!("{prefix}.mlp.down_proj.weight"), dtype)?;
     if down_w.dims() != [hidden, inter] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.mlp.down_proj: expected [{hidden}, {inter}], got {:?}",
             down_w.dims()
         );
@@ -634,7 +633,7 @@ impl DenseTrainModel {
         let ids = &row.ids;
         let seq = ids.len();
         if seq < 2 {
-            anyhow::bail!("seq_backward_checkpointed: need >=2 tokens, got {seq}");
+            bail!("seq_backward_checkpointed: need >=2 tokens, got {seq}");
         }
         let positions = Tensor::from_vec((0..seq as u32).collect::<Vec<_>>(), seq, dev)?;
         let tokens = Tensor::from_vec(ids.to_vec(), (1usize, seq), dev)?;
@@ -750,7 +749,7 @@ impl DenseTrainModel {
         let wt = w.t()?.contiguous()?;
         let rows = pred.dim(0)?;
         if targets.len() != rows || mask.len() != rows {
-            anyhow::bail!(
+            bail!(
                 "chunked_ce: targets {} / mask {} != rows {}",
                 targets.len(),
                 mask.len(),
@@ -759,7 +758,7 @@ impl DenseTrainModel {
         }
         let denom: f32 = mask.iter().sum();
         if denom <= 0.0 {
-            anyhow::bail!("chunked_ce: every target position is masked, the row has no loss");
+            bail!("chunked_ce: every target position is masked, the row has no loss");
         }
         let cap = self.config.final_logit_softcapping as f64;
         let mut loss = 0f32;

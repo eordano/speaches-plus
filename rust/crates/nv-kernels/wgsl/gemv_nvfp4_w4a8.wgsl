@@ -134,6 +134,7 @@ fn gemv_nvfp4_w4a8_mrow2(
     @builtin(subgroup_id) sgid: u32,
     @builtin(subgroup_invocation_id) lane: u32
 ) {
+    #def b1
     let row0 = (wid.x + wid.y * w48_p.groups_x) * (W48_SGS * 2u) + sgid * 2u;
     let row1 = row0 + 1u;
     let pairs = w48_p.k_blocks >> 1u;
@@ -185,6 +186,7 @@ fn gemv_nvfp4_w4a8_mrow2(
     let t1 = w48_bfly(acc1);
     let ep = (w48_p.alpha * w48_xs[0]) * W48_EPILOGUE_HALF_UNDOES_THE_I8MAP_DOUBLING_OF_E2M1;
     if (lane == 0u && live0) {
+    #end
         var word = bf16_encode(t0 * ep) & 0xffffu;
         if (live1) {
             word = word | (bf16_encode(t1 * ep) << 16u);
@@ -209,57 +211,7 @@ fn gemv_nvfp4_w4a8_mrow2_lora_fold(
     }
     workgroupBarrier();
 
-    let row0 = (wid.x + wid.y * w48_p.groups_x) * (W48_SGS * 2u) + sgid * 2u;
-    let row1 = row0 + 1u;
-    let pairs = w48_p.k_blocks >> 1u;
-    let stride = w48_p.k_blocks >> 1u;
-    let live0 = row0 < w48_p.n_rows;
-    let live1 = row1 < w48_p.n_rows;
-    let wb0 = select(0u, row0 * stride, live0);
-    let wb1 = select(0u, row1 * stride, live1);
-    let sr0 = select(0u, row0, live0);
-    let sr1 = select(0u, row1, live1);
-
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    for (var p = lane; p < pairs; p = p + W48_LANES) {
-        let xa = w48_xq4[2u * p];
-        let xc = w48_xq4[2u * p + 1u];
-        let b0 = p << 1u;
-
-        let wv0 = w48_w4[wb0 + p];
-        let wsi0 = nvfp4_scale_byte_index(sr0, b0, w48_p.k_tiles);
-        let wsw0 = w48_ws[wsi0 >> 2u];
-        let a0 = dot4I8Packed(w48_i8map(wv0.x), xa.x)
-            + dot4I8Packed(w48_i8map(wv0.x >> 4u), xa.y)
-            + dot4I8Packed(w48_i8map(wv0.y), xa.z)
-            + dot4I8Packed(w48_i8map(wv0.y >> 4u), xa.w);
-        let a1 = dot4I8Packed(w48_i8map(wv0.z), xc.x)
-            + dot4I8Packed(w48_i8map(wv0.z >> 4u), xc.y)
-            + dot4I8Packed(w48_i8map(wv0.w), xc.z)
-            + dot4I8Packed(w48_i8map(wv0.w >> 4u), xc.w);
-        acc0 = fma(ue4m3_decode(byte_at(wsw0, wsi0)), f32(a0), acc0);
-        acc0 = fma(ue4m3_decode(byte_at(wsw0, wsi0 + 1u)), f32(a1), acc0);
-
-        let wv1 = w48_w4[wb1 + p];
-        let wsi1 = nvfp4_scale_byte_index(sr1, b0, w48_p.k_tiles);
-        let wsw1 = w48_ws[wsi1 >> 2u];
-        let b0d = dot4I8Packed(w48_i8map(wv1.x), xa.x)
-            + dot4I8Packed(w48_i8map(wv1.x >> 4u), xa.y)
-            + dot4I8Packed(w48_i8map(wv1.y), xa.z)
-            + dot4I8Packed(w48_i8map(wv1.y >> 4u), xa.w);
-        let b1d = dot4I8Packed(w48_i8map(wv1.z), xc.x)
-            + dot4I8Packed(w48_i8map(wv1.z >> 4u), xc.y)
-            + dot4I8Packed(w48_i8map(wv1.w), xc.z)
-            + dot4I8Packed(w48_i8map(wv1.w >> 4u), xc.w);
-        acc1 = fma(ue4m3_decode(byte_at(wsw1, wsi1)), f32(b0d), acc1);
-        acc1 = fma(ue4m3_decode(byte_at(wsw1, wsi1 + 1u)), f32(b1d), acc1);
-    }
-
-    let t0 = w48_bfly(acc0);
-    let t1 = w48_bfly(acc1);
-    let ep = (w48_p.alpha * w48_xs[0]) * W48_EPILOGUE_HALF_UNDOES_THE_I8MAP_DOUBLING_OF_E2M1;
-    if (lane == 0u && live0) {
+    #use b1
         let y0 = t0 * ep;
         let d0 = w48_lora_row_delta(row0);
         var word = bf16_encode(select(y0, y0 + d0, d0 != 0.0)) & 0xffffu;

@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::kernels::gemv_w4a16;
 use crate::wgpu_backend::kernels::gemv_w4a16::ScaleGrain;
@@ -43,97 +41,125 @@ const COMPONENTS: [&str; 4] = ["x", "y", "z", "w"];
 
 fn write_preamble(b: &mut String) {
     b.push_str(
-        "struct GemmW4A16SmallMParams {\n    n_rows: u32,\n    k_elems: u32,\n    gs: u32,\n    w_row_words: u32,\n    scale_row_stride: u32,\n    groups_x: u32,\n    x_stride_words: u32,\n    y_stride_words: u32,\n};\n\n",
+        "struct GemmW4A16SmallMParams {
+    n_rows: u32,
+    k_elems: u32,
+    gs: u32,
+    w_row_words: u32,
+    scale_row_stride: u32,
+    groups_x: u32,
+    x_stride_words: u32,
+    y_stride_words: u32,
+};
+
+@group(0) @binding(0) var<storage, read> sm_packed4: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> sm_scale: array<u32>;
+@group(0) @binding(2) var<storage, read> sm_x4: array<vec4<u32>>;
+@group(0) @binding(3) var<storage, read_write> sm_y: array<u32>;
+@group(0) @binding(4) var<uniform> sm_params: GemmW4A16SmallMParams;
+
+const SM_LANES: u32 = 32u;
+const SM_ROWS: u32 = 8u;
+
+var<workgroup> sm_partial: array<f32, 256>;
+\n",
     );
-    b.push_str("@group(0) @binding(0) var<storage, read> sm_packed4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(1) var<storage, read> sm_scale: array<u32>;\n");
-    b.push_str("@group(0) @binding(2) var<storage, read> sm_x4: array<vec4<u32>>;\n");
-    b.push_str("@group(0) @binding(3) var<storage, read_write> sm_y: array<u32>;\n");
-    b.push_str("@group(0) @binding(4) var<uniform> sm_params: GemmW4A16SmallMParams;\n\n");
-    b.push_str("const SM_LANES: u32 = 32u;\n");
-    b.push_str("const SM_ROWS: u32 = 8u;\n\n");
-    b.push_str("var<workgroup> sm_partial: array<f32, 256>;\n\n");
 }
 
 fn write_entry(b: &mut String, m: u32) {
     use std::fmt::Write as _;
     let entry = entry_name(m);
-    writeln!(b, "@compute @workgroup_size({WORKGROUP_SIZE})").unwrap();
-    writeln!(b, "fn {entry}(").unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n");
-    b.push_str("    @builtin(local_invocation_id) lid: vec3<u32>\n) {\n");
-    b.push_str("    let tid = lid.x;\n");
-    b.push_str("    let lane = tid & (SM_LANES - 1u);\n");
-    b.push_str("    let warp = tid / SM_LANES;\n");
-    b.push_str("    let row = (wid.x + wid.y * sm_params.groups_x) * SM_ROWS + warp;\n");
-    b.push_str("    let live = row < sm_params.n_rows;\n");
-    b.push_str("    let kv = select(0u, sm_params.k_elems >> 5u, live);\n");
-    b.push_str("    let wbase4 = select(0u, row * (sm_params.w_row_words >> 2u), live);\n");
-    b.push_str("    let sbase = select(0u, row * sm_params.scale_row_stride, live);\n");
-    b.push_str("    let xs4 = sm_params.x_stride_words >> 2u;\n\n");
-    writeln!(b, "    var acc: array<f32, {m}>;").unwrap();
-    writeln!(b, "    for (var t = 0u; t < {m}u; t = t + 1u) {{").unwrap();
-    b.push_str("        acc[t] = 0.0;\n    }\n\n");
-    b.push_str("    for (var v = lane; v < kv; v = v + SM_LANES) {\n");
-    b.push_str("        let wv = sm_packed4[wbase4 + v];\n");
-    b.push_str("        let sc = bf16_decode(sm_scale[sbase + ((v << 5u) / sm_params.gs)]);\n\n");
+    write!(
+        b,
+        "@compute @workgroup_size({WORKGROUP_SIZE})
+fn {entry}(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {{
+    let tid = lid.x;
+    let lane = tid & (SM_LANES - 1u);
+    let warp = tid / SM_LANES;
+    let row = (wid.x + wid.y * sm_params.groups_x) * SM_ROWS + warp;
+    let live = row < sm_params.n_rows;
+    let kv = select(0u, sm_params.k_elems >> 5u, live);
+    let wbase4 = select(0u, row * (sm_params.w_row_words >> 2u), live);
+    let sbase = select(0u, row * sm_params.scale_row_stride, live);
+    let xs4 = sm_params.x_stride_words >> 2u;
+
+    var acc: array<f32, {m}>;
+    for (var t = 0u; t < {m}u; t = t + 1u) {{
+        acc[t] = 0.0;
+    }}
+
+    for (var v = lane; v < kv; v = v + SM_LANES) {{
+        let wv = sm_packed4[wbase4 + v];
+        let sc = bf16_decode(sm_scale[sbase + ((v << 5u) / sm_params.gs)]);
+\n"
+    )
+    .unwrap();
     for (c, comp) in COMPONENTS.iter().enumerate() {
         writeln!(
             b,
-            "        let qe{c} = vec4<f32>(unpack4xU8(wv.{comp} & 0x0f0f0f0fu)) - vec4<f32>(8.0);"
-        )
-        .unwrap();
-        writeln!(
-            b,
-            "        let qo{c} = vec4<f32>(unpack4xU8((wv.{comp} >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);"
+            "        let qe{c} = vec4<f32>(unpack4xU8(wv.{comp} & 0x0f0f0f0fu)) - vec4<f32>(8.0);
+        let qo{c} = vec4<f32>(unpack4xU8((wv.{comp} >> 4u) & 0x0f0f0f0fu)) - vec4<f32>(8.0);"
         )
         .unwrap();
     }
-    b.push_str("\n        let xb = v << 2u;\n");
-    writeln!(b, "        for (var t = 0u; t < {m}u; t = t + 1u) {{").unwrap();
-    b.push_str("            let xbase = t * xs4 + xb;\n");
+    write!(
+        b,
+        "
+        let xb = v << 2u;
+        for (var t = 0u; t < {m}u; t = t + 1u) {{
+            let xbase = t * xs4 + xb;\n"
+    )
+    .unwrap();
     for c in 0..4u32 {
         writeln!(b, "            let xw{c} = sm_x4[xbase + {c}u];").unwrap();
     }
     for c in 0..4u32 {
         writeln!(
             b,
-            "            let xe{c} = bitcast<vec4<f32>>(xw{c} << vec4<u32>(16u));"
-        )
-        .unwrap();
-        writeln!(
-            b,
-            "            let xo{c} = bitcast<vec4<f32>>(xw{c} & vec4<u32>(0xffff0000u));"
+            "            let xe{c} = bitcast<vec4<f32>>(xw{c} << vec4<u32>(16u));
+            let xo{c} = bitcast<vec4<f32>>(xw{c} & vec4<u32>(0xffff0000u));"
         )
         .unwrap();
     }
     b.push_str("\n            var a = 0.0;\n");
     for c in 0..4u32 {
         for sub in COMPONENTS {
-            writeln!(b, "            a = fma(qe{c}.{sub}, xe{c}.{sub}, a);").unwrap();
-            writeln!(b, "            a = fma(qo{c}.{sub}, xo{c}.{sub}, a);").unwrap();
+            writeln!(
+                b,
+                "            a = fma(qe{c}.{sub}, xe{c}.{sub}, a);
+            a = fma(qo{c}.{sub}, xo{c}.{sub}, a);"
+            )
+            .unwrap();
         }
     }
-    b.push_str("\n            acc[t] = fma(sc, a, acc[t]);\n");
-    b.push_str("        }\n");
-    b.push_str("    }\n\n");
-    writeln!(b, "    for (var t = 0u; t < {m}u; t = t + 1u) {{").unwrap();
-    b.push_str("        sm_partial[tid] = acc[t];\n");
-    b.push_str("        workgroupBarrier();\n");
-    b.push_str("        for (var stride = SM_LANES >> 1u; stride > 0u; stride = stride >> 1u) {\n");
-    b.push_str("            if (lane < stride) {\n");
-    b.push_str("                sm_partial[tid] = sm_partial[tid] + sm_partial[tid + stride];\n");
-    b.push_str("            }\n");
-    b.push_str("            workgroupBarrier();\n");
-    b.push_str("        }\n");
-    b.push_str("        if (lane == 0u && live) {\n");
-    b.push_str(
-        "            sm_y[t * sm_params.y_stride_words + row] = bf16_encode(sm_partial[tid]);\n",
-    );
-    b.push_str("        }\n");
-    b.push_str("        workgroupBarrier();\n");
-    b.push_str("    }\n");
-    b.push_str("}\n\n");
+    write!(
+        b,
+        "
+            acc[t] = fma(sc, a, acc[t]);
+        }}
+    }}
+
+    for (var t = 0u; t < {m}u; t = t + 1u) {{
+        sm_partial[tid] = acc[t];
+        workgroupBarrier();
+        for (var stride = SM_LANES >> 1u; stride > 0u; stride = stride >> 1u) {{
+            if (lane < stride) {{
+                sm_partial[tid] = sm_partial[tid] + sm_partial[tid + stride];
+            }}
+            workgroupBarrier();
+        }}
+        if (lane == 0u && live) {{
+            sm_y[t * sm_params.y_stride_words + row] = bf16_encode(sm_partial[tid]);
+        }}
+        workgroupBarrier();
+    }}
+}}
+\n"
+    )
+    .unwrap();
 }
 
 pub fn small_m_source() -> String {
@@ -261,22 +287,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn entry_for_covers_the_supported_range() {
-        assert_eq!(entry_for(1).unwrap(), "gemm_w4a16_small_m_m1");
-        assert_eq!(entry_for(9).unwrap(), "gemm_w4a16_small_m_m9");
-        assert!(entry_for(0).is_err());
-        assert!(entry_for(10).is_err());
-    }
-
-    #[test]
-    fn small_m_source_declares_every_entry_point() {
-        let src = small_m_source();
-        for m in MIN_M..=MAX_M {
-            assert!(src.contains(&entry_name(m)), "missing entry for M={m}");
+    fn entries_and_params_cover_the_supported_range() {
+        {
+            assert_eq!(entry_for(1).unwrap(), "gemm_w4a16_small_m_m1");
+            assert_eq!(entry_for(9).unwrap(), "gemm_w4a16_small_m_m9");
+            assert!(entry_for(0).is_err());
+            assert!(entry_for(10).is_err());
         }
-        assert!(src.contains("unpack4xU8"));
-        assert!(src.contains("fn bf16_encode("));
-        assert!(src.contains("fn bf16_decode("));
+        {
+            let src = small_m_source();
+            for m in MIN_M..=MAX_M {
+                assert!(src.contains(&entry_name(m)), "missing entry for M={m}");
+            }
+            assert!(src.contains("unpack4xU8"));
+            assert!(src.contains("fn bf16_encode("));
+            assert!(src.contains("fn bf16_decode("));
+        }
+        {
+            assert_eq!(std::mem::size_of::<Params>() % 4, 0);
+        }
     }
 
     #[test]
@@ -288,10 +317,5 @@ mod tests {
         assert!(check_grain(64).is_ok());
         assert!(check_grain(128).is_ok());
         assert!(small_m_source().contains("(v << 5u) / sm_params.gs"));
-    }
-
-    #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert_eq!(std::mem::size_of::<Params>() % 4, 0);
     }
 }

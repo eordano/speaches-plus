@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use opus::{Channels, Decoder};
-use rubato::{FastFixedIn, PolynomialDegree, Resampler};
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::{Async, FixedAsync, PolynomialDegree, Resampler};
 
 use crate::defaults;
 
@@ -14,7 +15,7 @@ pub struct AudioIngest {
     decoder: Decoder,
     channels: usize,
     out: Vec<f32>,
-    resampler: FastFixedIn<f32>,
+    resampler: Async<f32>,
     decode_workspace: Vec<i16>,
     mono_48k_workspace: Vec<f32>,
     resampler_in: Vec<Vec<f32>>,
@@ -34,12 +35,13 @@ impl AudioIngest {
             Decoder::new(OPUS_SAMPLE_RATE_HZ, opus_channels).context("create opus decoder")?;
 
         let chunk_in_frames = OPUS_FRAME_SAMPLES;
-        let resampler = FastFixedIn::<f32>::new(
+        let resampler = Async::<f32>::new_poly(
             OUTPUT_HZ / INPUT_HZ,
             1.0,
             PolynomialDegree::Septic,
             chunk_in_frames,
             1,
+            FixedAsync::Input,
         )
         .context("create rubato resampler")?;
 
@@ -88,9 +90,14 @@ impl AudioIngest {
             let chunk = &self.leftover_48k[consumed..consumed + self.chunk_in_frames];
             self.resampler_in[0].clear();
             self.resampler_in[0].extend_from_slice(chunk);
+            let out_frames = self.resampler_out[0].len();
+            let input = SequentialSliceOfVecs::new(&self.resampler_in, 1, self.chunk_in_frames)
+                .context("rubato input buffer")?;
+            let mut output = SequentialSliceOfVecs::new_mut(&mut self.resampler_out, 1, out_frames)
+                .context("rubato output buffer")?;
             let (in_used, out_produced) = self
                 .resampler
-                .process_into_buffer(&self.resampler_in, &mut self.resampler_out, None)
+                .process_into_buffer(&input, &mut output, None)
                 .context("rubato process")?;
             debug_assert_eq!(in_used, self.chunk_in_frames);
             self.out
@@ -128,6 +135,39 @@ mod tests {
             samples.iter().all(|&s| s.abs() < 0.001),
             "expected silence, got non-zero peak"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn tone_keeps_its_frequency_and_duration_through_the_resampler() -> Result<()> {
+        let mut enc = Encoder::new(OPUS_SAMPLE_RATE_HZ, Channels::Mono, Application::Audio)?;
+        let mut ingest = AudioIngest::new(1)?;
+        let mut payload = vec![0u8; defaults::audio::OPUS_ENCODE_BUFFER_BYTES];
+        let frames = 50;
+        for f in 0..frames {
+            let pcm: Vec<i16> = (0..OPUS_FRAME_SAMPLES)
+                .map(|i| {
+                    let t = (f * OPUS_FRAME_SAMPLES + i) as f64 / INPUT_HZ;
+                    ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 16_000.0) as i16
+                })
+                .collect();
+            let n = enc.encode(&pcm, &mut payload)?;
+            ingest.process(&payload[..n])?;
+        }
+        let out = ingest.take();
+        let expected = (frames * OPUS_FRAME_SAMPLES) as f64 * OUTPUT_HZ / INPUT_HZ;
+        assert!(
+            (out.len() as f64 - expected).abs() <= OPUS_FRAME_SAMPLES as f64,
+            "{} samples out, expected about {expected}",
+            out.len()
+        );
+        let steady = &out[out.len() / 4..];
+        let crossings = steady
+            .windows(2)
+            .filter(|w| w[0] < 0.0 && w[1] >= 0.0)
+            .count() as f64;
+        let hz = crossings * OUTPUT_HZ / steady.len() as f64;
+        assert!((hz - 440.0).abs() < 15.0, "tone came out at {hz:.1} Hz");
         Ok(())
     }
 }

@@ -1,15 +1,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Deserialize;
-use serde_json::{json, Map};
+use serde_json::{Map, json};
 
-use super::{
-    kind, openai_error, task, ListModelsResponse, Model, KOKORO_LANGUAGES, WHISPER_LANGUAGES,
-};
+use super::{KOKORO_LANGUAGES, ListModelsResponse, Model, WHISPER_LANGUAGES, task};
+
+const VOXTRAL_TTS_LANGUAGES: [&str; 9] = ["en", "fr", "de", "es", "nl", "pt", "it", "hi", "ar"];
 use crate::models::Models;
 
 #[derive(Debug, Default, Deserialize)]
@@ -43,6 +43,29 @@ pub async fn handle_list_models(
                 extras,
             });
         }
+    }
+    if let Some(vd) = crate::oapi::audio_speech_nvtts::voice_design() {
+        let mut extras = Map::new();
+        extras.insert(
+            "sample_rate".into(),
+            json!(crate::oapi::audio_speech::NV_TTS_SAMPLE_RATE),
+        );
+        extras.insert("voices".into(), json!([]));
+        extras.insert("requires".into(), json!(["instructions"]));
+        data.push(Model {
+            id: vd.model_id.clone(),
+            created: 1,
+            owned_by: vd
+                .model_id
+                .split('/')
+                .next()
+                .unwrap_or("speaches-plus")
+                .to_string(),
+            languages: None,
+            task: task::TTS.into(),
+            max_model_len: None,
+            extras,
+        });
     }
     if state.speaker_encoder.is_some() {
         data.push(Model {
@@ -87,6 +110,7 @@ pub async fn handle_list_models(
         }
     }
 
+    data.extend(super::ocr_mistral::model_rows());
     for m in super::lora::model_rows() {
         match data.iter_mut().find(|x| x.id == m.id) {
             Some(existing) => {
@@ -102,17 +126,6 @@ pub async fn handle_list_models(
         data.retain(|m| m.task == filter);
     }
     Json(ListModelsResponse::new(data)).into_response()
-}
-
-#[allow(dead_code)]
-pub fn models_unavailable() -> Response {
-    openai_error(
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "models registry not initialised",
-        kind::SERVICE_UNAVAIL,
-        None,
-        Some("models_not_loaded"),
-    )
 }
 
 fn build_models(models: &Arc<Models>) -> Vec<Model> {
@@ -148,6 +161,28 @@ fn build_models(models: &Arc<Models>) -> Vec<Model> {
         });
     }
 
+    if let Some(tts) = &models.voxtral_tts {
+        use crate::oapi::audio_speech::AudioSpeech;
+        let mut extras = Map::new();
+        extras.insert("sample_rate".into(), json!(tts.sample_rate()));
+        extras.insert("voices".into(), json!(tts.voices()));
+        extras.insert("device".into(), json!(tts.device_name()));
+        out.push(Model {
+            id: crate::tts::voxtral_tts::VOXTRAL_TTS_MODEL_ID.into(),
+            created: 1,
+            owned_by: "mistralai".into(),
+            languages: Some(
+                VOXTRAL_TTS_LANGUAGES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            task: task::TTS.into(),
+            max_model_len: None,
+            extras,
+        });
+    }
+
     if models.vad().is_ok() {
         out.push(Model {
             id: "silero_vad_v6".into(),
@@ -164,8 +199,57 @@ fn build_models(models: &Arc<Models>) -> Vec<Model> {
         super::text_embeddings::served_embedding_model_id(),
     ));
     out.extend(pii_model_entry(loaded_pii_model_id()));
+    out.extend(systemone_model_entries(
+        super::systemone::model_dir().as_deref(),
+    ));
+    out.extend(
+        super::systemone_clm::configured()
+            .into_iter()
+            .map(|(_, meta)| Model {
+                id: meta.name,
+                created: 1,
+                owned_by: "user".into(),
+                languages: None,
+                task: task::SYSTEM_ONE.into(),
+                max_model_len: Some(meta.max_tokens as u64),
+                extras: Map::new(),
+            }),
+    );
+    out.extend(
+        super::systemone::fine_tuned()
+            .read()
+            .unwrap()
+            .keys()
+            .map(|id| Model {
+                id: id.clone(),
+                created: 1,
+                owned_by: "user".into(),
+                languages: None,
+                task: task::SYSTEM_ONE.into(),
+                max_model_len: None,
+                extras: Map::new(),
+            }),
+    );
 
     out
+}
+
+fn systemone_model_entries(dir: Option<&Path>) -> Vec<Model> {
+    let Some(dir) = dir else { return Vec::new() };
+    nv_laya::router::MODELS
+        .iter()
+        .map(|m| nv_laya::router::directory(m))
+        .filter(|repo| dir.join(repo).join("model.safetensors").is_file())
+        .map(|repo| Model {
+            id: format!("convaiinnovations/{repo}"),
+            created: 1,
+            owned_by: "convaiinnovations".into(),
+            languages: None,
+            task: task::SYSTEM_ONE.into(),
+            max_model_len: None,
+            extras: Map::new(),
+        })
+        .collect()
 }
 
 fn embeddings_model_entry(loaded_id: Option<String>) -> Option<Model> {
@@ -236,7 +320,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embeddings_and_pii_rows_follow_load_state_in_both_directions() {
+    fn model_rows_follow_load_state_and_disk_presence_not_env_vars() {
         assert!(
             embeddings_model_entry(None).is_none(),
             "/v1/models must not advertise an embeddings model that never loaded"
@@ -256,36 +340,45 @@ mod tests {
             .expect("a loaded PII classifier must be advertised");
         assert_eq!(p.id, "piiranha-v1");
         assert_eq!(p.task, task::TOKEN_CLASSIFICATION);
+        {
+            let root = std::env::temp_dir().join(format!(
+                "speaches-plus-systemone-models-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(root.join("laya-multilingual")).unwrap();
+            std::fs::write(root.join("laya-multilingual/model.safetensors"), b"").unwrap();
+            let ids: Vec<String> = systemone_model_entries(Some(&root))
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            assert_eq!(ids, ["convaiinnovations/laya-multilingual"]);
+            assert!(systemone_model_entries(None).is_empty());
+            let _ = std::fs::remove_dir_all(&root);
+        }
+        {
+            unsafe { std::env::set_var("REDACT_MODEL_DIR", "/no/such/pii/dir") };
+            assert!(
+                loaded_pii_model_id().is_none(),
+                "REDACT_MODEL_DIR alone must not put a model in /v1/models"
+            );
+            unsafe { std::env::remove_var("REDACT_MODEL_DIR") };
+        }
     }
 
     #[test]
-    fn pii_is_not_advertised_from_the_env_var_alone() {
-        std::env::set_var("REDACT_MODEL_DIR", "/no/such/pii/dir");
-        assert!(
-            loaded_pii_model_id().is_none(),
-            "REDACT_MODEL_DIR alone must not put a model in /v1/models"
-        );
-        std::env::remove_var("REDACT_MODEL_DIR");
-    }
-
-    #[test]
-    fn whisper_id_and_owner_handles_hf_ids() {
+    fn whisper_id_and_owner_handles_hf_ids_local_paths_and_bare_dirs() {
         let (id, owner) = whisper_id_and_owner("deepdml/faster-whisper-large-v3-turbo-ct2");
         assert_eq!(id, "deepdml/faster-whisper-large-v3-turbo-ct2");
         assert_eq!(owner, "deepdml");
-    }
-
-    #[test]
-    fn whisper_id_and_owner_handles_local_paths() {
-        let (id, owner) = whisper_id_and_owner("models/ggml-tiny.en.bin");
-        assert_eq!(id, "ggml-tiny.en");
-        assert_eq!(owner, "speaches-plus");
-    }
-
-    #[test]
-    fn whisper_id_and_owner_handles_bare_dir_name() {
-        let (id, owner) = whisper_id_and_owner("ct2-large-v3-turbo");
-        assert_eq!(id, "ct2-large-v3-turbo");
-        assert_eq!(owner, "speaches-plus");
+        {
+            let (id, owner) = whisper_id_and_owner("models/ggml-tiny.en.bin");
+            assert_eq!(id, "ggml-tiny.en");
+            assert_eq!(owner, "speaches-plus");
+        }
+        {
+            let (id, owner) = whisper_id_and_owner("ct2-large-v3-turbo");
+            assert_eq!(id, "ct2-large-v3-turbo");
+            assert_eq!(owner, "speaches-plus");
+        }
     }
 }

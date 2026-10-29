@@ -164,7 +164,7 @@ def main() -> int:
     logger.info(f"  {'gated (this)':14s} {100 * full_acc:.1f}%")
 
     print()
-    print(f"// Trained on a real-data corpus from pipecat-ai/smart-turn-data-v3-test.")
+    print("// Trained on a real-data corpus from pipecat-ai/smart-turn-data-v3-test.")
     print(f"// Corpus: {len(rows)} clips, {pos} positive / {len(rows) - pos} negative.")
     print()
     fields = [

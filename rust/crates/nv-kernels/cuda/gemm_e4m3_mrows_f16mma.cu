@@ -137,7 +137,12 @@ __global__ void __launch_bounds__(kThreads) gemm_e4m3_mrows_f16mma_kernel(
 }
 
 constexpr int kStepsPerIter8Gives256ContiguousBytesPerRowPerWarpSoDramSeesFullBursts = 8;
+constexpr int kKMultipleTheLauncherAccepts = kKMultipleOf128SoEveryWarpQuarterIsWholeK32Steps * kStepsPerIter8Gives256ContiguousBytesPerRowPerWarpSoDramSeesFullBursts;
 
+}
+
+extern "C" int nv_kernels_gemm_e4m3_mrows_f16mma_k_multiple() {
+    return e4m3mrows::kKMultipleTheLauncherAccepts;
 }
 
 extern "C" int nv_kernels_gemm_e4m3_mrows_f16mma(
@@ -154,7 +159,7 @@ extern "C" int nv_kernels_gemm_e4m3_mrows_f16mma(
     if (N <= 0 || K <= 0 || M <= 0) return -1;
     if (M > kTokensMax8IsOneN8Tile) return -2;
     constexpr int S = kStepsPerIter8Gives256ContiguousBytesPerRowPerWarpSoDramSeesFullBursts;
-    if ((K % (kKMultipleOf128SoEveryWarpQuarterIsWholeK32Steps * S)) != 0) return -3;
+    if ((K % kKMultipleTheLauncherAccepts) != 0) return -3;
     const unsigned grid = (unsigned)((N + kTileRows - 1) / kTileRows);
     gemm_e4m3_mrows_f16mma_kernel<S><<<grid, kThreads, 0, (cudaStream_t)stream>>>(
         wq, row_scale, reinterpret_cast<const __nv_bfloat16*>(x),

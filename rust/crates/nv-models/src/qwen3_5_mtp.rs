@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, Tensor, D};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use nv_layers::linear::Linear;
 use nv_layers::mlp::Mlp;
@@ -12,6 +12,8 @@ use crate::graph_engine::GraphedQwen3Moe;
 use crate::qwen3_5_moe::{AttentionLayer, Qwen3Moe, Qwen3MoeConfig};
 #[cfg(feature = "cuda")]
 use crate::qwen3_5_moe::{GroupedMoeDispatch, MoeDispatch, Qwen3MoeKvCache};
+#[cfg(feature = "cuda")]
+use std::time::Instant;
 
 struct MtpMoe {
     gate: Linear,
@@ -57,39 +59,15 @@ impl MtpMoe {
 
 enum MtpFfn {
     Moe(MtpMoe),
-    Dense(Mlp),
 }
 
 impl MtpFfn {
     fn forward(&self, x_flat: &Tensor) -> Result<Tensor> {
         match self {
             MtpFfn::Moe(m) => m.forward(x_flat),
-            MtpFfn::Dense(mlp) => Ok(mlp.forward(x_flat)?),
         }
     }
 }
-
-pub struct MtpDenseDims {
-    pub hidden_size: usize,
-    pub intermediate_size: usize,
-    pub head_dim: usize,
-    pub num_attention_heads: usize,
-    pub num_key_value_heads: usize,
-    pub attn_output_gate: bool,
-    pub rotary_dim: usize,
-    pub rms_norm_eps: f64,
-}
-
-pub const QWEN38_27B_MTP_DIMS: MtpDenseDims = MtpDenseDims {
-    hidden_size: 5120,
-    intermediate_size: 17408,
-    head_dim: 256,
-    num_attention_heads: 24,
-    num_key_value_heads: 4,
-    attn_output_gate: true,
-    rotary_dim: 64,
-    rms_norm_eps: 1e-6,
-};
 
 pub struct MtpHead {
     pre_fc_norm_embedding: RmsNorm,
@@ -134,7 +112,7 @@ impl MtpHead {
         let lin = |name: &str, out_f: usize, in_f: usize| -> Result<Linear> {
             let w = get(name)?.to_dtype(dtype)?.contiguous()?;
             let d = w.dims();
-            anyhow::ensure!(
+            ensure!(
                 d.len() == 2 && d[0] == out_f && d[1] == in_f,
                 "MTP {name}: expected [{out_f}, {in_f}], got {d:?}"
             );
@@ -144,7 +122,7 @@ impl MtpHead {
         let norm = |name: &str, dim: usize| -> Result<RmsNorm> {
             let raw = get(name)?.to_dtype(DType::F32)?;
             let d = raw.dims();
-            anyhow::ensure!(
+            ensure!(
                 d.len() == 1 && d[0] == dim,
                 "MTP {name}: expected [{dim}], got {d:?}"
             );
@@ -196,7 +174,7 @@ impl MtpHead {
         let gate = lin("mtp.layers.0.mlp.gate.weight", cfg.num_experts, hidden)?;
         let gate_up = get("mtp.layers.0.mlp.experts.gate_up_proj")?;
         let gu_d = gate_up.dims();
-        anyhow::ensure!(
+        ensure!(
             gu_d == [cfg.num_experts, 2 * inter, hidden],
             "MTP experts.gate_up_proj: expected [{}, {}, {}], got {:?}",
             cfg.num_experts,
@@ -206,7 +184,7 @@ impl MtpHead {
         );
         let down = get("mtp.layers.0.mlp.experts.down_proj")?;
         let dn_d = down.dims();
-        anyhow::ensure!(
+        ensure!(
             dn_d == [cfg.num_experts, hidden, inter],
             "MTP experts.down_proj: expected [{}, {}, {}], got {:?}",
             cfg.num_experts,
@@ -260,112 +238,6 @@ impl MtpHead {
         })
     }
 
-    pub fn from_safetensors_dense(
-        path: impl AsRef<std::path::Path>,
-        dims: &MtpDenseDims,
-        dtype: DType,
-        device: &Device,
-    ) -> Result<Self> {
-        let map = candle_core::safetensors::load(path.as_ref(), device)
-            .with_context(|| format!("load MTP safetensors {}", path.as_ref().display()))?;
-        Self::from_map_dense(&map, dims, dtype)
-    }
-
-    pub fn from_map_dense(
-        map: &HashMap<String, Tensor>,
-        dims: &MtpDenseDims,
-        dtype: DType,
-    ) -> Result<Self> {
-        let hidden = dims.hidden_size;
-        let inter = dims.intermediate_size;
-        let eps = dims.rms_norm_eps;
-
-        let get = |name: &str| -> Result<Tensor> {
-            map.get(name)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("MTP tensor missing: {name}"))
-        };
-        let lin = |name: &str, out_f: usize, in_f: usize| -> Result<Linear> {
-            let w = get(name)?.to_dtype(dtype)?.contiguous()?;
-            let d = w.dims();
-            anyhow::ensure!(
-                d.len() == 2 && d[0] == out_f && d[1] == in_f,
-                "MTP {name}: expected [{out_f}, {in_f}], got {d:?}"
-            );
-            Linear::new(w, None)
-        };
-        let norm = |name: &str, dim: usize| -> Result<RmsNorm> {
-            let raw = get(name)?.to_dtype(DType::F32)?;
-            let d = raw.dims();
-            anyhow::ensure!(
-                d.len() == 1 && d[0] == dim,
-                "MTP {name}: expected [{dim}], got {d:?}"
-            );
-            let w = raw.affine(1.0, 1.0)?.to_dtype(dtype)?;
-            Ok(RmsNorm::new(w, eps))
-        };
-
-        let pre_fc_norm_embedding = norm("mtp.pre_fc_norm_embedding.weight", hidden)?;
-        let pre_fc_norm_hidden = norm("mtp.pre_fc_norm_hidden.weight", hidden)?;
-        let fc = lin("mtp.fc.weight", hidden, 2 * hidden)?;
-        let input_layernorm = norm("mtp.layers.0.input_layernorm.weight", hidden)?;
-        let post_attention_layernorm =
-            norm("mtp.layers.0.post_attention_layernorm.weight", hidden)?;
-
-        let head_dim = dims.head_dim;
-        let n_heads = dims.num_attention_heads;
-        let n_kv_heads = dims.num_key_value_heads;
-        let q_out = if dims.attn_output_gate {
-            n_heads * head_dim * 2
-        } else {
-            n_heads * head_dim
-        };
-        let kv_out = n_kv_heads * head_dim;
-        let q_proj = lin("mtp.layers.0.self_attn.q_proj.weight", q_out, hidden)?;
-        let k_proj = lin("mtp.layers.0.self_attn.k_proj.weight", kv_out, hidden)?;
-        let v_proj = lin("mtp.layers.0.self_attn.v_proj.weight", kv_out, hidden)?;
-        let o_proj = lin(
-            "mtp.layers.0.self_attn.o_proj.weight",
-            hidden,
-            n_heads * head_dim,
-        )?;
-        let q_norm = norm("mtp.layers.0.self_attn.q_norm.weight", head_dim)?;
-        let k_norm = norm("mtp.layers.0.self_attn.k_norm.weight", head_dim)?;
-        let self_attn = AttentionLayer::from_parts(
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            q_norm,
-            k_norm,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            dims.attn_output_gate,
-            dims.rotary_dim,
-        );
-
-        let ffn = MtpFfn::Dense(Mlp::new(
-            lin("mtp.layers.0.mlp.gate_proj.weight", inter, hidden)?,
-            lin("mtp.layers.0.mlp.up_proj.weight", inter, hidden)?,
-            lin("mtp.layers.0.mlp.down_proj.weight", hidden, inter)?,
-        )?);
-
-        let norm_final = norm("mtp.norm.weight", hidden)?;
-        Ok(Self {
-            pre_fc_norm_embedding,
-            pre_fc_norm_hidden,
-            fc,
-            input_layernorm,
-            self_attn,
-            post_attention_layernorm,
-            ffn,
-            norm: norm_final,
-            hidden_size: hidden,
-            dtype,
-        })
-    }
-
     pub fn forward(
         &self,
         base: &Qwen3Moe,
@@ -386,7 +258,7 @@ impl MtpHead {
         position: i32,
     ) -> Result<(Tensor, Tensor)> {
         let d = base_hidden.dims();
-        anyhow::ensure!(
+        ensure!(
             d == [1, 1, self.hidden_size],
             "MTP base_hidden: expected [1, 1, {}], got {:?}",
             self.hidden_size,
@@ -477,12 +349,6 @@ impl MtpHead {
     }
 }
 
-pub fn qwen_mtp_enabled() -> bool {
-    std::env::var("NV_QWEN_MTP")
-        .map(|v| v != "0")
-        .unwrap_or(false)
-}
-
 pub fn qwen_mtp_k() -> usize {
     std::env::var("NV_QWEN_MTP_K")
         .ok()
@@ -537,7 +403,7 @@ pub struct MtpSpecStats {
     pub emitted: usize,
     pub pos0_accepted: usize,
     pub round_ms: Vec<f64>,
-    pub accept_len_hist: std::collections::BTreeMap<usize, usize>,
+    pub accept_len_hist: BTreeMap<usize, usize>,
     pub stop_token: Option<u32>,
 
     pub draft_ms: f64,
@@ -588,7 +454,7 @@ fn top2_host_row_for_argmax_margin_triage(row: &[f32]) -> (f32, f32) {
 
 #[cfg(feature = "cuda")]
 fn argmax_rows(flat: &[f32], rows: usize, vocab: usize) -> Result<Vec<u32>> {
-    anyhow::ensure!(
+    ensure!(
         flat.len() == rows * vocab,
         "argmax rows: {} logits != {rows} x {vocab}",
         flat.len()
@@ -635,7 +501,7 @@ pub struct MtpMoeEagerDecodeSession<'a> {
     base_hidden: Tensor,
     max_seq: usize,
     pub stats: MtpSpecStats,
-    pub submitted_draft_len_hist: std::collections::BTreeMap<usize, usize>,
+    pub submitted_draft_len_hist: BTreeMap<usize, usize>,
     pub emitted_argmax_margins_after_anchor_recorded_only_under_p_min_so_the_default_arm_skips_the_full_logits_readback:
         Vec<f32>,
 }
@@ -650,15 +516,15 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
         max_seq: usize,
         dispatch: Option<&'a dyn MoeDispatch>,
     ) -> Result<Self> {
-        anyhow::ensure!(!prompt.is_empty(), "moe mtp session: empty prompt");
-        anyhow::ensure!(k >= 1, "moe mtp session: k must be >= 1");
+        ensure!(!prompt.is_empty(), "moe mtp session: empty prompt");
+        ensure!(k >= 1, "moe mtp session: k must be >= 1");
         let p_min = q36_mtp_draft_p_min_from_env();
-        anyhow::ensure!(
+        ensure!(
             p_min.is_none() || k >= 2,
             "{NV_Q36_MTP_P_MIN_ENV} needs k >= 2: a k=1 draft is already the minimum the cut \
              keeps, so there is nothing to shorten"
         );
-        anyhow::ensure!(
+        ensure!(
             prompt.len() + k < max_seq,
             "moe mtp session: prompt {} + k+1 {} > max_seq {max_seq}",
             prompt.len(),
@@ -710,7 +576,7 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
             base_hidden,
             max_seq,
             stats: MtpSpecStats::default(),
-            submitted_draft_len_hist: std::collections::BTreeMap::new(),
+            submitted_draft_len_hist: BTreeMap::new(),
             emitted_argmax_margins_after_anchor_recorded_only_under_p_min_so_the_default_arm_skips_the_full_logits_readback:
                 Vec::new(),
         })
@@ -736,7 +602,7 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
         &mut self,
         drafts: &[u32],
     ) -> Result<Vec<u32>> {
-        anyhow::ensure!(
+        ensure!(
             drafts.len() == self.k,
             "oracle round needs exactly k={} drafts, got {}",
             self.k,
@@ -747,10 +613,10 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
 
     fn round_inner(&mut self, forced_drafts: Option<&[u32]>) -> Result<Vec<u32>> {
         let device = self.base.device().clone();
-        let round_t0 = std::time::Instant::now();
+        let round_t0 = Instant::now();
         let l = self.cache.current_len();
         let k = self.k;
-        anyhow::ensure!(
+        ensure!(
             l + k < self.max_seq,
             "moe mtp verify overflow: committed={l} + k+1={} > max_seq={}",
             k + 1,
@@ -806,7 +672,7 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
         let _ = device.synchronize();
         let draft_dt = round_t0.elapsed().as_secs_f64();
 
-        let verify_t0 = std::time::Instant::now();
+        let verify_t0 = Instant::now();
         let mut block: Vec<u32> = Vec::with_capacity(drafts.len() + 1);
         block.push(self.anchor);
         block.extend_from_slice(&drafts);
@@ -830,7 +696,7 @@ impl<'a> MtpMoeEagerDecodeSession<'a> {
         let _ = device.synchronize();
         let verify_dt = verify_t0.elapsed().as_secs_f64();
 
-        let commit_t0 = std::time::Instant::now();
+        let commit_t0 = Instant::now();
         let (accepted, bonus) = accept_prefix_len_then_bonus(&drafts, &greedy);
         let consumed = accepted + 1;
         if self
@@ -920,7 +786,7 @@ pub struct MtpMoeGraphedDecodeSession<'a> {
     base_hidden: Tensor,
     max_seq: usize,
     pub stats: MtpSpecStats,
-    pub submitted_draft_len_hist: std::collections::BTreeMap<usize, usize>,
+    pub submitted_draft_len_hist: BTreeMap<usize, usize>,
     pub emitted_argmax_margins_aligned_to_tokens_after_the_anchor_so_a_cross_shape_divergence_can_be_triaged_tie_vs_corruption:
         Vec<f32>,
 }
@@ -933,10 +799,10 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
         k: usize,
         prompt: &[u32],
     ) -> Result<Self> {
-        anyhow::ensure!(!prompt.is_empty(), "graphed moe mtp session: empty prompt");
-        anyhow::ensure!(k >= 1, "graphed moe mtp session: k must be >= 1");
+        ensure!(!prompt.is_empty(), "graphed moe mtp session: empty prompt");
+        ensure!(k >= 1, "graphed moe mtp session: k must be >= 1");
         let max_seq = engine.cache().max_seq_len();
-        anyhow::ensure!(
+        ensure!(
             prompt.len() + k < max_seq,
             "graphed moe mtp session: prompt {} + k+1 {} > max_seq {max_seq}",
             prompt.len(),
@@ -977,7 +843,7 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
         engine.ensure_verify_lane(k + 1)?;
         let p_min = q36_mtp_draft_p_min_from_env();
         if p_min.is_some() {
-            anyhow::ensure!(
+            ensure!(
                 k >= 2,
                 "{NV_Q36_MTP_P_MIN_ENV} needs k >= 2: a k=1 draft is already the minimum the \
                  cut keeps, so there is nothing to shorten"
@@ -1002,7 +868,7 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
             base_hidden,
             max_seq,
             stats: MtpSpecStats::default(),
-            submitted_draft_len_hist: std::collections::BTreeMap::new(),
+            submitted_draft_len_hist: BTreeMap::new(),
             emitted_argmax_margins_aligned_to_tokens_after_the_anchor_so_a_cross_shape_divergence_can_be_triaged_tie_vs_corruption:
                 Vec::new(),
         })
@@ -1028,7 +894,7 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
         &mut self,
         drafts: &[u32],
     ) -> Result<Vec<u32>> {
-        anyhow::ensure!(
+        ensure!(
             drafts.len() == self.k,
             "oracle round needs exactly k={} drafts, got {}",
             self.k,
@@ -1039,10 +905,10 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
 
     fn round_inner(&mut self, forced_drafts: Option<&[u32]>) -> Result<Vec<u32>> {
         let device = self.engine.device().clone();
-        let round_t0 = std::time::Instant::now();
+        let round_t0 = Instant::now();
         let l = self.engine.current_pos();
         let k = self.k;
-        anyhow::ensure!(
+        ensure!(
             l + k < self.max_seq,
             "graphed moe mtp verify overflow: committed={l} + k+1={} > max_seq={}",
             k + 1,
@@ -1103,7 +969,7 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
         let _ = device.synchronize();
         let draft_dt = round_t0.elapsed().as_secs_f64();
 
-        let verify_t0 = std::time::Instant::now();
+        let verify_t0 = Instant::now();
         let mut block: Vec<u32> = Vec::with_capacity(drafts.len() + 1);
         block.push(self.anchor);
         block.extend_from_slice(&drafts);
@@ -1115,7 +981,7 @@ impl<'a> MtpMoeGraphedDecodeSession<'a> {
         let greedy = argmax_rows(&flat, m, vocab)?;
         let verify_dt = verify_t0.elapsed().as_secs_f64();
 
-        let commit_t0 = std::time::Instant::now();
+        let commit_t0 = Instant::now();
         let (accepted, bonus) = accept_prefix_len_then_bonus(&drafts, &greedy);
         let consumed = accepted + 1;
 
@@ -1236,21 +1102,14 @@ impl<'a> MtpSpecEngine<'a> {
         max_seq: usize,
         use_draft: bool,
     ) -> Result<(Vec<u32>, MtpSpecStats)> {
-        anyhow::ensure!(!prompt.is_empty(), "generate: empty prompt");
+        ensure!(!prompt.is_empty(), "generate: empty prompt");
         let device = self.base.device().clone();
         let mut cache = self.base.new_kv_cache(max_seq)?;
         let mut stats = MtpSpecStats::default();
         let k = self.k;
 
-        let host_verify = std::env::var("NV_QWEN_MTP_HOST")
-            .map(|v| v != "0")
-            .unwrap_or(false);
-        let dispatch: Option<GroupedMoeDispatch> = if host_verify {
-            None
-        } else {
-            Some(GroupedMoeDispatch::from_model(self.base)?)
-        };
-        let disp: Option<&dyn MoeDispatch> = dispatch.as_ref().map(|d| d as &dyn MoeDispatch);
+        let dispatch = GroupedMoeDispatch::from_model(self.base)?;
+        let disp: Option<&dyn MoeDispatch> = Some(&dispatch);
 
         if use_draft {
             let mut session =
@@ -1313,7 +1172,7 @@ impl<'a> MtpSpecEngine<'a> {
 
         let _ = device.synchronize();
         while generated.len() < max_new {
-            let round_t0 = std::time::Instant::now();
+            let round_t0 = Instant::now();
             let l = cache.current_len();
             let bt = Tensor::from_vec(vec![anchor], (1usize, 1usize), &device)?;
             let bp = Tensor::from_vec(vec![l as i32], 1usize, &device)?;
@@ -1333,33 +1192,5 @@ impl<'a> MtpSpecEngine<'a> {
             }
         }
         Ok((generated, stats))
-    }
-}
-
-#[cfg(test)]
-mod adaptive_p_min_cut {
-    use super::*;
-
-    #[test]
-    fn p_min_parser_accepts_only_the_open_unit_interval() {
-        assert_eq!(q36_mtp_draft_p_min(None), None);
-        assert_eq!(q36_mtp_draft_p_min(Some("")), None);
-        assert_eq!(q36_mtp_draft_p_min(Some("0")), None);
-        assert_eq!(q36_mtp_draft_p_min(Some("1")), None);
-        assert_eq!(q36_mtp_draft_p_min(Some("1.5")), None);
-        assert_eq!(q36_mtp_draft_p_min(Some("-0.3")), None);
-        assert_eq!(q36_mtp_draft_p_min(Some("junk")), None);
-        assert_eq!(q36_mtp_draft_p_min(Some(" 0.75 ")), Some(0.75));
-    }
-
-    #[test]
-    fn leading_confident_run_keeps_at_least_one_and_at_most_the_drafted_len() {
-        let cut = q36_adaptive_submitted_draft_len_matching_llama_cpp_p_min_leading_confident_run;
-        assert_eq!(cut(&[0.9, 0.9, 0.9], 0.75), 3);
-        assert_eq!(cut(&[0.9, 0.5, 0.9], 0.75), 1);
-        assert_eq!(cut(&[0.5, 0.9, 0.9], 0.75), 1);
-        assert_eq!(cut(&[0.9, 0.9, 0.5], 0.75), 2);
-        assert_eq!(cut(&[0.2], 0.75), 1);
-        assert_eq!(cut(&[], 0.75), 1);
     }
 }

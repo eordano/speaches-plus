@@ -449,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn vel_field_rejects_rank_or_dim_mismatch() {
+    fn vel_field_rejects_rank_or_dim_mismatch_and_invalid_configs() {
         let cfg = LearnedVelFieldConfig {
             latent_dim: 4,
             d_model: 8,
@@ -473,23 +473,18 @@ mod tests {
         let x = Tensor::zeros((1usize, 2usize, cfg.latent_dim), DType::F32, &dev).unwrap();
         let cond_bad = Tensor::zeros((1usize, 3usize, cfg.latent_dim), DType::F32, &dev).unwrap();
         assert!(net.vel(&x, 0.0, &cond_bad).is_err());
-    }
 
-    #[test]
-    fn config_rejects_invalid_values() {
-        let dev = Device::Cpu;
         let mut cfg = LearnedVelFieldConfig {
             kernel: 4,
             ..Default::default()
         };
-        assert!(LearnedVelField::new(cfg.clone(), &dev).is_err());
-
+        assert!(LearnedVelField::new(cfg.clone(), &dev).is_err(), "even kernel");
         cfg.kernel = 3;
         cfg.time_embed_dim = 7;
-        assert!(LearnedVelField::new(cfg.clone(), &dev).is_err());
-
+        assert!(LearnedVelField::new(cfg.clone(), &dev).is_err(), "odd time embed");
         cfg.time_embed_dim = 8;
         cfg.n_blocks = 0;
-        assert!(LearnedVelField::new(cfg.clone(), &dev).is_err());
+        assert!(LearnedVelField::new(cfg.clone(), &dev).is_err(), "zero blocks");
     }
+
 }

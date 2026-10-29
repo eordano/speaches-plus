@@ -4,14 +4,10 @@ use anyhow::{ensure, Result};
 use nv_specdecode::chain::{accept_prefix_argmax, build_chain_batch, ChainAccept};
 use nv_specdecode::suffix_automaton::{AcceptEma, SuffixAutomaton};
 
-pub const SPEC_ENV: &str = "NV_WGPU_SPEC";
 pub const SPEC_KINDS_ENV: &str = "NV_WGPU_SPEC_KINDS";
 pub const SPEC_K_ENV: &str = "NV_WGPU_SPEC_K";
 pub const SPEC_MIN_MATCH_ENV: &str = "NV_WGPU_SPEC_MIN_MATCH";
-pub const SPEC_DRAFTER_ENV: &str = "NV_WGPU_SPEC_DRAFTER";
 pub const SPEC_ASSISTANT_DIR_ENV: &str = "NV_WGPU_SPEC_ASSISTANT_DIR";
-pub const SPEC_ASSISTANT_EMA_FLOOR_ENV: &str = "NV_WGPU_SPEC_ASSISTANT_EMA_FLOOR";
-pub const SPEC_ASSISTANT_EMA_FLOOR_DEFAULT: f64 = 2.05;
 pub const SPEC_PROBE_MIN_MATCH_ENV: &str = "NV_WGPU_SPEC_PROBE_MIN_MATCH";
 pub const SPEC_PROBE_MIN_MATCH_DEFAULT: usize = 16;
 pub const SPEC_ASSISTANT_PROBE_ROUNDS_ENV: &str = "NV_WGPU_SPEC_ASSISTANT_PROBE_ROUNDS";
@@ -99,24 +95,17 @@ pub fn chain_capacity(verify_rows: usize, pos: usize, chunk_span: usize, max_seq
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpecKnobs {
-    pub enabled: bool,
     pub k: usize,
     pub min_match: usize,
     pub kinds: SpecKinds,
 }
 
 impl SpecKnobs {
-    pub fn parse(spec: Option<&str>, k: Option<&str>, min_match: Option<&str>) -> Self {
-        Self::parse_with_kinds(spec, k, min_match, None)
+    pub fn parse(k: Option<&str>, min_match: Option<&str>) -> Self {
+        Self::parse_with_kinds(k, min_match, None)
     }
 
-    pub fn parse_with_kinds(
-        spec: Option<&str>,
-        k: Option<&str>,
-        min_match: Option<&str>,
-        kinds: Option<&str>,
-    ) -> Self {
-        let enabled = spec.map(str::trim) != Some("0");
+    pub fn parse_with_kinds(k: Option<&str>, min_match: Option<&str>, kinds: Option<&str>) -> Self {
         let k = k
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(SPEC_K_DEFAULT)
@@ -126,7 +115,6 @@ impl SpecKnobs {
             .unwrap_or(SPEC_MIN_MATCH_DEFAULT)
             .max(1);
         Self {
-            enabled,
             k,
             min_match,
             kinds: SpecKinds::parse(kinds),
@@ -135,7 +123,6 @@ impl SpecKnobs {
 
     pub fn from_env() -> Self {
         Self::parse_with_kinds(
-            std::env::var(SPEC_ENV).ok().as_deref(),
             std::env::var(SPEC_K_ENV).ok().as_deref(),
             std::env::var(SPEC_MIN_MATCH_ENV).ok().as_deref(),
             std::env::var(SPEC_KINDS_ENV).ok().as_deref(),
@@ -145,7 +132,7 @@ impl SpecKnobs {
 
 impl Default for SpecKnobs {
     fn default() -> Self {
-        Self::parse(None, None, None)
+        Self::parse(None, None)
     }
 }
 
@@ -409,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_probes_then_disables_when_tau_below_breakeven() {
+    fn gate_probes_then_disables_below_breakeven_and_enables_when_tau_clears_it_with_margin() {
         let g = AssistantGate::new();
         assert!(g.should_draft(16), "must probe before it has any samples");
         for _ in 0..SPEC_ASSISTANT_PROBE_MIN_ROUNDS {
@@ -422,23 +409,21 @@ mod tests {
             !g.should_draft(16),
             "tau 1.0 vs breakeven {be} is hopeless; must abort the probe early"
         );
-    }
-
-    #[test]
-    fn gate_enables_when_tau_clears_breakeven_with_margin() {
-        let g = AssistantGate::new();
-        for _ in 0..32 {
-            g.observe_decode(ms(26.0));
-            g.observe_spec(ms(30.0), 3);
+        {
+            let g = AssistantGate::new();
+            for _ in 0..32 {
+                g.observe_decode(ms(26.0));
+                g.observe_spec(ms(30.0), 3);
+            }
+            let be = g.breakeven_tau().expect("breakeven");
+            assert!((be - 30.0 / 26.0).abs() < 1e-6, "breakeven {be}");
+            assert_eq!(g.measured_tau(), Some(3.0));
+            assert!(g.should_draft(16), "tau 3.0 clears breakeven {be} * margin");
         }
-        let be = g.breakeven_tau().expect("breakeven");
-        assert!((be - 30.0 / 26.0).abs() < 1e-6, "breakeven {be}");
-        assert_eq!(g.measured_tau(), Some(3.0));
-        assert!(g.should_draft(16), "tau 3.0 clears breakeven {be} * margin");
     }
 
     #[test]
-    fn gate_keeps_probing_when_marginal() {
+    fn gate_keeps_probing_when_marginal_and_never_claims_profitability_without_samples() {
         let g = AssistantGate::new();
         for _ in 0..SPEC_ASSISTANT_PROBE_MIN_ROUNDS {
             g.observe_decode(ms(26.0));
@@ -453,13 +438,12 @@ mod tests {
             !g.should_draft(SPEC_ASSISTANT_PROBE_MIN_ROUNDS),
             "budget spent"
         );
+        {
+            let g = AssistantGate::new();
+            assert_eq!(g.breakeven_tau(), None);
+            assert_eq!(g.measured_tau(), None);
+            assert!(!g.should_draft(0), "no probe budget and no evidence");
+        }
     }
 
-    #[test]
-    fn gate_without_samples_never_claims_profitability() {
-        let g = AssistantGate::new();
-        assert_eq!(g.breakeven_tau(), None);
-        assert_eq!(g.measured_tau(), None);
-        assert!(!g.should_draft(0), "no probe budget and no evidence");
-    }
 }

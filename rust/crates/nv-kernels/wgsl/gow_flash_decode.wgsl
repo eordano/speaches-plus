@@ -81,6 +81,7 @@ fn gow_flash_stage1(
     let lane = lid & 31u;
     let warp = lid >> 5u;
 
+    #def b3
     for (var d = lid; d < hd; d = d + GFD_BLOCK) {
         let qi = h * hd + d;
         gfd_qsh[d] = bf16_decode(u16_at(gfd_q[qi >> 1u], qi));
@@ -101,6 +102,7 @@ fn gow_flash_stage1(
     let total = gfd_p.total;
     let base = gfd_p.start + split * GFD_WARPS;
     let stride = gfd_p.splits * GFD_WARPS;
+    #end
     var rounds = 0u;
     if (total > base) {
         rounds = (total - base + stride - 1u) / stride;
@@ -188,6 +190,7 @@ fn gow_flash_stage1(
             }
             m = m_new;
         }
+    #def b1
     }
 
     {
@@ -268,6 +271,7 @@ fn gow_flash_stage1(
         gfd_scratch[slot + 2u + d] = a;
     }
 }
+    #end
 
 @compute @workgroup_size(256)
 fn gow_flash_stage1_sg(
@@ -289,26 +293,7 @@ fn gow_flash_stage1_sg(
     let lane = sglane;
     let warp = sgid;
 
-    for (var d = lid; d < hd; d = d + GFD_BLOCK) {
-        let qi = h * hd + d;
-        gfd_qsh[d] = bf16_decode(u16_at(gfd_q[qi >> 1u], qi));
-    }
-    workgroupBarrier();
-
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    var acc2 = 0.0;
-    var acc3 = 0.0;
-    var acc4 = 0.0;
-    var acc5 = 0.0;
-    var acc6 = 0.0;
-    var acc7 = 0.0;
-    var m = gfd_neg_inf();
-    var l = 0.0;
-
-    let total = gfd_p.total;
-    let base = gfd_p.start + split * GFD_WARPS;
-    let stride = gfd_p.splits * GFD_WARPS;
+    #use b3
     let use_vec8 = (hd & 7u) == 0u;
 
     for (var p = base + warp; p < total; p = p + stride) {
@@ -386,86 +371,7 @@ fn gow_flash_stage1_sg(
             }
         }
         m = m_new;
-    }
-
-    {
-        let d = lane + 0u * GFD_LANES;
-        if (d < hd) {
-            gfd_sacc[warp * GFD_MAX_HD + d] = acc0;
-        }
-    }
-    {
-        let d = lane + 1u * GFD_LANES;
-        if (d < hd) {
-            gfd_sacc[warp * GFD_MAX_HD + d] = acc1;
-        }
-    }
-    {
-        let d = lane + 2u * GFD_LANES;
-        if (d < hd) {
-            gfd_sacc[warp * GFD_MAX_HD + d] = acc2;
-        }
-    }
-    {
-        let d = lane + 3u * GFD_LANES;
-        if (d < hd) {
-            gfd_sacc[warp * GFD_MAX_HD + d] = acc3;
-        }
-    }
-    {
-        let d = lane + 4u * GFD_LANES;
-        if (d < hd) {
-            gfd_sacc[warp * GFD_MAX_HD + d] = acc4;
-        }
-    }
-    {
-        let d = lane + 5u * GFD_LANES;
-        if (d < hd) {
-            gfd_sacc[warp * GFD_MAX_HD + d] = acc5;
-        }
-    }
-    {
-        let d = lane + 6u * GFD_LANES;
-        if (d < hd) {
-            gfd_sacc[warp * GFD_MAX_HD + d] = acc6;
-        }
-    }
-    {
-        let d = lane + 7u * GFD_LANES;
-        if (d < hd) {
-            gfd_sacc[warp * GFD_MAX_HD + d] = acc7;
-        }
-    }
-    let slot = (h * gfd_p.splits + split) * (hd + 2u);
-    if (lane == 0u) {
-        gfd_sm[warp] = m;
-        gfd_sl[warp] = l;
-    }
-    workgroupBarrier();
-    var m_blk = gfd_neg_inf();
-    for (var w = 0u; w < GFD_WARPS; w = w + 1u) {
-        m_blk = max(m_blk, gfd_sm[w]);
-    }
-    if (lid == 0u) {
-        var l_blk = 0.0;
-        for (var w = 0u; w < GFD_WARPS; w = w + 1u) {
-            if (gfd_sm[w] > gfd_neg_inf()) {
-                l_blk = l_blk + gfd_sl[w] * gfd_exp(gfd_sm[w] - m_blk);
-            }
-        }
-        gfd_scratch[slot] = m_blk;
-        gfd_scratch[slot + 1u] = l_blk;
-    }
-    for (var d = lid; d < hd; d = d + GFD_BLOCK) {
-        var a = 0.0;
-        for (var w = 0u; w < GFD_WARPS; w = w + 1u) {
-            if (gfd_sm[w] > gfd_neg_inf()) {
-                a = a + gfd_sacc[w * GFD_MAX_HD + d] * gfd_exp(gfd_sm[w] - m_blk);
-            }
-        }
-        gfd_scratch[slot + 2u + d] = a;
-    }
-}
+    #use b1
 
 const GK_HD: u32 = 64u;
 const GK_GROUP: u32 = 8u;
@@ -584,6 +490,7 @@ var<workgroup> gfd_scc_l: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn gow_flash_stage2_sink_pk_scc(
+    #def b2
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
 ) {
@@ -596,6 +503,7 @@ fn gow_flash_stage2_sink_pk_scc(
     let stride = hd + 2u;
     let base = h * splits * stride;
     let sink = gfd_sinks[h];
+    #end
 
     var m_glob = sink;
     for (var s = 0u; s < splits; s = s + 1u) {
@@ -628,18 +536,7 @@ fn gow_flash_stage2_sink_pk_scc(
 
 @compute @workgroup_size(256)
 fn gow_flash_stage2_sink_pk(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    if (h >= gfd_p.n_heads) {
-        return;
-    }
-    let hd = gfd_p.head_dim;
-    let splits = gfd_p.splits;
-    let stride = hd + 2u;
-    let base = h * splits * stride;
-    let sink = gfd_sinks[h];
+    #use b2
 
     var m_glob = sink;
     for (var s = 0u; s < splits; s = s + 1u) {
@@ -677,18 +574,7 @@ var<workgroup> gfd_par_acc: array<f32, 2048>;
 
 @compute @workgroup_size(256)
 fn gow_flash_stage2_sink_pk_par(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    if (h >= gfd_p.n_heads) {
-        return;
-    }
-    let hd = gfd_p.head_dim;
-    let splits = gfd_p.splits;
-    let stride = hd + 2u;
-    let base = h * splits * stride;
-    let sink = gfd_sinks[h];
+    #use b2
     let lane = tid.x & 31u;
     let warp = tid.x >> 5u;
 

@@ -120,10 +120,6 @@ impl PreprocessSpec {
             convert_rgb: true,
         }
     }
-
-    pub fn pixel_len(&self) -> usize {
-        3 * self.width * self.height
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

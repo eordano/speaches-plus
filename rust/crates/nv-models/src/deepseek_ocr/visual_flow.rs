@@ -343,8 +343,16 @@ mod tests {
     }
 
     #[test]
-    fn rope_position_zero_is_identity() {
+    fn rope_position_zero_is_identity_and_repeat_kv_interleaves_heads() {
         let dev = Device::Cpu;
+        let kv = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 2, 1, 2), &dev).unwrap();
+        let rep = repeat_kv(&kv, 3).unwrap();
+        assert_eq!(rep.dims(), &[1, 6, 1, 2]);
+        let v: Vec<f32> = rep.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(
+            v,
+            vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]
+        );
         let rope = rope_tables(4, 8, 1e6, &dev).unwrap();
         let x = Tensor::from_vec(
             (0..8).map(|i| i as f32 + 1.0).collect::<Vec<_>>(),
@@ -362,18 +370,5 @@ mod tests {
         for (a, b) in v.iter().zip(&expect) {
             assert!((a - b).abs() < 1e-6);
         }
-    }
-
-    #[test]
-    fn repeat_kv_interleaves_heads() {
-        let dev = Device::Cpu;
-        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 2, 1, 2), &dev).unwrap();
-        let y = repeat_kv(&x, 3).unwrap();
-        assert_eq!(y.dims(), &[1, 6, 1, 2]);
-        let v: Vec<f32> = y.flatten_all().unwrap().to_vec1().unwrap();
-        assert_eq!(
-            v,
-            vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]
-        );
     }
 }

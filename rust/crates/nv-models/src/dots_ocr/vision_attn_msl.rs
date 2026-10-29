@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use nv_kernels::wgpu_backend::{na, WgpuContext};
+use na::{storage_entry, uniform_entry};
 
 pub const WG_THREADS: u32 = 128;
 pub const HEAD_DIM: u32 = 128;
@@ -22,32 +23,6 @@ pub const THE_FUSED_VISION_ATTENTION_IS_STEEL_BECAUSE_THE_MISSING_OP_WAS_NAGAS_A
      against the shipped default's own 4.5656e-2) and the corpus token gate holds all twelve \
      stable pages at exactly 0.0000 with every bistable on its standing trajectory and token \
      count.";
-
-fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
-
-fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
-}
 
 pub const STEEL_BQ: u32 = 32;
 pub const STEEL_BK: u32 = 16;
@@ -73,19 +48,6 @@ pub const STEEL_ATTN_SUB_BQ32_ARMS_EXIST_BECAUSE_CROP_GRIDS_STARVE_THE_76_CORE_G
      below m=128. bq16 and bq8 keep bk=16 and TQ==1, so they move only which workgroup owns a \
      query row and stay in the bitwise class; they exist for the crop-shape ladder and any \
      per-shape selection, never for the 13600-patch whole page where bq32 is the crowned tile.";
-
-pub const STEEL_ATTN_TILE_LADDER_VERDICT_ON_THE_M2_ULTRA: &str =
-    "The tile config space at the kernel's TQ==1 constraint and Metal's 32768B workgroup limit is \
-     warps {4 -> bq32, 8 -> bq64} x bk {16, 32, 64}, and the whole-forward wall at the invoice \
-     shape (13600 patches) crowns the shipped bq32_bk16_wm4_wn1: bk32 is a wash (-0.1 pct), bk64 \
-     loses 21 pct and bq64 arms lose 17-23 pct (bigger tiles buy barrier amortisation with \
-     occupancy the 425x12 grid cannot spare), so the optimum is bracketed from both sides. Class \
-     was measured, not assumed: bq/warp arms are bit-identical to the shipped tile (0 of 5222400 \
-     merged bits) because they move only which workgroup owns a query row; bk arms move the \
-     online-softmax block boundary and reassociate (rel-rms ~1.7e-3). The fused attention runs \
-     ~19 TF/s of QK+PV work against the steel GEMM's 24.5 on the same silicon -- the deficit is \
-     the exp2/rescale and smem round trips between the two MMAs, the form every cheaper mechanism \
-     on the kill list already died buying.";
 
 pub const STEEL_ATTN_CFGS_ALL_KEEP_TQ_1_AND_FIT_METALS_32768B_WORKGROUP_LIMIT: () = {
     let mut i = 0;
@@ -295,7 +257,7 @@ fn steel_build(
             }),
     );
     if let Some(err) = pollster::block_on(scope.pop()) {
-        anyhow::bail!("dv-steel-attn pipeline: {err}");
+        bail!("dv-steel-attn pipeline: {err}");
     }
     Ok(Arc::new(SteelPipelines {
         pipeline,
@@ -465,13 +427,6 @@ pub const STEEL_GEMM_SPLITK_LIVES_IN_GRID_Z_BECAUSE_SLICE_DISPATCHES_DIE_ON_THE_
      Partial sums reassociate the k-chain, so every splitk arm is tolerance-class: census \
      before serving, opt-in env, never a silent default.";
 
-pub const STEEL_GEMM_SPLITK_CONFIGS: &[(u32, u32, u32, u32, u32)] =
-    &[(16, 32, 16, 2, 2), (32, 32, 16, 2, 2)];
-
-pub fn steel_gemm_splitk_entry(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32) -> String {
-    format!("dv_steel_gemm_nt_sk_{bm}_{bn}_{bk}_{wm}_{wn}")
-}
-
 pub const STEEL_GEMM_COMPLEX_SHIM_EXISTS_SO_THE_NEVER_INSTANTIATED_COMPLEX_SPECIALIZATIONS_PARSE:
     &str = "
 #include <metal_stdlib>
@@ -539,36 +494,6 @@ template <typename T, typename U, int BM, int BN, int BK, int WM, int WN>
             steel_gemm_entry(*bm, *bn, *bk, *wm, *wn)
         ));
     }
-    b.push_str(
-        "
-template <typename T, typename U, int BM, int BN, int BK, int WM, int WN>
-[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void dv_steel_gemm_nt_sk(
-    const device T* A [[buffer(0)]],
-    const device T* B [[buffer(1)]],
-    device U* D [[buffer(2)]],
-    const constant GEMMParams* params [[buffer(3)]],
-    uint simd_lane_id [[thread_index_in_simdgroup]],
-    uint simd_group_id [[simdgroup_index_in_threadgroup]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint3 lid [[thread_position_in_threadgroup]]) {
-  using gemm_kernel =
-      GEMMKernel<T, U, BM, BN, BK, WM, WN, false, true, false, true, float>;
-  threadgroup T As[gemm_kernel::tgp_mem_size_a];
-  threadgroup T Bs[gemm_kernel::tgp_mem_size_b];
-  gemm_kernel::run(
-      A + tid.z * params->batch_stride_a,
-      B + tid.z * params->batch_stride_b,
-      D + tid.z * params->batch_stride_d,
-      params, As, Bs, simd_lane_id, simd_group_id, tid, lid);
-}
-",
-    );
-    for (bm, bn, bk, wm, wn) in STEEL_GEMM_SPLITK_CONFIGS {
-        b.push_str(&format!(
-            "template [[host_name(\"{}\")]] [[kernel]] decltype(dv_steel_gemm_nt_sk<half, float, {bm}, {bn}, {bk}, {wm}, {wn}>) dv_steel_gemm_nt_sk<half, float, {bm}, {bn}, {bk}, {wm}, {wn}>;\n",
-            steel_gemm_splitk_entry(*bm, *bn, *bk, *wm, *wn)
-        ));
-    }
     b
 }
 
@@ -596,23 +521,12 @@ const _: () = assert!(std::mem::size_of::<SteelGemmParams>() == 72);
 
 pub struct SteelGemmPipelines {
     pub by_config: Vec<((u32, u32, u32, u32, u32), Arc<wgpu::ComputePipeline>)>,
-    pub by_splitk: Vec<((u32, u32, u32, u32, u32), Arc<wgpu::ComputePipeline>)>,
     pub layout: wgpu::BindGroupLayout,
 }
 
 impl SteelGemmPipelines {
     pub fn pick(&self, cfg: (u32, u32, u32, u32, u32)) -> Option<Arc<wgpu::ComputePipeline>> {
         self.by_config
-            .iter()
-            .find(|(c, _)| *c == cfg)
-            .map(|(_, p)| p.clone())
-    }
-
-    pub fn pick_splitk(
-        &self,
-        cfg: (u32, u32, u32, u32, u32),
-    ) -> Option<Arc<wgpu::ComputePipeline>> {
-        self.by_splitk
             .iter()
             .find(|(c, _)| *c == cfg)
             .map(|(_, p)| p.clone())
@@ -632,7 +546,7 @@ fn steel_gemm_cache() -> &'static SteelGemmCache {
 }
 
 fn steel_gemm_build(ctx: &WgpuContext) -> Result<Arc<SteelGemmPipelines>> {
-    let mut entries_meta: Vec<(&'static str, (u32, u32, u32))> = STEEL_GEMM_CONFIGS
+    let entries_meta: Vec<(&'static str, (u32, u32, u32))> = STEEL_GEMM_CONFIGS
         .iter()
         .map(|(bm, bn, bk, wm, wn)| {
             let e: &'static str =
@@ -640,15 +554,6 @@ fn steel_gemm_build(ctx: &WgpuContext) -> Result<Arc<SteelGemmPipelines>> {
             (e, (wm * wn * 32, 1, 1))
         })
         .collect();
-    entries_meta.extend(
-        STEEL_GEMM_SPLITK_CONFIGS
-            .iter()
-            .map(|(bm, bn, bk, wm, wn)| {
-                let e: &'static str =
-                    Box::leak(steel_gemm_splitk_entry(*bm, *bn, *bk, *wm, *wn).into_boxed_str());
-                (e, (wm * wn * 32, 1, 1))
-            }),
-    );
     let src: &'static str = Box::leak(steel_gemm_source().into_boxed_str());
     let module = na::msl_module(ctx, "dv-steel-gemm", &entries_meta, src)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -673,11 +578,7 @@ fn steel_gemm_build(ctx: &WgpuContext) -> Result<Arc<SteelGemmPipelines>> {
             immediate_size: 0,
         });
     let mut by_config = Vec::new();
-    let mut by_splitk = Vec::new();
-    let all_cfgs = STEEL_GEMM_CONFIGS
-        .iter()
-        .chain(STEEL_GEMM_SPLITK_CONFIGS.iter());
-    for ((i, cfg), (name, _)) in all_cfgs.enumerate().zip(entries_meta.iter()) {
+    for (cfg, (name, _)) in STEEL_GEMM_CONFIGS.iter().zip(entries_meta.iter()) {
         let pipeline = Arc::new(ctx.device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some(name),
@@ -688,18 +589,13 @@ fn steel_gemm_build(ctx: &WgpuContext) -> Result<Arc<SteelGemmPipelines>> {
                 cache: None,
             },
         ));
-        if i < STEEL_GEMM_CONFIGS.len() {
-            by_config.push((*cfg, pipeline));
-        } else {
-            by_splitk.push((*cfg, pipeline));
-        }
+        by_config.push((*cfg, pipeline));
     }
     if let Some(err) = pollster::block_on(scope.pop()) {
-        anyhow::bail!("dv-steel-gemm pipelines: {err}");
+        bail!("dv-steel-gemm pipelines: {err}");
     }
     Ok(Arc::new(SteelGemmPipelines {
         by_config,
-        by_splitk,
         layout: bgl,
     }))
 }
@@ -1139,7 +1035,7 @@ fn steel_gemm_fused_build(ctx: &WgpuContext) -> Result<Arc<SteelGemmFusedPipelin
         by_config.push((*cfg, r, g));
     }
     if let Some(err) = pollster::block_on(scope.pop()) {
-        anyhow::bail!("dv-steel-gemm-fused pipelines: {err}");
+        bail!("dv-steel-gemm-fused pipelines: {err}");
     }
     Ok(Arc::new(SteelGemmFusedPipelines {
         resadd_layout,
@@ -1212,8 +1108,6 @@ pub const STEEL_GEMM_CVT_CFGS_ARE_A_SUBSET_OF_THE_COMPILE_ASSERTED_STEEL_GEMM_CO
         i += 1;
     }
 };
-
-pub const STEEL_GEMM_CVT_KINDS: &[&str] = &["bf16o", "abf16", "abf16o", "sk_abf16"];
 
 pub fn steel_gemm_cvt_entry(kind: &str, cfg: (u32, u32, u32, u32, u32)) -> String {
     let (bm, bn, bk, wm, wn) = cfg;
@@ -1648,7 +1542,7 @@ fn steel_gemm_cvt_build(ctx: &WgpuContext) -> Result<Arc<SteelGemmCvtPipelines>>
         by_kind.push(((kind.clone(), *cfg), pipeline));
     }
     if let Some(err) = pollster::block_on(scope.pop()) {
-        anyhow::bail!("dv-steel-gemm-cvt pipelines: {err}");
+        bail!("dv-steel-gemm-cvt pipelines: {err}");
     }
     Ok(Arc::new(SteelGemmCvtPipelines {
         layout: bgl,
@@ -1672,9 +1566,8 @@ pub fn steel_gemm_cvt_pipelines(ctx: &'static WgpuContext) -> Result<Arc<SteelGe
     built
 }
 
-pub const DOTS_VATTN_RESTAGE_ENV: &str = "NV_DOTS_VATTN_RESTAGE";
-
-pub const STEEL_RESTAGE_MOVES_STAGING_AND_BARRIERS_NEVER_AN_FP_OP_SO_THE_ARM_IS_BITWISE_CLASS_AND_OPT_IN: &str =
+pub const STEEL_RESTAGE_MOVES_STAGING_AND_BARRIERS_NEVER_AN_FP_OP_SO_THE_ARM_IS_BITWISE_CLASS:
+    &str =
     "The vendored attention keeps the score tile in simdgroup registers between its two MMAs \
      already; what it stages through threadgroup memory is K and V, ALIASED in one buffer, and \
      the alias forces 4 threadgroup barriers per k-block. The structure bracket priced that \
@@ -1695,8 +1588,7 @@ pub const STEEL_RESTAGE_MOVES_STAGING_AND_BARRIERS_NEVER_AN_FP_OP_SO_THE_ARM_IS_
      the bitwise pre-authorization after the real-weight trunk gate held every one of the \
      5,222,400 merged f32 bits across both arms: unset serves the restage form at the bq32 \
      whole-page cfg -- at bq16 crop grids the win does not transfer (+1.1 pct at n=448), so \
-     crops keep stock at every polarity -- and NV_DOTS_VATTN_RESTAGE=0 restores the untouched \
-     stock pipeline object byte-identically.";
+     crops keep stock at every polarity.";
 
 pub const STEEL_RESTAGE_SMEM_FITS_METALS_32768B_WORKGROUP_LIMIT: () = {
     let (_bq, bk, _wm, _wn) = STEEL_ATTN_DEFAULT_CFG;
@@ -1960,7 +1852,7 @@ pub fn steel_restage_entry_cfg(cfg: SteelAttnCfg, align_q: bool, align_k: bool) 
 }
 
 pub fn steel_restage_source_cfg(cfg: SteelAttnCfg, align_q: bool, align_k: bool) -> String {
-    let _ = STEEL_RESTAGE_MOVES_STAGING_AND_BARRIERS_NEVER_AN_FP_OP_SO_THE_ARM_IS_BITWISE_CLASS_AND_OPT_IN;
+    let _ = STEEL_RESTAGE_MOVES_STAGING_AND_BARRIERS_NEVER_AN_FP_OP_SO_THE_ARM_IS_BITWISE_CLASS;
     const _: () = STEEL_RESTAGE_SMEM_FITS_METALS_32768B_WORKGROUP_LIMIT;
     let (bq, bk, wm, wn) = cfg;
     let mut b = steel_source_cfg(cfg, align_q, align_k);
@@ -2040,7 +1932,7 @@ pub fn steel_restage_pipelines_cfg(
             },
         ));
         if let Some(err) = pollster::block_on(scope.pop()) {
-            anyhow::bail!("dv-steel-attn-rs pipeline: {err}");
+            bail!("dv-steel-attn-rs pipeline: {err}");
         }
         Ok(Arc::new(SteelPipelines {
             pipeline,
@@ -2055,17 +1947,13 @@ pub fn steel_restage_pipelines_cfg(
     built
 }
 
-pub fn steel_attn_restage_enabled() -> bool {
-    std::env::var(DOTS_VATTN_RESTAGE_ENV).as_deref() != Ok("0")
-}
-
 pub fn steel_pipelines_serving(
     ctx: &'static WgpuContext,
     cfg: SteelAttnCfg,
     align_q: bool,
     align_k: bool,
 ) -> Result<Arc<SteelPipelines>> {
-    if steel_attn_restage_enabled() && cfg == STEEL_ATTN_DEFAULT_CFG {
+    if cfg == STEEL_ATTN_DEFAULT_CFG {
         return steel_restage_pipelines_cfg(ctx, cfg, align_q, align_k);
     }
     steel_pipelines_cfg(ctx, cfg, align_q, align_k)

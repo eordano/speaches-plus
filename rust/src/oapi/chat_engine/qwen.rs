@@ -1,41 +1,7 @@
 #[cfg(feature = "cuda")]
 use super::*;
 
-#[cfg(any(test, feature = "cuda"))]
-const NV_Q38_SOLO_DEVICE_ARGMAX_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_HOST_FEED: &str =
-    "NV_Q38_SOLO_DEVICE_ARGMAX";
-
-#[cfg(any(test, feature = "cuda"))]
-fn solo_device_argmax_default_on_user_sign_off_2026_09_12(raw: Option<&std::ffi::OsStr>) -> bool {
-    raw.is_none() || raw == Some(std::ffi::OsStr::new("1"))
-}
-
-#[cfg(test)]
-mod solo_device_argmax_default_tests {
-    use super::solo_device_argmax_default_on_user_sign_off_2026_09_12 as selected;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn only_unset_changes_and_zero_restores_host_feed() {
-        assert!(selected(None));
-        assert!(selected(Some(OsStr::new("1"))));
-        for raw in ["0", "", " 1", "1 ", "true", "gate"] {
-            assert!(
-                !selected(Some(OsStr::new(raw))),
-                "explicit {raw:?} stays off"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_unicode_remains_explicit_off() {
-        use std::os::unix::ffi::OsStrExt;
-        assert!(!selected(Some(OsStr::from_bytes(&[0xff]))));
-    }
-}
-
-#[cfg(any(test, feature = "cuda"))]
+#[cfg(feature = "cuda")]
 fn qwen_emitted_token_ids_fnv1a64_u32_le(tokens: &[u32]) -> u64 {
     tokens
         .iter()
@@ -156,7 +122,7 @@ mod qwen_ready_blocks_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn excludes_every_retained_token_in_the_first_ready_block() {
+    fn ready_blocks_exclude_the_first_block_and_report_no_interval_for_one_block() {
         let t = Instant::now();
         let mut blocks = QwenReadyBlocks::default();
         for (ready, block) in [
@@ -174,29 +140,26 @@ mod qwen_ready_blocks_tests {
             (blocks.tokens - blocks.first_block_tokens) as f64 / 0.1,
             20.0
         );
+        {
+            let mut blocks = QwenReadyBlocks::default();
+            assert_eq!(blocks.generation_seconds(), None);
+            let t = Instant::now();
+            blocks.retain(t, 0);
+            blocks.retain(t, 0);
+            assert_eq!(blocks.generation_seconds(), None);
+            assert_eq!(blocks.tokens, blocks.first_block_tokens);
+        }
+        {
+            let mut blocks = QwenReadyBlocks::default();
+            let t = Instant::now();
+            blocks.retain(t, 0);
+            blocks.retain(t, 1);
+            assert_eq!(blocks.first_block_tokens, 1);
+            assert_eq!(blocks.tokens, 2);
+            assert_eq!(blocks.generation_seconds(), None);
+        }
     }
 
-    #[test]
-    fn no_interval_is_reported_for_empty_or_single_block_output() {
-        let mut blocks = QwenReadyBlocks::default();
-        assert_eq!(blocks.generation_seconds(), None);
-        let t = Instant::now();
-        blocks.retain(t, 0);
-        blocks.retain(t, 0);
-        assert_eq!(blocks.generation_seconds(), None);
-        assert_eq!(blocks.tokens, blocks.first_block_tokens);
-    }
-
-    #[test]
-    fn distinct_blocks_with_equal_clock_values_do_not_merge_their_counts() {
-        let mut blocks = QwenReadyBlocks::default();
-        let t = Instant::now();
-        blocks.retain(t, 0);
-        blocks.retain(t, 1);
-        assert_eq!(blocks.first_block_tokens, 1);
-        assert_eq!(blocks.tokens, 2);
-        assert_eq!(blocks.generation_seconds(), None);
-    }
 }
 
 #[cfg(any(test, feature = "cuda"))]
@@ -453,7 +416,7 @@ mod solo_device_greedy_tests {
     }
 
     #[test]
-    fn device_zero_preserves_invalid_rows_ties_and_host_errors() {
+    fn device_token_is_taken_only_for_unmodified_greedy_and_zero_falls_back_to_the_host() {
         for row in [
             vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY],
             vec![3.0, 3.0, f32::NAN],
@@ -472,34 +435,33 @@ mod solo_device_greedy_tests {
             || anyhow::bail!("host copy failed"),
         )
         .is_err());
-    }
-
-    #[test]
-    fn device_nonzero_skips_host_copy_only_for_unmodified_greedy_sampling() {
-        let mut sampler = greedy();
-        let result = qwen_solo_sample_device_token_or_checked_host(&mut sampler, Some(7), || {
-            panic!("finite nonzero winner must not copy logits")
-        })
-        .unwrap();
-        assert_eq!(result.token, 7);
-        assert!(!result.exhausted);
-        assert_eq!(sampler.counts.get(&7), Some(&1));
-        for mode in 0..3 {
+        {
             let mut sampler = greedy();
-            match mode {
-                0 => sampler.logprobs = true,
-                1 => sampler.logit_bias.push((0, 10.0)),
-                _ => sampler.params.presence_penalty = 1.0,
-            }
-            let result =
-                qwen_solo_sample_device_token_or_checked_host(&mut sampler, Some(7), || {
-                    Ok(vec![3.0, 1.0])
-                })
-                .unwrap();
-            assert_eq!(result.token, 0);
+            let result = qwen_solo_sample_device_token_or_checked_host(&mut sampler, Some(7), || {
+                panic!("finite nonzero winner must not copy logits")
+            })
+            .unwrap();
+            assert_eq!(result.token, 7);
             assert!(!result.exhausted);
+            assert_eq!(sampler.counts.get(&7), Some(&1));
+            for mode in 0..3 {
+                let mut sampler = greedy();
+                match mode {
+                    0 => sampler.logprobs = true,
+                    1 => sampler.logit_bias.push((0, 10.0)),
+                    _ => sampler.params.presence_penalty = 1.0,
+                }
+                let result =
+                    qwen_solo_sample_device_token_or_checked_host(&mut sampler, Some(7), || {
+                        Ok(vec![3.0, 1.0])
+                    })
+                    .unwrap();
+                assert_eq!(result.token, 0);
+                assert!(!result.exhausted);
+            }
         }
     }
+
 }
 
 #[cfg(feature = "cuda")]
@@ -619,13 +581,8 @@ async fn run_sampling_qwen3_5_moe_graphed(
         }
     }
 
-    let device_greedy = engine.underlying().dense_intermediate().is_some()
-        && sampler.fast_greedy()
-        && solo_device_argmax_default_on_user_sign_off_2026_09_12(
-            std::env::var_os(
-                NV_Q38_SOLO_DEVICE_ARGMAX_DEFAULT_ON_USER_SIGN_OFF_2026_09_12_ZERO_RESTORES_HOST_FEED,
-            ).as_deref(),
-        );
+    let device_greedy =
+        engine.underlying().dense_intermediate().is_some() && sampler.fast_greedy();
     tracing::debug!(
         device_argmax = device_greedy,
         "qwen CUDA solo decode sampling"
@@ -737,15 +694,15 @@ async fn run_sampling_qwen3_5_moe_graphed(
         }
     }
 
-    let done = solo_push(
+    let done = send_stopped_by_then_done(
         tx,
-        ChatEvent::Done {
-            finish_reason: finish_reason.clone(),
-            completion_tokens,
-        },
+        &mut emitter,
+        finish_reason.clone(),
+        completion_tokens,
         send_timeout,
     )
     .await;
+    log_sse_abort(done, "qwen-solo");
     if qwen_generation_trace_deliverable(tail_sent, done) {
         if let Some(mut trace) = generation_trace {
             trace.capture_active = Some(engine.capture_active());
@@ -791,7 +748,6 @@ async fn tokenize_before_prefill(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 async fn run_sampling_qwen3_5_moe_eager(
     model: Arc<tokio::sync::Mutex<nv_models::qwen3_5_moe::Qwen3Moe>>,
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -857,7 +813,6 @@ async fn run_sampling_qwen3_5_moe_eager(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_qwen36_solo_via_scheduler(
     model: &nv_models::qwen3_5_moe::Qwen3Moe,
     mtp: Option<&nv_models::qwen3_5_mtp::MtpHead>,
@@ -913,7 +868,6 @@ pub(crate) async fn run_qwen36_solo_via_scheduler(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 async fn run_qwen36_moe_eager_mtp_or_plain(
     model: &nv_models::qwen3_5_moe::Qwen3Moe,
     tokenizer: &Arc<tokenizers::Tokenizer>,
@@ -985,7 +939,6 @@ async fn run_qwen36_moe_eager_mtp_or_plain(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 async fn run_qwen36_moe_mtp_greedy_rounds<S: nv_models::qwen3_5_mtp::MtpMoeServingRounds>(
     mut session: S,
     tokenizer: &Arc<tokenizers::Tokenizer>,
@@ -1063,20 +1016,15 @@ async fn run_qwen36_moe_mtp_greedy_rounds<S: nv_models::qwen3_5_mtp::MtpMoeServi
         }
     }
 
-    let _ = solo_push(
-        tx,
-        ChatEvent::Done {
-            finish_reason,
-            completion_tokens,
-        },
-        send_timeout,
-    )
-    .await;
+    log_sse_abort(
+        send_stopped_by_then_done(tx, &mut emitter, finish_reason, completion_tokens, send_timeout)
+            .await,
+        "qwen-solo",
+    );
     Ok(())
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_qwen38_solo_via_scheduler(
     model: &nv_models::qwen3_5_moe::Qwen3Moe,
     mtp: Option<&nv_specdecode::qwen38_mtp::Qwen38DenseMtpHead>,
@@ -1114,7 +1062,6 @@ pub(crate) async fn run_qwen38_solo_via_scheduler(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 async fn run_qwen38_dense_solo_body(
     model: &nv_models::qwen3_5_moe::Qwen3Moe,
     tokenizer: &Arc<tokenizers::Tokenizer>,
@@ -1291,15 +1238,15 @@ async fn run_qwen38_dense_solo_body(
         }
     }
 
-    let done = solo_push(
+    let done = send_stopped_by_then_done(
         tx,
-        ChatEvent::Done {
-            finish_reason: finish_reason.clone(),
-            completion_tokens,
-        },
+        &mut emitter,
+        finish_reason.clone(),
+        completion_tokens,
         send_timeout,
     )
     .await;
+    log_sse_abort(done, "qwen-solo");
     if qwen_generation_trace_deliverable(tail_sent, done) {
         if let Some(trace) = generation_trace {
             trace.report(completion_tokens, &finish_reason);
@@ -1309,7 +1256,6 @@ async fn run_qwen38_dense_solo_body(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 async fn run_qwen38_mtp_greedy_rounds(
     model: &nv_models::qwen3_5_moe::Qwen3Moe,
     mtp: &nv_specdecode::qwen38_mtp::Qwen38DenseMtpHead,
@@ -1348,7 +1294,6 @@ async fn run_qwen38_mtp_greedy_rounds(
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 async fn run_qwen38_mtp_rounds_streaming<S: nv_models::qwen3_5_mtp::MtpMoeServingRounds>(
     mut session: S,
     tokenizer: &Arc<tokenizers::Tokenizer>,
@@ -1456,15 +1401,15 @@ async fn run_qwen38_mtp_rounds_streaming<S: nv_models::qwen3_5_mtp::MtpMoeServin
         }
     }
 
-    let done = solo_push(
+    let done = send_stopped_by_then_done(
         tx,
-        ChatEvent::Done {
-            finish_reason: finish_reason.clone(),
-            completion_tokens,
-        },
+        &mut emitter,
+        finish_reason.clone(),
+        completion_tokens,
         send_timeout,
     )
     .await;
+    log_sse_abort(done, "qwen-solo");
     if qwen_generation_trace_deliverable(tail_sent, done) {
         if let Some(mut trace) = generation_trace {
             trace.capture_active = Some(session.capture_active());
@@ -1640,6 +1585,43 @@ mod qwen_generation_streaming_tests {
         let on = budget_events(true).await;
         assert_eq!(on, off);
         assert_eq!(on.last(), Some(&("done", Some(("length".into(), 2)))));
+    }
+
+    #[tokio::test]
+    async fn cuda_stop_hit_reports_stop_sequence() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut req = request(8);
+        req.stop = vec!["beta".into()];
+        run_qwen38_mtp_rounds_streaming(
+            FakeRounds::new(0, [vec![1, 2]]),
+            &tiny_tokenizer(),
+            &req,
+            8,
+            &[3],
+            2,
+            &tx,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        let mut terminal = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                ChatEvent::StoppedBy { stop_sequence } => terminal.push(stop_sequence),
+                ChatEvent::Done { finish_reason, .. } => {
+                    terminal.push(format!("done:{finish_reason}"))
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            terminal,
+            ["beta", "done:stop"],
+            "a CUDA loop that stops on a stop string must report it before Done, or /v1/messages \
+             answers end_turn with stop_sequence null"
+        );
     }
 
     #[tokio::test]
@@ -1823,15 +1805,11 @@ pub(crate) async fn run_sampling_qwen3(
         }
     }
 
-    let _ = solo_push(
-        tx,
-        ChatEvent::Done {
-            finish_reason,
-            completion_tokens,
-        },
-        send_timeout,
-    )
-    .await;
+    log_sse_abort(
+        send_stopped_by_then_done(tx, &mut emitter, finish_reason, completion_tokens, send_timeout)
+            .await,
+        "qwen-solo",
+    );
     Ok(())
 }
 
@@ -1889,7 +1867,7 @@ mod solo_send_discipline_tests {
             sse_timeout_opt_from_ms_zero_keeps_the_old_infinite_wait(10_000),
             Some(std::time::Duration::from_millis(10_000))
         );
-        if std::env::var_os("NV_SSE_SEND_TIMEOUT_MS").is_none() {
+        if !nv_config::env_arm_present_at_all_reread_every_call("NV_SSE_SEND_TIMEOUT_MS") {
             assert_eq!(
                 solo_send_timeout_via_scheduler_zero_restores_the_old_infinite_wait_matching_sched_push(),
                 Some(std::time::Duration::from_millis(10_000))

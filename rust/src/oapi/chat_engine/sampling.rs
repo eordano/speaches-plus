@@ -46,6 +46,7 @@ pub(crate) fn last_row_logits_3d(logits: &candle_core::Tensor) -> anyhow::Result
     Ok(last.to_dtype(candle_core::DType::F32)?.to_vec1::<f32>()?)
 }
 
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn sampling_params_from(
     req: &ChatGenerateRequest,
 ) -> nv_layers::sampler::SamplingParams {
@@ -60,6 +61,7 @@ pub(crate) fn sampling_params_from(
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct SampleOutput {
     pub(crate) token: u32,
 
@@ -70,6 +72,7 @@ pub(crate) struct SampleOutput {
     pub(crate) exhausted: bool,
 }
 
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct ChatSampler {
     pub(crate) params: nv_layers::sampler::SamplingParams,
     pub(crate) rng: Pcg64,
@@ -86,6 +89,7 @@ pub(crate) struct ChatSampler {
     scratch: Vec<f32>,
 }
 
+#[cfg(any(feature = "cuda", test))]
 impl ChatSampler {
     pub(crate) fn new(
         params: nv_layers::sampler::SamplingParams,
@@ -154,6 +158,44 @@ impl ChatSampler {
             && self.guided.is_none()
             && self.logit_bias.is_empty()
             && !self.logprobs
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn speculation_keeps_the_greedy_output(&self) -> bool {
+        self.params.is_greedy() && !self.params.has_penalties() && !self.logprobs
+    }
+
+    #[cfg(any(test, feature = "cuda"))]
+    pub(crate) fn greedy_pick_after(&mut self, path: &[u32], logits: &[f32]) -> Option<u32> {
+        let cp = self.guided.as_ref().map(GuidedRun::checkpoint);
+        let mut lg = std::mem::take(&mut self.scratch);
+        lg.clear();
+        lg.extend_from_slice(logits);
+        for &(id, bias) in &self.logit_bias {
+            if let Some(v) = lg.get_mut(id as usize) {
+                *v += bias;
+            }
+        }
+        let mut alive = true;
+        if let Some(g) = &mut self.guided {
+            alive = path.iter().all(|&t| g.advance(t));
+            if alive {
+                g.apply_mask(&mut lg);
+            }
+        }
+        let picked = alive.then(|| nv_layers::sampler::argmax_checked(&lg)).flatten();
+        if let (Some(g), Some(cp)) = (&mut self.guided, cp) {
+            g.rollback(cp);
+        }
+        self.scratch = lg;
+        picked
+    }
+
+    #[cfg(any(test, feature = "cuda"))]
+    #[must_use = "false means the token left the grammar"]
+    pub(crate) fn commit_greedy(&mut self, tok: u32) -> bool {
+        *self.counts.entry(tok).or_insert(0) += 1;
+        self.guided.as_mut().is_none_or(|g| g.advance(tok))
     }
 
     #[cfg(feature = "cuda")]
@@ -313,6 +355,7 @@ impl ChatSampler {
         DraftOutcome::Reject(repl)
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn commit(&mut self, tok: u32) {
         *self.counts.entry(tok).or_insert(0) += 1;
     }
@@ -325,42 +368,152 @@ impl ChatSampler {
     }
 }
 
+#[cfg(any(test, feature = "cuda"))]
+pub(crate) struct SamplerPick<'a>(pub(crate) &'a mut ChatSampler);
+
+#[cfg(any(test, feature = "cuda"))]
+impl nv_models::spec_pick::SpecPick for SamplerPick<'_> {
+    fn draft(&mut self, path: &[u32], row: &[f32]) -> u32 {
+        self.0
+            .greedy_pick_after(path, row)
+            .unwrap_or_else(|| nv_layers::sampler::argmax(row))
+    }
+
+    fn target(&mut self, path: &[u32], row: &[f32]) -> anyhow::Result<u32> {
+        self.0.greedy_pick_after(path, row).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no legal token after {} speculative tokens: the sampling mask left every \
+                 candidate at -inf",
+                path.len()
+            )
+        })
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
 pub(crate) enum DraftOutcome {
     Accept,
     Reject(u32),
 }
 
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
+fn gpt2_byte_of_char() -> &'static std::collections::HashMap<char, u8> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<char, u8>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let printable = |b: u8| (b'!'..=b'~').contains(&b) || (0xa1..=0xac).contains(&b) || b >= 0xae;
+        let mut next = 256u32;
+        (0..=255u8)
+            .map(|b| {
+                let c = if printable(b) {
+                    b as u32
+                } else {
+                    next += 1;
+                    next - 1
+                };
+                (char::from_u32(c).expect("byte-level alphabet"), b)
+            })
+            .collect()
+    })
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
+fn decodes_byte_level(d: Option<&tokenizers::decoders::DecoderWrapper>) -> bool {
+    match d {
+        Some(tokenizers::decoders::DecoderWrapper::ByteLevel(_)) => true,
+        Some(tokenizers::decoders::DecoderWrapper::Sequence(seq)) => {
+            seq.get_decoders().iter().any(|d| decodes_byte_level(Some(d)))
+        }
+        _ => false,
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
+fn byte_fallback_token(tok: &str) -> Option<u8> {
+    let hex = tok.strip_prefix("<0x")?.strip_suffix('>')?;
+    (hex.len() == 2).then(|| u8::from_str_radix(hex, 16).ok()).flatten()
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
+pub(crate) fn token_bytes_for_guided(tokenizer: &tokenizers::Tokenizer) -> Vec<Vec<u8>> {
+    let n = tokenizer.get_vocab_size(true) as u32;
+    let added = tokenizer.get_added_tokens_decoder();
+    let byte_level = decodes_byte_level(tokenizer.get_decoder());
+    let table = gpt2_byte_of_char();
+    (0..n)
+        .map(|id| {
+            if let Some(t) = added.get(&id) {
+                return if t.special { Vec::new() } else { t.content.clone().into_bytes() };
+            }
+            let Some(tok) = tokenizer.id_to_token(id) else {
+                return Vec::new();
+            };
+            if byte_level {
+                if let Some(bytes) = tok.chars().map(|c| table.get(&c).copied()).collect::<Option<Vec<u8>>>() {
+                    return bytes;
+                }
+            } else if let Some(b) = byte_fallback_token(&tok) {
+                return vec![b];
+            }
+            tokenizer.decode(&[id], false).unwrap_or_default().into_bytes()
+        })
+        .collect()
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
+pub(crate) const GUIDED_VOCAB_FINGERPRINT_STRIDE_997_SAMPLES_EVERY_TOKENIZER_CHEAPLY: u32 = 997;
+
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
+fn tokenizer_fingerprint(tokenizer: &tokenizers::Tokenizer) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let n = tokenizer.get_vocab_size(true) as u32;
+    n.hash(&mut h);
+    let mut id = 0;
+    while id < n {
+        tokenizer.id_to_token(id).hash(&mut h);
+        id += GUIDED_VOCAB_FINGERPRINT_STRIDE_997_SAMPLES_EVERY_TOKENIZER_CHEAPLY;
+    }
+    let mut added: Vec<(u32, String, bool)> = tokenizer
+        .get_added_tokens_decoder()
+        .into_iter()
+        .map(|(id, t)| (id, t.content, t.special))
+        .collect();
+    added.sort_unstable();
+    added.hash(&mut h);
+    h.finish()
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 pub(crate) fn guided_vocab_bytes(
     tokenizer: &tokenizers::Tokenizer,
     eos_ids: &[u32],
 ) -> Arc<nv_grammar::VocabBytes> {
-    type Key = (u32, Vec<u32>);
+    type Key = (usize, u64, Vec<u32>);
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<Key, Arc<nv_grammar::VocabBytes>>>,
     > = std::sync::OnceLock::new();
 
-    let n = tokenizer.get_vocab_size(true) as u32;
-    let key: Key = (n, eos_ids.to_vec());
+    let key: Key = (
+        tokenizer as *const tokenizers::Tokenizer as usize,
+        tokenizer_fingerprint(tokenizer),
+        eos_ids.to_vec(),
+    );
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
         return hit;
     }
 
-    let bytes: Vec<Vec<u8>> = (0..n)
-        .map(|id| {
-            tokenizer
-                .decode(&[id], false)
-                .unwrap_or_default()
-                .into_bytes()
-        })
-        .collect();
-    let built = Arc::new(nv_grammar::VocabBytes::new(bytes, eos_ids));
+    let built = Arc::new(nv_grammar::VocabBytes::new(
+        token_bytes_for_guided(tokenizer),
+        eos_ids,
+    ));
     if let Ok(mut c) = cache.lock() {
         c.entry(key).or_insert_with(|| built.clone());
     }
     built
 }
 
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 pub(crate) fn build_guided(
     tokenizer: &tokenizers::Tokenizer,
     eos_ids: &[u32],
@@ -370,10 +523,13 @@ pub(crate) fn build_guided(
     nv_grammar::GuidedDecoder::from_grammar(spec, vocab)
 }
 
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 pub(crate) const GUIDED_THINK_CLOSE_MAX_TOKENS: usize = 8;
 pub(crate) const GUIDED_THINK_FALLBACK_MARKER: &str = "</think>";
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 pub(crate) const GUIDED_THINK_FALLBACK_MAX_TOKENS: usize = 1;
 
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 pub(crate) fn think_close_tokens(
     tokenizer: &tokenizers::Tokenizer,
     marker: &str,
@@ -421,6 +577,7 @@ pub(crate) fn template_thinking_default(engine: &dyn ChatEngine) -> Option<bool>
         })
 }
 
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 pub(crate) fn build_guided_for_request(
     tokenizer: &tokenizers::Tokenizer,
     eos_ids: &[u32],
@@ -446,8 +603,10 @@ pub(crate) fn build_guided_for_request(
     Ok(g)
 }
 
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 pub(crate) const GUIDED_THINK_TAIL_RESERVE: usize = 256;
 
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 fn think_budget_for(max_new: usize) -> usize {
     match max_new.checked_sub(GUIDED_THINK_TAIL_RESERVE) {
         Some(n) if n > 0 => n,
@@ -455,6 +614,14 @@ fn think_budget_for(max_new: usize) -> usize {
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
+pub(crate) struct GuidedCheckpoint {
+    decoder: nv_grammar::Checkpoint,
+    sampled: usize,
+    killed_by: Option<u32>,
+}
+
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 pub(crate) struct GuidedRun {
     decoder: nv_grammar::GuidedDecoder,
     think_budget: usize,
@@ -463,6 +630,7 @@ pub(crate) struct GuidedRun {
     killed_by: Option<u32>,
 }
 
+#[cfg(any(feature = "cuda", feature = "wgpu", test))]
 impl GuidedRun {
     pub(crate) fn new(decoder: nv_grammar::GuidedDecoder, max_new: usize) -> Self {
         Self {
@@ -486,6 +654,7 @@ impl GuidedRun {
         let outside = self.decoder.close_token_outside_logits(logits.len());
         if outside.is_none() {
             if self.sampled < self.think_budget {
+                self.decoder.apply_mask(logits);
                 return;
             }
             if self.decoder.mask_to_defer_token(logits) {
@@ -549,15 +718,34 @@ impl GuidedRun {
         false
     }
 
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn checkpoint(&self) -> GuidedCheckpoint {
+        GuidedCheckpoint {
+            decoder: self.decoder.checkpoint(),
+            sampled: self.sampled,
+            killed_by: self.killed_by,
+        }
+    }
+
+    #[cfg(any(feature = "cuda", test))]
+    pub(crate) fn rollback(&mut self, cp: GuidedCheckpoint) {
+        self.decoder.rollback(&cp.decoder);
+        self.sampled = cp.sampled;
+        self.killed_by = cp.killed_by;
+    }
+
+    #[cfg(any(test, feature = "wgpu"))]
     pub(crate) fn decoder(&self) -> &nv_grammar::GuidedDecoder {
         &self.decoder
     }
 
+    #[cfg(feature = "wgpu")]
     pub(crate) fn decoder_mut(&mut self) -> &mut nv_grammar::GuidedDecoder {
         &mut self.decoder
     }
 }
 
+#[cfg(test)]
 pub(crate) fn sample_logits(
     logits: &[f32],
     temperature: f32,
@@ -667,6 +855,7 @@ pub(crate) fn sample_logits(
     0
 }
 
+#[cfg(test)]
 pub(crate) fn argmax_u32(logits: &[f32]) -> u32 {
     let (id, _) = logits
         .iter()
@@ -681,6 +870,7 @@ pub(crate) fn argmax_u32(logits: &[f32]) -> u32 {
     id as u32
 }
 
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn os_random_u64() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -718,7 +908,7 @@ mod scratch_tests {
     }
 
     #[test]
-    fn scratch_is_reset_between_consecutive_samples() {
+    fn scratch_is_reset_between_samples_and_survives_an_exhausted_step() {
         let mut s = ChatSampler::new(bias_params(), 1, None, vec![(3, 0.0)], false, 0);
 
         assert_eq!(s.sample(&[0.0f32, 0.0, 10.0, 0.0]).token, 2);
@@ -733,23 +923,22 @@ mod scratch_tests {
             "the scratch grew past one vocab row, so it was appended to rather \
              than cleared"
         );
+        {
+            let mut s = ChatSampler::new(bias_params(), 1, None, vec![(0, 0.0)], false, 0);
+            assert_eq!(s.sample(&[1.0f32, 0.0, 0.0, 0.0]).token, 0);
+            let n = s.scratch_len();
+            assert_eq!(n, 4);
+
+            let out = s.sample(&[f32::NEG_INFINITY; 4]);
+            assert!(out.exhausted, "all -inf must report exhausted");
+            assert_eq!(
+                s.scratch_len(),
+                4,
+                "the exhausted early return dropped the scratch buffer"
+            );
+        }
     }
 
-    #[test]
-    fn scratch_survives_an_exhausted_step() {
-        let mut s = ChatSampler::new(bias_params(), 1, None, vec![(0, 0.0)], false, 0);
-        assert_eq!(s.sample(&[1.0f32, 0.0, 0.0, 0.0]).token, 0);
-        let n = s.scratch_len();
-        assert_eq!(n, 4);
-
-        let out = s.sample(&[f32::NEG_INFINITY; 4]);
-        assert!(out.exhausted, "all -inf must report exhausted");
-        assert_eq!(
-            s.scratch_len(),
-            4,
-            "the exhausted early return dropped the scratch buffer"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -762,25 +951,11 @@ mod think_budget_tests {
 
     fn thinking_request(max_new_tokens: usize) -> ChatGenerateRequest {
         ChatGenerateRequest {
-            prompt: String::new(),
             max_new_tokens,
-            stop: Vec::new(),
             seed: Some(1),
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            min_p: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            repetition_penalty: None,
             guided: Some(boolean_spec()),
             guided_think_close: Some("<|end|>".into()),
-            logit_bias: Vec::new(),
-            logprobs: false,
-            top_logprobs: 0,
-            kv_resume: None,
-            kv_store: None,
-            mm: None,
+            ..Default::default()
         }
     }
 
@@ -821,27 +996,51 @@ mod think_budget_tests {
     }
 
     #[test]
-    fn a_runaway_thought_is_closed_on_the_sampler_every_cuda_engine_shares() {
+    fn a_runaway_thought_is_closed_against_the_cap_the_loop_will_actually_sample() {
         walk_a_runaway_thought(&thinking_request(8), 8);
+        {
+            walk_a_runaway_thought(&thinking_request(0), 8);
+
+            let tk = harmony_tokenizer();
+            let long = ChatSampler::for_request(&thinking_request(4096), &tk, &[EOS], 4096)
+                .expect("<|end|> is one token of this vocabulary");
+            assert_eq!(
+                long.guided.as_ref().expect("guided request").think_budget,
+                4096 - GUIDED_THINK_TAIL_RESERVE,
+                "past the reserve the budget is max_new minus the reserve; a request whose loop cap \
+                 is 0 or unset would otherwise close the thought on its very first token"
+            );
+        }
     }
 
     #[test]
-    fn the_budget_is_measured_against_the_cap_the_loop_will_actually_sample() {
-        walk_a_runaway_thought(&thinking_request(0), 8);
-
+    fn a_thought_cannot_end_on_eos_before_its_close_marker_arms_the_grammar() {
+        const PADDED_LM_HEAD_EOS: u32 = 9;
         let tk = harmony_tokenizer();
-        let long = ChatSampler::for_request(&thinking_request(4096), &tk, &[EOS], 4096)
-            .expect("<|end|> is one token of this vocabulary");
-        assert_eq!(
-            long.guided.as_ref().expect("guided request").think_budget,
-            4096 - GUIDED_THINK_TAIL_RESERVE,
-            "past the reserve the budget is max_new minus the reserve; a request whose loop cap \
-             is 0 or unset would otherwise close the thought on its very first token"
+        let mut s =
+            ChatSampler::for_request(&thinking_request(8), &tk, &[EOS, PADDED_LM_HEAD_EOS], 8)
+                .expect("<|end|> is one token of this vocabulary");
+        let eos_argmax = [0.0f32, 1.0, 5.0, 0.5, 3.0, 0.4, 0.3, 9.0, 0.0, 0.2];
+        let padded_eos_argmax = [0.0f32, 1.0, 5.0, 0.5, 3.0, 0.4, 0.3, 0.2, 0.0, 9.0];
+        for (step, row) in [eos_argmax, padded_eos_argmax].iter().enumerate() {
+            let out = s.sample(row);
+            assert!(!out.exhausted, "step {step}: thinking always has a legal token");
+            assert_eq!(
+                out.token, ILLEGAL_ARGMAX,
+                "step {step}: while the grammar waits for the close marker, an EOS id (in the \
+                 vocabulary or in the padded lm_head tail) must be masked: sampling it stops the \
+                 loop with finish_reason=stop and HTTP 200 before the schema ever arms, so the \
+                 caller who asked for structured output gets none. Every other token stays free"
+            );
+        }
+        assert!(
+            s.guided.as_ref().expect("guided request").decoder().deferred(),
+            "the model is still thinking"
         );
     }
 
     #[test]
-    fn a_request_without_thinking_is_constrained_from_the_first_token() {
+    fn a_request_without_thinking_is_constrained_from_the_first_token_and_a_dead_grammar_cannot_produce_output() {
         let tk = harmony_tokenizer();
         let mut req = thinking_request(8);
         req.guided_think_close = None;
@@ -852,58 +1051,56 @@ mod think_budget_tests {
             1,
             "no thought to wait for means no budget to spend: the schema binds immediately"
         );
+        {
+            let tk = harmony_tokenizer();
+            let mut req = thinking_request(8);
+            req.guided_think_close = None;
+            let mut s = ChatSampler::for_request(&req, &tk, &[EOS], 8)
+                .expect("a grammar without thinking always builds");
+            let row = vec![0.0f32, 1.0, 5.0, 0.5, 3.0, 0.4, 0.3, 0.2];
+            assert_eq!(
+                s.sample(&row).token,
+                1,
+                "the schema binds from the first token, so the boolean literal wins"
+            );
+
+            let g = s.guided.as_mut().expect("guided request");
+            assert!(
+                !g.advance(ILLEGAL_ARGMAX),
+                "token {ILLEGAL_ARGMAX} leaves the boolean DFA: GuidedRun::advance must hand the \
+                 decoder's death back to its caller instead of swallowing the bool"
+            );
+            assert_eq!(
+                g.killed_by(),
+                Some(ILLEGAL_ARGMAX),
+                "the token that killed the grammar must be recorded and named, not dropped as a bool"
+            );
+            assert!(g.decoder().is_dead());
+
+            let mut masked = row.clone();
+            g.apply_mask(&mut masked);
+            assert!(
+                masked.iter().all(|x| *x == f32::NEG_INFINITY),
+                "the mask itself must leave nothing legal once the grammar is dead: a decoder that \
+                 stops masking has stopped enforcing the schema, and every token after it is \
+                 unconstrained even though the request still reports success"
+            );
+
+            assert!(
+                s.sample(&row).exhausted,
+                "a dead decoder has no continuation, so every candidate must be masked; leaving the \
+                 row alone would let the request run to its token cap sampling freely and answer HTTP \
+                 200 with finish_reason=stop to a caller who asked for a schema"
+            );
+            assert!(
+                s.sample(&row).exhausted,
+                "death is permanent: no later step may quietly resume unconstrained sampling"
+            );
+        }
     }
 
     #[test]
-    fn a_dead_grammar_cannot_silently_produce_output() {
-        let tk = harmony_tokenizer();
-        let mut req = thinking_request(8);
-        req.guided_think_close = None;
-        let mut s = ChatSampler::for_request(&req, &tk, &[EOS], 8)
-            .expect("a grammar without thinking always builds");
-        let row = vec![0.0f32, 1.0, 5.0, 0.5, 3.0, 0.4, 0.3, 0.2];
-        assert_eq!(
-            s.sample(&row).token,
-            1,
-            "the schema binds from the first token, so the boolean literal wins"
-        );
-
-        let g = s.guided.as_mut().expect("guided request");
-        assert!(
-            !g.advance(ILLEGAL_ARGMAX),
-            "token {ILLEGAL_ARGMAX} leaves the boolean DFA: GuidedRun::advance must hand the \
-             decoder's death back to its caller instead of swallowing the bool"
-        );
-        assert_eq!(
-            g.killed_by(),
-            Some(ILLEGAL_ARGMAX),
-            "the token that killed the grammar must be recorded and named, not dropped as a bool"
-        );
-        assert!(g.decoder().is_dead());
-
-        let mut masked = row.clone();
-        g.apply_mask(&mut masked);
-        assert!(
-            masked.iter().all(|x| *x == f32::NEG_INFINITY),
-            "the mask itself must leave nothing legal once the grammar is dead: a decoder that \
-             stops masking has stopped enforcing the schema, and every token after it is \
-             unconstrained even though the request still reports success"
-        );
-
-        assert!(
-            s.sample(&row).exhausted,
-            "a dead decoder has no continuation, so every candidate must be masked; leaving the \
-             row alone would let the request run to its token cap sampling freely and answer HTTP \
-             200 with finish_reason=stop to a caller who asked for a schema"
-        );
-        assert!(
-            s.sample(&row).exhausted,
-            "death is permanent: no later step may quietly resume unconstrained sampling"
-        );
-    }
-
-    #[test]
-    fn a_close_marker_the_logits_row_cannot_hold_fails_the_request_on_the_first_token() {
+    fn a_close_marker_outside_the_logits_row_fails_the_request_and_one_inside_is_left_alone() {
         let tk = harmony_tokenizer();
         let mut s = ChatSampler::for_request(&thinking_request(8), &tk, &[EOS], 8)
             .expect("<|end|> is one token of this vocabulary");
@@ -931,28 +1128,27 @@ mod think_budget_tests {
             "the failure is a property of the model's logits width, so it cannot heal by \
              sampling further"
         );
+        {
+            let tk = harmony_tokenizer();
+            let mut s = ChatSampler::for_request(&thinking_request(8), &tk, &[EOS], 8)
+                .expect("<|end|> is one token of this vocabulary");
+            let out = s.sample(&[0.0f32, 1.0, 5.0, 0.5, 3.0]);
+            assert!(
+                !out.exhausted,
+                "a row that ends exactly at the close marker holds it: the reachability check must \
+                 not reject the boundary case it exists to admit"
+            );
+            assert_eq!(out.token, ILLEGAL_ARGMAX);
+            assert_eq!(
+                s.guided
+                    .as_ref()
+                    .expect("guided request")
+                    .unforceable_close(),
+                None
+            );
+        }
     }
 
-    #[test]
-    fn a_logits_row_wide_enough_for_the_close_marker_is_left_alone() {
-        let tk = harmony_tokenizer();
-        let mut s = ChatSampler::for_request(&thinking_request(8), &tk, &[EOS], 8)
-            .expect("<|end|> is one token of this vocabulary");
-        let out = s.sample(&[0.0f32, 1.0, 5.0, 0.5, 3.0]);
-        assert!(
-            !out.exhausted,
-            "a row that ends exactly at the close marker holds it: the reachability check must \
-             not reject the boundary case it exists to admit"
-        );
-        assert_eq!(out.token, ILLEGAL_ARGMAX);
-        assert_eq!(
-            s.guided
-                .as_ref()
-                .expect("guided request")
-                .unforceable_close(),
-            None
-        );
-    }
 }
 
 #[cfg(test)]
@@ -1017,7 +1213,7 @@ mod think_close_tests {
     }
 
     #[test]
-    fn a_multi_token_thinking_close_marker_arms_only_on_the_full_sequence() {
+    fn a_multi_token_close_marker_arms_only_on_the_full_sequence_and_the_forced_close_walks_it() {
         let tk = harmony_tokenizer();
         let seq: Vec<u32> = tk
             .encode(HARMONY_CLOSE, false)
@@ -1044,8 +1240,8 @@ mod think_close_tests {
         );
         assert_eq!(
             finite(&mut g, 8),
-            vec![true; 8],
-            "nothing is masked while the model is still thinking"
+            vec![true, true, true, true, true, true, true, false],
+            "while the model is still thinking only EOS is masked"
         );
 
         assert!(g.advance(seq[0]));
@@ -1070,44 +1266,42 @@ mod think_close_tests {
             vec![true, true, false, false, false, false, false, false],
             "grammar live: only the boolean literals survive"
         );
-    }
+        {
+            let tk = harmony_tokenizer();
+            let seq: Vec<u32> = tk
+                .encode(HARMONY_CLOSE, false)
+                .expect("harmony close encodes")
+                .get_ids()
+                .to_vec();
+            let mut g = build_guided_for_request(&tk, &[EOS], &boolean_spec(), Some(HARMONY_CLOSE))
+                .expect("multi-token close must be supported");
 
-    #[test]
-    fn the_forced_close_walks_the_whole_sequence_one_token_per_step() {
-        let tk = harmony_tokenizer();
-        let seq: Vec<u32> = tk
-            .encode(HARMONY_CLOSE, false)
-            .expect("harmony close encodes")
-            .get_ids()
-            .to_vec();
-        let mut g = build_guided_for_request(&tk, &[EOS], &boolean_spec(), Some(HARMONY_CLOSE))
-            .expect("multi-token close must be supported");
-
-        for (i, want) in seq.iter().enumerate() {
-            let mut logits = vec![0.0f32; 8];
+            for (i, want) in seq.iter().enumerate() {
+                let mut logits = vec![0.0f32; 8];
+                assert!(
+                    g.mask_to_defer_token(&mut logits),
+                    "step {i}: the spent thinking budget must still force a close"
+                );
+                let legal: Vec<u32> = (0..8u32)
+                    .filter(|id| logits[*id as usize].is_finite())
+                    .collect();
+                assert_eq!(
+                    legal,
+                    vec![*want],
+                    "step {i}: the forced close must emit the sequence one token per step"
+                );
+                assert!(g.advance(*want));
+            }
             assert!(
-                g.mask_to_defer_token(&mut logits),
-                "step {i}: the spent thinking budget must still force a close"
+                !g.deferred(),
+                "after the whole sequence is forced out the grammar must be live, or the forced \
+                 close never terminates and the schema is never written"
             );
-            let legal: Vec<u32> = (0..8u32)
-                .filter(|id| logits[*id as usize].is_finite())
-                .collect();
-            assert_eq!(
-                legal,
-                vec![*want],
-                "step {i}: the forced close must emit the sequence one token per step"
+            assert!(
+                !g.mask_to_defer_token(&mut [0.0f32; 8]),
+                "there is nothing left to force once the grammar is armed"
             );
-            assert!(g.advance(*want));
         }
-        assert!(
-            !g.deferred(),
-            "after the whole sequence is forced out the grammar must be live, or the forced \
-             close never terminates and the schema is never written"
-        );
-        assert!(
-            !g.mask_to_defer_token(&mut [0.0f32; 8]),
-            "there is nothing left to force once the grammar is armed"
-        );
     }
 
     #[test]
@@ -1125,28 +1319,7 @@ mod think_close_tests {
     }
 
     #[test]
-    #[allow(clippy::assertions_on_constants)]
-    fn the_close_marker_cap_cannot_eat_the_room_reserved_for_the_answer() {
-        assert!(
-            GUIDED_THINK_CLOSE_MAX_TOKENS >= 6,
-            "harmony ends analysis with <|end|><|start|>assistant<|channel|>final<|message|>, \
-             six tokens; a cap below that refuses the very family this path exists for"
-        );
-        assert!(
-            GUIDED_THINK_CLOSE_MAX_TOKENS < GUIDED_THINK_TAIL_RESERVE,
-            "the forced close spends one reserved token per marker token, so a cap at or above \
-             the reserve lets closing the thought consume every token left to answer with; a zero \
-             reserve lands the close on the last token and the schema is never emitted at all"
-        );
-        assert_eq!(
-            GUIDED_THINK_FALLBACK_MAX_TOKENS, 1,
-            "a sequence is only ever the model's OWN marker; </think> is our guess, and a guess \
-             is allowed only where the model actually carries that token"
-        );
-    }
-
-    #[test]
-    fn the_generic_close_guess_is_never_taken_as_a_sequence() {
+    fn an_unexpressible_or_guessed_close_marker_is_refused_with_the_reason() {
         let tk = think_split_tokenizer();
         assert_eq!(
             tk.encode(GUIDED_THINK_FALLBACK_MARKER, false)
@@ -1173,18 +1346,284 @@ mod think_close_tests {
             msg.contains("enable_thinking=false"),
             "the refusal must tell the caller how to proceed: {msg}"
         );
+        {
+            let tk = harmony_tokenizer();
+            let msg = match build_guided_for_request(&tk, &[EOS], &boolean_spec(), Some("<|nope|>")) {
+                Ok(_) => panic!("an unresolvable close marker has no position at which to arm"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains("enable_thinking=false"),
+                "the refusal must tell the caller how to proceed: {msg}"
+            );
+        }
     }
 
     #[test]
-    fn a_marker_the_tokenizer_cannot_express_is_still_refused_with_the_reason() {
-        let tk = harmony_tokenizer();
-        let msg = match build_guided_for_request(&tk, &[EOS], &boolean_spec(), Some("<|nope|>")) {
-            Ok(_) => panic!("an unresolvable close marker has no position at which to arm"),
-            Err(e) => e.to_string(),
-        };
+    #[allow(clippy::assertions_on_constants)]
+    fn the_close_marker_cap_cannot_eat_the_room_reserved_for_the_answer() {
         assert!(
-            msg.contains("enable_thinking=false"),
-            "the refusal must tell the caller how to proceed: {msg}"
+            GUIDED_THINK_CLOSE_MAX_TOKENS >= 6,
+            "harmony ends analysis with <|end|><|start|>assistant<|channel|>final<|message|>, \
+             six tokens; a cap below that refuses the very family this path exists for"
+        );
+        assert!(
+            GUIDED_THINK_CLOSE_MAX_TOKENS < GUIDED_THINK_TAIL_RESERVE,
+            "the forced close spends one reserved token per marker token, so a cap at or above \
+             the reserve lets closing the thought consume every token left to answer with; a zero \
+             reserve lands the close on the last token and the schema is never emitted at all"
+        );
+        assert_eq!(
+            GUIDED_THINK_FALLBACK_MAX_TOKENS, 1,
+            "a sequence is only ever the model's OWN marker; </think> is our guess, and a guess \
+             is allowed only where the model actually carries that token"
         );
     }
+}
+
+#[cfg(test)]
+mod guided_vocab_tests {
+    use super::*;
+
+    const BYTE_LEVEL_TOKENIZER: &str = r#"{
+      "version": "1.0", "truncation": null, "padding": null,
+      "added_tokens": [
+        {"id": 5, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false},
+        {"id": 6, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+      ],
+      "normalizer": null,
+      "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": true},
+      "post_processor": null,
+      "decoder": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": true},
+      "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+                "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                "vocab": {"Ġhi": 0, "ä¸": 1, "Ń": 2, "a": 3, "Ġ": 4}, "merges": []}
+    }"#;
+
+    #[test]
+    fn byte_level_tokens_map_to_raw_bytes_and_special_tokens_are_never_legal_inside_a_grammar() {
+        let tk: tokenizers::Tokenizer = BYTE_LEVEL_TOKENIZER.parse().expect("fixture tokenizer");
+        let bytes = token_bytes_for_guided(&tk);
+        assert_eq!(
+            bytes,
+            vec![
+                b" hi".to_vec(),
+                vec![0xe4, 0xb8],
+                vec![0xad],
+                b"a".to_vec(),
+                b" ".to_vec(),
+                b"<think>".to_vec(),
+                Vec::new(),
+            ],
+            "the two halves of U+4E2D must be the bytes E4 B8 | AD, the leading-space token must \
+             keep its space, a plain added token is its text, and a special token emits nothing"
+        );
+        assert_ne!(
+            tk.decode(&[1], false).unwrap().into_bytes(),
+            bytes[1],
+            "a lone decode of a partial UTF-8 token is lossy (U+FFFD), which is why the table \
+             cannot be built from decode()"
+        );
+        {
+            let tk: tokenizers::Tokenizer = BYTE_LEVEL_TOKENIZER.parse().expect("fixture tokenizer");
+            let spec = nv_grammar::GrammarSpec::JsonSchema(serde_json::json!({"type": "string"}));
+            let mut g = build_guided(&tk, &[], &spec).unwrap();
+            let v = guided_vocab_bytes(&tk, &[]);
+            assert_eq!(v.len(), 7);
+            let mut row = vec![0.0f32; 7];
+            g.apply_mask(&mut row);
+            assert!(!row[6].is_finite(), "<|im_end|> is special: its text is not output text");
+        }
+    }
+
+    #[test]
+    fn a_choice_spelled_across_partial_utf8_tokens_stays_reachable() {
+        let tk: tokenizers::Tokenizer = BYTE_LEVEL_TOKENIZER.parse().expect("fixture tokenizer");
+        let spec = nv_grammar::GrammarSpec::Regex(nv_grammar::choice_to_regex(&["中".into()]));
+        let mut g = build_guided(&tk, &[6], &spec).unwrap();
+        let mut row = vec![0.0f32; 7];
+        g.apply_mask(&mut row);
+        assert!(row[1].is_finite(), "E4 B8 starts 中");
+        assert!(row.iter().enumerate().all(|(i, x)| i == 1 || !x.is_finite()));
+        assert!(g.advance(1));
+        let mut row = vec![0.0f32; 7];
+        g.apply_mask(&mut row);
+        assert!(row[2].is_finite() && !row[6].is_finite(), "AD completes it, EOS not yet");
+        assert!(g.advance(2));
+        let mut row = vec![0.0f32; 7];
+        g.apply_mask(&mut row);
+        assert!(row[6].is_finite(), "EOS once the choice is complete");
+    }
+
+}
+
+#[cfg(test)]
+mod guided_spec_tests {
+    use super::*;
+    use nv_models::spec_pick::{accept_drafts, SpecPick};
+
+    const WORDS: [&str; 26] = [
+        "{", "}", "\"a\"", "\"b\"", ":", ",", " ", "1", "2", "true", "false", "x", "\"", "[", "]",
+        "a", "b", "c", "e", "f", "l", "n", "r", "s", "t", "u",
+    ];
+    const EOS: u32 = WORDS.len() as u32;
+
+    fn tokenizer() -> tokenizers::Tokenizer {
+        let words = WORDS;
+        let model = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab(words.iter().enumerate().map(|(i, s)| ((*s).to_string(), i as u32)).collect())
+            .build()
+            .expect("word-level model");
+        let mut tk = tokenizers::Tokenizer::new(model);
+        tk.add_special_tokens([
+            tokenizers::AddedToken::from("<eos>", true),
+            tokenizers::AddedToken::from("</think>", false),
+        ])
+        .expect("specials");
+        tk
+    }
+
+    const CLOSE: u32 = EOS + 1;
+    const VOCAB: usize = WORDS.len() + 2;
+
+    fn row(history: &[u32], salt: u64) -> Vec<f32> {
+        use std::hash::{Hash, Hasher};
+        (0..VOCAB)
+            .map(|t| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (history, t, salt).hash(&mut h);
+                let quiet = if t == EOS as usize || t == CLOSE as usize { 20.0 } else { 0.0 };
+                (h.finish() % 1000) as f32 / 100.0 - quiet
+            })
+            .collect()
+    }
+
+    fn target(history: &[u32]) -> Vec<f32> {
+        row(history, 0)
+    }
+
+    fn drafter(history: &[u32]) -> Vec<f32> {
+        let mut r = target(history);
+        if history.len() % 3 == 0 {
+            r = row(history, 7);
+        }
+        r
+    }
+
+    fn request(spec: nv_grammar::GrammarSpec, think: bool, max: usize) -> ChatGenerateRequest {
+        ChatGenerateRequest {
+            max_new_tokens: max,
+            seed: Some(1),
+            temperature: Some(0.0),
+            guided: Some(spec),
+            guided_think_close: think.then(|| "</think>".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn plain(req: &ChatGenerateRequest, prompt: &[u32], max: usize) -> Vec<u32> {
+        let tk = tokenizer();
+        let mut s = ChatSampler::for_request(req, &tk, &[EOS], max).unwrap();
+        let mut hist = prompt.to_vec();
+        let mut out = Vec::new();
+        while out.len() < max {
+            let o = s.sample(&target(&hist));
+            assert!(!o.exhausted, "plain decode exhausted after {out:?}");
+            if o.token == EOS {
+                break;
+            }
+            out.push(o.token);
+            hist.push(o.token);
+        }
+        out
+    }
+
+    fn speculative(req: &ChatGenerateRequest, prompt: &[u32], max: usize, k: usize) -> Vec<u32> {
+        let tk = tokenizer();
+        let mut s = ChatSampler::for_request(req, &tk, &[EOS], max).unwrap();
+        let mut hist = prompt.to_vec();
+        let mut out = Vec::new();
+        let mut pending = vec![SamplerPick(&mut s).target(&[], &target(&hist)).unwrap()];
+        loop {
+            for tok in pending.drain(..) {
+                if tok == EOS || out.len() >= max {
+                    return out;
+                }
+                assert!(s.commit_greedy(tok), "token {tok} left the grammar");
+                out.push(tok);
+                hist.push(tok);
+            }
+            let mut drafts = Vec::new();
+            for _ in 0..k {
+                let h: Vec<u32> = hist.iter().chain(&drafts).copied().collect();
+                let d = SamplerPick(&mut s).draft(&drafts, &drafter(&h));
+                drafts.push(d);
+            }
+            let rows: Vec<f32> = (0..=k)
+                .flat_map(|r| {
+                    let h: Vec<u32> = hist.iter().chain(&drafts[..r]).copied().collect();
+                    target(&h)
+                })
+                .collect();
+            let (a, bonus) = accept_drafts(&mut SamplerPick(&mut s), &drafts, &rows, VOCAB).unwrap();
+            pending = drafts[..a].to_vec();
+            pending.push(bonus);
+        }
+    }
+
+    #[test]
+    fn grammar_plus_speculation_emits_exactly_the_non_speculative_greedy_tokens() {
+        let specs = [
+            nv_grammar::GrammarSpec::JsonSchema(serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"type": "integer", "minimum": 1, "maximum": 2}, "b": {"type": "boolean"}},
+                "required": ["a"]
+            })),
+            nv_grammar::GrammarSpec::JsonSchema(serde_json::json!({"type": "object"})),
+            nv_grammar::GrammarSpec::JsonSchema(serde_json::json!({"type": "array", "items": {"enum": [1, 2, "x"]}, "maxItems": 4})),
+            nv_grammar::GrammarSpec::Regex(nv_grammar::choice_to_regex(&["true".into(), "false".into()])),
+        ];
+        let mut compared = 0;
+        for spec in specs {
+            for think in [false, true] {
+                for seed in 0u32..12 {
+                    let prompt = vec![seed % 15, (seed * 7) % 15];
+                    let max = 48;
+                    let req = request(spec.clone(), think, max);
+                    let want = plain(&req, &prompt, max);
+                    for k in [1, 2, 3] {
+                        assert_eq!(speculative(&req, &prompt, max, k), want, "{spec:?} think={think} seed={seed} k={k}");
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 4 * 2 * 12 * 3);
+    }
+
+    #[test]
+    fn the_thought_before_the_close_marker_is_free_and_every_request_starts_from_a_fresh_grammar() {
+        let spec = nv_grammar::GrammarSpec::Regex(nv_grammar::choice_to_regex(&["true".into()]));
+        let req = request(spec, true, 600);
+        let out = plain(&req, &[3, 4], 600);
+        let close = out.iter().position(|&t| t == CLOSE).expect("the budget forces the close");
+        assert!(
+            out[..close].iter().any(|&t| t != 9),
+            "the reasoning is free text: tokens the grammar would forbid appear before </think>"
+        );
+        assert_eq!(close, 600 - GUIDED_THINK_TAIL_RESERVE, "the free budget is max_new minus the tail reserve");
+        let answer: String = out[close + 1..].iter().map(|&t| WORDS[t as usize]).collect();
+        assert_eq!(answer, "true", "after </think> only the grammar's answer follows");
+        assert_eq!(speculative(&req, &[3, 4], 600, 2), out);
+        {
+            let spec = nv_grammar::GrammarSpec::JsonSchema(serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}));
+            let req = request(spec, false, 32);
+            let first = speculative(&req, &[1, 2], 32, 2);
+            let again = speculative(&req, &[1, 2], 32, 2);
+            assert_eq!(first, again);
+            let text: String = first.iter().map(|&t| tokenizer().id_to_token(t).unwrap()).collect();
+            assert!(serde_json::from_str::<serde_json::Value>(&text).unwrap()["a"].is_i64(), "{text}");
+        }
+    }
+
 }

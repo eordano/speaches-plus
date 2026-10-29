@@ -22,7 +22,7 @@ Canonical references, in order of authority:
   on Apple silicon.** How to run LLMs well on the M2 Ultra: the crossover
   rule that decides whether fewer bits is actually faster (here it usually
   is not -- int8 beats every 4-bit kernel in the survey, and the 31B got
-  1.96x faster by reading 43.5% *more* bytes), why our own per-dispatch
+  1.96x faster by reading 43.5% more bytes), why our own per-dispatch
   profiler overstates small passes ~10x and once invented a 154 ms/token
   overhead that did not exist, the standing list of "obviously better"
   changes that measured worse, the kernel rules, the per-token cost model
@@ -42,7 +42,7 @@ Canonical references, in order of authority:
   normative PRD.
 - [`docs/book/07.1-barge-turn-spec-rfc-v3.md`](docs/book/07.1-barge-turn-spec-rfc-v3.md) --
   the normative realtime protocol spec.
-- [`CLAUDE.md`](CLAUDE.md) -- working conventions and operational
+- [`AGENTS.md`](AGENTS.md) -- working conventions and operational
   gotchas for this machine.
 
 ## API surface
@@ -55,10 +55,11 @@ Canonical references, in order of authority:
 | Audio | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations`, `/v1/audio/embeddings`, `/v1/audio/diarization`, `/v1/voice-profiles` |
 | Vision | `/v1/ocr` |
 | PII | `/v1/pii/classify`, `/v1/pii/classify/batch`, `/v1/pii/redact/analyze`, `/v1/pii/redact/render` |
+| System One | `/v1/systemone` (TypeSafe Jev wire contract over the Laya checkpoints), `/v1/systemone/detailed`, `/v1/systemone/presets` |
 | Realtime | `/v1/realtime` (WebRTC), `/v1/realtime/capabilities`, `/v1/inspect/sessions`, `/v1/inspect/sessions/history` |
 
 Those 23 are the OpenAI/Anthropic-shaped surface, not the whole surface:
-the binary mounts **35 distinct paths / 40 method+path pairs**. The rest are
+the binary mounts 35 distinct paths / 40 method+path pairs. The rest are
 operational or non-OpenAI -- `/health`, `/health/ready`, `/health/sessions`,
 `/version`, `/metrics`, `/v1/internal/chat-engines`,
 `/v1/voice-profiles/{name}`, three more `/v1/inspect/*` paths, and the
@@ -73,8 +74,8 @@ Apple-silicon measured matrix.
 
 ## Engine
 
-- **Backends.** `nv-layers::backend::BackendKind` has three: **Cuda**,
-  **Wgpu**, **Cpu**. CUDA is the mature path -- graph capture, paged KV,
+- Backends. `nv-layers::backend::BackendKind` has three: Cuda,
+  Wgpu, Cpu. CUDA is the mature path -- graph capture, paged KV,
   speculative decoding all live there. The wgpu path is real and serves
   chat with coherent output on five checkpoints across four model graphs
   (Gemma4-E4B bf16 and qat-w4a16-ct, Gemma4-31B-NVFP4, Qwen3.6-35B-A3B-NVFP4,
@@ -83,26 +84,26 @@ Apple-silicon measured matrix.
   newer and less proven ([`docs/book/05.1-wgpu-status.md`](docs/book/05.1-wgpu-status.md)).
   Backend selection is `NV_SERVE_BACKEND=cuda|wgpu|auto`; `auto` is
   cuda-first and only falls back to wgpu when CUDA reports a concrete
-  reason it cannot serve the model. The **`metal` cargo feature is real**
+  reason it cannot serve the model. The `metal` cargo feature is real
   -- wired through `candle-core/metal` in eight crates plus the binary, and
   the whole Apple-silicon serving surface runs on it; Metal compute reaches
   the GPU through wgpu/WGSL, so `nv-kernels`' own `metal` feature is an
   empty stub (there are no in-tree `.metal` kernels). `rocm` is a stub
   everywhere.
-- **Quantization.** NVFP4 (e2m1 values + ue4m3 block scales, group 16),
+- Quantization. NVFP4 (e2m1 values + ue4m3 block scales, group 16),
   MXFP4 (group 32, e8m0 scales), FP8 e4m3, int8, w4a16/Marlin, bf16.
-- **Speculative decoding.** Eagle3, DFlash, DSpark, MTP, an
+- Speculative decoding. Eagle3, DFlash, DSpark, MTP, an
   ngram/suffix-automaton drafter, and a chain speculative loop on wgpu.
-  On wgpu/Metal it is measured as a **net loss** and gates itself off --
+  On wgpu/Metal it is measured as a net loss and gates itself off --
   `verify_chain` costs 2-5x a decode step, so break-even needs tau~2-7
   while the best drafter reaches 1.55-1.73
   ([`docs/book/05.6-macos-port-status.md`](docs/book/05.6-macos-port-status.md)).
-- **OCR.** A classical CPU pipeline (`nv-ocr`) plus DeepSeek-OCR-2,
+- OCR. A classical CPU pipeline (`nv-ocr`) plus DeepSeek-OCR-2,
   both served at `/v1/ocr` ([`docs/book/06.3-ocr.md`](docs/book/06.3-ocr.md)).
-- **Diarization.** DiariZen segmentation + WeSpeaker ResNet293-LM
+- Diarization. DiariZen segmentation + WeSpeaker ResNet293-LM
   embeddings + online cosine clustering, at `/v1/audio/diarization`,
   as `response_format=diarized_json` on transcriptions, and as realtime
-  data-channel events. **The segmentation ONNX is not shipped** -- until
+  data-channel events. The segmentation ONNX is not shipped -- until
   `rust/scripts/export-diarizen-onnx.py` has been run, `/v1/audio/diarization`
   answers `503 model_not_loaded` (correctly) and `diarized_json` returns
   every `speaker` as `null` with no failure signal (a real defect, tracked
@@ -120,12 +121,12 @@ documents as unverified.
 
 ## Building and testing
 
-**Always build through `rust/scripts/nvk.sh`.** It owns the nix
+Always build through `rust/scripts/nvk.sh`. It owns the nix
 devshell (cached `nix print-dev-env`, so `.cu` files are not recompiled
 on every invocation), `TMPDIR`, `CUDA_ARCH_LIST`, a per-lane
 `CARGO_TARGET_DIR`, and parity-gate env. Bare `cargo` or ad-hoc
 `nix develop --command cargo` invocations are slower and subtly
-different; see `CLAUDE.md` for the full rationale.
+different; see `AGENTS.md` for the full rationale.
 
 ```sh
 # default: cuda,wgpu features, nv-kernels package
@@ -235,8 +236,8 @@ speaches-plus/
 
 ## License
 
-Source code: **AGPL-3.0-or-later** (see [`LICENSE`](LICENSE)), except
-`python/`, which derives from upstream speaches and stays **Apache-2.0**
+Source code: AGPL-3.0-or-later (see [`LICENSE`](LICENSE)), except
+`python/`, which derives from upstream speaches and stays Apache-2.0
 (see [`python/LICENSE`](python/LICENSE)).
 
 Model weights are governed by their own licenses -- see

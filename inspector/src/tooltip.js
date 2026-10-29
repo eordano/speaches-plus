@@ -19,7 +19,6 @@ export function setupTooltip({ store }) {
     if (p.text)  rows.push(['text',  String(p.text)]);
     if (p.delta) rows.push(['delta', String(p.delta)]);
 
-    // Cumulative LLM text up to this chunk/done/cancelled.
     if (e.lane === 'llm' && (e.kind === 'chunk' || e.kind === 'done' || e.kind === 'cancelled')) {
       const rid = e.corr?.response_id;
       let cumm = '';
@@ -32,7 +31,6 @@ export function setupTooltip({ store }) {
       if (cumm) rows.push([e.kind === 'chunk' ? 'cumm' : 'text', cumm]);
     }
 
-    // All phrases for a completed/cancelled response.
     if (e.lane === 'response' && (e.kind === 'done' || e.kind === 'cancelled')) {
       const rid = e.corr?.response_id;
       const phrases = [];

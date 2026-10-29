@@ -122,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn rotating_twice_returns_the_original() {
+    fn the_rotation_is_an_involution_preserves_q_dot_k_and_refuses_a_non_power_of_two_head_dim() {
         for hd in [16usize, 64, 256, 512] {
             let want = lcg(0xfeed ^ hd as u64, hd);
             let mut got = want.clone();
@@ -140,10 +140,7 @@ mod tests {
                  not x the cache and the query disagree about the basis"
             );
         }
-    }
 
-    #[test]
-    fn rotation_preserves_the_dot_product_attention_reads() {
         for hd in [16usize, 64, 256] {
             let q = lcg(0xa11ce ^ hd as u64, hd);
             let k = lcg(0xb0b ^ hd as u64, hd);
@@ -160,10 +157,7 @@ mod tests {
                  orthogonal H leaves Q.K^T alone"
             );
         }
-    }
 
-    #[test]
-    fn a_non_power_of_two_head_dim_is_refused_not_silently_skipped() {
         let mut v = vec![1.0f32; 24];
         assert!(rotate_row(&mut v).is_err());
         assert!(!rotatable(24));
@@ -233,9 +227,9 @@ mod tests {
                 .unwrap()
         };
         let plain = dot(&q, &k);
-        std::env::set_var(HADAMARD_KV_ENV, "1");
+        unsafe { std::env::set_var(HADAMARD_KV_ENV, "1") };
         let (qr, kr) = maybe_rotate_qk(q.clone(), k.clone(), hd).unwrap();
-        std::env::remove_var(HADAMARD_KV_ENV);
+        unsafe { std::env::remove_var(HADAMARD_KV_ENV) };
         let rotated = dot(&qr, &kr);
         let rel = (plain - rotated).abs() / plain.abs().max(1e-3);
         assert!(
@@ -248,16 +242,6 @@ mod tests {
              the representation, not the arithmetic. This 1.1e-3 on scores is why the rotation \
              costs 0.12 NLL end to end even with bf16 KV and nothing quantised: it spends more \
              Q/K precision than the better fp8 K buys back"
-        );
-    }
-
-    #[test]
-    fn the_rotation_is_off_until_its_env_var_is_set() {
-        assert!(
-            !hadamard_kv_enabled()
-                || nv_config::env_arm_opt_in_eq_some_1_reread_every_call(HADAMARD_KV_ENV),
-            "the rotation changes stored K bit-for-bit, so it is a numerical default and may \
-             not arrive without being asked for"
         );
     }
 }

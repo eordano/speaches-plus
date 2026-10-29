@@ -11,8 +11,8 @@ Usage:
         models/diarizen-large-s80-v2 \
         models/diarizen-segmentation.onnx
 
-Requirements (one-time, in a Python venv):
-    pip install torch torchaudio diarizen toml
+Requirements (one-time, in a uv venv):
+    uv venv && uv pip install torch torchaudio diarizen toml
 
 License notes:
     Code: MIT. Weights: CC-BY-NC-4.0 -- see models/diarizen-large-s80-v2/MODEL_LICENSE
@@ -49,7 +49,7 @@ def main() -> int:
         from diarizen.models.eend.model_wavlm_conformer import Model as DiariZenModel
     except ImportError as e:
         print(f"missing dependency: {e}", file=sys.stderr)
-        print("install: pip install torch torchaudio diarizen toml", file=sys.stderr)
+        print("install: uv pip install torch torchaudio diarizen toml", file=sys.stderr)
         return 2
 
     config_path = args.model_dir / "config.toml"

@@ -25,13 +25,11 @@ function loadHidden() {
 
 export function createStore() {
   const state = {
-    // Session identity + connection state.
     sessionId: null,
-    sessionStartMs: 0,           // monotonic anchor, set from first event's ts_mono_ns
+    sessionStartMs: 0,
     mode: 'replay',              // 'live' | 'replay' | 'paused'
     wsAlive: false,
 
-    // Event stream and derived data.
     events: [],
     bands: [],
     turns: [],
@@ -39,17 +37,14 @@ export function createStore() {
     ttsChunkRows: 1,
     aliases: { turn: new Map(), item: new Map(), response: new Map(), phrase: new Map() },
 
-    // View state (timeline viewport).
     view: { t0: 0, pxPerMs: 0.25 },
     followTail: true,
     paused: false,
 
-    // Selection / hover.
     selected: null,
     hover: null,
     cursorMs: null,
 
-    // Playback (replay scheduler).
     playback: {
       active: false,
       mode: null,                // 'window' | 'live'
@@ -63,11 +58,9 @@ export function createStore() {
       range: null,               // {t0, t1} highlighted range while playing
     },
 
-    // Persistent UI prefs.
     tweaks: loadTweaks(),
     hiddenLanes: loadHidden(),
 
-    // Detail panel.
     activeTab: 'pretty',         // 'pretty' | 'raw' | 'related'
   };
 

@@ -174,6 +174,3 @@ def _choice_grammar(choices: list[str]) -> str:
         raise ValueError("guided_choice cannot be empty")
     alternatives = " | ".join(json.dumps(choice) for choice in choices)
     return f'root ::= {alternatives}'
-
-def has_xgrammar() -> bool:
-    return _HAS_XGRAMMAR

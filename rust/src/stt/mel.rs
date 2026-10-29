@@ -97,22 +97,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pad_short_audio() {
+    fn pad_or_truncate_to_30s_pads_short_and_truncates_long_audio() {
         let p = pad_or_truncate_to_30s(&[1.0, 2.0, 3.0]);
         assert_eq!(p.len(), TARGET_SAMPLES);
         assert_eq!(&p[..3], &[1.0, 2.0, 3.0]);
         assert_eq!(p[3], 0.0);
+        {
+            let big = vec![1.0_f32; TARGET_SAMPLES + 100];
+            let p = pad_or_truncate_to_30s(&big);
+            assert_eq!(p.len(), TARGET_SAMPLES);
+        }
     }
 
     #[test]
-    fn truncate_long_audio() {
-        let big = vec![1.0_f32; TARGET_SAMPLES + 100];
-        let p = pad_or_truncate_to_30s(&big);
-        assert_eq!(p.len(), TARGET_SAMPLES);
-    }
-
-    #[test]
-    fn mel_shape_for_80() {
+    fn mel_shape_matches_for_80_and_128_bins() {
         let m = WhisperMel::new(80);
         let audio = vec![0.1_f32; TARGET_SAMPLES];
         let mel = m.log_mel(&audio);
@@ -120,13 +118,12 @@ mod tests {
         for v in &mel {
             assert!(v.is_finite());
         }
+        {
+            let m = WhisperMel::new(128);
+            let audio = vec![0.0_f32; TARGET_SAMPLES];
+            let mel = m.log_mel(&audio);
+            assert_eq!(mel.len(), 128 * N_FRAMES);
+        }
     }
 
-    #[test]
-    fn mel_shape_for_128() {
-        let m = WhisperMel::new(128);
-        let audio = vec![0.0_f32; TARGET_SAMPLES];
-        let mel = m.log_mel(&audio);
-        assert_eq!(mel.len(), 128 * N_FRAMES);
-    }
 }

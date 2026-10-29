@@ -11,10 +11,9 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
   const stDropped= document.getElementById('stDropped');
   const tlCanvas = document.getElementById('tlCanvas');
 
-  // ── timeline mouse: pan, click-to-select, hover, scrub ─────────────────
   let dragging = false;
   let dragLast = 0;
-  let selDrag  = null;       // {startMs} for shift-drag range select
+  let selDrag  = null;
   let playheadDrag = false;
 
   wrap.addEventListener('wheel', (e) => {
@@ -36,7 +35,6 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
     const py = e.clientY - r.top;
     const tMs = timeline.pxToMs(px);
 
-    // Scrub the playhead during active playback.
     const pb = store.state.playback;
     if (pb.active && pb.playheadMs != null) {
       const phPx = timeline.msToPx(pb.playheadMs);
@@ -74,7 +72,6 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
     const px = e.clientX - r.left;
     const py = e.clientY - r.top;
 
-    // Playhead scrubbing.
     if (playheadDrag) {
       const ph = Math.max(0, timeline.pxToMs(px));
       store.setPlayback({
@@ -85,7 +82,6 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
       return;
     }
 
-    // Range selection (shift-drag).
     if (selDrag) {
       const tMs = timeline.pxToMs(px);
       store.setPlayback({
@@ -94,14 +90,12 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
       return;
     }
 
-    // Plain drag pans the view.
     if (dragging) {
       timeline.panBy(e.clientX - dragLast);
       dragLast = e.clientX;
       return;
     }
 
-    // Hover -> tooltip + cursor.
     if (px < 0 || py < 0 || px > r.width || py > r.height) {
       if (store.state.hover || store.state.cursorMs != null) {
         store.setHover(null);
@@ -141,7 +135,6 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
     }
   });
 
-  // ── lane gutter clicks: toggle visibility / dblclick-jump ──────────────
   gutter.addEventListener('click', (e) => {
     const lbl = e.target.closest('.lane-label');
     if (!lbl) return;
@@ -157,7 +150,6 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
     if (next) store.setSelection(next);
   });
 
-  // ── minimap: click + drag jumps the viewport ───────────────────────────
   let mmDragging = false;
   function mmJump(px) {
     const events = store.state.events;
@@ -181,7 +173,6 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
   });
   window.addEventListener('mouseup', () => { mmDragging = false; });
 
-  // ── keyboard ───────────────────────────────────────────────────────────
   function turnEnds() {
     return store.state.events
       .filter(e => e.lane === 'turn' && e.kind === 'turn_end')
@@ -198,7 +189,6 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
     timeline.centerOn(target);
   }
 
-  // Space conductor (matches the topbar Play button).
   function handleSpace() {
     const s = store.state;
     if (s.followTail) {
@@ -229,7 +219,6 @@ export function setupInteractions({ store, timeline, audio, tooltip }) {
     if (e.key === '.') { timeline.panBy(-60); return; }
   });
 
-  // ── status bar updates ─────────────────────────────────────────────────
   store.subscribe('events', () => {
     if (stEvents)  stEvents.textContent  = store.state.events.length;
     if (stSeq)     stSeq.textContent     = store.state.events.length ? store.state.events[store.state.events.length - 1].seq : '--';

@@ -10,10 +10,8 @@ pub struct GqaSdpaRecomputePerKvHeadGroup {
     pub head_dim: usize,
     pub seq: usize,
     pub window: Option<usize>,
+    pub serial_kv_groups: bool,
 }
-
-pub const NV_TRAIN_ATTN_FUSED_SOFTMAX_DEFAULT_ON_0_RESTORES_THE_F32_CANDLE_SOFTMAX_AND_F32_GEMMS: &str =
-    "NV_TRAIN_ATTN_FUSED_SOFTMAX";
 
 pub const GQA_SDPA_RECOMPUTE_KEEPS_ONLY_Q_K_V_AND_O_ON_THE_GRAPH_AND_REBUILDS_THE_PROBABILITIES_IN_THE_BACKWARD: &str =
     "the naive training attention held f32 q, K/V expanded to every query head and three T x T score \
@@ -56,6 +54,107 @@ fn causal_window_mask(
 }
 
 impl GqaSdpaRecomputePerKvHeadGroup {
+    fn one_group(&self) -> Self {
+        Self {
+            batch: 1,
+            n_q: self.group(),
+            n_kv: 1,
+            head_dim: self.head_dim,
+            seq: self.seq,
+            window: self.window,
+            serial_kv_groups: false,
+        }
+    }
+
+    fn group_slice(&self, x: &Tensor, batch: usize, head: usize, heads: usize) -> Result<Tensor> {
+        Ok(x.narrow(0, batch, 1)?
+            .narrow(2, head, heads)?
+            .contiguous()?)
+    }
+
+    fn forward_serial(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        let mut op = self.one_group();
+        op.n_q = 1;
+        let mut batches = Vec::with_capacity(self.batch);
+        for b in 0..self.batch {
+            let mut heads = Vec::with_capacity(self.n_q);
+            for h in 0..self.n_kv {
+                let key = self.group_slice(k, b, h, 1)?;
+                let value = self.group_slice(v, b, h, 1)?;
+                for query in h * self.group()..(h + 1) * self.group() {
+                    heads.push(op.forward_detached(
+                        &self.group_slice(q, b, query, 1)?,
+                        &key,
+                        &value,
+                    )?);
+                }
+            }
+            batches.push(Tensor::cat(&heads, 2)?);
+        }
+        Ok(Tensor::cat(&batches, 0)?)
+    }
+
+    fn backward_serial(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        out: &Tensor,
+        dout: &Tensor,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let mut op = self.one_group();
+        op.n_q = 1;
+        let mut batches: [Vec<Tensor>; 3] = std::array::from_fn(|_| Vec::with_capacity(self.batch));
+        for b in 0..self.batch {
+            let mut groups: [Vec<Tensor>; 3] =
+                std::array::from_fn(|_| Vec::with_capacity(self.n_kv));
+            for h in 0..self.n_kv {
+                let key = self.group_slice(k, b, h, 1)?.to_dtype(DType::F32)?;
+                let value = self.group_slice(v, b, h, 1)?.to_dtype(DType::F32)?;
+                let mut queries = Vec::with_capacity(self.group());
+                let mut dk_sum: Option<Tensor> = None;
+                let mut dv_sum: Option<Tensor> = None;
+                for query in h * self.group()..(h + 1) * self.group() {
+                    let (dq, dk, dv) = op.backward_detached(
+                        &self.group_slice(q, b, query, 1)?,
+                        &key,
+                        &value,
+                        &self.group_slice(out, b, query, 1)?,
+                        &self.group_slice(dout, b, query, 1)?,
+                    )?;
+                    queries.push(dq);
+                    dk_sum = Some(match dk_sum {
+                        Some(sum) => sum.add(&dk)?,
+                        None => dk,
+                    });
+                    dv_sum = Some(match dv_sum {
+                        Some(sum) => sum.add(&dv)?,
+                        None => dv,
+                    });
+                }
+                groups[0].push(Tensor::cat(&queries, 2)?);
+                groups[1].push(
+                    dk_sum
+                        .ok_or_else(|| anyhow::anyhow!("missing key gradient"))?
+                        .to_dtype(k.dtype())?,
+                );
+                groups[2].push(
+                    dv_sum
+                        .ok_or_else(|| anyhow::anyhow!("missing value gradient"))?
+                        .to_dtype(v.dtype())?,
+                );
+            }
+            for (batch, group) in batches.iter_mut().zip(groups) {
+                batch.push(Tensor::cat(&group, 2)?);
+            }
+        }
+        Ok((
+            Tensor::cat(&batches[0], 0)?,
+            Tensor::cat(&batches[1], 0)?,
+            Tensor::cat(&batches[2], 0)?,
+        ))
+    }
+
     fn group(&self) -> usize {
         self.n_q / self.n_kv
     }
@@ -111,15 +210,16 @@ impl GqaSdpaRecomputePerKvHeadGroup {
         Ok(candle_nn::ops::softmax_last_dim(&scores)?.reshape((bn, gt, t))?)
     }
 
+    #[cfg(feature = "cuda")]
     fn q_grouped_keep_dtype(&self, q: &Tensor) -> Result<Tensor> {
         let (b, t, g, d) = (self.batch, self.seq, self.group(), self.head_dim);
-        Ok(q
-            .reshape((b, t, self.n_kv, g, d))?
+        Ok(q.reshape((b, t, self.n_kv, g, d))?
             .permute((0, 2, 3, 1, 4))?
             .contiguous()?
             .reshape((b * self.n_kv, g * t, d))?)
     }
 
+    #[cfg(feature = "cuda")]
     fn kv_grouped_keep_dtype(&self, kv: &Tensor) -> Result<Tensor> {
         let (b, t, d) = (self.batch, self.seq, self.head_dim);
         Ok(kv
@@ -131,11 +231,7 @@ impl GqaSdpaRecomputePerKvHeadGroup {
 
     #[cfg(feature = "cuda")]
     fn fused_softmax_serves(&self, k: &Tensor) -> bool {
-        std::env::var(NV_TRAIN_ATTN_FUSED_SOFTMAX_DEFAULT_ON_0_RESTORES_THE_F32_CANDLE_SOFTMAX_AND_F32_GEMMS)
-            .as_deref()
-            != Ok("0")
-            && k.dtype() == DType::BF16
-            && matches!(k.device(), candle_core::Device::Cuda(_))
+        k.dtype() == DType::BF16 && k.device().is_cuda()
     }
 
     #[cfg(feature = "cuda")]
@@ -272,6 +368,9 @@ impl GqaSdpaRecomputePerKvHeadGroup {
     }
 
     pub fn forward_detached(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        if self.serial_kv_groups {
+            return self.forward_serial(q, k, v);
+        }
         #[cfg(feature = "cuda")]
         let _span = match q.device() {
             candle_core::Device::Cuda(d) => crate::prof_events::span(
@@ -299,6 +398,9 @@ impl GqaSdpaRecomputePerKvHeadGroup {
         out: &Tensor,
         dout: &Tensor,
     ) -> Result<(Tensor, Tensor, Tensor)> {
+        if self.serial_kv_groups {
+            return self.backward_serial(q, k, v, out, dout);
+        }
         #[cfg(feature = "cuda")]
         if self.fused_softmax_serves(k) {
             return self.backward_detached_fused(q, k, v, out, dout);
@@ -439,7 +541,6 @@ impl CustomOp3 for GqaSdpaRecomputePerKvHeadGroup {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn gqa_sdpa_recompute(
     q: &Tensor,
     k: &Tensor,
@@ -450,6 +551,23 @@ pub fn gqa_sdpa_recompute(
     head_dim: usize,
     seq: usize,
     window: Option<usize>,
+) -> Result<Tensor> {
+    gqa_sdpa_recompute_with_group_serialization(
+        q, k, v, batch, n_q, n_kv, head_dim, seq, window, false,
+    )
+}
+
+pub fn gqa_sdpa_recompute_with_group_serialization(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    batch: usize,
+    n_q: usize,
+    n_kv: usize,
+    head_dim: usize,
+    seq: usize,
+    window: Option<usize>,
+    serial_kv_groups: bool,
 ) -> Result<Tensor> {
     anyhow::ensure!(
         n_kv > 0 && n_q % n_kv == 0,
@@ -469,6 +587,7 @@ pub fn gqa_sdpa_recompute(
         head_dim,
         seq,
         window,
+        serial_kv_groups,
     };
     Ok(q.contiguous()?
         .apply_op3(&k.contiguous()?, &v.contiguous()?, op)?)

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use nv_layers::linear::Linear;
 use nv_layers::norm::RmsNorm;
@@ -86,7 +86,7 @@ impl Gemma4MoeConfig {
     pub fn from_hf_json_str(s: &str) -> Result<Self> {
         let base = Gemma4Config::from_hf_json_str(s)?;
         if !base.enable_moe_block {
-            anyhow::bail!("gemma4-moe: config has enable_moe_block=false");
+            bail!("gemma4-moe: config has enable_moe_block=false");
         }
         let v: serde_json::Value = serde_json::from_str(s).context("parse gemma4 moe config")?;
         let text = v.get("text_config").unwrap_or(&v);
@@ -103,7 +103,7 @@ impl Gemma4MoeConfig {
             moe_intermediate_size: get_u("moe_intermediate_size")?,
         };
         if cfg.top_k_experts == 0 || cfg.top_k_experts > cfg.num_experts {
-            anyhow::bail!(
+            bail!(
                 "gemma4-moe: top_k_experts {} invalid for num_experts {}",
                 cfg.top_k_experts,
                 cfg.num_experts
@@ -190,7 +190,7 @@ impl Gemma4MoeBlock {
         let t0 = std::time::Instant::now();
         let in_dims = x_router.dims().to_vec();
         if *in_dims.last().unwrap() != self.hidden_size {
-            anyhow::bail!(
+            bail!(
                 "Gemma4MoeBlock: router last dim {} != hidden_size {}",
                 in_dims.last().unwrap(),
                 self.hidden_size
@@ -242,7 +242,7 @@ impl Gemma4MoeBlock {
         let t0 = std::time::Instant::now();
         let in_dims = x.dims().to_vec();
         if *in_dims.last().unwrap() != self.hidden_size {
-            anyhow::bail!(
+            bail!(
                 "Gemma4MoeBlock: last dim {} != hidden_size {}",
                 in_dims.last().unwrap(),
                 self.hidden_size
@@ -456,7 +456,7 @@ impl Gemma4Moe {
             .with_context(|| format!("load {embed_name}"))?;
         let embed_dims = embed_weight.dims();
         if embed_dims != [base.vocab_size, base.hidden_size] {
-            anyhow::bail!(
+            bail!(
                 "gemma4-moe embed: expected [{}, {}], got {:?}",
                 base.vocab_size,
                 base.hidden_size,
@@ -537,6 +537,15 @@ impl Gemma4Moe {
             .0)
     }
 
+    pub fn forward_with_cache_hidden<C: Gemma4Cache>(
+        &self,
+        tokens: &Tensor,
+        positions: &Tensor,
+        cache: &mut C,
+    ) -> Result<(Tensor, Tensor)> {
+        self.forward_with_cache_body(tokens, positions, cache, None)
+    }
+
     pub fn forward_with_cache_embeds<C: Gemma4Cache>(
         &self,
         tokens: &Tensor,
@@ -549,17 +558,6 @@ impl Gemma4Moe {
             .0)
     }
 
-    pub fn forward_with_cache_prenorm_hidden_the_row_the_gemma4_assistant_drafter_consumes<
-        C: Gemma4Cache,
-    >(
-        &self,
-        tokens: &Tensor,
-        positions: &Tensor,
-        cache: &mut C,
-    ) -> Result<(Tensor, Tensor)> {
-        self.forward_with_cache_body(tokens, positions, cache, None)
-    }
-
     fn forward_with_cache_body<C: Gemma4Cache>(
         &self,
         tokens: &Tensor,
@@ -569,11 +567,11 @@ impl Gemma4Moe {
     ) -> Result<(Tensor, Tensor)> {
         let dims = tokens.dims();
         if dims.len() != 2 || dims[0] != 1 {
-            anyhow::bail!("Gemma4Moe.forward: tokens must be [1, seq], got {:?}", dims);
+            bail!("Gemma4Moe.forward: tokens must be [1, seq], got {:?}", dims);
         }
         let seq = dims[1];
         if positions.dims() != [seq] {
-            anyhow::bail!(
+            bail!(
                 "Gemma4Moe.forward: positions must be [{}], got {:?}",
                 seq,
                 positions.dims()
@@ -627,7 +625,45 @@ impl Gemma4Moe {
         Ok((logits, hidden))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    pub fn residual_rows_after_layer<C: Gemma4Cache>(
+        &self,
+        tokens: &Tensor,
+        positions: &Tensor,
+        cache: &mut C,
+        layer: usize,
+    ) -> Result<Tensor> {
+        let base = &self.config.base;
+        anyhow::ensure!(
+            layer < self.layers.len(),
+            "capture layer {layer} out of range for {} blocks",
+            self.layers.len()
+        );
+        let dims = tokens.dims();
+        anyhow::ensure!(
+            dims.len() == 2 && dims[0] == 1,
+            "Gemma4Moe capture: tokens must be [1, seq], got {dims:?}"
+        );
+        let seq = dims[1];
+        let tokens_flat = tokens.flatten_all()?.to_dtype(DType::U32)?;
+        let mut hidden = self
+            .embed_weight
+            .index_select(&tokens_flat, 0)?
+            .reshape((1usize, seq, base.hidden_size))?
+            .to_dtype(self.dtype)?
+            .affine(self.embed_scale as f64, 0.0)?;
+        let write_start = cache.current_len();
+        let new_total = write_start + seq;
+        cache.prepare_for_decode(write_start, new_total)?;
+        for li in 0..=layer {
+            hidden =
+                self.layer_forward(li, &hidden, positions, cache, seq, write_start, new_total)?;
+        }
+        cache.advance(seq);
+        Ok(hidden
+            .reshape((seq, base.hidden_size))?
+            .to_dtype(DType::F32)?)
+    }
+
     fn layer_forward<C: Gemma4Cache>(
         &self,
         idx: usize,
@@ -667,7 +703,6 @@ impl Gemma4Moe {
             .affine(layer.layer_scalar_host as f64, 0.0)?)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn attention_forward<C: Gemma4Cache>(
         &self,
         layer_idx: usize,
@@ -755,13 +790,6 @@ pub const GEMMA4_KV_CACHE_WRITE_AT_USES_SLICE_SET_WHICH_COPIES_INTO_A_PREALLOCAT
      this step's gradient. Serving never takes it: on an untracked k the view is returned \
      unchanged, so the decoder reads the same tensor it always did.";
 
-fn a_gradient_is_being_built_through_this_kv_write(k_new: &Tensor) -> bool {
-    if !k_new.track_op() {
-        return false;
-    }
-    std::env::var("NV_ALLOW_LEAF_GRADIENT_LOSS").ok().as_deref() != Some("1")
-}
-
 pub fn kv_that_keeps_this_steps_own_keys_and_values_on_the_graph(
     k_view: &Tensor,
     v_view: &Tensor,
@@ -769,13 +797,13 @@ pub fn kv_that_keeps_this_steps_own_keys_and_values_on_the_graph(
     v_new: &Tensor,
     seq: usize,
 ) -> Result<(Tensor, Tensor)> {
-    if !a_gradient_is_being_built_through_this_kv_write(k_new) {
+    if !k_new.track_op() {
         let _ = GEMMA4_KV_CACHE_WRITE_AT_USES_SLICE_SET_WHICH_COPIES_INTO_A_PREALLOCATED_BUFFER_IN_PLACE_SO_THE_VIEW_IT_HANDS_BACK_IS_A_GRAPH_LEAF_AND_K_AND_V_WOULD_NOT_TRAIN;
         return Ok((k_view.clone(), v_view.clone()));
     }
     let stored = k_view.dims()[1];
     if stored < seq {
-        anyhow::bail!(
+        bail!(
             "gemma4_moe: the cache view holds {stored} entries but this step wrote {seq}, so the \
              write this splice is meant to keep on the graph is not in the view"
         );
@@ -792,7 +820,6 @@ pub fn kv_that_keeps_this_steps_own_keys_and_values_on_the_graph(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn naive_sdpa(
     q: &Tensor,
     k: &Tensor,
@@ -915,7 +942,7 @@ fn load_layer<S: TensorSource>(
         .get(&format!("{prefix}.layer_scalar"), dtype)
         .with_context(|| format!("load {prefix}.layer_scalar"))?;
     if layer_scalar.dims() != [1] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.layer_scalar expected [1], got {:?}",
             layer_scalar.dims()
         );
@@ -934,7 +961,7 @@ fn load_layer<S: TensorSource>(
             .get(&format!("{prefix}.self_attn.{name}.weight"), dtype)
             .with_context(|| format!("load {prefix}.self_attn.{name}.weight"))?;
         if t.dims() != [out_f, in_f] {
-            anyhow::bail!(
+            bail!(
                 "{prefix}.self_attn.{name}: expected [{out_f}, {in_f}], got {:?}",
                 t.dims()
             );
@@ -974,7 +1001,7 @@ fn load_layer<S: TensorSource>(
     let gate_w = weights.get(&format!("{prefix}.mlp.gate_proj.weight"), dtype)?;
     let up_w = weights.get(&format!("{prefix}.mlp.up_proj.weight"), dtype)?;
     if gate_w.dims() != [inter, hidden] || up_w.dims() != [inter, hidden] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.mlp gate/up: expected [{inter}, {hidden}], got {:?} / {:?}",
             gate_w.dims(),
             up_w.dims()
@@ -982,7 +1009,7 @@ fn load_layer<S: TensorSource>(
     }
     let down_w = weights.get(&format!("{prefix}.mlp.down_proj.weight"), dtype)?;
     if down_w.dims() != [hidden, inter] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.mlp.down_proj: expected [{hidden}, {inter}], got {:?}",
             down_w.dims()
         );
@@ -1026,14 +1053,14 @@ fn load_moe_block<S: TensorSource>(
         .get(&format!("{prefix}.router.proj.weight"), dtype)
         .with_context(|| format!("load {prefix}.router.proj.weight"))?;
     if router_proj_w.dims() != [n_e, hidden] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.router.proj: expected [{n_e}, {hidden}], got {:?}",
             router_proj_w.dims()
         );
     }
     let router_scale = weights.get(&format!("{prefix}.router.scale"), dtype)?;
     if router_scale.dims() != [hidden] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.router.scale: expected [{hidden}], got {:?}",
             router_scale.dims()
         );
@@ -1043,7 +1070,7 @@ fn load_moe_block<S: TensorSource>(
         .flatten_all()?
         .to_vec1::<f32>()?;
     if per_expert_scale.len() != n_e {
-        anyhow::bail!(
+        bail!(
             "{prefix}.router.per_expert_scale: expected [{n_e}], got [{}]",
             per_expert_scale.len()
         );
@@ -1053,7 +1080,7 @@ fn load_moe_block<S: TensorSource>(
         .get(&format!("{prefix}.experts.gate_up_proj"), dtype)
         .with_context(|| format!("load {prefix}.experts.gate_up_proj"))?;
     if gate_up.dims() != [n_e, 2 * inter, hidden] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.experts.gate_up_proj: expected [{n_e}, {}, {hidden}], got {:?}",
             2 * inter,
             gate_up.dims()
@@ -1063,7 +1090,7 @@ fn load_moe_block<S: TensorSource>(
         .get(&format!("{prefix}.experts.down_proj"), dtype)
         .with_context(|| format!("load {prefix}.experts.down_proj"))?;
     if down.dims() != [n_e, hidden, inter] {
-        anyhow::bail!(
+        bail!(
             "{prefix}.experts.down_proj: expected [{n_e}, {hidden}, {inter}], got {:?}",
             down.dims()
         );
@@ -1155,7 +1182,7 @@ pub(crate) fn build_rope(
 impl CausalLm for Gemma4Moe {
     fn forward(&mut self, tokens: &[u32], positions: &[u32]) -> Result<Vec<f32>> {
         if tokens.is_empty() || tokens.len() != positions.len() {
-            anyhow::bail!(
+            bail!(
                 "gemma4-moe CausalLm.forward: tokens len {} positions len {}",
                 tokens.len(),
                 positions.len()
@@ -1174,7 +1201,7 @@ impl CausalLm for Gemma4Moe {
             .flatten_all()?
             .to_vec1::<f32>()?;
         if last.len() != vocab {
-            anyhow::bail!(
+            bail!(
                 "gemma4-moe CausalLm.forward: logits row len {} != vocab {}",
                 last.len(),
                 vocab

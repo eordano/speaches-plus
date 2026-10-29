@@ -31,6 +31,7 @@ fn lgw_moe_router_topk(@builtin(local_invocation_id) lid: vec3<u32>) {
     let n = lgm_p.n_experts;
     if (t < n) {
         var l = bitcast<f32>(lgm_rlogits[t]);
+        #def b1
         if (lgm_p.softcap > 0.0) {
             l = lgm_p.softcap * tanh(l / lgm_p.softcap);
         }
@@ -68,6 +69,7 @@ fn lgw_moe_router_topk(@builtin(local_invocation_id) lid: vec3<u32>) {
 
         let bi = lgm_bx[0];
         if (t == 0u) {
+        #end
             lgm_ids[j] = bi;
             lgm_wts[j] = lgm_sco[bi];
         }
@@ -97,43 +99,7 @@ fn lgw_moe_router_topk_rows(
     let obase = tok * lgm_p.top_k;
     if (t < n) {
         var l = bitcast<f32>(lgm_rlogits[lbase + t]);
-        if (lgm_p.softcap > 0.0) {
-            l = lgm_p.softcap * tanh(l / lgm_p.softcap);
-        }
-        let sc = 1.0 / (1.0 + exp(-l));
-        lgm_sco[t] = sc;
-        lgm_sel[t] = sc + lgm_bias[t];
-    } else {
-        lgm_sco[t] = 0.0;
-        lgm_sel[t] = LGM_NEG_INF;
-    }
-    workgroupBarrier();
-
-    var sum = 0.0;
-    for (var j = 0u; j < lgm_p.top_k; j = j + 1u) {
-        lgm_bv[t] = lgm_sel[t];
-        lgm_bx[t] = t;
-        workgroupBarrier();
-
-        var stride = LGM_WG >> 1u;
-        loop {
-            if (stride == 0u) {
-                break;
-            }
-            if (t < stride) {
-                let ov = lgm_bv[t + stride];
-                let ox = lgm_bx[t + stride];
-                if (ov > lgm_bv[t] || (ov == lgm_bv[t] && ox < lgm_bx[t])) {
-                    lgm_bv[t] = ov;
-                    lgm_bx[t] = ox;
-                }
-            }
-            workgroupBarrier();
-            stride = stride >> 1u;
-        }
-
-        let bi = lgm_bx[0];
-        if (t == 0u) {
+        #use b1
             lgm_ids[obase + j] = bi;
             lgm_wts[obase + j] = lgm_sco[bi];
         }

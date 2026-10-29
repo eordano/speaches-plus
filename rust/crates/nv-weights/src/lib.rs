@@ -1104,34 +1104,6 @@ pub fn recut_shard_name(index: usize, total: usize) -> String {
     format!("recut-{:05}-of-{:05}.safetensors", index + 1, total)
 }
 
-pub fn recut_dir_to_dir(src: &Path, out: &Path, cap_bytes: usize) -> Result<Vec<String>> {
-    let loader = WeightLoader::open_dir(src, &Device::Cpu)?;
-    std::fs::create_dir_all(out).with_context(|| format!("create {}", out.display()))?;
-    let groups = loader.recut_groups(cap_bytes)?;
-    let total = groups.len();
-    let mut names = Vec::with_capacity(total + 2);
-    for (i, g) in groups.iter().enumerate() {
-        let name = recut_shard_name(i, total);
-        let bytes = loader.recut_shard_bytes(g)?;
-        anyhow::ensure!(
-            bytes.len() <= cap_bytes,
-            "recut shard {name} serialized to {} bytes over the {cap_bytes}-byte cap",
-            bytes.len()
-        );
-        std::fs::write(out.join(&name), &bytes)
-            .with_context(|| format!("write {}", out.join(&name).display()))?;
-        names.push(name);
-    }
-    for side in ["config.json", "tokenizer.json"] {
-        let p = src.join(side);
-        if p.is_file() {
-            std::fs::copy(&p, out.join(side)).with_context(|| format!("copy {}", p.display()))?;
-            names.push(side.to_string());
-        }
-    }
-    Ok(names)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    fn i64_roundtrip_through_get() {
+    fn i64_roundtrips_through_get_and_bool_canonicalizes_to_u8() {
         let values: Vec<i64> = vec![0, 1, -1, 42, -42, i64::MAX, i64::MIN];
         let mut payload = Vec::with_capacity(values.len() * 8);
         for v in &values {
@@ -1198,6 +1170,16 @@ mod tests {
         assert_eq!(t.dims(), &[values.len()]);
         let got: Vec<i64> = t.to_vec1().unwrap();
         assert_eq!(got, values);
+
+        let bytes: Vec<u8> = vec![1, 0, 1, 1, 0, 0];
+        let path = write_safetensors_one("t2d", StDtype::BOOL, &[bytes.len()], &bytes);
+        let loader = WeightLoader::open_file(&path, &Device::Cpu).unwrap();
+        assert_eq!(loader.dtype_of("t2d"), Some(DType::U8), "BOOL canonicalizes to U8");
+        let t = loader.get("t2d", DType::U8).expect("get BOOL as U8");
+        assert_eq!(t.dtype(), DType::U8);
+        assert_eq!(t.dims(), &[bytes.len()]);
+        let got: Vec<u8> = t.to_vec1().unwrap();
+        assert_eq!(got, bytes);
     }
 
     fn write_safetensors_many(
@@ -1246,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn fp8_checkpoint_weight_and_input_scales_are_loaded_not_discarded() {
+    fn fp8_checkpoint_scales_are_loaded_broadcast_from_a_scalar_and_canonicalised_or_refused_by_shape() {
         let (out_features, in_features) = (4usize, 8usize);
         let w: Vec<u8> = (0..out_features * in_features)
             .map(|i| (i % 251) as u8)
@@ -1293,10 +1275,7 @@ mod tests {
             Some(row_scales),
             "per-row checkpoint scales must reach the consumer verbatim"
         );
-    }
 
-    #[test]
-    fn fp8_scalar_checkpoint_scale_broadcasts_to_every_output_row() {
         let (out_features, in_features) = (3usize, 4usize);
         let path = write_safetensors_many(
             &[
@@ -1316,12 +1295,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             qw.fp8_weight_scale_rows().unwrap(),
-            Some(vec![0.75; out_features])
+            Some(vec![0.75; out_features]),
+            "a scalar checkpoint scale broadcasts to every output row"
         );
-    }
 
-    #[test]
-    fn fp8_row_scale_canonicalisation_covers_the_shapes_and_rejects_the_rest() {
         assert_eq!(fp8_row_scales_from(&[], &[0.5], 3).unwrap(), vec![0.5; 3]);
         assert_eq!(fp8_row_scales_from(&[1], &[0.5], 3).unwrap(), vec![0.5; 3]);
         assert_eq!(
@@ -1336,122 +1313,55 @@ mod tests {
             fp8_row_scales_from(&[3, 1], &[0.5, 1.0, 2.0], 3).unwrap(),
             vec![0.5, 1.0, 2.0]
         );
-
         let err = fp8_row_scales_from(&[3, 2], &[1.0; 6], 3)
             .unwrap_err()
             .to_string();
         assert!(err.contains("block-wise"), "{err}");
         assert!(fp8_row_scales_from(&[1, 8], &[1.0; 8], 3).is_err());
-
         assert!(fp8_row_scales_from(&[3], &[1.0, 2.0], 3).is_err());
-
         assert!(fp8_row_scales_from(&[3], &[1.0, 0.0, 2.0], 3).is_err());
         assert!(fp8_row_scales_from(&[3], &[1.0, -1.0, 2.0], 3).is_err());
         assert!(fp8_row_scales_from(&[3], &[1.0, f32::NAN, 2.0], 3).is_err());
     }
 
     #[test]
-    fn nvfp4_group_size_16_is_accepted_and_is_the_effective_group_size() {
-        let json = r#"{
-          "quantization_config": {
-            "quant_method": "compressed-tensors",
-            "config_groups": {
-              "group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}
-            }
-          }
-        }"#;
-        let q = QuantizationConfig::from_hf_json_str(json).unwrap();
+    fn quantization_configs_accept_nvfp4_16_and_plain_fp8_and_refuse_other_group_sizes_by_name() {
+        let group = |bits: u32, group_size: &str| -> String {
+            format!(
+                r#"{{"quantization_config": {{"quant_method": "compressed-tensors", "config_groups": {{"group_0": {{"weights": {{"num_bits": {bits}, "type": "float"{group_size}}}}}}}, "ignore": ["lm_head"]}}}}"#
+            )
+        };
+        let q = QuantizationConfig::from_hf_json_str(&group(4, ", \"group_size\": 16")).unwrap();
         assert_eq!(q.scheme, QuantScheme::Nvfp4);
         assert_eq!(q.group_size, Some(16));
         assert_eq!(q.effective_group_size(), Some(NVFP4_GROUP_SIZE));
-    }
-
-    #[test]
-    fn nvfp4_without_a_declared_group_size_falls_back_to_the_implemented_one() {
-        let json = r#"{
-          "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}
-        }"#;
-        let q = QuantizationConfig::from_hf_json_str(json).unwrap();
+        let q = QuantizationConfig::from_hf_json_str(
+            r#"{"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"}}"#,
+        )
+        .unwrap();
         assert_eq!(q.scheme, QuantScheme::Nvfp4);
         assert_eq!(q.group_size, None);
-        assert_eq!(q.effective_group_size(), Some(NVFP4_GROUP_SIZE));
-    }
-
-    #[test]
-    fn nvfp4_group_size_32_is_rejected_rather_than_silently_treated_as_16() {
-        let json = r#"{
-          "quantization_config": {
-            "quant_method": "compressed-tensors",
-            "config_groups": {
-              "group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 32}}
-            }
-          }
-        }"#;
-        let err = QuantizationConfig::from_hf_json_str(json)
-            .expect_err("group_size 32 must not load as NVFP4")
-            .to_string();
-        assert!(err.contains("32"), "{err}");
-        assert!(err.contains("MXFP4"), "{err}");
-        assert!(err.contains(&NVFP4_GROUP_SIZE.to_string()), "{err}");
-    }
-
-    #[test]
-    fn fp8_declared_group_size_is_rejected_rather_than_dropped_on_the_floor() {
-        let json = r#"{
-          "quantization_config": {
-            "quant_method": "compressed-tensors",
-            "config_groups": {
-              "group_0": {"weights": {"num_bits": 8, "type": "float", "group_size": 128}}
-            }
-          }
-        }"#;
-        let err = QuantizationConfig::from_hf_json_str(json)
-            .expect_err("block-wise fp8 must not load as per-tensor fp8")
-            .to_string();
-        assert!(err.contains("128"), "{err}");
-        assert!(err.contains("per output row"), "{err}");
-
-        let modelopt = r#"{
-          "quantization_config": {
-            "quant_method": "modelopt",
-            "quant_algo": "FP8",
-            "config_groups": {"group_0": {"weights": {"group_size": 128}}}
-          }
-        }"#;
-        assert!(QuantizationConfig::from_hf_json_str(modelopt).is_err());
-    }
-
-    #[test]
-    fn plain_fp8_without_a_group_size_still_loads() {
-        let json = r#"{
-          "quantization_config": {
-            "quant_method": "compressed-tensors",
-            "config_groups": {"group_0": {"weights": {"num_bits": 8, "type": "float"}}},
-            "ignore": ["lm_head"]
-          }
-        }"#;
-        let q = QuantizationConfig::from_hf_json_str(json).unwrap();
+        assert_eq!(q.effective_group_size(), Some(NVFP4_GROUP_SIZE), "undeclared falls back to the implemented size");
+        let q = QuantizationConfig::from_hf_json_str(&group(8, "")).unwrap();
         assert_eq!(q.scheme, QuantScheme::Fp8E4m3);
         assert_eq!(q.group_size, None);
         assert_eq!(q.effective_group_size(), None);
         assert!(q.is_module_ignored("lm_head"));
-    }
-
-    #[test]
-    fn bool_canonicalizes_to_u8() {
-        let bytes: Vec<u8> = vec![1, 0, 1, 1, 0, 0];
-        let path = write_safetensors_one("t2d", StDtype::BOOL, &[bytes.len()], &bytes);
-        let loader = WeightLoader::open_file(&path, &Device::Cpu).unwrap();
-
-        assert_eq!(loader.dtype_of("t2d"), Some(DType::U8));
-
-        let t = loader.get("t2d", DType::U8).expect("get BOOL as U8");
-        assert_eq!(t.dtype(), DType::U8);
-        assert_eq!(t.dims(), &[bytes.len()]);
-        let got: Vec<u8> = t.to_vec1().unwrap();
-        assert_eq!(got, bytes);
-
-        assert!(got.iter().all(|b| *b == 0 || *b == 1));
+        for (json, words) in [
+            (group(4, ", \"group_size\": 32"), vec!["32", "MXFP4", &NVFP4_GROUP_SIZE.to_string()]),
+            (group(8, ", \"group_size\": 128"), vec!["128", "per output row"]),
+            (
+                r#"{"quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8", "config_groups": {"group_0": {"weights": {"group_size": 128}}}}}"#.to_string(),
+                vec![],
+            ),
+        ] {
+            let err = QuantizationConfig::from_hf_json_str(&json)
+                .expect_err("a group size the kernels do not implement must not load")
+                .to_string();
+            for w in words {
+                assert!(err.contains(w), "{json}: {err}");
+            }
+        }
     }
 
     fn synth_named_shard(tensors: &[(&str, usize)]) -> (String, Vec<u8>) {
@@ -1478,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn extern_shards_serve_every_tensor_bit_equal_to_the_resident_load_and_refuse_borrows() {
+    fn extern_shards_serve_every_tensor_bit_equal_and_recut_shards_respect_the_cap_and_round_trip() {
         let (label, bytes) =
             synth_named_shard(&[("a.weight", 700), ("b.scales", 96), ("c.biases", 40)]);
         let resident =
@@ -1544,10 +1454,7 @@ mod tests {
             fetches.load(std::sync::atomic::Ordering::SeqCst) > 0,
             "the extern arm never exercised its fetch closure"
         );
-    }
 
-    #[test]
-    fn recut_shards_respect_the_cap_and_round_trip_every_tensor_bit_for_bit() {
         let shard = synth_named_shard(&[
             ("a.weight", 700),
             ("b.weight", 700),
@@ -1590,16 +1497,13 @@ mod tests {
             );
             assert_eq!(loader.shape_of(n), re.shape_of(n), "{n} shape drifted");
         }
-    }
-
-    #[test]
-    fn recut_refuses_a_tensor_over_the_cap_instead_of_emitting_an_oversized_shard() {
-        let shard = synth_named_shard(&[("big.weight", 4096)]);
-        let loader = WeightLoader::open_from_named_bytes([shard], &Device::Cpu).unwrap();
+        let big = synth_named_shard(&[("big.weight", 4096)]);
+        let loader = WeightLoader::open_from_named_bytes([big], &Device::Cpu).unwrap();
         let err = loader.recut_named_shards(1024).unwrap_err().to_string();
         assert!(
             err.contains("cannot be recut"),
             "oversized tensor must refuse loudly, got: {err}"
         );
     }
+
 }

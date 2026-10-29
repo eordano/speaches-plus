@@ -2,26 +2,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::json;
-use tracing::warn;
 
 use crate::errors;
 
 use super::session::{CancelReason, CancelledSnapshot, FailReason, Session};
 use super::state::{ConversationItem, ItemContent, ItemRole};
+use super::wire::{OutboundEvent, ResponseStatus, ResponseStatusReason};
 
-pub(super) async fn emit_response_open_brackets(
-    session: &Session,
-    response_id: &str,
-    item_id: &str,
-) {
-    session
-        .emit_event(json!({
+pub(super) fn response_open_brackets(response_id: &str, item_id: &str) -> [serde_json::Value; 3] {
+    [
+        json!({
             "type": "response.created",
             "response": { "id": response_id, "object": "realtime.response", "status": "in_progress" },
-        }))
-        .await;
-    session
-        .emit_event(json!({
+        }),
+        json!({
             "type": "response.output_item.added",
             "response_id": response_id,
             "output_index": 0,
@@ -33,48 +27,49 @@ pub(super) async fn emit_response_open_brackets(
                 "status": "in_progress",
                 "content": [],
             },
-        }))
-        .await;
-    session
-        .emit_event(json!({
+        }),
+        json!({
             "type": "response.content_part.added",
             "response_id": response_id,
             "item_id": item_id,
             "output_index": 0,
             "content_index": 0,
             "part": { "type": "audio", "transcript": "" },
-        }))
-        .await;
+        }),
+    ]
 }
 
 pub(super) async fn fail_response(
-    session: &Session,
+    session: &Arc<Session>,
     response_id: &str,
+    item_id: &str,
     transcript: Option<String>,
     reason: FailReason,
     played_ms: &Arc<AtomicU64>,
 ) {
-    emit_response_done(
-        session,
-        response_id,
-        "failed",
-        transcript,
-        Some(reason),
-        played_ms.load(Ordering::Relaxed),
-    )
-    .await;
+    session
+        .close_response(
+            response_id,
+            None,
+            vec![failed_response(
+                response_id,
+                item_id,
+                transcript,
+                reason,
+                played_ms.load(Ordering::Relaxed),
+            )],
+        )
+        .await;
 }
 
-pub(super) async fn emit_response_brackets(
-    session: &Session,
+fn response_brackets(
     response_id: &str,
     item_id: &str,
     transcript: &str,
     item_status: &'static str,
-) {
-    use super::wire::OutboundEvent::*;
-    session
-        .emit(ResponseOutputAudioTranscriptDone(
+) -> Vec<OutboundEvent> {
+    vec![
+        OutboundEvent::ResponseOutputAudioTranscriptDone(
             super::wire::ResponseOutputAudioTranscriptDoneEvent {
                 response_id: response_id.into(),
                 item_id: item_id.into(),
@@ -82,53 +77,118 @@ pub(super) async fn emit_response_brackets(
                 content_index: 0,
                 transcript: transcript.to_string(),
             },
-        ))
-        .await;
-    session
-        .emit(ResponseOutputAudioDone(
-            super::wire::ResponseOutputAudioDoneEvent {
-                response_id: response_id.into(),
-                item_id: item_id.into(),
-                output_index: 0,
-                content_index: 0,
-            },
-        ))
-        .await;
-    session
-        .emit(ResponseContentPartDone(
-            super::wire::ResponseContentPartDoneEvent {
-                response_id: response_id.into(),
-                item_id: item_id.into(),
-                output_index: 0,
-                content_index: 0,
-                part: json!({ "type": "audio", "transcript": transcript }),
-            },
-        ))
-        .await;
-    session
-        .emit(ResponseOutputItemDone(
-            super::wire::ResponseOutputItemDoneEvent {
-                response_id: response_id.into(),
-                output_index: 0,
-                item: json!({
-                    "id": item_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "status": item_status,
-                    "content": [{ "type": "audio", "transcript": transcript }],
-                }),
-            },
-        ))
-        .await;
+        ),
+        OutboundEvent::ResponseOutputAudioDone(super::wire::ResponseOutputAudioDoneEvent {
+            response_id: response_id.into(),
+            item_id: item_id.into(),
+            output_index: 0,
+            content_index: 0,
+        }),
+        OutboundEvent::ResponseContentPartDone(super::wire::ResponseContentPartDoneEvent {
+            response_id: response_id.into(),
+            item_id: item_id.into(),
+            output_index: 0,
+            content_index: 0,
+            part: json!({ "type": "audio", "transcript": transcript }),
+        }),
+        OutboundEvent::ResponseOutputItemDone(super::wire::ResponseOutputItemDoneEvent {
+            response_id: response_id.into(),
+            output_index: 0,
+            item: json!({
+                "id": item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": item_status,
+                "content": [{ "type": "audio", "transcript": transcript }],
+            }),
+        }),
+    ]
 }
 
-pub(super) async fn emit_bracket_close(
-    session: &Session,
+fn response_done(
+    response_id: &str,
+    status: ResponseStatus,
+    reason: Option<ResponseStatusReason>,
+    output: serde_json::Value,
+    audio_end_ms: u64,
+) -> OutboundEvent {
+    OutboundEvent::ResponseDone(super::wire::ResponseDoneEvent {
+        response: super::wire::ResponsePayload {
+            id: crate::types::ResponseId::new(response_id),
+            object: "realtime.response",
+            status,
+            audio_end_ms,
+            output: vec![output],
+            status_details: reason.map(|reason| super::wire::ResponseStatusDetails {
+                reason,
+                error: None,
+            }),
+        },
+    })
+}
+
+fn done_output(item_id: &str, transcript: Option<String>) -> serde_json::Value {
+    let mut output = json!({
+        "id": item_id,
+        "type": "message",
+        "role": "assistant",
+    });
+    if let Some(t) = transcript {
+        output["content"] = json!([{ "type": "audio", "transcript": t }]);
+    }
+    output
+}
+
+pub(super) fn failed_response(
+    response_id: &str,
+    item_id: &str,
+    transcript: Option<String>,
+    reason: FailReason,
+    audio_end_ms: u64,
+) -> OutboundEvent {
+    response_done(
+        response_id,
+        ResponseStatus::Failed,
+        Some(reason.into()),
+        done_output(item_id, transcript),
+        audio_end_ms,
+    )
+}
+
+pub(super) fn completed_response(
     response_id: &str,
     item_id: &str,
     transcript: &str,
-) {
-    emit_response_brackets(session, response_id, item_id, transcript, "completed").await;
+    audio_end_ms: u64,
+) -> Vec<OutboundEvent> {
+    let mut events = response_brackets(response_id, item_id, transcript, "completed");
+    events.push(response_done(
+        response_id,
+        ResponseStatus::Completed,
+        None,
+        done_output(item_id, Some(transcript.to_string())),
+        audio_end_ms,
+    ));
+    events
+}
+
+pub(super) fn interrupted_response(
+    response_id: &str,
+    item_id: &str,
+    transcript: &str,
+    status: ResponseStatus,
+    reason: ResponseStatusReason,
+    audio_end_ms: u64,
+) -> Vec<OutboundEvent> {
+    let mut events = response_brackets(response_id, item_id, transcript, "incomplete");
+    events.push(response_done(
+        response_id,
+        status,
+        Some(reason),
+        assistant_audio_item_json(item_id, transcript, "incomplete"),
+        audio_end_ms,
+    ));
+    events
 }
 
 pub(super) async fn emit_audio_transcript_delta(
@@ -149,69 +209,6 @@ pub(super) async fn emit_audio_transcript_delta(
                 },
             ),
         )
-        .await;
-}
-
-pub(super) async fn emit_response_done(
-    session: &Session,
-    response_id: &str,
-    status: &str,
-    transcript: Option<String>,
-    fail_reason: Option<FailReason>,
-    audio_end_ms: u64,
-) {
-    use super::wire::{ResponsePayload, ResponseStatus, ResponseStatusDetails};
-    let item_id_owned: String = {
-        let state = session.state.lock().await;
-        state
-            .resp
-            .item_id()
-            .map(|i| i.as_str().to_string())
-            .unwrap_or_else(|| session.id_source.item().as_str().to_string())
-    };
-    let mut output = json!({
-        "id": item_id_owned,
-        "type": "message",
-        "role": "assistant",
-    });
-    if let Some(t) = transcript {
-        output["content"] = json!([{ "type": "audio", "transcript": t }]);
-    }
-
-    let parsed_status = match status {
-        "completed" => ResponseStatus::Completed,
-        "cancelled" => ResponseStatus::Cancelled,
-        "incomplete" => ResponseStatus::Incomplete,
-        "failed" => ResponseStatus::Failed,
-        other => {
-            warn!(
-                status = other,
-                "unknown response status; defaulting to failed"
-            );
-            ResponseStatus::Failed
-        }
-    };
-
-    let status_details = match parsed_status {
-        ResponseStatus::Failed => Some(ResponseStatusDetails {
-            reason: fail_reason.unwrap_or(FailReason::LlmError).into(),
-            error: None,
-        }),
-        _ => None,
-    };
-
-    let payload = ResponsePayload {
-        id: crate::types::ResponseId::new(response_id),
-        object: "realtime.response",
-        status: parsed_status,
-        audio_end_ms,
-        output: vec![output],
-        status_details,
-    };
-    session
-        .emit(super::wire::OutboundEvent::ResponseDone(
-            super::wire::ResponseDoneEvent { response: payload },
-        ))
         .await;
 }
 
@@ -240,75 +237,25 @@ pub(super) async fn emit_error(
         .await;
 }
 
-pub(super) async fn emit_incomplete_brackets(
-    session: &Session,
-    response_id: &str,
-    item_id: &str,
-    transcript: &str,
-    played_ms: u64,
-) {
-    use super::wire::{
-        ResponsePayload, ResponseStatus, ResponseStatusDetails, ResponseStatusReason,
-    };
-    emit_response_brackets(session, response_id, item_id, transcript, "incomplete").await;
-    let payload = ResponsePayload {
-        id: crate::types::ResponseId::new(response_id),
-        object: "realtime.response",
-        status: ResponseStatus::Incomplete,
-        audio_end_ms: played_ms,
-        output: vec![assistant_audio_item_json(item_id, transcript, "incomplete")],
-        status_details: Some(ResponseStatusDetails {
-            reason: ResponseStatusReason::DrainCap,
-            error: None,
-        }),
-    };
-    session
-        .emit(super::wire::OutboundEvent::ResponseDone(
-            super::wire::ResponseDoneEvent { response: payload },
-        ))
-        .await;
-}
-
 pub(super) async fn emit_cancelled_brackets(
     session: &Session,
     snap: &CancelledSnapshot,
     reason: CancelReason,
 ) {
-    use super::wire::{
-        ResponsePayload, ResponseStatus, ResponseStatusDetails, ResponseStatusReason,
-    };
-    emit_response_brackets(
-        session,
-        snap.response_id.as_str(),
-        snap.assistant_item_id.as_str(),
-        &snap.transcript,
-        "incomplete",
-    )
-    .await;
-    let cancel_reason = match reason {
+    let reason = match reason {
         CancelReason::ClientCancelled => ResponseStatusReason::ClientCancelled,
         CancelReason::BargeIn => ResponseStatusReason::BargeIn,
     };
-    let payload = ResponsePayload {
-        id: snap.response_id.clone(),
-        object: "realtime.response",
-        status: ResponseStatus::Cancelled,
-        audio_end_ms: snap.played_ms,
-        output: vec![assistant_audio_item_json(
-            snap.assistant_item_id.as_str(),
-            &snap.transcript,
-            "incomplete",
-        )],
-        status_details: Some(ResponseStatusDetails {
-            reason: cancel_reason,
-            error: None,
-        }),
-    };
-    session
-        .emit(super::wire::OutboundEvent::ResponseDone(
-            super::wire::ResponseDoneEvent { response: payload },
-        ))
-        .await;
+    for ev in interrupted_response(
+        snap.response_id.as_str(),
+        snap.assistant_item_id.as_str(),
+        &snap.transcript,
+        ResponseStatus::Cancelled,
+        reason,
+        snap.played_ms,
+    ) {
+        session.emit(ev).await;
+    }
 }
 
 pub(super) fn assistant_audio_item_json(

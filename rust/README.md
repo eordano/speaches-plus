@@ -6,35 +6,21 @@ Rust implementation of the speaches realtime endpoint.
 arbitrary TTS response text via libespeak-ng phonemization.
 
 `IMPLEMENTATION.md` is the canonical as-built reference.
-`../CLAUDE.md`
+`../AGENTS.md`
 has the working conventions + operational gotchas. Build discipline
 (nvk.sh, lanes, measurement traps) is owned by the root `README.md`
-§"Building and testing", `../CLAUDE.md`, and
+§"Building and testing", `../AGENTS.md`, and
 `../docs/book/08-build-and-testing.md` -- not duplicated here; this
 file keeps only the dev-shell internals and e2e client invocations.
 
 ## Conformance
 
 `client/` drives the language-agnostic e2e suite over the wire;
-`conformance/` holds the §15.6 fixture corpus + canonical assertion
-library that both Rust and Go replay in-process (corpus layout: root
-`README.md` and `../docs/book/08-build-and-testing.md`).
-
-| Tool | Purpose |
-|---|---|
-| `client/test_e2e.py` | Single-leg STT round-trip |
-| `client/test_e2e_full.py` | Full conversation (orchestrator spawns subprocess) |
-| `client/fuzz_e2e.py` | Black-box fuzzer + RFC v3 invariant checker (§9.6, §8.2, §8.4, §10.x) |
-| `client/fake_llm.py` | Deterministic LLM stub (validates received text + emits fixed response) |
-| `client/fixtures/` | Synthetic audio WAVs |
-| `conformance/fixtures/` | Fixture corpus (input.jsonl + expected.jsonl pairs) |
-| `conformance/lib/trace_invariants.py` | W1-W8 wire invariants and I1-I11 state-machine invariants checker |
-| `conformance/lib/trace_diff.py` | Canonical trace diff against expected |
-| `conformance/runner/run_fixture.py` | Standalone fixture runner (no per-language harness needed) |
-
-Run the e2e suite against this server with `--target` or
-`--speaches-binary`; run the in-process corpus replay with
-`cargo test --test conformance`. Spec-normative failures surface as
+`conformance/` holds the §15.6 fixture corpus that Rust and Go replay
+in-process (tools: `../conformance/README.md` §Running; corpus layout:
+`../docs/book/08-build-and-testing.md`). Run the e2e suite against this
+server with `--target` or `--speaches-binary`; run the corpus replay
+with `cargo test --test conformance`. Spec-normative failures surface as
 wire-trace diffs against the canonical expected.
 
 ## Build profiles (dev-shell internals)
@@ -46,7 +32,7 @@ backend:
 | Shell | Cargo feature | Backend |
 |---|---|---|
 | `nix develop` (Darwin) | `metal` | Metal whisper.cpp + Accelerate ct2 |
-| `nix develop` (Linux)  | (none)  | CPU-only whisper.cpp + ct2 |
+| `nix develop` (Linux) | (none) | CPU-only whisper.cpp + ct2 |
 | `nix develop .#cuda`   | `cuda`  | cuBLAS whisper.cpp + ct2 with `cuda-dynamic-loading` |
 
 The cuda shell drives `mkShell` off `cudaPackages.backendStdenv`,
@@ -61,7 +47,7 @@ against CUDA >= 12.8's reorganized thrust headers. See the root
 The model corpus is pinned declaratively via the
 [nix-hug](https://github.com/eordano/nix-hug) flake;
 `flake.nix::mkSpeachesHubCache` is the canonical pin set (profiles:
-`../CLAUDE.md`). `flake.nix` exposes a `speaches-models-hub` package --
+`../AGENTS.md`). `flake.nix` exposes a `speaches-models-hub` package --
 a store-path Hub cache (one snapshot per revision under
 `models--<org>--<repo>/snapshots/<rev>/`) that any process pointed at
 via `$HF_HUB_CACHE` reads without network access. The Qwen 3.6 pin
@@ -106,7 +92,7 @@ models live.
 ## Quick start
 
 Rust builds go through `rust/scripts/nvk.sh` (root `README.md` /
-`../CLAUDE.md`); the steps below are the realtime-server run + e2e
+`../AGENTS.md`); the steps below are the realtime-server run + e2e
 recipe.
 
 ```sh

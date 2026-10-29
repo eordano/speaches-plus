@@ -82,18 +82,6 @@ _DEFAULT: IdSource = RandomIdSource()
 def default_source() -> IdSource:
     return _DEFAULT
 
-def next_session_id() -> str:
-    return _DEFAULT.session()
-
-def next_item_id() -> str:
-    return _DEFAULT.item()
-
-def next_response_id() -> str:
-    return _DEFAULT.response()
-
-def next_event_id() -> str:
-    return _DEFAULT.event()
-
 def next_turn_id() -> str:
     return _DEFAULT.turn()
 

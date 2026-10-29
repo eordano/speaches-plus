@@ -21,8 +21,6 @@ import (
 	"github.com/eordano/speaches-plus-go/internal/inspect"
 )
 
-var silenceTimeout = time.Duration(defaultVADLessSilenceMs) * time.Millisecond
-
 type vadDecision int
 
 type sessionConfig struct {
@@ -227,24 +225,12 @@ type sessionPipeline struct {
 	relay      *inspect.Relay
 	audioStore *inspect.AudioStore
 
-	outboundCh   chan outboundSend
-	outboundOnce sync.Once
-
 	diarMu   sync.Mutex
 	diarizer *diarization.Diarizer
 }
 
 func (p *sessionPipeline) State() string { return "active" }
 func (p *sessionPipeline) Model() string { return p.session.Model }
-
-type outboundSend struct {
-	event   any
-	eventID string
-}
-
-func newSessionPipeline(server Config, sess sessionConfig, logger *slog.Logger) *sessionPipeline {
-	return newSessionPipelineWithID(server, sess, logger, newSessID())
-}
 
 func newSessionPipelineWithID(server Config, sess sessionConfig, logger *slog.Logger, sessionID string) *sessionPipeline {
 	p := &sessionPipeline{
@@ -812,12 +798,6 @@ func (p *sessionPipeline) priorTurns() []eou.Turn {
 		window = eouHistoryFallbackTurns
 	}
 	return eou.RollingHistory(out, window)
-}
-
-func (p *sessionPipeline) setEOU(fn eouFn) {
-	p.eouMu.Lock()
-	p.eou = fn
-	p.eouMu.Unlock()
 }
 
 func (p *sessionPipeline) callEOU(ctx context.Context, partial string, samples audio.MonoF32, hardCapDeadline time.Time) eouVerdict {
@@ -1505,47 +1485,6 @@ func (p *sessionPipeline) stopPartialLoop() {
 	if p.partialCancel != nil {
 		p.partialCancel()
 		p.partialCancel = nil
-	}
-}
-
-func (p *sessionPipeline) startOutboundQueue() {
-	p.outboundOnce.Do(func() {
-		cap := p.session.OutboundQueueCap
-		if cap <= 0 {
-			cap = defaultOutboundQueueCap
-		}
-		p.outboundCh = make(chan outboundSend, cap)
-		p.wg.Add(1)
-		go func() {
-			defer p.wg.Done()
-			for {
-				select {
-				case <-p.closed:
-					return
-				case s, ok := <-p.outboundCh:
-					if !ok {
-						return
-					}
-					ch := p.getChannel()
-					if ch == nil {
-						continue
-					}
-					if err := sendFragmented(ch, s.event, s.eventID); err != nil {
-						p.logger.Warn("outbound send failed", "err", err, "id", s.eventID)
-					}
-				}
-			}
-		}()
-	})
-}
-
-func (p *sessionPipeline) enqueueOutbound(event any, eventID string) bool {
-	p.startOutboundQueue()
-	select {
-	case p.outboundCh <- outboundSend{event: event, eventID: eventID}:
-		return true
-	default:
-		return false
 	}
 }
 

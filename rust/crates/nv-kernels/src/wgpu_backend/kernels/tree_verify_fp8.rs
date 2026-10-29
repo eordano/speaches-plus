@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::kernels::kv_fp8;
 use crate::wgpu_backend::kernels::tree_verify_attn::{
@@ -494,76 +492,33 @@ pub fn cpu_kv_append_fp8(
     }
 }
 
-pub fn cpu_kv_compact_fp8(
-    kc: &mut [u8],
-    vc: &mut [u8],
-    k_scales: &mut [f32],
-    v_scales: &mut [f32],
-    path: &[i32],
-    base: usize,
-    n_accept: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    ring: usize,
-) {
-    let row = n_kv_heads * head_dim;
-    let mut sk = vec![0u8; n_accept * row];
-    let mut sv = vec![0u8; n_accept * row];
-    let mut ssk = vec![0f32; n_accept * n_kv_heads];
-    let mut ssv = vec![0f32; n_accept * n_kv_heads];
-    for i in 0..n_accept {
-        let mut srow = base + path[i] as usize;
-        if ring > 0 {
-            srow %= ring;
-        }
-        sk[i * row..(i + 1) * row].copy_from_slice(&kc[srow * row..srow * row + row]);
-        sv[i * row..(i + 1) * row].copy_from_slice(&vc[srow * row..srow * row + row]);
-        for e in 0..n_kv_heads {
-            ssk[i * n_kv_heads + e] = k_scales[srow * n_kv_heads + e];
-            ssv[i * n_kv_heads + e] = v_scales[srow * n_kv_heads + e];
-        }
-    }
-    for i in 0..n_accept {
-        let mut drow = base + i;
-        if ring > 0 {
-            drow %= ring;
-        }
-        kc[drow * row..drow * row + row].copy_from_slice(&sk[i * row..(i + 1) * row]);
-        vc[drow * row..drow * row + row].copy_from_slice(&sv[i * row..(i + 1) * row]);
-        for e in 0..n_kv_heads {
-            k_scales[drow * n_kv_heads + e] = ssk[i * n_kv_heads + e];
-            v_scales[drow * n_kv_heads + e] = ssv[i * n_kv_heads + e];
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn composed_source_carries_the_shared_fp8_encoder() {
-        let src = source();
-        assert!(src.contains("fn kv_encode_e4m3"));
-        assert!(src.contains("fn e4m3_decode"));
-        assert!(src.contains("fn tree_verify_attn_fp8"));
-    }
-
-    #[test]
-    fn cpu_append_round_trips_through_the_shared_codec() {
-        let (nkv, hd, k) = (2usize, 8usize, 2usize);
-        let src: Vec<u16> = (0..k * nkv * hd)
-            .map(|i| half::bf16::from_f32(0.25 * (i as f32 + 1.0)).to_bits())
-            .collect();
-        let mut kc = vec![0u8; 4 * nkv * hd];
-        let mut vc = vec![0u8; 4 * nkv * hd];
-        let mut ks = vec![0f32; 4 * nkv];
-        let mut vs = vec![0f32; 4 * nkv];
-        cpu_kv_append_fp8(
-            &src, &src, &mut kc, &mut vc, &mut ks, &mut vs, 1, nkv, hd, k, 0,
-        );
-        assert_eq!(kc, vc);
-        assert!(ks[nkv] > 0.0);
-        assert_eq!(&kc[..nkv * hd], &vec![0u8; nkv * hd][..]);
+    fn the_composed_source_and_the_cpu_append_share_one_fp8_codec() {
+        {
+            let src = source();
+            assert!(src.contains("fn kv_encode_e4m3"));
+            assert!(src.contains("fn e4m3_decode"));
+            assert!(src.contains("fn tree_verify_attn_fp8"));
+        }
+        {
+            let (nkv, hd, k) = (2usize, 8usize, 2usize);
+            let src: Vec<u16> = (0..k * nkv * hd)
+                .map(|i| half::bf16::from_f32(0.25 * (i as f32 + 1.0)).to_bits())
+                .collect();
+            let mut kc = vec![0u8; 4 * nkv * hd];
+            let mut vc = vec![0u8; 4 * nkv * hd];
+            let mut ks = vec![0f32; 4 * nkv];
+            let mut vs = vec![0f32; 4 * nkv];
+            cpu_kv_append_fp8(
+                &src, &src, &mut kc, &mut vc, &mut ks, &mut vs, 1, nkv, hd, k, 0,
+            );
+            assert_eq!(kc, vc);
+            assert!(ks[nkv] > 0.0);
+            assert_eq!(&kc[..nkv * hd], &vec![0u8; nkv * hd][..]);
+        }
     }
 }

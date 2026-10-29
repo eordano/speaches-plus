@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
 use crate::wgpu_backend::{Result, WgpuError};
@@ -227,28 +225,28 @@ mod tests {
     }
 
     #[test]
-    fn blocked_rank_matches_sequential_cursors() {
-        let mut seed: u64 = 0x243f6a8885a308d3;
-        let (n, k, e) = (37usize, 3usize, 11usize);
-        let ids: Vec<i32> = (0..n * k)
-            .map(|_| {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                ((seed >> 33) as u32 % e as u32) as i32
-            })
-            .collect();
-        for block in [1usize, 4, 8, 256] {
-            assert_eq!(
-                sequential(&ids, k, e),
-                blocked(&ids, k, e, block),
-                "block={block}"
-            );
+    fn blocked_rank_matches_sequential_cursors_and_params_are_sixteen_bytes() {
+        {
+            let mut seed: u64 = 0x243f6a8885a308d3;
+            let (n, k, e) = (37usize, 3usize, 11usize);
+            let ids: Vec<i32> = (0..n * k)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((seed >> 33) as u32 % e as u32) as i32
+                })
+                .collect();
+            for block in [1usize, 4, 8, 256] {
+                assert_eq!(
+                    sequential(&ids, k, e),
+                    blocked(&ids, k, e, block),
+                    "block={block}"
+                );
+            }
         }
-    }
-
-    #[test]
-    fn params_are_sixteen_bytes() {
-        assert_eq!(std::mem::size_of::<Params>(), 16);
+        {
+            assert_eq!(std::mem::size_of::<Params>(), 16);
+        }
     }
 }

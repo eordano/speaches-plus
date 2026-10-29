@@ -173,9 +173,6 @@ pub use cuda::PagedGemma4Cache;
 pub use cuda::{derive_v_enabled, DeriveVPlan, DERIVE_V_ENV};
 
 #[cfg(feature = "cuda")]
-pub use cuda::{paged_attn_fp8_ring_enabled, PAGED_ATTN_FP8_RING_ENV};
-
-#[cfg(feature = "cuda")]
 pub const PREFILL_MK_TILE_IS_THE_KERNELS_KMAXM_OF_8: usize = 8;
 
 pub const PREFILL_MK_MAX_HEAD_DIM_IS_THE_KERNELS_KMAXHDMK_OF_256: usize = 256;
@@ -342,7 +339,6 @@ mod host {
 #[cfg(feature = "cuda")]
 mod cuda {
     use super::*;
-    use anyhow::anyhow;
     use candle_core::{CudaDevice, Device, Tensor};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use half::bf16;
@@ -492,9 +488,8 @@ mod cuda {
             device: &Device,
             plan: Option<&DeriveVPlan>,
         ) -> Result<Self> {
-            let dev = match device {
-                Device::Cuda(d) => d.clone(),
-                _ => bail!("PagedKvFp8Pool requires a CUDA device"),
+            let Device::Cuda(dev) = device.clone() else {
+                bail!("PagedKvFp8Pool requires a CUDA device")
             };
             let plan = plan.filter(|_| derive_v_enabled());
             let stream = nv_layers::cuda_stream::current_stream(&dev);
@@ -508,13 +503,13 @@ mod cuda {
                     (None, None)
                 } else {
                     (
-                        Some(stream.alloc_zeros::<u8>(kv).map_err(|e| anyhow!(e))?),
-                        Some(stream.alloc_zeros::<f32>(sc).map_err(|e| anyhow!(e))?),
+                        Some(stream.alloc_zeros::<u8>(kv)?),
+                        Some(stream.alloc_zeros::<f32>(sc)?),
                     )
                 };
                 layers.push(LayerSlabs {
-                    k_fp8: stream.alloc_zeros::<u8>(kv).map_err(|e| anyhow!(e))?,
-                    k_scale: stream.alloc_zeros::<f32>(sc).map_err(|e| anyhow!(e))?,
+                    k_fp8: stream.alloc_zeros::<u8>(kv)?,
+                    k_scale: stream.alloc_zeros::<f32>(sc)?,
                     v_fp8,
                     v_scale,
                 });
@@ -522,8 +517,7 @@ mod cuda {
             let derive = match plan {
                 Some(p) if p.layer_count() > 0 => Some(DeriveState {
                     w_inv: p.w_inv.clone(),
-                    #[allow(deprecated)]
-                    inv_freq: stream.memcpy_stod(&p.inv_freq).map_err(|e| anyhow!(e))?,
+                    inv_freq: stream.clone_htod(&p.inv_freq)?,
                     rope_angles: p.rope_angles as i32,
                     dispatches: AtomicU64::new(0),
                 }),
@@ -646,9 +640,8 @@ mod cuda {
         ) -> Result<()> {
             let g = self.cfg.layers[layer];
             let bs = self.cfg.block_size;
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let slab = &mut self.layers[layer];
@@ -681,7 +674,6 @@ mod cuda {
             Ok(())
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn derive_one_v(
             &self,
             layer: usize,
@@ -694,13 +686,11 @@ mod cuda {
             let d = self
                 .derive
                 .as_ref()
-                .ok_or_else(|| anyhow!("derive_one_v layer {layer}: no derive state"))?;
-            let w_inv = d
-                .w_inv
-                .get(layer)
-                .copied()
-                .flatten()
-                .ok_or_else(|| anyhow!("derive_one_v layer {layer}: not a derive layer"))?;
+                .ok_or_else(|| anyhow::anyhow!("derive_one_v layer {layer}: no derive state"))?;
+            let w_inv =
+                d.w_inv.get(layer).copied().flatten().ok_or_else(|| {
+                    anyhow::anyhow!("derive_one_v layer {layer}: not a derive layer")
+                })?;
             let slab = &self.layers[layer];
             let (k_ptr, _g0) = slab.k_fp8.device_ptr(stream);
             let (ks_ptr, _g1) = slab.k_scale.device_ptr(stream);
@@ -746,7 +736,7 @@ mod cuda {
             dev: &CudaDevice,
         ) -> Result<Tensor> {
             let need = len * n_kv * head_dim;
-            let mut out = stream.alloc_zeros::<bf16>(need).map_err(|e| anyhow!(e))?;
+            let mut out = stream.alloc_zeros::<bf16>(need)?;
             {
                 let (fp8_ptr, _g0) = fp8.device_ptr(stream);
                 let (sc_ptr, _g1) = scale.device_ptr(stream);
@@ -780,7 +770,6 @@ mod cuda {
             Ok(t)
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn decode_attention_paged(
             &self,
             layer: usize,
@@ -796,9 +785,8 @@ mod cuda {
         ) -> Result<Tensor> {
             let g = self.cfg.layers[layer];
             let head_dim = g.head_dim;
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
 
@@ -816,9 +804,7 @@ mod cuda {
                 _ => bail!("q must be on CUDA"),
             };
             let q_slice = q_cuda.as_cuda_slice::<bf16>()?;
-            let mut out = stream
-                .alloc_zeros::<bf16>(expected)
-                .map_err(|e| anyhow!(e))?;
+            let mut out = stream.alloc_zeros::<bf16>(expected)?;
 
             self.decode_attention_paged_into(
                 layer,
@@ -845,7 +831,6 @@ mod cuda {
             ))
         }
 
-        #[allow(clippy::too_many_arguments)]
         pub fn decode_attention_paged_into(
             &self,
             layer: usize,
@@ -864,9 +849,8 @@ mod cuda {
         ) -> Result<()> {
             let g = self.cfg.layers[layer];
             let (n_kv, head_dim) = (g.n_kv, g.head_dim);
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let slab = &self.layers[layer];
@@ -1005,9 +989,8 @@ mod cuda {
         ) -> Result<()> {
             let g = self.cfg.layers[layer];
             let (n_kv, head_dim) = (g.n_kv, g.head_dim);
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let slab = &self.layers[layer];
@@ -1093,9 +1076,8 @@ mod cuda {
         ) -> Result<(Tensor, Tensor)> {
             let g = self.cfg.layers[layer];
             let bs = self.cfg.block_size;
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let slab = &self.layers[layer];
@@ -1123,9 +1105,7 @@ mod cuda {
                     &dev,
                 )?,
                 _ => {
-                    let mut out = stream
-                        .alloc_zeros::<bf16>(len * g.kv_elems())
-                        .map_err(|e| anyhow!(e))?;
+                    let mut out = stream.alloc_zeros::<bf16>(len * g.kv_elems())?;
                     self.derive_one_v(layer, &stream, block_table_dev, len, &mut out)?;
                     let storage = candle_core::CudaStorage::wrap_cuda_slice(out, dev.clone());
                     Tensor::from_storage(
@@ -1144,9 +1124,8 @@ mod cuda {
                 return Ok(());
             }
             let bs = self.cfg.block_size;
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let s_raw = stream.cu_stream() as *mut c_void;
@@ -1184,24 +1163,10 @@ mod cuda {
         }
     }
 
-    pub fn paged_attn_fp8_enabled() -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            "NV_PAGED_ATTN_FP8",
-        )
-    }
-
     pub const PAGED_PREFILL_FP8_ENV: &str = "NV_PAGED_PREFILL_FP8";
 
     pub fn paged_prefill_fp8_enabled() -> bool {
         nv_config::env_arm_opt_in_eq_some_1_reread_every_call(PAGED_PREFILL_FP8_ENV)
-    }
-
-    pub const PAGED_ATTN_FP8_RING_ENV: &str = "NV_PAGED_ATTN_FP8_RING";
-
-    pub fn paged_attn_fp8_ring_enabled() -> bool {
-        nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-            PAGED_ATTN_FP8_RING_ENV,
-        )
     }
 
     pub struct PagedGemma4Cache {
@@ -1217,7 +1182,6 @@ mod cuda {
         htod_scratch: Vec<i32>,
         lane: Option<u32>,
         layer_sliding: Vec<bool>,
-        ring_enabled: bool,
         ring_decodes: u64,
         sliding_ring_blocks: usize,
         start_dev: CudaSlice<i32>,
@@ -1232,9 +1196,8 @@ mod cuda {
 
     impl PagedGemma4Cache {
         pub fn new(pool: Arc<Mutex<PagedKvFp8Pool>>, device: &Device) -> Result<Self> {
-            let dev = match device {
-                Device::Cuda(d) => d.clone(),
-                _ => bail!("PagedGemma4Cache requires a CUDA device"),
+            let Device::Cuda(dev) = device.clone() else {
+                bail!("PagedGemma4Cache requires a CUDA device")
             };
             let (block_size, max_blocks, lanes, layer_sliding, ring_blocks) = {
                 let p = pool.lock().unwrap();
@@ -1248,24 +1211,18 @@ mod cuda {
                 )
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
-            let block_table_dev = stream
-                .alloc_zeros::<i32>(max_blocks.max(1))
-                .map_err(|e| anyhow!(e))?;
+            let block_table_dev = stream.alloc_zeros::<i32>(max_blocks.max(1))?;
             let (lane, sliding_table_dev) = if lanes > 0 {
-                let lane = pool
-                    .lock()
-                    .unwrap()
-                    .acquire_lane()
-                    .ok_or_else(|| anyhow!("PagedGemma4Cache: no free sliding-ring lane"))?;
-                let t = stream
-                    .alloc_zeros::<i32>(max_blocks.max(1))
-                    .map_err(|e| anyhow!(e))?;
+                let lane = pool.lock().unwrap().acquire_lane().ok_or_else(|| {
+                    anyhow::anyhow!("PagedGemma4Cache: no free sliding-ring lane")
+                })?;
+                let t = stream.alloc_zeros::<i32>(max_blocks.max(1))?;
                 (Some(lane), Some(t))
             } else {
                 (None, None)
             };
-            let start_dev = stream.alloc_zeros::<i32>(1).map_err(|e| anyhow!(e))?;
-            let n_total_dev = stream.alloc_zeros::<i32>(1).map_err(|e| anyhow!(e))?;
+            let start_dev = stream.alloc_zeros::<i32>(1)?;
+            let n_total_dev = stream.alloc_zeros::<i32>(1)?;
 
             let (flash_scratch, flash_fan_in) = (None, None);
             Ok(Self {
@@ -1279,7 +1236,6 @@ mod cuda {
                 htod_scratch: Vec::new(),
                 lane,
                 layer_sliding,
-                ring_enabled: paged_attn_fp8_ring_enabled(),
                 ring_decodes: 0,
                 sliding_ring_blocks: ring_blocks,
                 start_dev,
@@ -1294,9 +1250,8 @@ mod cuda {
         }
 
         pub fn set_block_table(&mut self, table: &[u32]) -> Result<()> {
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             if table.len() > self.block_table_dev.len() {
@@ -1333,10 +1288,7 @@ mod cuda {
                     .extend(table[first_diff..].iter().map(|&b| b as i32));
                 let mut view = self.block_table_dev.slice_mut(first_diff..table.len());
                 self.block_table_uploaded = 0;
-                #[allow(deprecated)]
-                stream
-                    .memcpy_htod(&self.htod_scratch, &mut view)
-                    .map_err(|e| anyhow!(e))?;
+                stream.memcpy_htod(&self.htod_scratch, &mut view)?;
             }
 
             self.block_table_uploaded = table.len();
@@ -1351,10 +1303,7 @@ mod cuda {
                     );
                     let mut view = sdev.slice_mut(from..table.len());
                     self.sliding_uploaded = 0;
-                    #[allow(deprecated)]
-                    stream
-                        .memcpy_htod(&self.htod_scratch, &mut view)
-                        .map_err(|e| anyhow!(e))?;
+                    stream.memcpy_htod(&self.htod_scratch, &mut view)?;
                     self.sliding_uploaded = table.len();
                 }
             }
@@ -1371,10 +1320,6 @@ mod cuda {
             } else {
                 &self.block_table_dev
             }
-        }
-
-        pub fn apply_cow(&mut self, src_block: u32, dst_block: u32) -> Result<()> {
-            self.pool.lock().unwrap().copy_block(src_block, dst_block)
         }
 
         pub fn ring_decodes(&self) -> u64 {
@@ -1398,28 +1343,22 @@ mod cuda {
         }
 
         fn push_n_total(&mut self, n_total: usize) -> Result<()> {
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let host = [n_total as i32];
-            stream
-                .memcpy_htod(&host, &mut self.n_total_dev)
-                .map_err(|e| anyhow!(e))?;
+            stream.memcpy_htod(&host, &mut self.n_total_dev)?;
             Ok(())
         }
 
         fn push_start(&mut self, write_pos: usize) -> Result<()> {
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let host = [write_pos as i32];
-            stream
-                .memcpy_htod(&host, &mut self.start_dev)
-                .map_err(|e| anyhow!(e))?;
+            stream.memcpy_htod(&host, &mut self.start_dev)?;
             Ok(())
         }
     }
@@ -1480,13 +1419,10 @@ mod cuda {
             sliding_window: Option<usize>,
             scaling: f32,
         ) -> Result<Option<Tensor>> {
-            if !paged_attn_fp8_enabled() || !paged_prefill_fp8_enabled() {
+            if !paged_prefill_fp8_enabled() {
                 return Ok(None);
             }
             let sliding = self.layer_sliding.get(layer).copied().unwrap_or(false);
-            if sliding && !self.ring_enabled {
-                return Ok(None);
-            }
             let head_dim = {
                 let p = self.pool.lock().unwrap();
                 p.cfg.layers[layer].head_dim
@@ -1494,9 +1430,8 @@ mod cuda {
             if head_dim > PREFILL_MK_MAX_HEAD_DIM_IS_THE_KERNELS_KMAXHDMK_OF_256 {
                 return Ok(None);
             }
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => return Ok(None),
+            let Device::Cuda(dev) = self.device.clone() else {
+                return Ok(None);
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             let need = nv_kernels::cuda::flash_splitk_scratch_elems_mk(
@@ -1505,18 +1440,14 @@ mod cuda {
                 PREFILL_MK_TILE_IS_THE_KERNELS_KMAXM_OF_8 as i32,
             );
             if self.flash_scratch.as_ref().is_none_or(|b| b.len() < need) {
-                self.flash_scratch = Some(stream.alloc_zeros::<f32>(need).map_err(|e| anyhow!(e))?);
+                self.flash_scratch = Some(stream.alloc_zeros::<f32>(need)?);
             }
             if self
                 .flash_fan_in
                 .as_ref()
                 .is_none_or(|b| b.len() < n_q.max(1))
             {
-                self.flash_fan_in = Some(
-                    stream
-                        .alloc_zeros::<u32>(n_q.max(1))
-                        .map_err(|e| anyhow!(e))?,
-                );
+                self.flash_fan_in = Some(stream.alloc_zeros::<u32>(n_q.max(1))?);
             }
             let table = if sliding {
                 self.sliding_table_dev
@@ -1532,9 +1463,7 @@ mod cuda {
                 _ => return Ok(None),
             };
             let q_slice = q_cuda.as_cuda_slice::<bf16>()?;
-            let mut out = stream
-                .alloc_zeros::<bf16>(seq * n_q * head_dim)
-                .map_err(|e| anyhow!(e))?;
+            let mut out = stream.alloc_zeros::<bf16>(seq * n_q * head_dim)?;
             let (Some(scratch), Some(fan_in)) =
                 (self.flash_scratch.as_mut(), self.flash_fan_in.as_mut())
             else {
@@ -1573,9 +1502,6 @@ mod cuda {
             sliding_window: Option<usize>,
             scaling: f32,
         ) -> Result<Option<Tensor>> {
-            if !paged_attn_fp8_enabled() {
-                return Ok(None);
-            }
             let head_dim = {
                 let p = self.pool.lock().unwrap();
                 p.cfg.layers[layer].head_dim
@@ -1586,24 +1512,19 @@ mod cuda {
                 "paged attn: bad scratch size n_q={n_q} hd={head_dim}"
             );
             let need = need as usize;
-            let dev = match self.device.clone() {
-                Device::Cuda(d) => d,
-                _ => return Ok(None),
+            let Device::Cuda(dev) = self.device.clone() else {
+                return Ok(None);
             };
             let stream = nv_layers::cuda_stream::current_stream(&dev);
             if self.flash_scratch.as_ref().is_none_or(|b| b.len() < need) {
-                self.flash_scratch = Some(stream.alloc_zeros::<f32>(need).map_err(|e| anyhow!(e))?);
+                self.flash_scratch = Some(stream.alloc_zeros::<f32>(need)?);
             }
             if self
                 .flash_fan_in
                 .as_ref()
                 .is_none_or(|b| b.len() < n_q.max(1))
             {
-                self.flash_fan_in = Some(
-                    stream
-                        .alloc_zeros::<u32>(n_q.max(1))
-                        .map_err(|e| anyhow!(e))?,
-                );
+                self.flash_fan_in = Some(stream.alloc_zeros::<u32>(n_q.max(1))?);
             }
             let (Some(scratch), Some(fan_in)) =
                 (self.flash_scratch.as_mut(), self.flash_fan_in.as_mut())
@@ -1612,9 +1533,6 @@ mod cuda {
             };
 
             let sliding = self.layer_sliding.get(layer).copied().unwrap_or(false);
-            if sliding && !self.ring_enabled {
-                return Ok(None);
-            }
             if sliding {
                 self.ring_decodes += 1;
             }
@@ -1679,17 +1597,15 @@ mod tests {
     }
 
     #[test]
-    fn physical_slot_routes_through_block_table() {
+    fn physical_slots_route_through_the_block_table_and_append_gather_and_copy_block_round_trip_within_fp8_error(
+    ) {
         let table = vec![3u32, 1u32];
         assert_eq!(physical_slot(&table, 4, 0).unwrap(), 12);
         assert_eq!(physical_slot(&table, 4, 3).unwrap(), 15);
         assert_eq!(physical_slot(&table, 4, 4).unwrap(), 4);
         assert_eq!(physical_slot(&table, 4, 7).unwrap(), 7);
         assert!(physical_slot(&table, 4, 8).is_err());
-    }
 
-    #[test]
-    fn append_then_gather_round_trips_within_fp8_error() {
         let mut pool = PagedKvFp8Pool::new(pool_cfg()).unwrap();
         let table = vec![2u32, 0u32];
         let n_kv = 2usize;
@@ -1731,10 +1647,7 @@ mod tests {
                 }
             }
         }
-    }
 
-    #[test]
-    fn copy_block_duplicates_contents() {
         let mut pool = PagedKvFp8Pool::new(pool_cfg()).unwrap();
         let table = vec![1u32];
         let n_kv = 2usize;

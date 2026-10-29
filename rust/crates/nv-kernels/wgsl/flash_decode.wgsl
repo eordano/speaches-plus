@@ -115,6 +115,7 @@ fn flash_decode_f32(
     @builtin(local_invocation_id) tid: vec3<u32>
 ) {
     let h = wg.x;
+    #def b3
     if (h >= fd_params.n_heads) {
         return;
     }
@@ -151,6 +152,7 @@ fn flash_decode_f32(
     var l = 0.0;
 
     let total = fd_params.total;
+    #end
     let start = fd_params.start;
     var rounds = 0u;
     if (total > start) {
@@ -292,6 +294,7 @@ fn flash_decode_f32(
         fd_sm[warp] = m;
         fd_sl[warp] = l;
     }
+    #def b1
     {
         let d = lane + 0u * FD_LANES;
         if (d < hd) {
@@ -388,6 +391,7 @@ fn flash_decode_f32(
             fd_sacc[warp * FD_MAX_HD + d] = acc15;
         }
     }
+    #end
     workgroupBarrier();
 
     if (warp == 0u) {
@@ -456,53 +460,20 @@ fn fd_stage1_epilogue(lid: u32, lane: u32, warp: u32, hd: u32, slot: u32, m: f32
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage1_bf16kv(
+    #def b21
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
 ) {
     let h = wg.x;
     let split = wg.y;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let nkv = fd_params.n_kv;
-    let group = fd_params.n_heads / nkv;
-    let kvh = h / group;
-    let lid = tid.x;
-    let lane = lid & 31u;
-    let warp = lid >> 5u;
-
-    for (var d = lid; d < hd; d = d + FD_BLOCK) {
-        fd_qsh[d] = fd_q[h * hd + d];
-    }
-    workgroupBarrier();
-
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    var acc2 = 0.0;
-    var acc3 = 0.0;
-    var acc4 = 0.0;
-    var acc5 = 0.0;
-    var acc6 = 0.0;
-    var acc7 = 0.0;
-    var acc8 = 0.0;
-    var acc9 = 0.0;
-    var acc10 = 0.0;
-    var acc11 = 0.0;
-    var acc12 = 0.0;
-    var acc13 = 0.0;
-    var acc14 = 0.0;
-    var acc15 = 0.0;
-    var m = fd_neg_inf();
-    var l = 0.0;
-
-    let total = fd_params.total;
+    #use b3
     let base = fd_params.start + split * FD_WARPS;
     let stride = fd_params.splits * FD_WARPS;
     var rounds = 0u;
     if (total > base) {
         rounds = (total - base + stride - 1u) / stride;
     }
+    #end
     let use_vec8 = (hd & 7u) == 0u;
     let fused_vecv = fd_params.fused == 1u && (hd % 256u) == 0u && (hd / FD_LANES) <= FD_MAX_ACC;
 
@@ -740,155 +711,15 @@ fn flash_splitk_stage1_bf16kv(
         }
     }
 
-    {
-        let d = lane + 0u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc0;
-        }
-    }
-    {
-        let d = lane + 1u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc1;
-        }
-    }
-    {
-        let d = lane + 2u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc2;
-        }
-    }
-    {
-        let d = lane + 3u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc3;
-        }
-    }
-    {
-        let d = lane + 4u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc4;
-        }
-    }
-    {
-        let d = lane + 5u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc5;
-        }
-    }
-    {
-        let d = lane + 6u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc6;
-        }
-    }
-    {
-        let d = lane + 7u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc7;
-        }
-    }
-    {
-        let d = lane + 8u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc8;
-        }
-    }
-    {
-        let d = lane + 9u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc9;
-        }
-    }
-    {
-        let d = lane + 10u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc10;
-        }
-    }
-    {
-        let d = lane + 11u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc11;
-        }
-    }
-    {
-        let d = lane + 12u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc12;
-        }
-    }
-    {
-        let d = lane + 13u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc13;
-        }
-    }
-    {
-        let d = lane + 14u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc14;
-        }
-    }
-    {
-        let d = lane + 15u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc15;
-        }
-    }
+    #use b1
     let slot = (h * fd_params.splits + split) * (hd + 2u);
     fd_stage1_epilogue(lid, lane, warp, hd, slot, m, l);
 }
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage1_fp8kv(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    let split = wg.y;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let nkv = fd_params.n_kv;
-    let group = fd_params.n_heads / nkv;
-    let kvh = h / group;
-    let lid = tid.x;
-    let lane = lid & 31u;
-    let warp = lid >> 5u;
-
-    for (var d = lid; d < hd; d = d + FD_BLOCK) {
-        fd_qsh[d] = fd_q[h * hd + d];
-    }
-    workgroupBarrier();
-
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    var acc2 = 0.0;
-    var acc3 = 0.0;
-    var acc4 = 0.0;
-    var acc5 = 0.0;
-    var acc6 = 0.0;
-    var acc7 = 0.0;
-    var acc8 = 0.0;
-    var acc9 = 0.0;
-    var acc10 = 0.0;
-    var acc11 = 0.0;
-    var acc12 = 0.0;
-    var acc13 = 0.0;
-    var acc14 = 0.0;
-    var acc15 = 0.0;
-    var m = fd_neg_inf();
-    var l = 0.0;
-
-    let total = fd_params.total;
-    let base = fd_params.start + split * FD_WARPS;
-    let stride = fd_params.splits * FD_WARPS;
-    var rounds = 0u;
-    if (total > base) {
-        rounds = (total - base + stride - 1u) / stride;
-    }
+    #def b11
+    #use b21
     let use_vec4 = (hd & 3u) == 0u;
 
     for (var r = 0u; r < rounds; r = r + 1u) {
@@ -902,6 +733,7 @@ fn flash_splitk_stage1_fp8kv(
         var ks = 0.0;
         if (live) {
             let kbase = (sp * nkv + kvh) * hd;
+    #end
             ks = fd_k_scales[sp * nkv + kvh];
             if (use_vec4) {
                 let n4 = hd >> 2u;
@@ -912,6 +744,7 @@ fn flash_splitk_stage1_fp8kv(
                     let f1 = fd_k_fp8(kb + 1u);
                     let f2 = fd_k_fp8(kb + 2u);
                     let f3 = fd_k_fp8(kb + 3u);
+                    #def b22
                     var t = fd_qsh[qb + 1u] * f1;
                     t = fma(fd_qsh[qb], f0, t);
                     t = fma(fd_qsh[qb + 2u], f2, t);
@@ -920,7 +753,9 @@ fn flash_splitk_stage1_fp8kv(
                 }
             } else {
                 for (var d = lane; d < hd; d = d + FD_LANES) {
+                    #end
                     partial = fma(fd_qsh[d], fd_k_fp8(kbase + d), partial);
+                #def b23
                 }
             }
         }
@@ -931,6 +766,7 @@ fn flash_splitk_stage1_fp8kv(
             let w = fd_exp(score - m_new);
             l = fma(l, corr, w);
             let vbase = (sp * nkv + kvh) * hd;
+                #end
             let w_v = w * fd_v_scales[sp * nkv + kvh];
             {
                 let d = lane + 0u * FD_LANES;
@@ -1032,102 +868,7 @@ fn flash_splitk_stage1_fp8kv(
         }
     }
 
-    {
-        let d = lane + 0u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc0;
-        }
-    }
-    {
-        let d = lane + 1u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc1;
-        }
-    }
-    {
-        let d = lane + 2u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc2;
-        }
-    }
-    {
-        let d = lane + 3u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc3;
-        }
-    }
-    {
-        let d = lane + 4u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc4;
-        }
-    }
-    {
-        let d = lane + 5u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc5;
-        }
-    }
-    {
-        let d = lane + 6u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc6;
-        }
-    }
-    {
-        let d = lane + 7u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc7;
-        }
-    }
-    {
-        let d = lane + 8u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc8;
-        }
-    }
-    {
-        let d = lane + 9u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc9;
-        }
-    }
-    {
-        let d = lane + 10u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc10;
-        }
-    }
-    {
-        let d = lane + 11u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc11;
-        }
-    }
-    {
-        let d = lane + 12u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc12;
-        }
-    }
-    {
-        let d = lane + 13u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc13;
-        }
-    }
-    {
-        let d = lane + 14u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc14;
-        }
-    }
-    {
-        let d = lane + 15u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc15;
-        }
-    }
+    #use b1
     let slot = (h * fd_params.splits + split) * (hd + 2u);
     fd_stage1_epilogue(lid, lane, warp, hd, slot, m, l);
 }
@@ -1146,66 +887,7 @@ fn fd_v_fp8_sd(idx: u32) -> f32 {
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage1_fp8kv_sd(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    let split = wg.y;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let nkv = fd_params.n_kv;
-    let group = fd_params.n_heads / nkv;
-    let kvh = h / group;
-    let lid = tid.x;
-    let lane = lid & 31u;
-    let warp = lid >> 5u;
-
-    for (var d = lid; d < hd; d = d + FD_BLOCK) {
-        fd_qsh[d] = fd_q[h * hd + d];
-    }
-    workgroupBarrier();
-
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    var acc2 = 0.0;
-    var acc3 = 0.0;
-    var acc4 = 0.0;
-    var acc5 = 0.0;
-    var acc6 = 0.0;
-    var acc7 = 0.0;
-    var acc8 = 0.0;
-    var acc9 = 0.0;
-    var acc10 = 0.0;
-    var acc11 = 0.0;
-    var acc12 = 0.0;
-    var acc13 = 0.0;
-    var acc14 = 0.0;
-    var acc15 = 0.0;
-    var m = fd_neg_inf();
-    var l = 0.0;
-
-    let total = fd_params.total;
-    let base = fd_params.start + split * FD_WARPS;
-    let stride = fd_params.splits * FD_WARPS;
-    var rounds = 0u;
-    if (total > base) {
-        rounds = (total - base + stride - 1u) / stride;
-    }
-    let use_vec4 = (hd & 3u) == 0u;
-
-    for (var r = 0u; r < rounds; r = r + 1u) {
-        let p = base + warp + r * stride;
-        let live = p < total;
-        var sp = p;
-        if (fd_params.ring > 0u) {
-            sp = p % fd_params.ring;
-        }
-        var partial = 0.0;
-        var ks = 0.0;
-        if (live) {
-            let kbase = (sp * nkv + kvh) * hd;
+    #use b11
             ks = fd_k_scales[sp * nkv + kvh] * bitcast<f32>(0x7B800000u);
             if (use_vec4) {
                 let n4 = hd >> 2u;
@@ -1216,25 +898,9 @@ fn flash_splitk_stage1_fp8kv_sd(
                     let f1 = fd_k_fp8_sd(kb + 1u);
                     let f2 = fd_k_fp8_sd(kb + 2u);
                     let f3 = fd_k_fp8_sd(kb + 3u);
-                    var t = fd_qsh[qb + 1u] * f1;
-                    t = fma(fd_qsh[qb], f0, t);
-                    t = fma(fd_qsh[qb + 2u], f2, t);
-                    t = fma(fd_qsh[qb + 3u], f3, t);
-                    partial = partial + t;
-                }
-            } else {
-                for (var d = lane; d < hd; d = d + FD_LANES) {
+                    #use b22
                     partial = fma(fd_qsh[d], fd_k_fp8_sd(kbase + d), partial);
-                }
-            }
-        }
-        let score = (fd_warp_sum(lid, partial) * ks) * fd_params.scaling;
-        if (live) {
-            let m_new = max(m, score);
-            let corr = fd_exp(m - m_new);
-            let w = fd_exp(score - m_new);
-            l = fma(l, corr, w);
-            let vbase = (sp * nkv + kvh) * hd;
+                #use b23
             let w_v = w * fd_v_scales[sp * nkv + kvh] * bitcast<f32>(0x7B800000u);
             {
                 let d = lane + 0u * FD_LANES;
@@ -1336,108 +1002,14 @@ fn flash_splitk_stage1_fp8kv_sd(
         }
     }
 
-    {
-        let d = lane + 0u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc0;
-        }
-    }
-    {
-        let d = lane + 1u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc1;
-        }
-    }
-    {
-        let d = lane + 2u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc2;
-        }
-    }
-    {
-        let d = lane + 3u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc3;
-        }
-    }
-    {
-        let d = lane + 4u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc4;
-        }
-    }
-    {
-        let d = lane + 5u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc5;
-        }
-    }
-    {
-        let d = lane + 6u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc6;
-        }
-    }
-    {
-        let d = lane + 7u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc7;
-        }
-    }
-    {
-        let d = lane + 8u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc8;
-        }
-    }
-    {
-        let d = lane + 9u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc9;
-        }
-    }
-    {
-        let d = lane + 10u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc10;
-        }
-    }
-    {
-        let d = lane + 11u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc11;
-        }
-    }
-    {
-        let d = lane + 12u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc12;
-        }
-    }
-    {
-        let d = lane + 13u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc13;
-        }
-    }
-    {
-        let d = lane + 14u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc14;
-        }
-    }
-    {
-        let d = lane + 15u * FD_LANES;
-        if (d < hd) {
-            fd_sacc[warp * FD_MAX_HD + d] = acc15;
-        }
-    }
+    #use b1
     let slot = (h * fd_params.splits + split) * (hd + 2u);
     fd_stage1_epilogue(lid, lane, warp, hd, slot, m, l);
 }
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage2(
+    #def b10
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
 ) {
@@ -1454,6 +1026,8 @@ fn flash_splitk_stage2(
     for (var s = 0u; s < splits; s = s + 1u) {
         m_glob = max(m_glob, fd_scratch[base + s * stride]);
     }
+    #end
+    #def b14
     for (var s = tid.x; s < splits; s = s + FD_BLOCK) {
         fd_s2w[s] = fd_split_scale(base, stride, s, m_glob);
     }
@@ -1471,6 +1045,7 @@ fn flash_splitk_stage2(
         for (var s = 0u; s < splits; s = s + 1u) {
             a = fma(fd_scratch[base + s * stride + 2u + d], fd_s2w[s], a);
         }
+    #end
         fd_store_out(h * hd + d, a * inv_l);
     }
 }
@@ -1486,22 +1061,8 @@ fn fd_split_scale(base: u32, stride: u32, s: u32, m_glob: f32) -> f32 {
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage2_u(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let splits = fd_params.splits;
-    let stride = hd + 2u;
-    let base = h * splits * stride;
-
-    var m_glob = fd_neg_inf();
-    for (var s = 0u; s < splits; s = s + 1u) {
-        m_glob = max(m_glob, fd_scratch[base + s * stride]);
-    }
+    #use b10
+    #def b15
     var l_glob = 0.0;
     for (var s = 0u; s < splits; s = s + 1u) {
         let sc = fd_split_scale(base, stride, s, m_glob);
@@ -1517,28 +1078,14 @@ fn flash_splitk_stage2_u(
             let sc = fd_split_scale(base, stride, s, m_glob);
             a = fma(fd_scratch[base + s * stride + 2u + d], sc, a);
         }
+    #end
         fd_store_out(h * hd + d, a * inv_l);
     }
 }
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage2_pk_rt(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let splits = fd_params.splits;
-    let stride = hd + 2u;
-    let base = h * splits * stride;
-
-    var m_glob = fd_neg_inf();
-    for (var s = 0u; s < splits; s = s + 1u) {
-        m_glob = max(m_glob, fd_scratch[base + s * stride]);
-    }
+    #use b10
     var l_glob = 0.0;
     for (var s = 0u; s < splits; s = s + 1u) {
         let sc = fd_split_scale(base, stride, s, m_glob);
@@ -1581,6 +1128,8 @@ fn fd_mk_start_of(tq: i32) -> i32 {
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage1_bf16kv_mk(
+    #def b2
+    #def b8
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
 ) {
@@ -1604,6 +1153,7 @@ fn flash_splitk_stage1_bf16kv_mk(
         fd_qsh_mk[t] = fd_q[(qi * fd_params.n_heads + h) * hd + d];
     }
     workgroupBarrier();
+    #end
 
     var acc: array<f32, 64>;
     var mreg: array<f32, 8>;
@@ -1615,7 +1165,9 @@ fn flash_splitk_stage1_bf16kv_mk(
         mreg[qi] = fd_neg_inf();
         lreg[qi] = 0.0;
     }
+    #end
 
+    #def b20
     let total = i32(fd_params.total);
     let start0 = fd_mk_start_of(total - i32(mr - 1u));
     let base = start0 + i32(split * FD_WARPS);
@@ -1626,6 +1178,7 @@ fn flash_splitk_stage1_bf16kv_mk(
     }
     let use_vec8 = (hd & 7u) == 0u;
     let hot = hd == 256u;
+    #end
 
     for (var r = 0; r < rounds; r = r + 1) {
         let p = base + i32(warp) + r * stride;
@@ -1641,6 +1194,7 @@ fn flash_splitk_stage1_bf16kv_mk(
             let qoff = qi * hd;
             var partial = 0.0;
             if (act) {
+                #def b6
                 if (use_vec8) {
                     let n8 = hd >> 3u;
                     for (var j = lane; j < n8; j = j + FD_LANES) {
@@ -1659,6 +1213,7 @@ fn flash_splitk_stage1_bf16kv_mk(
                     }
                 }
             }
+                #end
             let score = fd_warp_sum(lid, partial);
             if (act) {
                 let m_new = max(mreg[qi], score);
@@ -1680,6 +1235,7 @@ fn flash_splitk_stage1_bf16kv_mk(
                             acc[qi * FD_MK_MAX_ACC + i] =
                                 fma(acc[qi * FD_MK_MAX_ACC + i], corr, w * fd_v_bf16(kbase + d));
                         }
+                    #def b4
                     }
                 }
                 mreg[qi] = m_new;
@@ -1699,44 +1255,13 @@ fn flash_splitk_stage1_bf16kv_mk(
         fd_stage1_epilogue(lid, lane, warp, hd, slot, mreg[qi], lreg[qi]);
     }
 }
+                    #end
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage1_fp8kv_mk(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    let split = wg.y;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let nkv = fd_params.n_kv;
-    let group = fd_params.n_heads / nkv;
-    let kvh = h / group;
-    let mr = fd_params.m_rows;
-    let lid = tid.x;
-    let lane = lid & 31u;
-    let warp = lid >> 5u;
+    #use b2
 
-    for (var t = lid; t < mr * hd; t = t + FD_BLOCK) {
-        let qi = t / hd;
-        let d = t - qi * hd;
-        fd_qsh_mk[t] = fd_q[(qi * fd_params.n_heads + h) * hd + d];
-    }
-    workgroupBarrier();
-
-    var acc: array<f32, 64>;
-    var mreg: array<f32, 8>;
-    var lreg: array<f32, 8>;
-    for (var qi = 0u; qi < 8u; qi = qi + 1u) {
-        for (var i = 0u; i < FD_MK_MAX_ACC; i = i + 1u) {
-            acc[qi * FD_MK_MAX_ACC + i] = 0.0;
-        }
-        mreg[qi] = fd_neg_inf();
-        lreg[qi] = 0.0;
-    }
-
+    #def b24
     let total = i32(fd_params.total);
     let start0 = fd_mk_start_of(total - i32(mr - 1u));
     let base = start0 + i32(split * FD_WARPS);
@@ -1746,6 +1271,7 @@ fn flash_splitk_stage1_fp8kv_mk(
         rounds = (total - base + stride - 1) / stride;
     }
     let use_vec4 = (hd & 3u) == 0u;
+    #end
 
     for (var r = 0; r < rounds; r = r + 1) {
         let p = base + i32(warp) + r * stride;
@@ -1771,6 +1297,7 @@ fn flash_splitk_stage1_fp8kv_mk(
             let qoff = qi * hd;
             var partial = 0.0;
             if (act) {
+                #def b5
                 if (use_vec4) {
                     let n4 = hd >> 2u;
                     for (var j = lane; j < n4; j = j + FD_LANES) {
@@ -1793,6 +1320,7 @@ fn flash_splitk_stage1_fp8kv_mk(
                 }
             }
             let score = (fd_warp_sum(lid, partial) * ks) * fd_params.scaling;
+                #end
             if (act) {
                 let m_new = max(mreg[qi], score);
                 let corr = fd_exp(mreg[qi] - m_new);
@@ -1804,28 +1332,11 @@ fn flash_splitk_stage1_fp8kv_mk(
                     if (d < hd) {
                         acc[qi * FD_MK_MAX_ACC + i] =
                             fma(w_v, fd_v_fp8(kbase + d), acc[qi * FD_MK_MAX_ACC + i] * corr);
-                    }
-                }
-                mreg[qi] = m_new;
-            }
-        }
-    }
-
-    for (var qi = 0u; qi < mr; qi = qi + 1u) {
-        workgroupBarrier();
-        for (var i = 0u; i < FD_MK_MAX_ACC; i = i + 1u) {
-            let d = lane + i * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc[qi * FD_MK_MAX_ACC + i];
-            }
-        }
-        let slot = ((h * mr + qi) * fd_params.splits + split) * (hd + 2u);
-        fd_stage1_epilogue(lid, lane, warp, hd, slot, mreg[qi], lreg[qi]);
-    }
-}
+                    #use b4
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage2_mk(
+    #def b17
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
 ) {
@@ -1843,61 +1354,16 @@ fn flash_splitk_stage2_mk(
     for (var s = 0u; s < splits; s = s + 1u) {
         m_glob = max(m_glob, fd_scratch[base + s * stride]);
     }
-    for (var s = tid.x; s < splits; s = s + FD_BLOCK) {
-        fd_s2w[s] = fd_split_scale(base, stride, s, m_glob);
-    }
-    workgroupBarrier();
-    var l_glob = 0.0;
-    for (var s = 0u; s < splits; s = s + 1u) {
-        l_glob = fma(fd_scratch[base + s * stride + 1u], fd_s2w[s], l_glob);
-    }
-    var inv_l = 0.0;
-    if (l_glob > 0.0) {
-        inv_l = fd_recip(l_glob);
-    }
-    for (var d = tid.x; d < hd; d = d + FD_BLOCK) {
-        var a = 0.0;
-        for (var s = 0u; s < splits; s = s + 1u) {
-            a = fma(fd_scratch[base + s * stride + 2u + d], fd_s2w[s], a);
-        }
+    #end
+    #use b14
         fd_store_out((qi * fd_params.n_heads + h) * hd + d, a * inv_l);
     }
 }
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage2_mk_u(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    let qi = wg.y;
-    if (h >= fd_params.n_heads || qi >= fd_params.m_rows) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let splits = fd_params.splits;
-    let stride = hd + 2u;
-    let base = (h * fd_params.m_rows + qi) * splits * stride;
-
-    var m_glob = fd_neg_inf();
-    for (var s = 0u; s < splits; s = s + 1u) {
-        m_glob = max(m_glob, fd_scratch[base + s * stride]);
-    }
-    var l_glob = 0.0;
-    for (var s = 0u; s < splits; s = s + 1u) {
-        let sc = fd_split_scale(base, stride, s, m_glob);
-        l_glob = fma(fd_scratch[base + s * stride + 1u], sc, l_glob);
-    }
-    var inv_l = 0.0;
-    if (l_glob > 0.0) {
-        inv_l = fd_recip(l_glob);
-    }
-    for (var d = tid.x; d < hd; d = d + FD_BLOCK) {
-        var a = 0.0;
-        for (var s = 0u; s < splits; s = s + 1u) {
-            let sc = fd_split_scale(base, stride, s, m_glob);
-            a = fma(fd_scratch[base + s * stride + 2u + d], sc, a);
-        }
+    #use b17
+    #use b15
         fd_store_out((qi * fd_params.n_heads + h) * hd + d, a * inv_l);
     }
 }
@@ -1916,40 +1382,9 @@ fn fd_smv2_sq(tq: u32) -> u32 {
 
 @compute @workgroup_size(256)
 fn flash_smv2_stage1_bf16kv(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    let split = wg.y;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let nkv = fd_params.n_kv;
-    let group = fd_params.n_heads / nkv;
-    let kvh = h / group;
-    let mr = fd_params.m_rows;
-    let lid = tid.x;
-    let lane = lid & 31u;
-    let warp = lid >> 5u;
-
-    for (var t = lid; t < mr * hd; t = t + FD_BLOCK) {
-        let qi = t / hd;
-        let d = t - qi * hd;
-        fd_qsh_mk[t] = fd_q[(qi * fd_params.n_heads + h) * hd + d];
-    }
-    workgroupBarrier();
-
-    var acc: array<f32, 64>;
-    var mreg: array<f32, 8>;
-    var lreg: array<f32, 8>;
-    for (var qi = 0u; qi < 8u; qi = qi + 1u) {
-        for (var i = 0u; i < FD_MK_MAX_ACC; i = i + 1u) {
-            acc[qi * FD_MK_MAX_ACC + i] = 0.0;
-        }
-        mreg[qi] = fd_neg_inf();
-        lreg[qi] = 0.0;
-    }
+    #def b9
+    #def b18
+    #use b2
 
     var tqr: array<u32, 8>;
     var baser: array<u32, 8>;
@@ -1963,9 +1398,11 @@ fn flash_smv2_stage1_bf16kv(
             rounds = max(rounds, (tq - baser[qi] + stride - 1u) / stride);
         }
     }
+    #end
     let use_vec8 = (hd & 7u) == 0u;
     let fused_vecv = fd_params.fused == 1u && (hd % 256u) == 0u && (hd / FD_LANES) <= FD_MAX_ACC;
 
+    #def b19
     for (var r = 0u; r < rounds; r = r + 1u) {
         for (var qi = 0u; qi < mr; qi = qi + 1u) {
             let p = baser[qi] + warp + r * stride;
@@ -1976,26 +1413,12 @@ fn flash_smv2_stage1_bf16kv(
             }
             let qoff = qi * hd;
             var partial = 0.0;
+    #end
             if (live) {
                 let kbase = (sp * nkv + kvh) * hd;
-                if (use_vec8) {
-                    let n8 = hd >> 3u;
-                    for (var j = lane; j < n8; j = j + FD_LANES) {
-                        let qb = qoff + j * 8u;
-                        let kb = kbase + j * 8u;
-                        for (var t = 0u; t < 4u; t = t + 1u) {
-                            let kx = fd_k_bf16(kb + 2u * t);
-                            let ky = fd_k_bf16(kb + 2u * t + 1u);
-                            let pair = fma(kx, fd_qsh_mk[qb + 2u * t], ky * fd_qsh_mk[qb + 2u * t + 1u]);
-                            partial = partial + pair;
-                        }
-                    }
-                } else {
-                    for (var d = lane; d < hd; d = d + FD_LANES) {
-                        partial = fma(fd_qsh_mk[qoff + d], fd_k_bf16(kbase + d), partial);
-                    }
-                }
-            }
+    #end
+                #use b6
+            #def b13
             let score = fd_warp_sum(lid, partial) * fd_params.scaling;
             if (live) {
                 let m_new = max(mreg[qi], score);
@@ -2008,6 +1431,7 @@ fn flash_smv2_stage1_bf16kv(
                         let d = lane + i * FD_LANES;
                         if (d < hd) {
                             acc[qi * FD_MK_MAX_ACC + i] =
+            #end
                                 fma(w, fd_v_bf16(vbase + d), acc[qi * FD_MK_MAX_ACC + i] * corr);
                         }
                     }
@@ -2018,90 +1442,11 @@ fn flash_smv2_stage1_bf16kv(
                             acc[qi * FD_MK_MAX_ACC + i] =
                                 fma(acc[qi * FD_MK_MAX_ACC + i], corr, w * fd_v_bf16(vbase + d));
                         }
-                    }
-                }
-                mreg[qi] = m_new;
-            }
-        }
-    }
-
-    for (var qi = 0u; qi < mr; qi = qi + 1u) {
-        workgroupBarrier();
-        for (var i = 0u; i < FD_MK_MAX_ACC; i = i + 1u) {
-            let d = lane + i * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc[qi * FD_MK_MAX_ACC + i];
-            }
-        }
-        let slot = ((h * mr + qi) * fd_params.splits + split) * (hd + 2u);
-        fd_stage1_epilogue(lid, lane, warp, hd, slot, mreg[qi], lreg[qi]);
-    }
-}
+                    #use b4
 
 @compute @workgroup_size(256)
 fn flash_smv2_stage1_f32(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    let split = wg.y;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let nkv = fd_params.n_kv;
-    let group = fd_params.n_heads / nkv;
-    let kvh = h / group;
-    let mr = fd_params.m_rows;
-    let lid = tid.x;
-    let lane = lid & 31u;
-    let warp = lid >> 5u;
-
-    for (var t = lid; t < mr * hd; t = t + FD_BLOCK) {
-        let qi = t / hd;
-        let d = t - qi * hd;
-        fd_qsh_mk[t] = fd_q[(qi * fd_params.n_heads + h) * hd + d];
-    }
-    workgroupBarrier();
-
-    var acc: array<f32, 64>;
-    var mreg: array<f32, 8>;
-    var lreg: array<f32, 8>;
-    for (var qi = 0u; qi < 8u; qi = qi + 1u) {
-        for (var i = 0u; i < FD_MK_MAX_ACC; i = i + 1u) {
-            acc[qi * FD_MK_MAX_ACC + i] = 0.0;
-        }
-        mreg[qi] = fd_neg_inf();
-        lreg[qi] = 0.0;
-    }
-
-    var tqr: array<u32, 8>;
-    var baser: array<u32, 8>;
-    let stride = fd_params.splits * FD_WARPS;
-    var rounds = 0u;
-    for (var qi = 0u; qi < mr; qi = qi + 1u) {
-        let tq = fd_smv2_tq(qi);
-        tqr[qi] = tq;
-        baser[qi] = fd_smv2_sq(tq) + split * FD_WARPS;
-        if (tq > baser[qi]) {
-            rounds = max(rounds, (tq - baser[qi] + stride - 1u) / stride);
-        }
-    }
-    let use_vec8 = (hd & 7u) == 0u;
-    let fused_vecv = fd_params.fused == 1u && (hd % 256u) == 0u && (hd / FD_LANES) <= FD_MAX_ACC;
-
-    for (var r = 0u; r < rounds; r = r + 1u) {
-        for (var qi = 0u; qi < mr; qi = qi + 1u) {
-            let p = baser[qi] + warp + r * stride;
-            let live = p < tqr[qi];
-            var sp = p;
-            if (fd_params.ring > 0u) {
-                sp = p % fd_params.ring;
-            }
-            let qoff = qi * hd;
-            var partial = 0.0;
-            if (live) {
-                let kbase = (sp * nkv + kvh) * hd;
+    #use b9
                 if (use_vec8) {
                     let n8 = hd >> 3u;
                     for (var j = lane; j < n8; j = j + FD_LANES) {
@@ -2120,18 +1465,7 @@ fn flash_smv2_stage1_f32(
                     }
                 }
             }
-            let score = fd_warp_sum(lid, partial) * fd_params.scaling;
-            if (live) {
-                let m_new = max(mreg[qi], score);
-                let corr = fd_exp(mreg[qi] - m_new);
-                let w = fd_exp(score - m_new);
-                lreg[qi] = fma(lreg[qi], corr, w);
-                let vbase = (sp * nkv + kvh) * hd;
-                if (fused_vecv) {
-                    for (var i = 0u; i < FD_MK_MAX_ACC; i = i + 1u) {
-                        let d = lane + i * FD_LANES;
-                        if (d < hd) {
-                            acc[qi * FD_MK_MAX_ACC + i] =
+            #use b13
                                 fma(w, fd_v_f32[vbase + d], acc[qi * FD_MK_MAX_ACC + i] * corr);
                         }
                     }
@@ -2142,113 +1476,19 @@ fn flash_smv2_stage1_f32(
                             acc[qi * FD_MK_MAX_ACC + i] =
                                 fma(acc[qi * FD_MK_MAX_ACC + i], corr, w * fd_v_f32[vbase + d]);
                         }
-                    }
-                }
-                mreg[qi] = m_new;
-            }
-        }
-    }
-
-    for (var qi = 0u; qi < mr; qi = qi + 1u) {
-        workgroupBarrier();
-        for (var i = 0u; i < FD_MK_MAX_ACC; i = i + 1u) {
-            let d = lane + i * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc[qi * FD_MK_MAX_ACC + i];
-            }
-        }
-        let slot = ((h * mr + qi) * fd_params.splits + split) * (hd + 2u);
-        fd_stage1_epilogue(lid, lane, warp, hd, slot, mreg[qi], lreg[qi]);
-    }
-}
+                    #use b4
 
 @compute @workgroup_size(256)
 fn flash_smv2_stage1_fp8kv(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    let split = wg.y;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let nkv = fd_params.n_kv;
-    let group = fd_params.n_heads / nkv;
-    let kvh = h / group;
-    let mr = fd_params.m_rows;
-    let lid = tid.x;
-    let lane = lid & 31u;
-    let warp = lid >> 5u;
-
-    for (var t = lid; t < mr * hd; t = t + FD_BLOCK) {
-        let qi = t / hd;
-        let d = t - qi * hd;
-        fd_qsh_mk[t] = fd_q[(qi * fd_params.n_heads + h) * hd + d];
-    }
-    workgroupBarrier();
-
-    var acc: array<f32, 64>;
-    var mreg: array<f32, 8>;
-    var lreg: array<f32, 8>;
-    for (var qi = 0u; qi < 8u; qi = qi + 1u) {
-        for (var i = 0u; i < FD_MK_MAX_ACC; i = i + 1u) {
-            acc[qi * FD_MK_MAX_ACC + i] = 0.0;
-        }
-        mreg[qi] = fd_neg_inf();
-        lreg[qi] = 0.0;
-    }
-
-    var tqr: array<u32, 8>;
-    var baser: array<u32, 8>;
-    let stride = fd_params.splits * FD_WARPS;
-    var rounds = 0u;
-    for (var qi = 0u; qi < mr; qi = qi + 1u) {
-        let tq = fd_smv2_tq(qi);
-        tqr[qi] = tq;
-        baser[qi] = fd_smv2_sq(tq) + split * FD_WARPS;
-        if (tq > baser[qi]) {
-            rounds = max(rounds, (tq - baser[qi] + stride - 1u) / stride);
-        }
-    }
+    #use b18
     let use_vec4 = (hd & 3u) == 0u;
 
-    for (var r = 0u; r < rounds; r = r + 1u) {
-        for (var qi = 0u; qi < mr; qi = qi + 1u) {
-            let p = baser[qi] + warp + r * stride;
-            let live = p < tqr[qi];
-            var sp = p;
-            if (fd_params.ring > 0u) {
-                sp = p % fd_params.ring;
-            }
-            let qoff = qi * hd;
-            var partial = 0.0;
+    #use b19
             var ks = 0.0;
             if (live) {
                 let kbase = (sp * nkv + kvh) * hd;
                 ks = fd_k_scales[sp * nkv + kvh];
-                if (use_vec4) {
-                    let n4 = hd >> 2u;
-                    for (var j = lane; j < n4; j = j + FD_LANES) {
-                        let qb = qoff + j * 4u;
-                        let kb = kbase + j * 4u;
-                        let f0 = fd_k_fp8(kb);
-                        let f1 = fd_k_fp8(kb + 1u);
-                        let f2 = fd_k_fp8(kb + 2u);
-                        let f3 = fd_k_fp8(kb + 3u);
-                        var t = fd_qsh_mk[qb + 1u] * f1;
-                        t = fma(fd_qsh_mk[qb], f0, t);
-                        t = fma(fd_qsh_mk[qb + 2u], f2, t);
-                        t = fma(fd_qsh_mk[qb + 3u], f3, t);
-                        partial = partial + t;
-                    }
-                } else {
-                    for (var d = lane; d < hd; d = d + FD_LANES) {
-                        partial = fma(fd_qsh_mk[qoff + d], fd_k_fp8(kbase + d), partial);
-                    }
-                }
-            }
-            let score = (fd_warp_sum(lid, partial) * ks) * fd_params.scaling;
+                #use b5
             if (live) {
                 let m_new = max(mreg[qi], score);
                 let corr = fd_exp(mreg[qi] - m_new);
@@ -2261,25 +1501,7 @@ fn flash_smv2_stage1_fp8kv(
                     if (d < hd) {
                         acc[qi * FD_MK_MAX_ACC + i] =
                             fma(w_v, fd_v_fp8(vbase + d), acc[qi * FD_MK_MAX_ACC + i] * corr);
-                    }
-                }
-                mreg[qi] = m_new;
-            }
-        }
-    }
-
-    for (var qi = 0u; qi < mr; qi = qi + 1u) {
-        workgroupBarrier();
-        for (var i = 0u; i < FD_MK_MAX_ACC; i = i + 1u) {
-            let d = lane + i * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc[qi * FD_MK_MAX_ACC + i];
-            }
-        }
-        let slot = ((h * mr + qi) * fd_params.splits + split) * (hd + 2u);
-        fd_stage1_epilogue(lid, lane, warp, hd, slot, mreg[qi], lreg[qi]);
-    }
-}
+                    #use b4
 
 fn fd_slot_base() -> u32 {
     var slot = fd_params.total - 1u;
@@ -2291,6 +1513,7 @@ fn fd_slot_base() -> u32 {
 
 @compute @workgroup_size(128)
 fn write_kv_from_f32(@builtin(local_invocation_id) tid: vec3<u32>) {
+    #def b12
     let region = fd_params.n_kv * fd_params.head_dim;
     if (fd_params.total == 0u || region == 0u) {
         return;
@@ -2309,6 +1532,7 @@ fn write_kv_from_f32(@builtin(local_invocation_id) tid: vec3<u32>) {
         var v_hi = (old_v >> 16u) & 0xffffu;
         if (e0 >= base && e0 < base + region) {
             let s = e0 - base;
+    #end
             k_lo = bf16_encode(fd_src_k[s]);
             v_lo = bf16_encode(fd_src_v[s]);
         }
@@ -2324,24 +1548,7 @@ fn write_kv_from_f32(@builtin(local_invocation_id) tid: vec3<u32>) {
 
 @compute @workgroup_size(128)
 fn write_kv_from_bf16(@builtin(local_invocation_id) tid: vec3<u32>) {
-    let region = fd_params.n_kv * fd_params.head_dim;
-    if (fd_params.total == 0u || region == 0u) {
-        return;
-    }
-    let base = fd_slot_base();
-    let w_lo = base >> 1u;
-    let w_hi = (base + region - 1u) >> 1u;
-    for (var w = w_lo + tid.x; w <= w_hi; w = w + 128u) {
-        let e0 = w * 2u;
-        let e1 = e0 + 1u;
-        let old_k = fd_cache_k[w];
-        let old_v = fd_cache_v[w];
-        var k_lo = old_k & 0xffffu;
-        var k_hi = (old_k >> 16u) & 0xffffu;
-        var v_lo = old_v & 0xffffu;
-        var v_hi = (old_v >> 16u) & 0xffffu;
-        if (e0 >= base && e0 < base + region) {
-            let s = e0 - base;
+    #use b12
             k_lo = u16_at(fd_k_words[s >> 1u], s);
             v_lo = u16_at(fd_v_words[s >> 1u], s);
         }
@@ -2357,41 +1564,11 @@ fn write_kv_from_bf16(@builtin(local_invocation_id) tid: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage1_bf16kv_mk_u(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    let split = wg.y;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let nkv = fd_params.n_kv;
-    let group = fd_params.n_heads / nkv;
-    let kvh = h / group;
-    let mr = fd_params.m_rows;
-    let lid = tid.x;
-    let lane = lid & 31u;
-    let warp = lid >> 5u;
+    #use b8
 
-    for (var t = lid; t < mr * hd; t = t + FD_BLOCK) {
-        let qi = t / hd;
-        let d = t - qi * hd;
-        fd_qsh_mk[t] = fd_q[(qi * fd_params.n_heads + h) * hd + d];
-    }
-    workgroupBarrier();
+    #use b20
 
-    let total = i32(fd_params.total);
-    let start0 = fd_mk_start_of(total - i32(mr - 1u));
-    let base = start0 + i32(split * FD_WARPS);
-    let stride = i32(fd_params.splits * FD_WARPS);
-    var rounds = 0;
-    if (total > base) {
-        rounds = (total - base + stride - 1) / stride;
-    }
-    let use_vec8 = (hd & 7u) == 0u;
-    let hot = hd == 256u;
-
+    #def b16
     for (var qi = 0u; qi < mr; qi = qi + 1u) {
         var acc0 = 0.0;
         var acc1 = 0.0;
@@ -2410,6 +1587,7 @@ fn flash_splitk_stage1_bf16kv_mk_u(
         for (var r = 0; r < rounds; r = r + 1) {
             let p = base + i32(warp) + r * stride;
             let live = p < total;
+    #end
             var kbase = 0u;
             if (live) {
                 kbase = (u32(p) * nkv + kvh) * hd;
@@ -2417,24 +1595,7 @@ fn flash_splitk_stage1_bf16kv_mk_u(
             let act = live && p >= sq && p < tq;
             var partial = 0.0;
             if (act) {
-                if (use_vec8) {
-                    let n8 = hd >> 3u;
-                    for (var j = lane; j < n8; j = j + FD_LANES) {
-                        let qb = qoff + j * 8u;
-                        let kb = kbase + j * 8u;
-                        for (var t = 0u; t < 4u; t = t + 1u) {
-                            let kx = fd_k_bf16(kb + 2u * t);
-                            let ky = fd_k_bf16(kb + 2u * t + 1u);
-                            let pair = fma(kx, fd_qsh_mk[qb + 2u * t], ky * fd_qsh_mk[qb + 2u * t + 1u]);
-                            partial = partial + pair;
-                        }
-                    }
-                } else {
-                    for (var d = lane; d < hd; d = d + FD_LANES) {
-                        partial = fma(fd_qsh_mk[qoff + d], fd_k_bf16(kbase + d), partial);
-                    }
-                }
-            }
+                #use b6
             let score = fd_warp_sum(lid, partial);
             if (act) {
                 let m_new = max(mreg, score);
@@ -2538,6 +1699,7 @@ fn flash_splitk_stage1_bf16kv_mk_u(
                         if (d < hd) {
                             acc7 = fma(acc7, corr, w * fd_v_bf16(kbase + d));
                         }
+                    #def b7
                     }
                 }
                 mreg = m_new;
@@ -2597,61 +1759,15 @@ fn flash_splitk_stage1_bf16kv_mk_u(
         fd_stage1_epilogue(lid, lane, warp, hd, slot, mreg, lreg);
     }
 }
+                    #end
 
 @compute @workgroup_size(256)
 fn flash_splitk_stage1_fp8kv_mk_u(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x;
-    let split = wg.y;
-    if (h >= fd_params.n_heads) {
-        return;
-    }
-    let hd = fd_params.head_dim;
-    let nkv = fd_params.n_kv;
-    let group = fd_params.n_heads / nkv;
-    let kvh = h / group;
-    let mr = fd_params.m_rows;
-    let lid = tid.x;
-    let lane = lid & 31u;
-    let warp = lid >> 5u;
+    #use b8
 
-    for (var t = lid; t < mr * hd; t = t + FD_BLOCK) {
-        let qi = t / hd;
-        let d = t - qi * hd;
-        fd_qsh_mk[t] = fd_q[(qi * fd_params.n_heads + h) * hd + d];
-    }
-    workgroupBarrier();
+    #use b24
 
-    let total = i32(fd_params.total);
-    let start0 = fd_mk_start_of(total - i32(mr - 1u));
-    let base = start0 + i32(split * FD_WARPS);
-    let stride = i32(fd_params.splits * FD_WARPS);
-    var rounds = 0;
-    if (total > base) {
-        rounds = (total - base + stride - 1) / stride;
-    }
-    let use_vec4 = (hd & 3u) == 0u;
-
-    for (var qi = 0u; qi < mr; qi = qi + 1u) {
-        var acc0 = 0.0;
-        var acc1 = 0.0;
-        var acc2 = 0.0;
-        var acc3 = 0.0;
-        var acc4 = 0.0;
-        var acc5 = 0.0;
-        var acc6 = 0.0;
-        var acc7 = 0.0;
-        var mreg = fd_neg_inf();
-        var lreg = 0.0;
-        let tq = total - i32(mr - 1u - qi);
-        let sq = fd_mk_start_of(tq);
-        let qoff = qi * hd;
-
-        for (var r = 0; r < rounds; r = r + 1) {
-            let p = base + i32(warp) + r * stride;
-            let live = p < total;
+    #use b16
             var sp = 0u;
             if (live) {
                 sp = u32(p);
@@ -2669,28 +1785,7 @@ fn flash_splitk_stage1_fp8kv_mk_u(
             let act = live && p >= sq && p < tq;
             var partial = 0.0;
             if (act) {
-                if (use_vec4) {
-                    let n4 = hd >> 2u;
-                    for (var j = lane; j < n4; j = j + FD_LANES) {
-                        let qb = qoff + j * 4u;
-                        let kb = kbase + j * 4u;
-                        let f0 = fd_k_fp8(kb);
-                        let f1 = fd_k_fp8(kb + 1u);
-                        let f2 = fd_k_fp8(kb + 2u);
-                        let f3 = fd_k_fp8(kb + 3u);
-                        var t = fd_qsh_mk[qb + 1u] * f1;
-                        t = fma(fd_qsh_mk[qb], f0, t);
-                        t = fma(fd_qsh_mk[qb + 2u], f2, t);
-                        t = fma(fd_qsh_mk[qb + 3u], f3, t);
-                        partial = partial + t;
-                    }
-                } else {
-                    for (var d = lane; d < hd; d = d + FD_LANES) {
-                        partial = fma(fd_qsh_mk[qoff + d], fd_k_fp8(kbase + d), partial);
-                    }
-                }
-            }
-            let score = (fd_warp_sum(lid, partial) * ks) * fd_params.scaling;
+                #use b5
             if (act) {
                 let m_new = max(mreg, score);
                 let corr = fd_exp(mreg - m_new);
@@ -2743,62 +1838,4 @@ fn flash_splitk_stage1_fp8kv_mk_u(
                     let d = lane + 7u * FD_LANES;
                     if (d < hd) {
                         acc7 = fma(w_v, fd_v_fp8(kbase + d), acc7 * corr);
-                    }
-                }
-                mreg = m_new;
-            }
-        }
-
-        workgroupBarrier();
-        {
-            let d = lane + 0u * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc0;
-            }
-        }
-        {
-            let d = lane + 1u * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc1;
-            }
-        }
-        {
-            let d = lane + 2u * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc2;
-            }
-        }
-        {
-            let d = lane + 3u * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc3;
-            }
-        }
-        {
-            let d = lane + 4u * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc4;
-            }
-        }
-        {
-            let d = lane + 5u * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc5;
-            }
-        }
-        {
-            let d = lane + 6u * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc6;
-            }
-        }
-        {
-            let d = lane + 7u * FD_LANES;
-            if (d < hd) {
-                fd_sacc[warp * FD_MAX_HD + d] = acc7;
-            }
-        }
-        let slot = ((h * mr + qi) * fd_params.splits + split) * (hd + 2u);
-        fd_stage1_epilogue(lid, lane, warp, hd, slot, mreg, lreg);
-    }
-}
+                    #use b7

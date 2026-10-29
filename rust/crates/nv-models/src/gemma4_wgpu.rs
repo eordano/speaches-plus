@@ -1,7 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use bytemuck::cast_slice;
+use half::bf16;
+use nv_config::env_arm_opt_in_eq_some_1_reread_every_call;
+use nv_weights::WeightLoader;
+use pollster::block_on;
+use std::env;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
+use wgpu::{BindGroup, Buffer, CommandBuffer, ComputePipeline, ErrorFilter};
 
 use nv_kernels::wgpu_backend::dispatch::{self, GpuTensor, GpuUniform};
 use nv_kernels::wgpu_backend::kernels as wk;
@@ -10,29 +17,17 @@ use nv_kernels::wgpu_backend::{compose, WgpuContext};
 use crate::gemma4::{Gemma4Config, LayerType};
 use crate::gemma4_e4b_wgpu::KvCacheSnapshot;
 use crate::qwen3_5_moe_wgpu as q3m;
+use crate::wgpu_ledger::env_flag;
+use crate::wgpu_ledger::{spliced_chunk, ChunkRowSplice};
 
 use crate::gemma4_wgpu_shared::{
     bf16_bits, bytes_to_words, err, pack_pairs, rope_tables, FLASH2_PK_ENTRY, FLASH2_PK_WGSL,
     GEMV_PK3_ENTRY, GEMV_PK_ENTRY, GEMV_PK_WGSL, ROPE_F32_ENTRY, ROPE_F32_WGSL,
 };
+use crate::pod;
 
 pub fn flash_splits() -> u32 {
     wk::flash_decode::splits_env() as u32
-}
-
-pub const DEPTH_STACK_ENV_DEFAULT_ON_SET_0_FOR_THE_MONOLITHIC_ARM_SIGNED_OFF_ON_THE_DEPTH_WIN:
-    &str = "NV_G4_WGPU_DEPTH_STACK";
-
-pub fn depth_stack_enabled() -> bool {
-    match std::env::var(
-        DEPTH_STACK_ENV_DEFAULT_ON_SET_0_FOR_THE_MONOLITHIC_ARM_SIGNED_OFF_ON_THE_DEPTH_WIN,
-    ) {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => true,
-    }
 }
 
 pub fn flash1_gqa_fold_for_full_attention_geometry(
@@ -60,25 +55,18 @@ pub fn flash1_gqa_fold_for_full_attention_geometry(
     }
 }
 
-pub fn flash1_gqa_fold_when_depth_stack(n_q: usize, n_kv_f: usize, hd_max: usize) -> u32 {
-    if !depth_stack_enabled() {
-        return 1;
-    }
-    flash1_gqa_fold_for_full_attention_geometry(n_q, n_kv_f, hd_max)
-}
-
-pub const FLASH_TILE_ENV_0_UNTILED_2_TO_8_POSITIONS_PER_WARP_ROUND_SD_SG_ONLY: &str =
+pub const FLASH_TILE_ENV_2_TO_8_POSITIONS_PER_WARP_ROUND_SD_SG_ONLY: &str =
     "NV_G4_WGPU_FLASH_TILE";
 
 pub const DEPTH_STACK_TILE_4_MEASURED_BEST_WITH_FOLD8_SPLITS32_AT_122880: u32 = 4;
 
 fn flash_tile_env() -> u32 {
-    static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    static T: OnceLock<u32> = OnceLock::new();
     *T.get_or_init(|| {
-        std::env::var(FLASH_TILE_ENV_0_UNTILED_2_TO_8_POSITIONS_PER_WARP_ROUND_SD_SG_ONLY)
+        env::var(FLASH_TILE_ENV_2_TO_8_POSITIONS_PER_WARP_ROUND_SD_SG_ONLY)
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .map(|t| t.clamp(0, 8))
+            .map(|t| t.clamp(2, 8))
             .unwrap_or(DEPTH_STACK_TILE_4_MEASURED_BEST_WITH_FOLD8_SPLITS32_AT_122880)
     })
 }
@@ -93,54 +81,17 @@ fn depth_stack_splits() -> u32 {
     }
 }
 
-pub const FLASH_SD_DEFAULT_ON_SHIFT_TWIN_WINS_AT_DEPTH_AND_HOLDS_PPL: &str =
-    "the exact e4m3_decode is ~12 ops/element in a decode-ALU bound regime; the shift twin \
-     flash_splitk_stage1_fp8kv_sd decodes in 2 ops with the 2^120 carry folded into the \
-     per-position k/v scales the kernel already multiplies. At deep KV the shift twin wins \
-     decode ms/tok and teacher-forced ppl is unchanged (the e4m3-subnormal flush is below \
-     noise); current numbers: perf/runs.jsonl. NV_G4_FLASH_SD=0 restores the exact-decode \
-     stage1";
-
-fn flash_sd_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins!("NV_G4_FLASH_SD")
-}
-
-fn flash1_stage1_entry() -> &'static str {
-    if flash_sd_enabled() {
-        wk::flash_decode::ENTRY_STAGE1_FP8_SD
-    } else {
-        wk::flash_decode::ENTRY_STAGE1_FP8
-    }
-}
-
 pub const MAX_CHAIN: usize = 8;
 
 pub const VERIFY_ROWS_MAX_IS_THE_LONGEST_CHAIN_THE_SPEC_LOOP_SUBMITS: usize = MAX_CHAIN + 1;
 
 pub use crate::embed_row_splice::EmbedRowSplice;
 
-struct ChunkRowSplice<'a> {
-    rel_pos: usize,
-    row_words: &'a [u32],
-}
-
-pub fn preenc_enabled_default() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_G4_WGPU_PREENC")
-}
-
 fn uniform_probe_reps() -> usize {
-    std::env::var("NV_G4_WGPU_UNIFORM_PROBE")
+    env::var("NV_G4_WGPU_UNIFORM_PROBE")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(0)
-}
-
-pub fn chain_k_from_env() -> usize {
-    std::env::var("NV_G4_WGPU_CHAIN")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|k| k.clamp(1, MAX_CHAIN))
-        .unwrap_or(2)
 }
 
 const GLUE_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4w_glue.wgsl");
@@ -218,26 +169,34 @@ fn mk_bf16_source(mk_max: usize) -> String {
     ] {
         b.push_str("@compute @workgroup_size(256)\n");
         writeln!(b, "fn {entry}(").unwrap();
-        b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>\n) {\n");
-        b.push_str("    let tid = lid.x;\n");
-        b.push_str("    let lane = tid & (GEMV_BF16_LANES - 1u);\n");
-        b.push_str("    let warp = tid / GEMV_BF16_LANES;\n");
-        b.push_str("    let row = gemv_bf16_row(wid, warp);\n");
-        b.push_str("    let live = row < gemv_bf16_params.n_rows;\n");
-        b.push_str("    let kv = select(0u, gemv_bf16_params.k_elems >> 3u, live);\n");
-        b.push_str("    let w_base = select(0u, row * gemv_bf16_params.w_row_words, live);\n");
-        b.push_str("    let mm = g4w_mk_params.m;\n");
-        b.push_str("    let xs = g4w_mk_params.x_stride_words;\n");
+        b.push_str(
+            "    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let tid = lid.x;
+    let lane = tid & (GEMV_BF16_LANES - 1u);
+    let warp = tid / GEMV_BF16_LANES;
+    let row = gemv_bf16_row(wid, warp);
+    let live = row < gemv_bf16_params.n_rows;
+    let kv = select(0u, gemv_bf16_params.k_elems >> 3u, live);
+    let w_base = select(0u, row * gemv_bf16_params.w_row_words, live);
+    let mm = g4w_mk_params.m;
+    let xs = g4w_mk_params.x_stride_words;
+",
+        );
         for t in 0..mk_max {
             writeln!(b, "    var acc{t} = 0.0;").unwrap();
         }
-        b.push_str("    for (var v = lane; v < kv; v = v + GEMV_BF16_LANES) {\n");
-        b.push_str("        let wo = w_base + (v << 2u);\n");
-        b.push_str("        let xo = v << 2u;\n");
-        b.push_str("        for (var j = 0u; j < 4u; j = j + 1u) {\n");
-        b.push_str("            let ww = gemv_bf16_w[wo + j];\n");
-        b.push_str("            let wl = bf16_lo(ww);\n");
-        b.push_str("            let wh = bf16_hi(ww);\n");
+        b.push_str(
+            "    for (var v = lane; v < kv; v = v + GEMV_BF16_LANES) {
+        let wo = w_base + (v << 2u);
+        let xo = v << 2u;
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let ww = gemv_bf16_w[wo + j];
+            let wl = bf16_lo(ww);
+            let wh = bf16_hi(ww);
+",
+        );
         for t in 0..mk_max {
             let xi = if t == 0 {
                 "xo + j".to_string()
@@ -252,10 +211,10 @@ fn mk_bf16_source(mk_max: usize) -> String {
         }
         b.push_str("        }\n    }\n");
         for t in 0..mk_max {
-            writeln!(b, "    if ({t}u < mm) {{").unwrap();
             writeln!(
                 b,
-                "        let total{t} = gemv_bf16_reduce(tid, lane, acc{t});"
+                "    if ({t}u < mm) {{
+        let total{t} = gemv_bf16_reduce(tid, lane, acc{t});"
             )
             .unwrap();
             b.push_str("        if (lane == 0u && live && (warp & 1u) == 0u) {\n");
@@ -265,9 +224,12 @@ fn mk_bf16_source(mk_max: usize) -> String {
             )
             .unwrap();
             b.push_str(&store(t));
-            b.push_str("        }\n");
-            b.push_str("        workgroupBarrier();\n");
-            b.push_str("    }\n");
+            b.push_str(
+                "        }
+        workgroupBarrier();
+    }
+",
+            );
         }
         b.push_str("}\n\n");
     }
@@ -292,26 +254,32 @@ fn mk_q8_source(mk_max: usize) -> String {
         ] {
             b.push_str("@compute @workgroup_size(256)\n");
             writeln!(b, "fn g4w_gemm_{tag}_mk_{suffix}(").unwrap();
-            b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>\n) {\n");
-            b.push_str("    let tid = lid.x;\n");
-            b.push_str("    let lane = tid & (QG_LANES - 1u);\n");
-            b.push_str("    let warp = tid / QG_LANES;\n");
             b.push_str(
-                "    let row = (wid.x + wid.y * qg_params.groups_x) * QG_TREE_ROWS + warp;\n",
+                "    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let tid = lid.x;
+    let lane = tid & (QG_LANES - 1u);
+    let warp = tid / QG_LANES;
+    let row = (wid.x + wid.y * qg_params.groups_x) * QG_TREE_ROWS + warp;
+    let live = row < qg_params.n_rows;
+    let kv = select(0u, qg_params.k_elems >> 4u, live);
+    let wbase = select(0u, row * (qg_params.k_elems >> 4u), live);
+    let sbase = select(0u, row * qg_params.scales_per_row, live);
+    let sh = qg_params.group_shift;
+    let mm = g4w_mk_params.m;
+    let xs4 = g4w_mk_params.x_stride_words >> 2u;
+",
             );
-            b.push_str("    let live = row < qg_params.n_rows;\n");
-            b.push_str("    let kv = select(0u, qg_params.k_elems >> 4u, live);\n");
-            b.push_str("    let wbase = select(0u, row * (qg_params.k_elems >> 4u), live);\n");
-            b.push_str("    let sbase = select(0u, row * qg_params.scales_per_row, live);\n");
-            b.push_str("    let sh = qg_params.group_shift;\n");
-            b.push_str("    let mm = g4w_mk_params.m;\n");
-            b.push_str("    let xs4 = g4w_mk_params.x_stride_words >> 2u;\n");
             for t in 0..mk_max {
                 writeln!(b, "    var acc{t} = 0.0;").unwrap();
             }
-            b.push_str("    for (var v = lane; v < kv; v = v + QG_LANES) {\n");
-            b.push_str("        let wv = qg_w4[wbase + v];\n");
-            b.push_str("        let sc = qg_row_scale[sbase + (v >> sh)];\n");
+            b.push_str(
+                "    for (var v = lane; v < kv; v = v + QG_LANES) {
+        let wv = qg_w4[wbase + v];
+        let sc = qg_row_scale[sbase + (v >> sh)];
+",
+            );
             for t in 0..mk_max {
                 let base = if t == 0 {
                     "".to_string()
@@ -326,14 +294,21 @@ fn mk_q8_source(mk_max: usize) -> String {
             }
             b.push_str("    }\n");
             for t in 0..mk_max {
-                writeln!(b, "    if ({t}u < mm) {{").unwrap();
-                writeln!(b, "        let total{t} = qg_reduce(tid, lane, acc{t});").unwrap();
+                writeln!(
+                    b,
+                    "    if ({t}u < mm) {{
+        let total{t} = qg_reduce(tid, lane, acc{t});"
+                )
+                .unwrap();
                 b.push_str("        if (lane == 0u && live && (warp & 1u) == 0u) {\n");
                 writeln!(b, "            let word = qg_pk_word(tid, row, total{t});").unwrap();
                 b.push_str(&store(t));
-                b.push_str("        }\n");
-                b.push_str("        workgroupBarrier();\n");
-                b.push_str("    }\n");
+                b.push_str(
+                    "        }
+        workgroupBarrier();
+    }
+",
+                );
             }
             b.push_str("}\n\n");
         }
@@ -353,26 +328,34 @@ fn mk_i8_lmhead_source(mk_max: usize) -> String {
     b.push('\n');
     b.push_str("@compute @workgroup_size(256)\n");
     writeln!(b, "fn {LMHEAD_I8_MK_PK_ENTRY}(").unwrap();
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>\n) {\n");
-    b.push_str("    let tid = lid.x;\n");
-    b.push_str("    let lane = tid & (GEMV_BF16_LANES - 1u);\n");
-    b.push_str("    let warp = tid / GEMV_BF16_LANES;\n");
-    b.push_str("    let row = (wid.x + wid.y * gi8_params.groups_x) * GEMV_BF16_ROWS + warp;\n");
-    b.push_str("    let live = row < gi8_params.n_rows;\n");
-    b.push_str("    let kv = select(0u, gi8_params.k_elems >> 4u, live);\n");
-    b.push_str("    let w_base = select(0u, row * gi8_params.wq_row_words, live);\n");
-    b.push_str("    let mm = g4w_mk_params.m;\n");
+    b.push_str(
+        "    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let tid = lid.x;
+    let lane = tid & (GEMV_BF16_LANES - 1u);
+    let warp = tid / GEMV_BF16_LANES;
+    let row = (wid.x + wid.y * gi8_params.groups_x) * GEMV_BF16_ROWS + warp;
+    let live = row < gi8_params.n_rows;
+    let kv = select(0u, gi8_params.k_elems >> 4u, live);
+    let w_base = select(0u, row * gi8_params.wq_row_words, live);
+    let mm = g4w_mk_params.m;
+",
+    );
     for t in 0..mk_max {
         writeln!(b, "    var acc{t} = 0.0;").unwrap();
     }
-    b.push_str("    for (var v = lane; v < kv; v = v + GEMV_BF16_LANES) {\n");
-    b.push_str("        let wo = w_base + (v << 2u);\n");
-    b.push_str("        let kb = v << 4u;\n");
-    b.push_str("        for (var t = 0u; t < 4u; t = t + 1u) {\n");
-    b.push_str("            let word = gi8_wq[wo + t];\n");
-    b.push_str("            for (var i = 0u; i < 4u; i = i + 1u) {\n");
-    b.push_str("                let f = int8_decode(word, i);\n");
-    b.push_str("                let kk = kb + (t << 2u) + i;\n");
+    b.push_str(
+        "    for (var v = lane; v < kv; v = v + GEMV_BF16_LANES) {
+        let wo = w_base + (v << 2u);
+        let kb = v << 4u;
+        for (var t = 0u; t < 4u; t = t + 1u) {
+            let word = gi8_wq[wo + t];
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                let f = int8_decode(word, i);
+                let kk = kb + (t << 2u) + i;
+",
+    );
     for t in 0..mk_max {
         writeln!(
             b,
@@ -380,13 +363,18 @@ fn mk_i8_lmhead_source(mk_max: usize) -> String {
         )
         .unwrap();
     }
-    b.push_str("            }\n        }\n    }\n");
-    b.push_str("    let rs = gi8_row_scale[select(0u, row, live)];\n");
+    b.push_str(
+        "            }
+        }
+    }
+    let rs = gi8_row_scale[select(0u, row, live)];
+",
+    );
     for t in 0..mk_max {
-        writeln!(b, "    if ({t}u < mm) {{").unwrap();
         writeln!(
             b,
-            "        let scaled{t} = gi8_scale_mul(gemv_bf16_reduce_seq(tid, lane, acc{t}), rs);"
+            "    if ({t}u < mm) {{
+        let scaled{t} = gi8_scale_mul(gemv_bf16_reduce_seq(tid, lane, acc{t}), rs);"
         )
         .unwrap();
         b.push_str("        workgroupBarrier();\n");
@@ -395,22 +383,29 @@ fn mk_i8_lmhead_source(mk_max: usize) -> String {
             "        if (lane == 0u) {{\n            gemv_bf16_partial[tid] = scaled{t};\n        }}"
         )
         .unwrap();
-        b.push_str("        workgroupBarrier();\n");
-        b.push_str("        if (lane == 0u && live && (warp & 1u) == 0u) {\n");
-        writeln!(b, "            let lo = bf16_encode(scaled{t}) & 0xffffu;").unwrap();
-        b.push_str("            let hi_live = row + 1u < gi8_params.n_rows;\n");
         b.push_str(
-            "            let hi = bf16_encode(gemv_bf16_partial[tid + GEMV_BF16_LANES]) & 0xffffu;\n",
+            "        workgroupBarrier();
+        if (lane == 0u && live && (warp & 1u) == 0u) {
+",
         );
-        b.push_str("            let packed = lo | (select(0u, hi, hi_live) << 16u);\n");
+        writeln!(b, "            let lo = bf16_encode(scaled{t}) & 0xffffu;").unwrap();
+        b.push_str(
+            "            let hi_live = row + 1u < gi8_params.n_rows;
+            let hi = bf16_encode(gemv_bf16_partial[tid + GEMV_BF16_LANES]) & 0xffffu;
+            let packed = lo | (select(0u, hi, hi_live) << 16u);
+",
+        );
         writeln!(
             b,
             "            gi8_y[g4w_mk_params.dst_word_off + {t}u * g4w_mk_params.y_stride_words + (row >> 1u)] = packed;"
         )
         .unwrap();
-        b.push_str("        }\n");
-        b.push_str("        workgroupBarrier();\n");
-        b.push_str("    }\n");
+        b.push_str(
+            "        }
+        workgroupBarrier();
+    }
+",
+        );
     }
     b.push_str("}\n");
     b
@@ -561,220 +556,182 @@ const HEAD_PREP_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4w_head_prep.w
 
 const NORM_CHAIN_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4w_norm_chain.wgsl");
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct HpParams {
-    n_q: u32,
-    n_kv: u32,
-    head_dim: u32,
-    half_dim: u32,
-    eps: f32,
-    words: u32,
-    out_words: u32,
-    ring: u32,
-}
+pod! {
+    struct HpParams {
+        n_q: u32,
+        n_kv: u32,
+        head_dim: u32,
+        half_dim: u32,
+        eps: f32,
+        words: u32,
+        out_words: u32,
+        ring: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct NcParams {
-    hidden: u32,
-    words: u32,
-    eps: f32,
-    scale: f32,
-}
+    struct NcParams {
+        hidden: u32,
+        words: u32,
+        eps: f32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PkOffParams {
-    dst_word_off: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct PkOffParams {
+        dst_word_off: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct SplitParams {
-    q_rows: u32,
-    kv_rows: u32,
-    v_off: u32,
-    pad0: u32,
-}
+    struct SplitParams {
+        q_rows: u32,
+        kv_rows: u32,
+        v_off: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct MkParams {
-    m: u32,
-    x_stride_words: u32,
-    y_stride_words: u32,
-    dst_word_off: u32,
-}
+    struct MkParams {
+        m: u32,
+        x_stride_words: u32,
+        y_stride_words: u32,
+        dst_word_off: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PackParams {
-    src_off: u32,
-    dst_off: u32,
-    n_words: u32,
-    pad0: u32,
-}
+    struct PackParams {
+        src_off: u32,
+        dst_off: u32,
+        n_words: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct Gather2Params {
-    split_row: u32,
-    hidden_words: u32,
-    vocab: u32,
-    pad0: u32,
-}
+    struct Gather2Params {
+        split_row: u32,
+        hidden_words: u32,
+        vocab: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct SpliceParams {
-    hidden_words: u32,
-    m: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct SpliceParams {
+        hidden_words: u32,
+        m: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RmsParams {
-    hidden: u32,
-    batch: u32,
-    eps: f32,
-    words_per_row: u32,
-}
+    struct RmsParams {
+        hidden: u32,
+        batch: u32,
+        eps: f32,
+        words_per_row: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ScaleParams {
-    n: u32,
-    n_words: u32,
-    scale: f32,
-    cap: f32,
-    inv_cap: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct ScaleParams {
+        n: u32,
+        n_words: u32,
+        scale: f32,
+        cap: f32,
+        inv_cap: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvBf16Params {
-    n_rows: u32,
-    k_elems: u32,
-    w_row_words: u32,
-    groups_x: u32,
-}
+    struct GemvBf16Params {
+        n_rows: u32,
+        k_elems: u32,
+        w_row_words: u32,
+        groups_x: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RowQuantParams {
-    n_rows: u32,
-    k_elems: u32,
-    src_row_words: u32,
-    dst_row_words: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct RowQuantParams {
+        n_rows: u32,
+        k_elems: u32,
+        src_row_words: u32,
+        dst_row_words: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvI8Params {
-    n_rows: u32,
-    k_elems: u32,
-    wq_row_words: u32,
-    groups_x: u32,
-    m_rows: u32,
-    x_row_words: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct GemvI8Params {
+        n_rows: u32,
+        k_elems: u32,
+        wq_row_words: u32,
+        groups_x: u32,
+        m_rows: u32,
+        x_row_words: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvNvfp4Params {
-    alpha: f32,
-    n_rows: u32,
-    k_blocks: u32,
-    k_tiles: u32,
-    w_row_words: u32,
-    groups_x: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct GemvNvfp4Params {
+        alpha: f32,
+        n_rows: u32,
+        k_blocks: u32,
+        k_tiles: u32,
+        w_row_words: u32,
+        groups_x: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct QuantRowParams {
-    global_scale: f32,
-    k_blocks: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct QuantRowParams {
+        global_scale: f32,
+        k_blocks: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RopeParams {
-    n_heads: u32,
-    half_dim: u32,
-    total_words: u32,
-    table_rows: u32,
-}
+    struct RopeParams {
+        n_heads: u32,
+        half_dim: u32,
+        total_words: u32,
+        table_rows: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct KvFp8Params {
-    n_tokens: u32,
-    n_kv: u32,
-    head_dim: u32,
-    ring: u32,
-    pairs: u32,
-    start: u32,
-    slots: u32,
-    reserved: u32,
-}
+    struct KvFp8Params {
+        n_tokens: u32,
+        n_kv: u32,
+        head_dim: u32,
+        ring: u32,
+        pairs: u32,
+        start: u32,
+        slots: u32,
+        reserved: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct FdParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    total: u32,
-    start: u32,
-    splits: u32,
-    ring: u32,
-    out_bf16: u32,
-    scaling: f32,
-    pad0: u32,
-    fused: u32,
-    pad2: u32,
-    m_rows: u32,
-    window: u32,
-    pad3: u32,
-    pad4: u32,
-}
+    struct FdParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        total: u32,
+        start: u32,
+        splits: u32,
+        ring: u32,
+        out_bf16: u32,
+        scaling: f32,
+        pad0: u32,
+        fused: u32,
+        pad2: u32,
+        m_rows: u32,
+        window: u32,
+        pad3: u32,
+        pad4: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GeluParams {
-    inter: u32,
-    inter_words: u32,
-    rows: u32,
-    tot_pairs: u32,
-}
+    struct GeluParams {
+        inter: u32,
+        inter_words: u32,
+        rows: u32,
+        tot_pairs: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ArgmaxRowsParams {
-    rows: u32,
-    n: u32,
-    pad0: u32,
-    pad1: u32,
+    struct ArgmaxRowsParams {
+        rows: u32,
+        n: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 }
 
 pub struct HostBf16Lin {
@@ -934,23 +891,11 @@ fn par_bf16_bits(wf: &[f32], gi: f32) -> Vec<u16> {
     bits
 }
 
-pub const W8_FFN_DEFAULT: &str = "all";
-
-fn gelu_fold_enabled() -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call("NV_G4_WGPU_GELU_FOLD")
-}
-
-fn w8_ffn_mode() -> (bool, bool, usize) {
-    let v = std::env::var("NV_G4_WGPU_W8_FFN").unwrap_or_else(|_| W8_FFN_DEFAULT.to_string());
-    let group = std::env::var("NV_G4_WGPU_W8_FFN_GROUP")
+fn w8_ffn_group() -> usize {
+    env::var("NV_G4_WGPU_W8_FFN_GROUP")
         .ok()
         .and_then(|g| g.trim().parse::<usize>().ok())
-        .unwrap_or(128);
-    match v.trim() {
-        "down" => (false, true, group),
-        "1" | "all" => (true, true, group),
-        _ => (false, false, group),
-    }
+        .unwrap_or(128)
 }
 
 static CONV_DEQ_NS: AtomicU64 = AtomicU64::new(0);
@@ -998,20 +943,15 @@ enum ProjRole {
 struct Q8Plan {
     attn_fp8: bool,
     aq: AttnQuant,
-    w8_gate_up: bool,
-    w8_down: bool,
     w8_group: usize,
 }
 
 impl Q8Plan {
     fn from_env() -> Self {
-        let (w8_gate_up, w8_down, w8_group) = w8_ffn_mode();
         Self {
             attn_fp8: attn_fp8_enabled(),
             aq: attn_quant_config(),
-            w8_gate_up,
-            w8_down,
-            w8_group,
+            w8_group: w8_ffn_group(),
         }
     }
 
@@ -1024,11 +964,7 @@ impl Q8Plan {
                     && l.n % 2 == 0
             }
             (HostProj::Nvfp4(l), ProjRole::GateUp | ProjRole::Down) => {
-                let on = match role {
-                    ProjRole::GateUp => self.w8_gate_up,
-                    _ => self.w8_down,
-                };
-                on && wk::quant_gemv::group_rule(l.k, self.w8_group).is_ok() && l.n % 2 == 0
+                wk::quant_gemv::group_rule(l.k, self.w8_group).is_ok() && l.n % 2 == 0
             }
             (HostProj::Fp8(_), _) => true,
             _ => false,
@@ -1283,7 +1219,7 @@ impl Default for W4PtqSpec {
 
 impl W4PtqSpec {
     pub fn from_env() -> Option<Self> {
-        let raw = std::env::var("NV_G4_W4PTQ").ok()?;
+        let raw = env::var("NV_G4_W4PTQ").ok()?;
         let raw = raw.trim();
         if raw.is_empty() || raw == "off" || raw == "0" {
             return None;
@@ -1977,8 +1913,8 @@ pub fn quantize_q8_host(
 }
 
 struct Pass {
-    pipeline: Arc<wgpu::ComputePipeline>,
-    bind: wgpu::BindGroup,
+    pipeline: Arc<ComputePipeline>,
+    bind: BindGroup,
     grid: (u32, u32, u32),
     label: String,
 }
@@ -2000,7 +1936,7 @@ enum GpuProj {
         alpha: f32,
         mk_input_globals_one_per_slot: GpuTensor<f32>,
         deep: bool,
-        v2: Option<(Arc<wgpu::ComputePipeline>, wk::gemv_nvfp4_v2::V2Kernel)>,
+        v2: Option<(Arc<ComputePipeline>, wk::gemv_nvfp4_v2::V2Kernel)>,
     },
     Fp8 {
         w: GpuTensor<u32>,
@@ -2019,58 +1955,58 @@ struct GpuLayerKv {
 }
 
 struct Pipelines {
-    gather: Arc<wgpu::ComputePipeline>,
-    scale: Arc<wgpu::ComputePipeline>,
-    rms: Arc<wgpu::ComputePipeline>,
-    rmsres: Arc<wgpu::ComputePipeline>,
-    resadd: Arc<wgpu::ComputePipeline>,
-    cast_f32: Arc<wgpu::ComputePipeline>,
-    softcap: Arc<wgpu::ComputePipeline>,
-    rope: Arc<wgpu::ComputePipeline>,
-    rope_f32: Arc<wgpu::ComputePipeline>,
-    kvq: Arc<wgpu::ComputePipeline>,
-    flash1: Arc<wgpu::ComputePipeline>,
-    flash1_fold: Option<(u32, Arc<wgpu::ComputePipeline>)>,
-    flash2_pk: Arc<wgpu::ComputePipeline>,
-    gemv_pk: Arc<wgpu::ComputePipeline>,
-    gemv_pk3: Arc<wgpu::ComputePipeline>,
-    rowquant_i8: Arc<wgpu::ComputePipeline>,
-    gemv_i8: Arc<wgpu::ComputePipeline>,
-    gemv4_pk: Arc<wgpu::ComputePipeline>,
-    gemv4_pk_deep: Option<Arc<wgpu::ComputePipeline>>,
-    quant_pk: Arc<wgpu::ComputePipeline>,
-    gelu_even: Arc<wgpu::ComputePipeline>,
-    am1: Arc<wgpu::ComputePipeline>,
-    am2: Arc<wgpu::ComputePipeline>,
-    pack16: Arc<wgpu::ComputePipeline>,
+    gather: Arc<ComputePipeline>,
+    scale: Arc<ComputePipeline>,
+    rms: Arc<ComputePipeline>,
+    rmsres: Arc<ComputePipeline>,
+    resadd: Arc<ComputePipeline>,
+    cast_f32: Arc<ComputePipeline>,
+    softcap: Arc<ComputePipeline>,
+    rope: Arc<ComputePipeline>,
+    rope_f32: Arc<ComputePipeline>,
+    kvq: Arc<ComputePipeline>,
+    flash1: Arc<ComputePipeline>,
+    flash1_fold: Option<(u32, Arc<ComputePipeline>)>,
+    flash2_pk: Arc<ComputePipeline>,
+    gemv_pk: Arc<ComputePipeline>,
+    gemv_pk3: Arc<ComputePipeline>,
+    rowquant_i8: Arc<ComputePipeline>,
+    gemv_i8: Arc<ComputePipeline>,
+    gemv4_pk: Arc<ComputePipeline>,
+    gemv4_pk_deep: Option<Arc<ComputePipeline>>,
+    quant_pk: Arc<ComputePipeline>,
+    gelu_even: Arc<ComputePipeline>,
+    am1: Arc<ComputePipeline>,
+    am2: Arc<ComputePipeline>,
+    pack16: Arc<ComputePipeline>,
     fp8: Option<Fp8Pipelines>,
     fuse: Option<FusePipelines>,
     mk: Option<MkPipelines>,
-    splice: Arc<wgpu::ComputePipeline>,
+    splice: Arc<ComputePipeline>,
 }
 
 struct Fp8Pipelines {
-    pk: Arc<wgpu::ComputePipeline>,
-    pk3: Arc<wgpu::ComputePipeline>,
-    i8_pk: Arc<wgpu::ComputePipeline>,
-    i8_pk3: Arc<wgpu::ComputePipeline>,
+    pk: Arc<ComputePipeline>,
+    pk3: Arc<ComputePipeline>,
+    i8_pk: Arc<ComputePipeline>,
+    i8_pk3: Arc<ComputePipeline>,
 
-    i8_gelu: Arc<wgpu::ComputePipeline>,
+    i8_gelu: Arc<ComputePipeline>,
     rows_per_group: u32,
 }
 
 struct MkPipelines {
-    gather: Arc<wgpu::ComputePipeline>,
-    bf16_pk: Arc<wgpu::ComputePipeline>,
-    bf16_pk3: Arc<wgpu::ComputePipeline>,
+    gather: Arc<ComputePipeline>,
+    bf16_pk: Arc<ComputePipeline>,
+    bf16_pk3: Arc<ComputePipeline>,
     q8: Option<MkQ8Pipelines>,
 }
 
 struct MkQ8Pipelines {
-    i8_pk: Arc<wgpu::ComputePipeline>,
-    i8_pk3: Arc<wgpu::ComputePipeline>,
-    fp8_pk: Arc<wgpu::ComputePipeline>,
-    fp8_pk3: Arc<wgpu::ComputePipeline>,
+    i8_pk: Arc<ComputePipeline>,
+    i8_pk3: Arc<ComputePipeline>,
+    fp8_pk: Arc<ComputePipeline>,
+    fp8_pk3: Arc<ComputePipeline>,
 }
 
 struct Mk4SlotBufs {
@@ -2081,7 +2017,7 @@ struct Mk4SlotBufs {
     alphas_unread_when_per_expert_alpha_is_zero: GpuTensor<f32>,
 }
 
-const MK4_SLOT_V2_WGSL: &str = include_str!("../../nv-kernels/wgsl/q3m_gemv_nvfp4_v2.wgsl");
+const MK4_SLOT_V2_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/q3m_gemv_nvfp4_v2.wgsl");
 
 struct Mk4V2Route {
     source: String,
@@ -2131,23 +2067,23 @@ fn mk4_slot_v2_route(ctx: &WgpuContext, n: usize, k: usize, slots: usize) -> Opt
 }
 
 enum GemvBindDst<'a> {
-    Packed(&'a wgpu::Buffer),
+    Packed(&'a Buffer),
     Split {
-        q: &'a wgpu::Buffer,
-        k: &'a wgpu::Buffer,
-        v: &'a wgpu::Buffer,
-        sp: &'a wgpu::Buffer,
+        q: &'a Buffer,
+        k: &'a Buffer,
+        v: &'a Buffer,
+        sp: &'a Buffer,
     },
 }
 
 fn gemv_bind_list<'a>(
-    w: &'a wgpu::Buffer,
-    row_scale: Option<&'a wgpu::Buffer>,
-    x: &'a wgpu::Buffer,
-    params: &'a wgpu::Buffer,
+    w: &'a Buffer,
+    row_scale: Option<&'a Buffer>,
+    x: &'a Buffer,
+    params: &'a Buffer,
     dst: GemvBindDst<'a>,
-    tail: Option<(u32, &'a wgpu::Buffer)>,
-) -> Vec<(u32, &'a wgpu::Buffer)> {
+    tail: Option<(u32, &'a Buffer)>,
+) -> Vec<(u32, &'a Buffer)> {
     let mut binds = vec![(0u32, w)];
     let mut slot = 1u32;
     if let Some(rs) = row_scale {
@@ -2179,13 +2115,13 @@ type LmHeadI8Bufs = (
 );
 
 struct MrowHeadBufs<'a> {
-    hidden_in: &'a wgpu::Buffer,
-    normed: &'a wgpu::Buffer,
-    logits_pk: &'a wgpu::Buffer,
-    logits_f32: &'a wgpu::Buffer,
-    am_val: &'a wgpu::Buffer,
-    am_idx: &'a wgpu::Buffer,
-    token_out: &'a wgpu::Buffer,
+    hidden_in: &'a Buffer,
+    normed: &'a Buffer,
+    logits_pk: &'a Buffer,
+    logits_f32: &'a Buffer,
+    am_val: &'a Buffer,
+    am_idx: &'a Buffer,
+    token_out: &'a Buffer,
 }
 
 struct MrowHeadWeights<'a> {
@@ -2195,7 +2131,6 @@ struct MrowHeadWeights<'a> {
     i8: &'a Option<LmHeadI8Bufs>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_mrow_head(
     b: &mut Builder,
     ctx: &'static WgpuContext,
@@ -2366,9 +2301,9 @@ fn push_mrow_head(
 
 fn q8_pick(
     fmt: wk::quant_gemv::QFormat,
-    e4m3: &Arc<wgpu::ComputePipeline>,
-    int8: &Arc<wgpu::ComputePipeline>,
-) -> Arc<wgpu::ComputePipeline> {
+    e4m3: &Arc<ComputePipeline>,
+    int8: &Arc<ComputePipeline>,
+) -> Arc<ComputePipeline> {
     match fmt {
         wk::quant_gemv::QFormat::E4m3 => e4m3.clone(),
         wk::quant_gemv::QFormat::Int8 => int8.clone(),
@@ -2376,16 +2311,16 @@ fn q8_pick(
 }
 
 impl MkQ8Pipelines {
-    fn pk_for(&self, fmt: wk::quant_gemv::QFormat) -> Arc<wgpu::ComputePipeline> {
+    fn pk_for(&self, fmt: wk::quant_gemv::QFormat) -> Arc<ComputePipeline> {
         q8_pick(fmt, &self.fp8_pk, &self.i8_pk)
     }
-    fn pk3_for(&self, fmt: wk::quant_gemv::QFormat) -> Arc<wgpu::ComputePipeline> {
+    fn pk3_for(&self, fmt: wk::quant_gemv::QFormat) -> Arc<ComputePipeline> {
         q8_pick(fmt, &self.fp8_pk3, &self.i8_pk3)
     }
 }
 
 pub fn batch_slots_default() -> usize {
-    match std::env::var("NV_WGPU_BATCH_SLOTS")
+    match env::var("NV_WGPU_BATCH_SLOTS")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
     {
@@ -2395,12 +2330,11 @@ pub fn batch_slots_default() -> usize {
 }
 
 pub fn prefill_m() -> usize {
-    match std::env::var("NV_G4_WGPU_PREFILL_M")
-        .or_else(|_| std::env::var("NV_WGPU_PREFILL_M"))
+    match env::var("NV_G4_WGPU_PREFILL_M")
+        .or_else(|_| env::var("NV_WGPU_PREFILL_M"))
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
     {
-        Some(0) | Some(1) => 0,
         Some(m) => m.clamp(2, MK_MAX),
         None => MK_MAX,
     }
@@ -2415,7 +2349,7 @@ pub const PF_FLASH_MAX_HEAD_DIM_FDT_KV_STAGE_HOLDS_8_POSITIONS_OF_256_FLOATS: us
 pub fn pf_flash_full_attention_enabled_via_nv_g4_wgpu_pf_flash_default_off_pending_nll_adjudication(
 ) -> bool {
     matches!(
-        std::env::var("NV_G4_WGPU_PF_FLASH").ok().as_deref(),
+        env::var("NV_G4_WGPU_PF_FLASH").ok().as_deref(),
         Some("1") | Some("on")
     )
 }
@@ -2423,9 +2357,7 @@ pub fn pf_flash_full_attention_enabled_via_nv_g4_wgpu_pf_flash_default_off_pendi
 pub fn pf_flash_portable_arm_forced_via_nv_g4_wgpu_pf_flash_portable_for_testing_on_sg_adapters(
 ) -> bool {
     matches!(
-        std::env::var("NV_G4_WGPU_PF_FLASH_PORTABLE")
-            .ok()
-            .as_deref(),
+        env::var("NV_G4_WGPU_PF_FLASH_PORTABLE").ok().as_deref(),
         Some("1") | Some("on")
     )
 }
@@ -2461,7 +2393,7 @@ pub const PF_WIDE_M_MAX_VIA_MK_MAX_ROW_GEMM_TILES_AT_256B_ALIGNED_OFFSETS: usize
 pub const PF_GEMM_TILE_ROWS_BOUND_BY_ONE_F32_ACCUMULATOR_PER_SLOT_IN_REGISTERS: usize = MK_MAX;
 
 pub fn prefill_m_wide_via_nv_g4_wgpu_pf_m_in_mk_max_row_tiles() -> usize {
-    match std::env::var("NV_G4_WGPU_PF_M")
+    match env::var("NV_G4_WGPU_PF_M")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
     {
@@ -2479,7 +2411,7 @@ pub const PF_COOP_TN2_SG2_KU4_STAGES_4096_F16_WELL_UNDER_THE_24576_BUDGET: (u32,
 
 pub fn pf_coop_w4a16_ffn_opt_in_default_off_because_only_measured_on_this_blackwell_adapter() -> bool
 {
-    nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_G4_PF_COOP")
+    env_arm_opt_in_eq_some_1_reread_every_call("NV_G4_PF_COOP")
 }
 
 pub fn pf_coop_x_rows_round_up_to_a_whole_row_block_because_the_gemm_loads_every_row_of_its_last_block(
@@ -2511,13 +2443,7 @@ pub fn pf_passes_per_chunk_when_no_projection_is_nvfp4(layers: usize, m: usize) 
 pub const SLIDING_KV_RING_DEFAULT_ON: bool = false;
 
 pub fn sliding_kv_ring_enabled() -> bool {
-    match std::env::var("NV_G4_WGPU_KV_RING") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => SLIDING_KV_RING_DEFAULT_ON,
-    }
+    env_flag("NV_G4_WGPU_KV_RING").unwrap_or(SLIDING_KV_RING_DEFAULT_ON)
 }
 
 pub const SLIDING_KV_RING_HEADROOM_SLOTS_MATCHING_CUDA_KV_FP8_RING_SLOTS: usize = 128;
@@ -2533,7 +2459,7 @@ fn flash1_arm_for_kind(
     pl: &Pipelines,
     n_q: usize,
     gqa_group: usize,
-) -> (Arc<wgpu::ComputePipeline>, u32) {
+) -> (Arc<ComputePipeline>, u32) {
     match pl.flash1_fold.as_ref() {
         Some((fold, p)) if gqa_group.is_multiple_of(*fold as usize) => {
             (p.clone(), n_q as u32 / *fold)
@@ -2547,9 +2473,9 @@ fn mk_pipeline(
     label: &str,
     source: &str,
     entry: &str,
-) -> Result<Arc<wgpu::ComputePipeline>> {
+) -> Result<Arc<ComputePipeline>> {
     dispatch::cached_compute_pipeline(ctx, label, source, entry)
-        .map_err(|e| anyhow::anyhow!("pipeline {label}: {e}"))
+        .map_err(|e| anyhow!("pipeline {label}: {e}"))
 }
 
 fn build_mk_pipelines(ctx: &WgpuContext, m: usize, fp8: bool) -> Result<MkPipelines> {
@@ -2575,18 +2501,18 @@ fn build_mk_pipelines(ctx: &WgpuContext, m: usize, fp8: bool) -> Result<MkPipeli
 }
 
 impl Fp8Pipelines {
-    fn pk_for(&self, fmt: wk::quant_gemv::QFormat) -> Arc<wgpu::ComputePipeline> {
+    fn pk_for(&self, fmt: wk::quant_gemv::QFormat) -> Arc<ComputePipeline> {
         q8_pick(fmt, &self.pk, &self.i8_pk)
     }
-    fn pk3_for(&self, fmt: wk::quant_gemv::QFormat) -> Arc<wgpu::ComputePipeline> {
+    fn pk3_for(&self, fmt: wk::quant_gemv::QFormat) -> Arc<ComputePipeline> {
         q8_pick(fmt, &self.pk3, &self.i8_pk3)
     }
 }
 
 struct FusePipelines {
-    head_prep: Arc<wgpu::ComputePipeline>,
-    norm_res_norm: Arc<wgpu::ComputePipeline>,
-    norm_add_norm: Arc<wgpu::ComputePipeline>,
+    head_prep: Arc<ComputePipeline>,
+    norm_res_norm: Arc<ComputePipeline>,
+    norm_add_norm: Arc<ComputePipeline>,
 }
 
 pub fn fuse_workgroup_bytes(hd_max: usize) -> u32 {
@@ -2606,15 +2532,12 @@ pub fn fuse_mask(ctx: &WgpuContext, hd_max: usize) -> u32 {
     {
         return 0;
     }
-    match std::env::var("NV_WGPU_FUSE") {
-        Ok(v) => v.trim().parse::<u32>().unwrap_or(FUSE_ALL) & FUSE_ALL,
-        Err(_) => FUSE_ALL,
-    }
+    FUSE_ALL
 }
 
 fn build_fuse_pipelines(ctx: &WgpuContext, hd_max: usize) -> Result<FusePipelines> {
     let maxw = (hd_max / 2).max(1);
-    anyhow::ensure!(
+    ensure!(
         HEAD_PREP_WGSL.matches("HP_MAXW").count() == 2,
         "head-prep shader must declare HP_MAXW exactly twice"
     );
@@ -2631,17 +2554,9 @@ fn build_fuse_pipelines(ctx: &WgpuContext, hd_max: usize) -> Result<FusePipeline
 pub const NVFP4_SHAPE_PICK_DEFAULT_ON: bool = false;
 
 fn nvfp4_shape_pick_enabled() -> bool {
-    match std::env::var("NV_WGPU_NVFP4_SHAPE_PICK") {
+    match env::var("NV_WGPU_NVFP4_SHAPE_PICK") {
         Ok(v) => v != "0",
         Err(_) => NVFP4_SHAPE_PICK_DEFAULT_ON,
-    }
-}
-
-fn nvfp4_variant(ctx: &WgpuContext) -> wk::gemv_nvfp4::GemvVariant {
-    if nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_NVFP4_TREE") {
-        wk::gemv_nvfp4::GemvVariant::Tree
-    } else {
-        wk::gemv_nvfp4::select_variant(ctx)
     }
 }
 
@@ -2652,13 +2567,10 @@ pub const ATTN_FP8_FMT_DEFAULT: wk::quant_gemv::QFormat = wk::quant_gemv::QForma
 pub const NVFP4_V2_DEFAULT_ON: bool = false;
 
 pub fn nvfp4_v2_enabled(ctx: &WgpuContext) -> bool {
-    if nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_NVFP4_TREE") {
-        return false;
-    }
     if !wk::gemv_nvfp4_v2::subgroup32_ok(ctx) {
         return false;
     }
-    match std::env::var("NV_WGPU_NVFP4_V2") {
+    match env::var("NV_WGPU_NVFP4_V2") {
         Ok(v) => v != "0",
         Err(_) => NVFP4_V2_DEFAULT_ON,
     }
@@ -2668,7 +2580,7 @@ fn nvfp4_v2_pipeline(
     ctx: &WgpuContext,
     n: usize,
     k: usize,
-) -> Option<(Arc<wgpu::ComputePipeline>, wk::gemv_nvfp4_v2::V2Kernel, u32)> {
+) -> Option<(Arc<ComputePipeline>, wk::gemv_nvfp4_v2::V2Kernel, u32)> {
     let (kernel, cfg, entry) = wk::gemv_nvfp4_v2::select_pk(n, k)?;
     let src = wk::gemv_nvfp4_v2::source(cfg);
     let label = format!("g4w-gemv4-v2-{entry}-{}x{}", cfg.wg, cfg.mr);
@@ -2770,14 +2682,7 @@ pub fn weight_format_boot_line() -> String {
     } else {
         "checkpoint".to_string()
     };
-    let (w8_gu, w8_dn, g) = w8_ffn_mode();
-    let ffn = |on: bool| {
-        if on {
-            format!("int8/{g} if nvfp4")
-        } else {
-            "checkpoint".to_string()
-        }
-    };
+    let ffn = format!("int8/{} if nvfp4", w8_ffn_group());
     let lmhead =
         if nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_WGPU_LMHEAD_INT8")
         {
@@ -2794,11 +2699,9 @@ pub fn weight_format_boot_line() -> String {
         None => String::new(),
     };
     format!(
-        "[gemma4_wgpu] weight formats: attn.qkv+o={attn} ffn.gate_up={} ffn.down={} \
+        "[gemma4_wgpu] weight formats: attn.qkv+o={attn} ffn.gate_up={ffn} ffn.down={ffn} \
          lm_head={lmhead}{w4} (attn variant is hardcoded per arch; override with \
-         NV_G4_WGPU_W8_FFN=off / NV_WGPU_LMHEAD_INT8=0)",
-        ffn(w8_gu),
-        ffn(w8_dn)
+         NV_WGPU_LMHEAD_INT8=0)"
     )
 }
 
@@ -2889,35 +2792,14 @@ fn build_pipelines(
         );
     }
     let flash1_fold = if flash_fold > 1 && fold_sg {
-        const FOLD_REDUCE_IS_SG_SHUFFLE_WB_TREES_LOSE_AT_EVERY_DEPTH_SG_DRIFTS_1ULP_AT_HD512: bool =
-            true;
-        let sg = FOLD_REDUCE_IS_SG_SHUFFLE_WB_TREES_LOSE_AT_EVERY_DEPTH_SG_DRIFTS_1ULP_AT_HD512;
-        let tile = if flash_sd_enabled() {
-            flash_tile_env()
-        } else {
-            0
-        };
-        let (entry, generated) = if flash_sd_enabled() && tile >= 2 {
-            (
-                wk::flash_decode::fold_stage1_entry_sd_tiled(fold_hd_max, flash_fold, tile),
-                wk::flash_decode::fold_stage1_source_sd_tiled(fold_hd_max, flash_fold, tile),
-            )
-        } else if flash_sd_enabled() {
-            (
-                wk::flash_decode::fold_stage1_entry_sd(fold_hd_max, sg, flash_fold),
-                wk::flash_decode::fold_stage1_source_sd(fold_hd_max, sg, flash_fold),
-            )
-        } else {
-            (
-                wk::flash_decode::fold_stage1_entry(fold_hd_max, sg, flash_fold),
-                wk::flash_decode::fold_stage1_source(fold_hd_max, sg, flash_fold),
-            )
-        };
+        let tile = flash_tile_env();
+        let entry = wk::flash_decode::fold_stage1_entry_sd_tiled(fold_hd_max, flash_fold, tile);
+        let generated =
+            wk::flash_decode::fold_stage1_source_sd_tiled(fold_hd_max, flash_fold, tile);
         let src = format!("{}\n{}", compose(wk::flash_decode::WGSL), generated);
         eprintln!(
             "[gemma4_wgpu] depth stack: flash stage1 folds {flash_fold} query heads per \
-             workgroup (subgroup reduce, tile {tile}), splits {splits} ({})",
-            DEPTH_STACK_ENV_DEFAULT_ON_SET_0_FOR_THE_MONOLITHIC_ARM_SIGNED_OFF_ON_THE_DEPTH_WIN
+             workgroup (subgroup reduce, tile {tile}), splits {splits}"
         );
         Some((
             flash_fold,
@@ -2954,7 +2836,7 @@ fn build_pipelines(
         rope: mk("g4w-rope", &src_rope, "rope_bf16")?,
         rope_f32: mk("g4w-rope-f32", &src_rope, ROPE_F32_ENTRY)?,
         kvq: mk("g4w-kvq", &src_kv, wk::kv_fp8::QUANTIZE_ENTRY)?,
-        flash1: mk("g4w-flash1", &src_flash, flash1_stage1_entry())?,
+        flash1: mk("g4w-flash1", &src_flash, wk::flash_decode::ENTRY_STAGE1_FP8_SD)?,
         flash1_fold,
         flash2_pk,
         gemv_pk: mk("g4w-gemv8-pk", &src_gemvb, GEMV_PK_ENTRY)?,
@@ -3062,8 +2944,8 @@ struct PrefillState {
     fd_s: Vec<GpuUniform<FdParams>>,
     fd_f: Vec<GpuUniform<FdParams>>,
     fd_flash: Option<GpuUniform<FdParams>>,
-    splice_rows: wgpu::Buffer,
-    splice_mask: wgpu::Buffer,
+    splice_rows: Buffer,
+    splice_mask: Buffer,
     splice_mask_live: bool,
     validated: bool,
 }
@@ -3088,6 +2970,7 @@ pub struct Gemma4Wgpu {
     pos: usize,
     kv_base: usize,
     slot_pos: Vec<usize>,
+    kv_high_water: usize,
     validated: bool,
     prefill: Option<PrefillState>,
     pf_coop_sites: usize,
@@ -3110,7 +2993,7 @@ pub struct Gemma4Wgpu {
     logits_f32: GpuTensor<f32>,
     vocab: usize,
     preenc: bool,
-    pending_cb: Option<wgpu::CommandBuffer>,
+    pending_cb: Option<CommandBuffer>,
     preenc_hits: u64,
     chain_steps: u64,
     uniform_probe: usize,
@@ -3128,13 +3011,13 @@ struct W4Capture {
 
 enum GemvDst<'b> {
     Packed {
-        y: &'b wgpu::Buffer,
+        y: &'b Buffer,
         word_off: usize,
     },
     SplitQkv {
-        q: &'b wgpu::Buffer,
-        k: &'b wgpu::Buffer,
-        v: &'b wgpu::Buffer,
+        q: &'b Buffer,
+        k: &'b Buffer,
+        v: &'b Buffer,
         q_rows: usize,
         kv_rows: usize,
         v_off: usize,
@@ -3166,14 +3049,14 @@ struct Builder<'a> {
 
 enum GemvDstMk<'b> {
     Packed {
-        y: &'b wgpu::Buffer,
+        y: &'b Buffer,
         word_off: usize,
         y_stride_words: usize,
     },
     SplitQkv {
-        q: &'b wgpu::Buffer,
-        k: &'b wgpu::Buffer,
-        v: &'b wgpu::Buffer,
+        q: &'b Buffer,
+        k: &'b Buffer,
+        v: &'b Buffer,
         q_rows: usize,
         kv_rows: usize,
         v_off: usize,
@@ -3183,8 +3066,8 @@ enum GemvDstMk<'b> {
 impl<'a> Builder<'a> {
     fn push_offsets(
         &mut self,
-        pipeline: Arc<wgpu::ComputePipeline>,
-        binds: &[(u32, &wgpu::Buffer, u64)],
+        pipeline: Arc<ComputePipeline>,
+        binds: &[(u32, &Buffer, u64)],
         grid: (u32, u32, u32),
     ) {
         let bind = dispatch::bind_group_offsets(self.ctx, &pipeline, binds);
@@ -3216,8 +3099,8 @@ impl<'a> Builder<'a> {
 
     fn push(
         &mut self,
-        pipeline: Arc<wgpu::ComputePipeline>,
-        binds: &[(u32, &wgpu::Buffer)],
+        pipeline: Arc<ComputePipeline>,
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) {
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
@@ -3247,7 +3130,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn uni<T: bytemuck::Pod + Send + 'static>(&mut self, label: &str, value: T) -> wgpu::Buffer {
+    fn uni<T: bytemuck::Pod + Send + 'static>(&mut self, label: &str, value: T) -> Buffer {
         let u = GpuUniform::new(self.ctx, label, &value);
         let raw = u.raw().clone();
         self.keep.push(Box::new(u));
@@ -3258,15 +3141,7 @@ impl<'a> Builder<'a> {
         dispatch::workgroup_count_1d(self.ctx, invocations, wg)
     }
 
-    fn rms(
-        &mut self,
-        x: &wgpu::Buffer,
-        w: &wgpu::Buffer,
-        y: &wgpu::Buffer,
-        batch: usize,
-        hidden: usize,
-        eps: f32,
-    ) {
+    fn rms(&mut self, x: &Buffer, w: &Buffer, y: &Buffer, batch: usize, hidden: usize, eps: f32) {
         let p = self.uni(
             "g4w-rms-p",
             RmsParams {
@@ -3283,8 +3158,8 @@ impl<'a> Builder<'a> {
 
     fn pack16(
         &mut self,
-        src: &wgpu::Buffer,
-        dst: &wgpu::Buffer,
+        src: &Buffer,
+        dst: &Buffer,
         src_off: usize,
         dst_off_words: usize,
         n_elems: usize,
@@ -3304,15 +3179,14 @@ impl<'a> Builder<'a> {
         self.push(pipeline, &[(0, src), (1, dst), (2, &p)], grid);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn pf_coop_w4a16(
         &mut self,
         cc: &PfCoopCtx,
         lin: &CoopLin,
-        x_packed: &wgpu::Buffer,
+        x_packed: &Buffer,
         m: usize,
         x_stride_words: usize,
-        y: &wgpu::Buffer,
+        y: &Buffer,
         word_off: usize,
         y_stride_words: usize,
     ) {
@@ -3390,7 +3264,7 @@ impl<'a> Builder<'a> {
     fn gemv_mk(
         &mut self,
         proj: &GpuProj,
-        x_packed: &wgpu::Buffer,
+        x_packed: &Buffer,
         m: usize,
         x_stride_words: usize,
         dst: GemvDstMk,
@@ -3411,7 +3285,7 @@ impl<'a> Builder<'a> {
     fn gemv_mk_tile(
         &mut self,
         proj: &GpuProj,
-        x_packed: &wgpu::Buffer,
+        x_packed: &Buffer,
         m: usize,
         x_stride_words: usize,
         dst: &GemvDstMk,
@@ -3617,7 +3491,7 @@ impl<'a> Builder<'a> {
                             .expect("mk4 v2 slot pipeline");
                         let (w_slot, x_slot) = if r.vec4 { (18, 19) } else { (10, 12) };
                         let grid_z = if one_weight_sweep { 1 } else { m as u32 };
-                        let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![
+                        let mut binds: Vec<(u32, &Buffer)> = vec![
                             (w_slot, w.raw()),
                             (11, scales.raw()),
                             (13, &xs),
@@ -3692,7 +3566,7 @@ impl<'a> Builder<'a> {
             );
         }
         let x_slot = if row_scale.is_some() { 2u32 } else { 1u32 };
-        let with_offs: Vec<(u32, &wgpu::Buffer, u64)> = binds
+        let with_offs: Vec<(u32, &Buffer, u64)> = binds
             .iter()
             .map(|(slot, buf)| {
                 let off = match *slot {
@@ -3710,9 +3584,9 @@ impl<'a> Builder<'a> {
     fn gemv(
         &mut self,
         proj: &GpuProj,
-        x_packed: &wgpu::Buffer,
+        x_packed: &Buffer,
         dst: GemvDst,
-        aux: Option<(&wgpu::Buffer, &wgpu::Buffer)>,
+        aux: Option<(&Buffer, &Buffer)>,
     ) {
         let (pipeline, w, row_scale, params, grid, off_label, split_label) = match proj {
             GpuProj::Bf16 { w, params, grid } => {
@@ -3894,9 +3768,9 @@ struct CoopLin {
 }
 
 struct PfCoopCtx {
-    gemm: Arc<wgpu::ComputePipeline>,
-    x16: Arc<wgpu::ComputePipeline>,
-    pack: Arc<wgpu::ComputePipeline>,
+    gemm: Arc<ComputePipeline>,
+    x16: Arc<ComputePipeline>,
+    pack: Arc<ComputePipeline>,
     xf16: GpuTensor<u32>,
     yf32: GpuTensor<f32>,
     zero: GpuTensor<f32>,
@@ -4026,8 +3900,8 @@ fn upload_proj(
 ) -> Result<GpuProj> {
     match proj {
         HostProj::Bf16(l) => {
-            anyhow::ensure!(l.k % 8 == 0, "bf16 gemv needs k % 8 == 0, got {}", l.k);
-            anyhow::ensure!(l.w.len() == l.n * l.k, "bf16 weight length mismatch");
+            ensure!(l.k % 8 == 0, "bf16 gemv needs k % 8 == 0, got {}", l.k);
+            ensure!(l.w.len() == l.n * l.k, "bf16 weight length mismatch");
             b.weight_bytes += 2 * (l.n as u64) * (l.k as u64);
             let w = GpuTensor::upload(ctx, "g4w-linw", &pack_pairs(&l.w));
             let grid = b.grid_1d(l.n as u64, wk::gemv_bf16::ROWS_PER_GROUP);
@@ -4044,14 +3918,14 @@ fn upload_proj(
             Ok(GpuProj::Bf16 { w, params, grid })
         }
         HostProj::Nvfp4(l) => {
-            anyhow::ensure!(l.k % 16 == 0, "nvfp4 gemv needs k % 16 == 0, got {}", l.k);
-            anyhow::ensure!(
+            ensure!(l.k % 16 == 0, "nvfp4 gemv needs k % 16 == 0, got {}", l.k);
+            ensure!(
                 l.packed.len() == l.n * l.k / 2,
                 "nvfp4 packed length mismatch"
             );
             let k_blocks = l.k / 16;
             let want = wk::gemv_nvfp4::swizzled_scale_len(l.n, k_blocks);
-            anyhow::ensure!(
+            ensure!(
                 l.scales_swizzled.len() >= want,
                 "nvfp4 swizzled scales: got {} want {}",
                 l.scales_swizzled.len(),
@@ -4126,24 +4000,25 @@ fn upload_proj(
         }
         HostProj::Fp8(l) => {
             let rows_per_group =
-                b.pl.fp8.as_ref().map(|p| p.rows_per_group).ok_or_else(|| {
-                    anyhow::anyhow!("fp8 projection uploaded without fp8 pipelines")
-                })?;
+                b.pl.fp8
+                    .as_ref()
+                    .map(|p| p.rows_per_group)
+                    .ok_or_else(|| anyhow!("fp8 projection uploaded without fp8 pipelines"))?;
             wk::quant_gemv::group_rule(l.k, l.group).map_err(err)?;
             let per_row = wk::quant_gemv::scales_per_row(l.k, l.group);
-            anyhow::ensure!(
+            ensure!(
                 l.wq.len() == l.n * l.k / 4,
                 "fp8 packed length {} != n*k/4 = {}",
                 l.wq.len(),
                 l.n * l.k / 4
             );
-            anyhow::ensure!(
+            ensure!(
                 l.row_scale.len() == l.n * per_row,
                 "q8 scale length {} != n*scales_per_row = {}",
                 l.row_scale.len(),
                 l.n * per_row
             );
-            anyhow::ensure!(
+            ensure!(
                 l.n % 2 == 0,
                 "fp8 packed gemv needs n % 2 == 0, got {}",
                 l.n
@@ -4179,7 +4054,7 @@ impl Gemma4Wgpu {
         max_seq: usize,
         slots: usize,
     ) -> Result<Self> {
-        anyhow::ensure!(
+        ensure!(
             slots <= MK_MAX,
             "batch decode wants {slots} slots; the M-row GEMV twins are generated up to MK_MAX={MK_MAX} rows"
         );
@@ -4193,24 +4068,24 @@ impl Gemma4Wgpu {
         batch_slots: usize,
     ) -> Result<Self> {
         let t_boot = Instant::now();
-        anyhow::ensure!(
+        ensure!(
             config.num_kv_shared_layers == 0,
             "gemma4_wgpu: per-layer KV sharing (num_kv_shared_layers={}) is not wired on the wgpu path; \
              the CUDA gemma4.rs fp8 decode cache also allocates per-layer KV with no sharing",
             config.num_kv_shared_layers
         );
-        anyhow::ensure!(
+        ensure!(
             !config.has_per_layer_embeddings(),
             "gemma4_wgpu: per-layer embeddings unsupported"
         );
-        anyhow::ensure!(
+        ensure!(
             weights.layers.len() == config.num_hidden_layers,
             "gemma4_wgpu: {} host layers for {} config layers",
             weights.layers.len(),
             config.num_hidden_layers
         );
-        let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
-        let variant = nvfp4_variant(ctx);
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
+        let variant = wk::gemv_nvfp4::select_variant(ctx);
         let plan = Q8Plan::from_env();
         let attn_fp8 = plan.attn_fp8;
         eprintln!("{}", weight_format_boot_line());
@@ -4220,9 +4095,7 @@ impl Gemma4Wgpu {
         let vocab = config.vocab_size;
         let eps = config.rms_norm_eps as f32;
         let n_q = config.num_attention_heads;
-        anyhow::ensure!(
-            hidden.is_multiple_of(8) && inter.is_multiple_of(2) && vocab.is_multiple_of(8)
-        );
+        ensure!(hidden.is_multiple_of(8) && inter.is_multiple_of(2) && vocab.is_multiple_of(8));
 
         let hd_s = config.head_dim_for(LayerType::SlidingAttention);
         let hd_f = config.head_dim_for(LayerType::FullAttention);
@@ -4231,14 +4104,10 @@ impl Gemma4Wgpu {
         let hd_max = hd_s.max(hd_f);
         let q_dim_max = n_q * hd_max;
         let kv_dim_max = (nkv_s * hd_s).max(nkv_f * hd_f);
-        anyhow::ensure!(hd_max <= wk::flash_decode::MAX_HEAD_DIM);
-        let splits = if depth_stack_enabled() {
-            depth_stack_splits()
-        } else {
-            flash_splits()
-        };
-        let flash_fold = flash1_gqa_fold_when_depth_stack(n_q, nkv_f, hd_max);
-        anyhow::ensure!(
+        ensure!(hd_max <= wk::flash_decode::MAX_HEAD_DIM);
+        let splits = depth_stack_splits();
+        let flash_fold = flash1_gqa_fold_for_full_attention_geometry(n_q, nkv_f, hd_max);
+        ensure!(
             flash_fold == 1 || n_q.is_multiple_of(flash_fold as usize),
             "flash stage1 fold {flash_fold} must divide n_q {n_q}: the folded grid covers \
              fold query heads per workgroup"
@@ -4384,16 +4253,16 @@ impl Gemma4Wgpu {
             .unwrap_or(hidden)
             .max(hidden);
 
-        anyhow::ensure!(
+        ensure!(
             weights.embed.len() == vocab * hidden,
             "embed length {} != {}",
             weights.embed.len(),
             vocab * hidden
         );
-        anyhow::ensure!(vocab.is_multiple_of(4), "vocab must be a multiple of 4");
+        ensure!(vocab.is_multiple_of(4), "vocab must be a multiple of 4");
         let split_row = vocab / 2;
         let half_bytes = (split_row * hidden / 2 * 4) as u64;
-        anyhow::ensure!(
+        ensure!(
             half_bytes <= ctx.caps.max_storage_buffer_binding_size,
             "embed half needs {half_bytes} bytes in one storage binding; device allows {}",
             ctx.caps.max_storage_buffer_binding_size
@@ -4417,7 +4286,7 @@ impl Gemma4Wgpu {
         );
         let kv_slots = bt_slots.max(1);
         let lmhead_i8_bufs = if lmhead_i8 {
-            anyhow::ensure!(
+            ensure!(
                 hidden.is_multiple_of(16),
                 "int8 lm_head needs hidden % 16 == 0"
             );
@@ -4440,7 +4309,7 @@ impl Gemma4Wgpu {
                     pad2: 0,
                 },
             );
-            let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let scope = ctx.device.push_error_scope(ErrorFilter::Validation);
             for (src, dst, sc) in [(&embed_lo, &wq_lo, &rs_lo), (&embed_hi, &wq_hi, &rs_hi)] {
                 let bind = dispatch::bind_group(
                     ctx,
@@ -4462,8 +4331,8 @@ impl Gemma4Wgpu {
                 ctx.queue.submit([enc.finish()]);
                 ctx.poll_blocking().map_err(err)?;
             }
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gemma4_wgpu lm_head int8 rowquant: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gemma4_wgpu lm_head int8 rowquant: {e}");
             }
             let ones = vec![bf16_bits(1.0); hidden];
             let wn_ones = GpuTensor::upload(ctx, "g4w-lm-wn1", &pack_pairs(&ones));
@@ -4484,7 +4353,7 @@ impl Gemma4Wgpu {
         let t1 = GpuTensor::<u32>::zeroed(ctx, "g4w-t1", hidden / 2);
 
         let cap_align = ctx.device.limits().min_storage_buffer_offset_alignment as usize / 4;
-        let w4_cap = std::env::var("NV_G4_W4_CAPTURE")
+        let w4_cap = env::var("NV_G4_W4_CAPTURE")
             .ok()
             .filter(|v| v != "0")
             .map(|_| {
@@ -4755,15 +4624,15 @@ impl Gemma4Wgpu {
             let nkv = config.num_kv_heads_for(kind);
             let q_dim = n_q * hd;
             let kv_dim = nkv * hd;
-            anyhow::ensure!(
+            ensure!(
                 hl.qkv.n() == q_dim + kv_dim * if hl.has_v { 2 } else { 1 },
                 "layer {li}: qkv rows {} mismatch",
                 hl.qkv.n()
             );
-            anyhow::ensure!(hl.qkv.k() == hidden && hl.o.k() == q_dim && hl.o.n() == hidden);
-            anyhow::ensure!(hl.gate_up.n() == 2 * inter && hl.gate_up.k() == hidden);
-            anyhow::ensure!(hl.down.n() == hidden && hl.down.k() == inter);
-            anyhow::ensure!(
+            ensure!(hl.qkv.k() == hidden && hl.o.k() == q_dim && hl.o.n() == hidden);
+            ensure!(hl.gate_up.n() == 2 * inter && hl.gate_up.k() == hidden);
+            ensure!(hl.down.n() == hidden && hl.down.k() == inter);
+            ensure!(
                 !matches!(hl.qkv, HostProj::Nvfp4(_)),
                 "layer {li}: nvfp4 qkv is not wired for the fused split epilogue"
             );
@@ -5089,7 +4958,7 @@ impl Gemma4Wgpu {
                         fmt: wk::quant_gemv::QFormat::Int8,
                     },
                     Some(fp8),
-                ) if gelu_fold_enabled() && wk::quant_gemv::gelu_fold_rule(2 * inter).is_ok() => {
+                ) if wk::quant_gemv::gelu_fold_rule(2 * inter).is_ok() => {
                     b.push(
                         fp8.i8_gelu.clone(),
                         &[
@@ -6405,6 +6274,7 @@ impl Gemma4Wgpu {
             pos: 0,
             kv_base: 0,
             slot_pos: vec![0; kv_slots],
+            kv_high_water: 0,
             validated: false,
             prefill,
             pf_coop_sites,
@@ -6426,7 +6296,7 @@ impl Gemma4Wgpu {
             chain_out,
             logits_f32,
             vocab,
-            preenc: preenc_enabled_default(),
+            preenc: true,
             pending_cb: None,
             preenc_hits: 0,
             chain_steps: 0,
@@ -6453,7 +6323,7 @@ impl Gemma4Wgpu {
         let words = cap.buf.download(self.ctx).map_err(err)?;
         let hidden = self.config.hidden_size;
         let inter = self.config.intermediate_size;
-        anyhow::ensure!(
+        ensure!(
             calib.gate_up.len() == cap.layers && calib.down.len() == cap.layers,
             "w4_collect: calibration has {} layers, graph has {}",
             calib.gate_up.len(),
@@ -6503,11 +6373,20 @@ impl Gemma4Wgpu {
 
     pub fn reset(&mut self) {
         self.pos = 0;
+        self.kv_high_water = 0;
         self.sync_active();
     }
 
+    pub fn kv_high_water(&self) -> usize {
+        self.kv_high_water
+    }
+
+    fn note_kv_written_to(&mut self, end: usize) {
+        self.kv_high_water = self.kv_high_water.max(end);
+    }
+
     pub fn truncate_to(&mut self, pos: usize) -> Result<()> {
-        anyhow::ensure!(pos <= self.pos, "truncate_to {pos} beyond pos {}", self.pos);
+        ensure!(pos <= self.pos, "truncate_to {pos} beyond pos {}", self.pos);
         self.pos = pos;
         self.sync_active();
         Ok(())
@@ -6551,12 +6430,15 @@ impl Gemma4Wgpu {
     }
 
     pub fn restore_pos(&mut self, pos: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             pos <= self.max_seq,
             "restore_pos {pos} past max_seq {}",
             self.max_seq
         );
+        let a_restored_ring_may_hold_writes_up_to_one_ring_past_its_frontier =
+            pos + self.fd_sliding_base.ring as usize;
         self.pos = pos;
+        self.kv_high_water = a_restored_ring_may_hold_writes_up_to_one_ring_past_its_frontier;
         self.sync_active();
         Ok(())
     }
@@ -6570,7 +6452,10 @@ impl Gemma4Wgpu {
     }
 
     pub fn rewind_to(&mut self, pos: usize) -> Result<bool> {
-        if !self.rewind_limits().admits(self.pos, pos) {
+        if !self
+            .rewind_limits()
+            .admits_from_high_water(self.pos, self.kv_high_water, pos)
+        {
             return Ok(false);
         }
         self.truncate_to(pos)?;
@@ -6585,7 +6470,7 @@ impl Gemma4Wgpu {
         }
     }
 
-    fn encode_cb(&self, full: bool) -> wgpu::CommandBuffer {
+    fn encode_cb(&self, full: bool) -> CommandBuffer {
         let passes = if full {
             &self.passes[..]
         } else {
@@ -6655,8 +6540,8 @@ impl Gemma4Wgpu {
     }
 
     fn step_inner_full(&mut self, token: u32, full: bool) -> Result<()> {
-        anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
-        anyhow::ensure!(self.pos < self.max_seq, "kv cache full at {}", self.pos);
+        ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+        ensure!(self.pos < self.max_seq, "kv cache full at {}", self.pos);
         self.tok_idx.write(self.ctx, &[token as i32]).map_err(err)?;
         self.write_pos_uniforms(self.pos)?;
 
@@ -6666,11 +6551,7 @@ impl Gemma4Wgpu {
             !self.validated && !self.prefix_validated
         };
         let scope = if need_scope {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         } else {
             None
         };
@@ -6690,20 +6571,21 @@ impl Gemma4Wgpu {
             self.pending_cb = Some(self.encode_cb(true));
         }
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gemma4_wgpu decode step validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gemma4_wgpu decode step validation: {e}");
             }
             if full {
                 self.validated = true;
             }
             self.prefix_validated = true;
         }
+        self.note_kv_written_to(self.pos + 1);
         self.pos += 1;
         Ok(())
     }
 
     pub fn decode_chain(&mut self, token: u32, k: usize) -> Result<Vec<u32>> {
-        anyhow::ensure!(
+        ensure!(
             (1..=MAX_CHAIN).contains(&k),
             "decode_chain k {k} outside 1..={MAX_CHAIN}"
         );
@@ -6716,8 +6598,8 @@ impl Gemma4Wgpu {
             }
             return Ok(out);
         }
-        anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
-        anyhow::ensure!(
+        ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+        ensure!(
             self.pos + k <= self.max_seq,
             "kv cache full at {} + {k}",
             self.pos
@@ -6749,6 +6631,7 @@ impl Gemma4Wgpu {
             if self.preenc {
                 self.pending_cb = Some(self.encode_cb(true));
             }
+            self.note_kv_written_to(self.pos + 1);
             self.pos += 1;
             self.chain_steps += 1;
         }
@@ -6796,22 +6679,22 @@ impl Gemma4Wgpu {
         let base_s = self.fd_sliding_base;
         let base_f = self.fd_full_base;
         let Some(pf) = self.prefill.as_mut() else {
-            anyhow::bail!("chunked prefill is disabled on this graph");
+            bail!("chunked prefill is disabled on this graph");
         };
         let m = pf.m;
-        anyhow::ensure!(
+        ensure!(
             tokens.len() == m,
             "prefill_chunk wants exactly {m} tokens, got {}",
             tokens.len()
         );
-        anyhow::ensure!(
+        ensure!(
             (1..=m).contains(&live),
             "prefill live rows {live} out of 1..={m}"
         );
         for &t in tokens {
-            anyhow::ensure!((t as usize) < vocab, "token {t} out of vocab");
+            ensure!((t as usize) < vocab, "token {t} out of vocab");
         }
-        anyhow::ensure!(pos0 + m <= max_seq, "kv cache full at {pos0} + {m}");
+        ensure!(pos0 + m <= max_seq, "kv cache full at {pos0} + {m}");
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let poss: Vec<i32> = (0..m).map(|i| (pos0 + i) as i32).collect();
         pf.tok_idx.write(ctx, &ids).map_err(err)?;
@@ -6831,7 +6714,7 @@ impl Gemma4Wgpu {
             pf.fd_f[t].write(ctx, &ff);
         }
         if let Some(fdu) = pf.fd_flash.as_ref() {
-            anyhow::ensure!(
+            ensure!(
                 kv_base == 0,
                 "the tiled prefill flash arm derives its causal window from fd_params.window alone, \
                  so kv slot base {kv_base} != 0 needs NV_G4_WGPU_PF_FLASH=0 or slot 0"
@@ -6845,12 +6728,12 @@ impl Gemma4Wgpu {
         let hidden_words = self.config.hidden_size / 2;
         let mut mask = vec![0u32; m.max(4)];
         for sp in splices {
-            anyhow::ensure!(
+            ensure!(
                 sp.rel_pos < live,
                 "embed-row splice at {} is past the {live} live rows",
                 sp.rel_pos
             );
-            anyhow::ensure!(
+            ensure!(
                 sp.row_words.len() == hidden_words,
                 "embed-row splice has {} words, want {hidden_words}",
                 sp.row_words.len()
@@ -6859,14 +6742,15 @@ impl Gemma4Wgpu {
             ctx.queue.write_buffer(
                 &pf.splice_rows,
                 (sp.rel_pos * hidden_words * 4) as u64,
-                bytemuck::cast_slice(sp.row_words),
+                cast_slice(sp.row_words),
             );
         }
         if !splices.is_empty() || pf.splice_mask_live {
             ctx.queue
-                .write_buffer(&pf.splice_mask, 0, bytemuck::cast_slice(&mask));
+                .write_buffer(&pf.splice_mask, 0, cast_slice(&mask));
         }
         pf.splice_mask_live = !splices.is_empty();
+        self.note_kv_written_to(pos0 + m);
         Ok(())
     }
 
@@ -6879,17 +6763,17 @@ impl Gemma4Wgpu {
         let scope = if pf.validated {
             None
         } else {
-            Some(ctx.device.push_error_scope(wgpu::ErrorFilter::Validation))
+            Some(ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         if dispatch::profile::enabled() && ctx.caps.timestamp_query {
-            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = pf
+            let raw: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = pf
                 .passes
                 .iter()
                 .map(|p| (&*p.pipeline, &p.bind, p.grid))
                 .collect();
             let labels: Vec<String> = pf.passes.iter().map(|p| p.label.clone()).collect();
             dispatch::submit_profiled_slices(ctx, &raw, &labels).map_err(|e| {
-                anyhow::anyhow!(
+                anyhow!(
                     "profiled prefill chunk submit (sliced past the 1792-pass query ceiling): {e}"
                 )
             })?;
@@ -6901,8 +6785,8 @@ impl Gemma4Wgpu {
             ctx.queue.submit([cb]);
         }
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gemma4_wgpu prefill chunk validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gemma4_wgpu prefill chunk validation: {e}");
             }
             pf.validated = true;
         }
@@ -6923,7 +6807,7 @@ impl Gemma4Wgpu {
 
     pub fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
         let m = self.prefill_chunk_len();
-        anyhow::ensure!(m > 0, "chunked prefill is disabled on this graph");
+        ensure!(m > 0, "chunked prefill is disabled on this graph");
         self.prefill_chunk_advance(tokens, m)
     }
 
@@ -6932,7 +6816,7 @@ impl Gemma4Wgpu {
     }
 
     pub fn advance(&mut self, n: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.pos + n <= self.max_seq,
             "advance {n} past max_seq {} at {}",
             self.max_seq,
@@ -6944,12 +6828,12 @@ impl Gemma4Wgpu {
 
     pub fn verify_chain(&mut self, batch: &[u32]) -> Result<Vec<u32>> {
         let rows = self.verify_max_rows();
-        anyhow::ensure!(
+        ensure!(
             rows > 0,
             "verify_chain needs the m-row prefill graph and its lm_head epilogue"
         );
         let mb = batch.len();
-        anyhow::ensure!(
+        ensure!(
             (1..=rows).contains(&mb),
             "verify_chain batch {mb} out of 1..={rows}"
         );
@@ -6967,7 +6851,7 @@ impl Gemma4Wgpu {
         let scope = if vs.validated {
             None
         } else {
-            Some(ctx.device.push_error_scope(wgpu::ErrorFilter::Validation))
+            Some(ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         let cb = dispatch::encode_pass_list(
             ctx,
@@ -6975,8 +6859,8 @@ impl Gemma4Wgpu {
         );
         ctx.queue.submit([cb]);
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gemma4_wgpu verify chain validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gemma4_wgpu verify chain validation: {e}");
             }
             vs.validated = true;
         }
@@ -6988,8 +6872,8 @@ impl Gemma4Wgpu {
         let vs = self
             .verify
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("verify epilogue disabled"))?;
-        anyhow::ensure!(row < vs.rows, "verify row {row} out of 0..{}", vs.rows);
+            .ok_or_else(|| anyhow!("verify epilogue disabled"))?;
+        ensure!(row < vs.rows, "verify row {row} out of 0..{}", vs.rows);
         let all = vs.logits_f32.download(self.ctx).map_err(err)?;
         Ok(all[row * self.vocab..(row + 1) * self.vocab].to_vec())
     }
@@ -7000,26 +6884,25 @@ impl Gemma4Wgpu {
         splices: &[EmbedRowSplice],
     ) -> Result<usize> {
         let m = self.prefill_chunk_len();
-        anyhow::ensure!(
+        ensure!(
             m >= 2,
             "embed-row splice prefill requires the m-row prefill graph (NV_G4_WGPU_PREFILL_M >= 2)"
         );
         let hidden = self.config.hidden_size;
-        let hidden_words = hidden / 2;
         let mut prev_end = 0usize;
         let mut packed: Vec<Vec<u32>> = Vec::with_capacity(splices.len());
         for sp in splices {
-            anyhow::ensure!(
+            ensure!(
                 !sp.rows_bf16.is_empty() && sp.rows_bf16.len().is_multiple_of(hidden),
                 "embed-row splice rows_bf16 len {} is not a positive multiple of hidden {hidden}",
                 sp.rows_bf16.len()
             );
             let n_slots = sp.rows_bf16.len() / hidden;
-            anyhow::ensure!(
+            ensure!(
                 sp.position >= prev_end,
                 "embed-row splices must be sorted and non-overlapping"
             );
-            anyhow::ensure!(
+            ensure!(
                 sp.position + n_slots <= tokens.len(),
                 "embed-row splice at {} with {n_slots} rows exceeds {} tokens",
                 sp.position,
@@ -7031,29 +6914,13 @@ impl Gemma4Wgpu {
         let mut done = 0usize;
         while done < tokens.len() {
             let live = m.min(tokens.len() - done);
-            anyhow::ensure!(
+            ensure!(
                 self.pos + m <= self.max_seq,
                 "kv cache full at {} + {m} (max_seq {})",
                 self.pos,
                 self.max_seq
             );
-            let mut chunk: Vec<u32> = tokens[done..done + live].to_vec();
-            let pad = *chunk.last().expect("non-empty chunk");
-            chunk.resize(m, pad);
-            let chunk_end = done + live;
-            let mut rows: Vec<ChunkRowSplice> = Vec::new();
-            for (si, sp) in splices.iter().enumerate() {
-                let n_slots = sp.rows_bf16.len() / hidden;
-                let lo = sp.position.max(done);
-                let hi = (sp.position + n_slots).min(chunk_end);
-                for abs in lo..hi {
-                    let w0 = (abs - sp.position) * hidden_words;
-                    rows.push(ChunkRowSplice {
-                        rel_pos: abs - done,
-                        row_words: &packed[si][w0..w0 + hidden_words],
-                    });
-                }
-            }
+            let (chunk, rows) = spliced_chunk(tokens, splices, &packed, hidden, m, done, live);
             self.prefill_chunk_masked(&chunk, live, &rows)?;
             done += live;
         }
@@ -7083,7 +6950,7 @@ impl Gemma4Wgpu {
     }
 
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<u32> {
-        anyhow::ensure!(!tokens.is_empty(), "prefill needs at least one token");
+        ensure!(!tokens.is_empty(), "prefill needs at least one token");
         let (last, rest) = tokens.split_last().expect("non-empty");
         let done = self.prefill_tokens(rest)?;
         for t in &rest[done..] {
@@ -7122,7 +6989,7 @@ impl Gemma4Wgpu {
     }
 
     pub fn select_slot(&mut self, slot: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             slot < self.slot_pos.len(),
             "slot {slot} beyond the {} this graph allocates",
             self.slot_pos.len()
@@ -7145,26 +7012,24 @@ impl Gemma4Wgpu {
         self.prefill(tokens)
     }
 
-    fn write_batch_uniforms(&mut self, tokens: &[u32]) -> Result<()> {
-        self.sync_active();
+    fn write_batch_uniforms(&self, plan: &[BatchRowPlan]) -> Result<()> {
         let window = self.config.sliding_window;
         let base_s = self.fd_sliding_base;
         let base_f = self.fd_full_base;
         let max_seq = self.max_seq;
-        let live = tokens.len();
-        let pos = self.slot_pos.clone();
         let ctx = self.ctx;
         let bt = self.batch.as_ref().expect("batch graph");
         let s = bt.slots;
+        ensure!(
+            plan.len() == s,
+            "batch plan has {} rows for a {s}-slot graph",
+            plan.len()
+        );
         let mut ids = vec![0i32; s];
         let mut poss = vec![0i32; s];
-        for j in 0..s {
-            let (tok, p) = if j < live {
-                (tokens[j], pos[j])
-            } else {
-                (tokens[0], pos[j].min(max_seq - 1))
-            };
-            ids[j] = tok as i32;
+        for (j, row) in plan.iter().enumerate() {
+            let p = row.pos;
+            ids[j] = row.token as i32;
             poss[j] = p as i32;
             let kb = j * max_seq;
             bt.kv_start[j].write(ctx, &[(kb + p) as i32]).map_err(err)?;
@@ -7187,41 +7052,38 @@ impl Gemma4Wgpu {
         let bt = self
             .batch
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no batch graph on this model"))?;
+            .ok_or_else(|| anyhow!("no batch graph on this model"))?;
         bt.logits_f32.download(self.ctx).map_err(err)
     }
 
     pub fn decode_step_batch(&mut self, tokens: &[u32]) -> Result<Vec<u32>> {
-        anyhow::ensure!(!tokens.is_empty(), "decode_step_batch needs a token");
-        if tokens.len() == 1 {
+        let rows: Vec<Option<u32>> = tokens.iter().copied().map(Some).collect();
+        self.decode_step_batch_rows(&rows)
+    }
+
+    pub fn decode_step_batch_rows(&mut self, rows: &[Option<u32>]) -> Result<Vec<u32>> {
+        ensure!(!rows.is_empty(), "decode_step_batch needs a token");
+        if let [only] = rows {
+            let t = only.ok_or_else(|| anyhow!("{EVERY_ROW_PADDED_DECODES_NOTHING}"))?;
             self.select_slot(0)?;
-            return Ok(vec![self.decode_step(tokens[0])?]);
+            return Ok(vec![self.decode_step(t)?]);
         }
         let slots = self.batch_slots();
-        anyhow::ensure!(
-            slots >= tokens.len(),
+        ensure!(
+            slots >= rows.len(),
             "decode_step_batch got {} sequences; this graph holds {slots} \
              (build with new_batched or NV_WGPU_BATCH_SLOTS, and check the [gemma4_wgpu] boot line for a disabler)",
-            tokens.len()
+            rows.len()
         );
-        for (j, &t) in tokens.iter().enumerate() {
-            anyhow::ensure!(
-                (t as usize) < self.vocab,
-                "slot {j}: token {t} out of vocab"
-            );
-            anyhow::ensure!(
-                self.slot_pos(j) < self.max_seq,
-                "slot {j}: kv cache full at {}",
-                self.slot_pos(j)
-            );
-        }
-        self.write_batch_uniforms(tokens)?;
+        self.sync_active();
+        let plan = plan_batch_rows(&self.slot_pos[..slots], rows, self.max_seq, self.vocab)?;
+        self.write_batch_uniforms(&plan)?;
         let ctx = self.ctx;
         let bt = self.batch.as_mut().expect("batch graph");
         let scope = if bt.validated {
             None
         } else {
-            Some(ctx.device.push_error_scope(wgpu::ErrorFilter::Validation))
+            Some(ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         let cb = if dispatch::profile::enabled() {
             let labels: Vec<&str> = bt.passes.iter().map(|p| p.label.as_str()).collect();
@@ -7238,17 +7100,19 @@ impl Gemma4Wgpu {
         };
         ctx.queue.submit([cb]);
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gemma4_wgpu batch decode validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gemma4_wgpu batch decode validation: {e}");
             }
             bt.validated = true;
         }
         let out = bt
             .token_out
-            .download_range(ctx, 0, tokens.len())
+            .download_range(ctx, 0, rows.len())
             .map_err(err)?;
-        for j in 0..tokens.len() {
-            self.slot_pos[j] += 1;
+        for (j, row) in plan.iter().enumerate() {
+            if row.fed {
+                self.slot_pos[j] += 1;
+            }
         }
         self.pos = self.slot_pos[self.active_slot()];
         Ok(out)
@@ -7262,22 +7126,72 @@ impl Gemma4Wgpu {
     }
 }
 
+pub const EVERY_ROW_PADDED_DECODES_NOTHING: &str =
+    "decode_step_batch: every row is padding, so the step decodes nothing";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchRowPlan {
+    pub token: u32,
+    pub pos: usize,
+    pub fed: bool,
+}
+
+pub fn plan_batch_rows(
+    slot_pos: &[usize],
+    rows: &[Option<u32>],
+    max_seq: usize,
+    vocab: usize,
+) -> Result<Vec<BatchRowPlan>> {
+    ensure!(
+        rows.len() <= slot_pos.len(),
+        "decode_step_batch got {} rows; this graph holds {}",
+        rows.len(),
+        slot_pos.len()
+    );
+    let pad = rows
+        .iter()
+        .flatten()
+        .copied()
+        .next()
+        .ok_or_else(|| anyhow!("{EVERY_ROW_PADDED_DECODES_NOTHING}"))?;
+    slot_pos
+        .iter()
+        .enumerate()
+        .map(|(j, &p)| match rows.get(j).copied().flatten() {
+            Some(t) => {
+                ensure!((t as usize) < vocab, "slot {j}: token {t} out of vocab");
+                ensure!(p < max_seq, "slot {j}: kv cache full at {p}");
+                Ok(BatchRowPlan {
+                    token: t,
+                    pos: p,
+                    fed: true,
+                })
+            }
+            None => Ok(BatchRowPlan {
+                token: pad,
+                pos: p.min(max_seq - 1),
+                fed: false,
+            }),
+        })
+        .collect()
+}
+
 fn tensor_to_bf16_bits(t: &candle_core::Tensor) -> Result<Vec<u16>> {
-    let v: Vec<half::bf16> = t
+    let v: Vec<bf16> = t
         .to_dtype(candle_core::DType::BF16)?
         .flatten_all()?
         .to_vec1()?;
     Ok(v.into_iter().map(|x| x.to_bits()).collect())
 }
 
-fn scalar_f32(weights: &nv_weights::WeightLoader, name: &str) -> Result<f32> {
+fn scalar_f32(weights: &WeightLoader, name: &str) -> Result<f32> {
     let t = weights.get(name, candle_core::DType::F32)?;
     let v: Vec<f32> = t.flatten_all()?.to_vec1()?;
     Ok(*v.first().unwrap_or(&1.0))
 }
 
 fn load_nvfp4_fused_pair(
-    weights: &nv_weights::WeightLoader,
+    weights: &WeightLoader,
     module_a: &str,
     module_b: &str,
     n_each: usize,
@@ -7290,7 +7204,7 @@ fn load_nvfp4_fused_pair(
             return Ok(None);
         }
     }
-    anyhow::ensure!(
+    ensure!(
         n_each.is_multiple_of(128),
         "fused nvfp4 pair needs n % 128 == 0"
     );
@@ -7301,8 +7215,8 @@ fn load_nvfp4_fused_pair(
         let pname = format!("{m}.weight");
         let shape = weights
             .shape_of(&pname)
-            .ok_or_else(|| anyhow::anyhow!("missing {pname}"))?;
-        anyhow::ensure!(
+            .ok_or_else(|| anyhow!("missing {pname}"))?;
+        ensure!(
             shape == vec![n_each, k / 2],
             "{pname}: shape {shape:?} != [{n_each}, {}]",
             k / 2
@@ -7314,7 +7228,7 @@ fn load_nvfp4_fused_pair(
             scalar_f32(weights, &format!("{m}.input_scale"))?,
         ));
     }
-    anyhow::ensure!(
+    ensure!(
         globals[0] == globals[1],
         "fused nvfp4 pair global scales differ: {:?}",
         globals
@@ -7340,7 +7254,7 @@ fn load_nvfp4_fused_pair(
 }
 
 fn load_nvfp4_single(
-    weights: &nv_weights::WeightLoader,
+    weights: &WeightLoader,
     module: &str,
     n: usize,
     k: usize,
@@ -7353,8 +7267,8 @@ fn load_nvfp4_single(
     let pname = format!("{module}.weight");
     let shape = weights
         .shape_of(&pname)
-        .ok_or_else(|| anyhow::anyhow!("missing {pname}"))?;
-    anyhow::ensure!(
+        .ok_or_else(|| anyhow!("missing {pname}"))?;
+    ensure!(
         shape == vec![n, k / 2],
         "{pname}: shape {shape:?} != [{n}, {}]",
         k / 2
@@ -7382,7 +7296,7 @@ fn load_nvfp4_single(
 
 pub fn host_weights_from_loader(
     config: &Gemma4Config,
-    weights: &nv_weights::WeightLoader,
+    weights: &WeightLoader,
 ) -> Result<HostWeights> {
     use candle_core::DType;
     let hidden = config.hidden_size;
@@ -7397,7 +7311,7 @@ pub fn host_weights_from_loader(
             .get("model.language_model.norm.weight", DType::BF16)
             .context("load final norm")?,
     )?;
-    anyhow::ensure!(
+    ensure!(
         config.tie_word_embeddings,
         "gemma4_wgpu loader: untied lm_head not wired"
     );
@@ -7430,7 +7344,7 @@ pub fn host_weights_from_loader(
             qkv_w.extend(get_bits(&format!("{p}.self_attn.v_proj.weight"))?);
         }
         let qkv_rows = q_dim + kv_dim * if has_v { 2 } else { 1 };
-        anyhow::ensure!(qkv_w.len() == qkv_rows * hidden, "layer {i} qkv shape");
+        ensure!(qkv_w.len() == qkv_rows * hidden, "layer {i} qkv shape");
 
         let gate_up = match load_nvfp4_fused_pair(
             weights,
@@ -7461,7 +7375,7 @@ pub fn host_weights_from_loader(
 
         let scalar_t = weights.get(&format!("{p}.layer_scalar"), DType::BF16)?;
         let scalar_bits = tensor_to_bf16_bits(&scalar_t)?;
-        let layer_scalar = half::bf16::from_bits(scalar_bits[0]).to_f32();
+        let layer_scalar = bf16::from_bits(scalar_bits[0]).to_f32();
 
         layers.push(HostLayer {
             kind,

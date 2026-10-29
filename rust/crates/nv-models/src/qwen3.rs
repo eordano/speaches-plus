@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use nv_layers::attn::{flash_attn, sdpa, AttnConfig};
 use nv_layers::linear::Linear;
@@ -62,6 +62,11 @@ impl Qwen3Config {
     }
 }
 
+pub const KV_WRITES_ARE_IN_PLACE_BECAUSE_SLICE_ASSIGN_COPIES_THE_WHOLE_BUFFER_EVERY_STEP: &str =
+    "Tensor::slice_assign materialises a fresh copy of the entire [1, max_seq, kv_heads, head_dim] \
+     buffer per layer per call, so a decode step over a long cache moved the whole KV twice per \
+     layer; slice_set writes the new rows into the existing allocation";
+
 pub struct KvCache {
     layers: Vec<(Tensor, Tensor)>,
     current_len: usize,
@@ -79,14 +84,27 @@ impl KvCache {
         device: &Device,
         dtype: DType,
     ) -> Result<Self> {
-        let shape = (
-            1usize,
+        Self::with_dims(
+            config.num_hidden_layers,
             max_seq_len,
             config.num_key_value_heads,
             config.head_dim,
-        );
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        for _ in 0..config.num_hidden_layers {
+            device,
+            dtype,
+        )
+    }
+
+    pub fn with_dims(
+        num_layers: usize,
+        max_seq_len: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let shape = (1usize, max_seq_len, n_kv_heads, head_dim);
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
             let k = Tensor::zeros(shape, dtype, device)?;
             let v = Tensor::zeros(shape, dtype, device)?;
             layers.push((k, v));
@@ -95,8 +113,8 @@ impl KvCache {
             layers,
             current_len: 0,
             max_seq_len,
-            n_kv_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
+            n_kv_heads,
+            head_dim,
             device: device.clone(),
             dtype,
         })
@@ -132,7 +150,7 @@ impl KvCache {
         let dims = k_new.dims();
         if dims.len() != 4 || dims[0] != 1 || dims[2] != self.n_kv_heads || dims[3] != self.head_dim
         {
-            anyhow::bail!(
+            bail!(
                 "KvCache.write_at: expected [1, t, {}, {}], got {:?}",
                 self.n_kv_heads,
                 self.head_dim,
@@ -140,7 +158,7 @@ impl KvCache {
             );
         }
         if v_new.dims() != dims {
-            anyhow::bail!(
+            bail!(
                 "KvCache.write_at: k/v shape mismatch k={:?} v={:?}",
                 dims,
                 v_new.dims()
@@ -149,25 +167,19 @@ impl KvCache {
         let t = dims[1];
         let end = start + t;
         if end > self.max_seq_len {
-            anyhow::bail!(
+            bail!(
                 "KvCache.write_at: end {} exceeds max_seq_len {}",
                 end,
                 self.max_seq_len
             );
         }
         if layer >= self.layers.len() {
-            anyhow::bail!("KvCache.write_at: layer {} out of range", layer);
+            bail!("KvCache.write_at: layer {} out of range", layer);
         }
         let (k_buf, v_buf) = &self.layers[layer];
-        let k_updated = k_buf.slice_assign(
-            &[0..1, start..end, 0..self.n_kv_heads, 0..self.head_dim],
-            k_new,
-        )?;
-        let v_updated = v_buf.slice_assign(
-            &[0..1, start..end, 0..self.n_kv_heads, 0..self.head_dim],
-            v_new,
-        )?;
-        self.layers[layer] = (k_updated, v_updated);
+        let _ = KV_WRITES_ARE_IN_PLACE_BECAUSE_SLICE_ASSIGN_COPIES_THE_WHOLE_BUFFER_EVERY_STEP;
+        k_buf.slice_set(&k_new.contiguous()?, 1, start)?;
+        v_buf.slice_set(&v_new.contiguous()?, 1, start)?;
         Ok(())
     }
 
@@ -188,12 +200,19 @@ impl KvCache {
         self.view(layer, self.current_len)
     }
 
+    pub fn layer_tensors(&self, layer: usize) -> Result<(&Tensor, &Tensor)> {
+        let (k, v) = self.layers.get(layer).ok_or_else(|| {
+            anyhow::anyhow!("KvCache.layer_tensors: layer {} out of range", layer)
+        })?;
+        Ok((k, v))
+    }
+
     pub fn view(&self, layer: usize, len: usize) -> Result<(Tensor, Tensor)> {
         if layer >= self.layers.len() {
-            anyhow::bail!("KvCache.view: layer {} out of range", layer);
+            bail!("KvCache.view: layer {} out of range", layer);
         }
         if len > self.max_seq_len {
-            anyhow::bail!("KvCache.view: len {} > max {}", len, self.max_seq_len);
+            bail!("KvCache.view: len {} > max {}", len, self.max_seq_len);
         }
         let (k, v) = &self.layers[layer];
         let k = k.narrow(1, 0, len)?;
@@ -215,7 +234,6 @@ pub struct Qwen3Layer {
 }
 
 impl Qwen3Layer {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pre_attn_norm: RmsNorm,
         q_proj: Linear,
@@ -496,9 +514,8 @@ pub struct QuantRunners {
 #[cfg(feature = "cuda")]
 impl QuantRunners {
     pub fn new(device: &Device, scheme: QuantScheme) -> Result<Self> {
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("QuantRunners requires a CUDA device"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("QuantRunners requires a CUDA device")
         };
         let stream = dev.cuda_stream();
         let fp8 = matches!(scheme, QuantScheme::Fp8E4m3)
@@ -560,7 +577,7 @@ impl Qwen3 {
             || embed_dims[0] != config.vocab_size
             || embed_dims[1] != config.hidden_size
         {
-            anyhow::bail!(
+            bail!(
                 "embedding shape mismatch: expected [{}, {}], got {:?}",
                 config.vocab_size,
                 config.hidden_size,
@@ -632,7 +649,7 @@ impl Qwen3 {
             || embed_dims[0] != config.vocab_size
             || embed_dims[1] != config.hidden_size
         {
-            anyhow::bail!(
+            bail!(
                 "embedding shape mismatch: expected [{}, {}], got {:?}",
                 config.vocab_size,
                 config.hidden_size,
@@ -733,7 +750,7 @@ impl Qwen3 {
     ) -> Result<Tensor> {
         let tok_dims = tokens.dims();
         if tok_dims.len() != 2 || tok_dims[0] != 1 {
-            anyhow::bail!(
+            bail!(
                 "Qwen3.forward_hidden: tokens must be [1, seq], got {:?}",
                 tok_dims
             );
@@ -741,7 +758,7 @@ impl Qwen3 {
         let seq = tok_dims[1];
         let pos_dims = positions.dims();
         if pos_dims.len() != 1 || pos_dims[0] != seq {
-            anyhow::bail!(
+            bail!(
                 "Qwen3.forward_hidden: positions must be [{}], got {:?}",
                 seq,
                 pos_dims
@@ -781,7 +798,6 @@ impl Qwen3 {
         Ok(x)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn layer_forward(
         &self,
         idx: usize,
@@ -851,7 +867,7 @@ impl Qwen3 {
         let mlp_out = layer.mlp.forward(&normed2)?;
         let out = x_after.add(&mlp_out)?;
         if out.dims() != [1, seq, hidden] {
-            anyhow::bail!(
+            bail!(
                 "Qwen3 layer {} produced unexpected shape {:?}",
                 idx,
                 out.dims()
@@ -863,7 +879,7 @@ impl Qwen3 {
 
 impl CausalLm for Qwen3 {
     fn forward(&mut self, _tokens: &[u32], _positions: &[u32]) -> anyhow::Result<Vec<f32>> {
-        anyhow::bail!("Qwen3::forward(&[u32], &[u32]) shim not implemented; call Qwen3::forward(&Tensor, &Tensor, &mut KvCache)")
+        bail!("Qwen3::forward(&[u32], &[u32]) shim not implemented; call Qwen3::forward(&Tensor, &Tensor, &mut KvCache)")
     }
 
     fn vocab_size(&self) -> usize {
@@ -903,7 +919,7 @@ fn load_linear_quant(
         .with_context(|| format!("load {resolved}"))?;
     let d = w.dims();
     if d.len() != 2 || d[0] != out_features || d[1] != in_features {
-        anyhow::bail!(
+        bail!(
             "linear {resolved}: expected [{}, {}], got {:?}",
             out_features,
             in_features,
@@ -938,7 +954,7 @@ fn load_linear_quant(
             Linear::from_bf16_quantized_nvfp4(&w, None, device, runner)
         }
         QuantScheme::None => unreachable!(),
-        nv_weights::QuantScheme::MlxAffineW4 => anyhow::bail!(
+        nv_weights::QuantScheme::MlxAffineW4 => bail!(
             "MlxAffineW4 checkpoints have no cuda Linear path yet: the scheme landed for the              darwin/mlx line and this loader has not grown an arm for it; load a bf16/nvfp4              sibling snapshot or add the arm in the mlx line's session"
         ),
     }
@@ -957,7 +973,7 @@ pub(crate) fn host_tile_positions(
 ) -> Result<Tensor> {
     let n = positions.elem_count();
     if n != t {
-        anyhow::bail!("positions length {} != seq {}", n, t);
+        bail!("positions length {} != seq {}", n, t);
     }
     let cpu = positions.to_device(&Device::Cpu)?;
     let row: Vec<i32> = match cpu.dtype() {
@@ -972,7 +988,7 @@ pub(crate) fn host_tile_positions(
             .into_iter()
             .map(|v| v as i32)
             .collect(),
-        other => anyhow::bail!("unsupported positions dtype {other:?}"),
+        other => bail!("unsupported positions dtype {other:?}"),
     };
     let mut tiled = Vec::with_capacity(b * t);
     for _ in 0..b {

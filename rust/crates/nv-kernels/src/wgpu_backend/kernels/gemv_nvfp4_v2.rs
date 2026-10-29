@@ -2,7 +2,7 @@ use crate::wgpu_backend::compose;
 use crate::wgpu_backend::dequant::NVFP4_BLOCK_SIZE;
 use crate::wgpu_backend::device::WgpuContext;
 
-pub const WGSL: &str = include_str!("../../../wgsl/gemv_nvfp4_v2.wgsl");
+pub const WGSL: &str = crate::wgsl!("../../../wgsl/gemv_nvfp4_v2.wgsl");
 
 pub const WARP_ENTRY: &str = "gemv_nvfp4_warp";
 pub const WARPQ_ENTRY: &str = "gemv_nvfp4_warpq";
@@ -66,10 +66,6 @@ impl V2Kernel {
             Self::MRow2 => Some(MROW2_PK_ENTRY),
             _ => None,
         }
-    }
-
-    pub fn multi_row(self) -> bool {
-        matches!(self, Self::MRow | Self::FMRow | Self::FMLut)
     }
 
     pub fn rows_per_subgroup(self, mr: u32) -> u32 {
@@ -278,200 +274,194 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_entry_point_is_present_in_the_shader() {
-        let src = source(V2Config::default());
-        for e in [
-            WARP_ENTRY,
-            WARPQ_ENTRY,
-            FDEC_ENTRY,
-            MROW_ENTRY,
-            MROW2_ENTRY,
-            MROWQ_ENTRY,
-            FMROW_ENTRY,
-            FMLUT_ENTRY,
-        ] {
-            assert!(src.contains(&format!("fn {e}(")), "missing {e}");
+    fn every_entry_point_is_present_pair_packs_and_takes_both_config_knobs() {
+        {
+            let src = source(V2Config::default());
+            for e in [
+                WARP_ENTRY,
+                WARPQ_ENTRY,
+                FDEC_ENTRY,
+                MROW_ENTRY,
+                MROW2_ENTRY,
+                MROWQ_ENTRY,
+                FMROW_ENTRY,
+                FMLUT_ENTRY,
+            ] {
+                assert!(src.contains(&format!("fn {e}(")), "missing {e}");
+            }
+            assert!(src.contains("fn nvfp4_scale_byte_index("));
+            assert!(src.contains("subgroupShuffleXor"));
         }
-        assert!(src.contains("fn nvfp4_scale_byte_index("));
-        assert!(src.contains("subgroupShuffleXor"));
-    }
-
-    #[test]
-    fn config_substitution_reaches_both_knobs() {
-        let src = source(V2Config::new(128, 2));
-        assert!(src.contains("const NV2_WG: u32 = 128u;"));
-        assert!(src.contains("const NV2_MR: u32 = 2u;"));
-        assert!(!src.contains("const NV2_WG: u32 = 256u;"));
-    }
-
-    #[test]
-    fn row_geometry_matches_the_shader_layout() {
-        let c = V2Config::new(256, 4);
-        assert_eq!(c.subgroups(), 8);
-        assert_eq!(c.rows_per_group(V2Kernel::Warp), 8);
-        assert_eq!(c.rows_per_group(V2Kernel::WarpQ), 8);
-        assert_eq!(c.rows_per_group(V2Kernel::MRow), 32);
-        assert_eq!(c.rows_per_group(V2Kernel::MRow2), 16);
-        assert_eq!(c.rows_per_group(V2Kernel::MRowQ), 16);
-        assert_eq!(V2Config::new(128, 2).rows_per_group(V2Kernel::FMRow), 8);
-        assert!(c.valid());
-        assert!(!V2Config::new(48, 1).valid());
-    }
-
-    #[test]
-    fn quad_kernels_reject_k_that_is_not_quad_aligned() {
-        assert!(V2Kernel::WarpQ.shape_ok(5376));
-        assert!(V2Kernel::WarpQ.shape_ok(21504));
-        assert!(V2Kernel::WarpQ.shape_ok(512));
-        assert!(!V2Kernel::WarpQ.shape_ok(16 * 6));
-        assert!(!V2Kernel::MRowQ.shape_ok(16 * 6));
-        assert!(V2Kernel::MRowQ.shape_ok(16 * 8));
-        assert!(V2Kernel::MRow.shape_ok(16 * 6));
-        assert!(V2Kernel::MRow2.shape_ok(16 * 6));
-        assert!(!V2Kernel::MRow.shape_ok(16 * 3));
-        assert!(V2Kernel::Warp.shape_ok(16 * 3));
-    }
-
-    #[test]
-    fn select_picks_the_measured_winner_at_every_production_shape() {
-        let mrow = (V2Kernel::MRow, V2Config::new(128, 2));
-        let fdec = (V2Kernel::FDec, V2Config::new(128, 1));
-        let warp = (V2Kernel::Warp, V2Config::new(64, 1));
-        assert_eq!(select(43008, 5376), mrow);
-        assert_eq!(select(5376, 21504), mrow);
-        assert_eq!(select(8192, 2048), mrow);
-        assert_eq!(select(2048, 4096), mrow);
-        assert_eq!(select(512, 2048), fdec);
-        assert_eq!(select(2048, 512), warp);
-        assert_eq!(select(4096, 16 * 33), warp);
-        for (n, k) in [(43008usize, 5376usize), (512, 2048), (2048, 512)] {
-            let (kern, cfg) = select(n, k);
-            assert!(kern.shape_ok(k) && cfg.valid());
+        {
+            let src = source(V2Config::new(128, 2));
+            assert!(src.contains("const NV2_WG: u32 = 128u;"));
+            assert!(src.contains("const NV2_MR: u32 = 2u;"));
+            assert!(!src.contains("const NV2_WG: u32 = 256u;"));
+        }
+        {
+            let src = source(V2Config::new(128, 4));
+            for e in [
+                WARP_PK_ENTRY,
+                FDEC_PK_ENTRY,
+                FMLUT_PK_ENTRY,
+                MROW_PK_ENTRY,
+                MROW2_PK_ENTRY,
+            ] {
+                assert!(src.contains(&format!("fn {e}(")), "missing {e}");
+            }
+            let pk = src
+                .split_once("const NV2_SECTION_PK")
+                .expect("pk section")
+                .1;
+            assert!(pk.contains("nv2_y[(row0 + m) >> 1u]"));
+            assert!(pk.contains("nv2_y[row >> 1u]"));
+            assert!(pk.contains("(hi << 16u)"));
         }
     }
 
     #[test]
-    fn slots_move_the_moe_stacks_and_nothing_else() {
-        let fmlut = (V2Kernel::FMLut, V2Config::new(128, 4));
-        let fdec = (V2Kernel::FDec, V2Config::new(128, 1));
-        let warp = (V2Kernel::Warp, V2Config::new(64, 1));
+    fn row_geometry_quad_alignment_and_pk_capability_follow_the_shader_layout() {
+        {
+            let c = V2Config::new(256, 4);
+            assert_eq!(c.subgroups(), 8);
+            assert_eq!(c.rows_per_group(V2Kernel::Warp), 8);
+            assert_eq!(c.rows_per_group(V2Kernel::WarpQ), 8);
+            assert_eq!(c.rows_per_group(V2Kernel::MRow), 32);
+            assert_eq!(c.rows_per_group(V2Kernel::MRow2), 16);
+            assert_eq!(c.rows_per_group(V2Kernel::MRowQ), 16);
+            assert_eq!(V2Config::new(128, 2).rows_per_group(V2Kernel::FMRow), 8);
+            assert!(c.valid());
+            assert!(!V2Config::new(48, 1).valid());
+        }
+        {
+            assert!(V2Kernel::WarpQ.shape_ok(5376));
+            assert!(V2Kernel::WarpQ.shape_ok(21504));
+            assert!(V2Kernel::WarpQ.shape_ok(512));
+            assert!(!V2Kernel::WarpQ.shape_ok(16 * 6));
+            assert!(!V2Kernel::MRowQ.shape_ok(16 * 6));
+            assert!(V2Kernel::MRowQ.shape_ok(16 * 8));
+            assert!(V2Kernel::MRow.shape_ok(16 * 6));
+            assert!(V2Kernel::MRow2.shape_ok(16 * 6));
+            assert!(!V2Kernel::MRow.shape_ok(16 * 3));
+            assert!(V2Kernel::Warp.shape_ok(16 * 3));
+        }
+        {
+            assert!(!pk_capable(V2Kernel::FMLut, V2Config::new(128, 3)));
+            assert!(pk_capable(V2Kernel::FMLut, V2Config::new(128, 4)));
+            assert!(!pk_capable(V2Kernel::Warp, V2Config::new(32, 1)));
+            assert!(pk_capable(V2Kernel::Warp, V2Config::new(64, 1)));
+            assert!(!pk_capable(V2Kernel::MRow, V2Config::new(128, 3)));
+            assert!(pk_capable(V2Kernel::MRow, V2Config::new(128, 2)));
+            assert!(pk_capable(V2Kernel::MRow2, V2Config::new(128, 3)));
+            assert!(!pk_capable(V2Kernel::MRowQ, V2Config::new(128, 2)));
+        }
+    }
 
-        assert_eq!(select_slots(1024, 2048, 9), fmlut);
+    #[test]
+    fn select_and_select_pk_pick_the_measured_winner_and_slots_move_only_the_moe_stacks() {
+        {
+            let mrow = (V2Kernel::MRow, V2Config::new(128, 2));
+            let fdec = (V2Kernel::FDec, V2Config::new(128, 1));
+            let warp = (V2Kernel::Warp, V2Config::new(64, 1));
+            assert_eq!(select(43008, 5376), mrow);
+            assert_eq!(select(5376, 21504), mrow);
+            assert_eq!(select(8192, 2048), mrow);
+            assert_eq!(select(2048, 4096), mrow);
+            assert_eq!(select(512, 2048), fdec);
+            assert_eq!(select(2048, 512), warp);
+            assert_eq!(select(4096, 16 * 33), warp);
+            for (n, k) in [(43008usize, 5376usize), (512, 2048), (2048, 512)] {
+                let (kern, cfg) = select(n, k);
+                assert!(kern.shape_ok(k) && cfg.valid());
+            }
+        }
+        {
+            let fmlut = (V2Kernel::FMLut, V2Config::new(128, 4));
+            let fdec = (V2Kernel::FDec, V2Config::new(128, 1));
+            let warp = (V2Kernel::Warp, V2Config::new(64, 1));
 
-        assert_eq!(select_slots(512, 2048, 9), fmlut);
+            assert_eq!(select_slots(1024, 2048, 9), fmlut);
 
-        assert_eq!(select_slots(2048, 512, 9), warp);
+            assert_eq!(select_slots(512, 2048, 9), fmlut);
 
-        for (n, k) in [
-            (43008usize, 5376usize),
-            (5376, 21504),
-            (8192, 2048),
-            (2048, 4096),
-            (512, 2048),
-            (1024, 2048),
-            (2048, 512),
-            (4096, 16 * 33),
-            (300, 1024),
-            (37, 2048),
-        ] {
+            assert_eq!(select_slots(2048, 512, 9), warp);
+
+            for (n, k) in [
+                (43008usize, 5376usize),
+                (5376, 21504),
+                (8192, 2048),
+                (2048, 4096),
+                (512, 2048),
+                (1024, 2048),
+                (2048, 512),
+                (4096, 16 * 33),
+                (300, 1024),
+                (37, 2048),
+            ] {
+                assert_eq!(
+                    select_slots(n, k, 1),
+                    select(n, k),
+                    "n={n} k={k}: the slots-aware path must reproduce the old rule at one slot"
+                );
+                assert_eq!(select_pk_slots(n, k, 1), select_pk(n, k), "n={n} k={k}");
+            }
+            assert_eq!(select_slots(1024, 2048, 1), fdec);
+
             assert_eq!(
-                select_slots(n, k, 1),
-                select(n, k),
-                "n={n} k={k}: the slots-aware path must reproduce the old rule at one slot"
+                select_pk_slots(1024, 2048, 9).map(|r| r.2),
+                Some(FMLUT_PK_ENTRY)
             );
-            assert_eq!(select_pk_slots(n, k, 1), select_pk(n, k), "n={n} k={k}");
+            assert_eq!(
+                select_pk_slots(1024, 2048, 1).map(|r| r.2),
+                Some(FDEC_PK_ENTRY)
+            );
+            assert_eq!(
+                select_pk_slots(2048, 512, 9).map(|r| r.2),
+                Some(WARP_PK_ENTRY)
+            );
+
+            assert_eq!(select_slots(1024, 2048, 0), select_slots(1024, 2048, 1));
         }
-        assert_eq!(select_slots(1024, 2048, 1), fdec);
-
-        assert_eq!(
-            select_pk_slots(1024, 2048, 9).map(|r| r.2),
-            Some(FMLUT_PK_ENTRY)
-        );
-        assert_eq!(
-            select_pk_slots(1024, 2048, 1).map(|r| r.2),
-            Some(FDEC_PK_ENTRY)
-        );
-        assert_eq!(
-            select_pk_slots(2048, 512, 9).map(|r| r.2),
-            Some(WARP_PK_ENTRY)
-        );
-
-        assert_eq!(select_slots(1024, 2048, 0), select_slots(1024, 2048, 1));
-    }
-
-    #[test]
-    fn every_pk_entry_point_is_present_and_pair_packs() {
-        let src = source(V2Config::new(128, 4));
-        for e in [
-            WARP_PK_ENTRY,
-            FDEC_PK_ENTRY,
-            FMLUT_PK_ENTRY,
-            MROW_PK_ENTRY,
-            MROW2_PK_ENTRY,
-        ] {
-            assert!(src.contains(&format!("fn {e}(")), "missing {e}");
+        {
+            for (n, k, want) in [
+                (43008usize, 5376usize, MROW_PK_ENTRY),
+                (5376, 21504, MROW_PK_ENTRY),
+                (8192, 2048, MROW_PK_ENTRY),
+                (2048, 4096, MROW_PK_ENTRY),
+                (512, 2048, FDEC_PK_ENTRY),
+                (2048, 512, WARP_PK_ENTRY),
+            ] {
+                let (kern, cfg, entry) = select_pk(n, k).expect("pk route");
+                assert_eq!(entry, want, "n={n} k={k}");
+                assert!(kern.shape_ok(k));
+                assert!(cfg.rows_per_group(kern).is_multiple_of(2));
+            }
+            assert!(select_pk(4096, 16 * 33).is_some());
+            assert!(select_pk(4096, 24).is_none());
         }
-        let pk = src
-            .split_once("const NV2_SECTION_PK")
-            .expect("pk section")
-            .1;
-        assert!(pk.contains("nv2_y[(row0 + m) >> 1u]"));
-        assert!(pk.contains("nv2_y[row >> 1u]"));
-        assert!(pk.contains("(hi << 16u)"));
     }
 
     #[test]
-    fn select_pk_routes_every_production_shape_to_a_pair_packed_entry() {
-        for (n, k, want) in [
-            (43008usize, 5376usize, MROW_PK_ENTRY),
-            (5376, 21504, MROW_PK_ENTRY),
-            (8192, 2048, MROW_PK_ENTRY),
-            (2048, 4096, MROW_PK_ENTRY),
-            (512, 2048, FDEC_PK_ENTRY),
-            (2048, 512, WARP_PK_ENTRY),
-        ] {
-            let (kern, cfg, entry) = select_pk(n, k).expect("pk route");
-            assert_eq!(entry, want, "n={n} k={k}");
-            assert!(kern.shape_ok(k));
-            assert!(cfg.rows_per_group(kern).is_multiple_of(2));
+    fn the_decode_block_is_swappable_and_only_the_int_path_keeps_the_swar_map() {
+        {
+            let src = source(V2Config::default());
+            let swapped = with_decode(&src, "// gone").expect("markers present");
+            assert!(!swapped.contains("fn nv2_i8map("));
+            assert!(!swapped.contains("fn nv2_dec4("));
+            assert!(!swapped.contains("fn nv2_mdec4("));
+            assert!(swapped.contains("fn nv2_ue4m3("));
+            assert!(swapped.contains(MROW_ENTRY));
+            assert!(with_decode("no markers", "x").is_none());
         }
-        assert!(select_pk(4096, 16 * 33).is_some());
-        assert!(select_pk(4096, 24).is_none());
-    }
-
-    #[test]
-    fn pk_capability_rejects_odd_row_blocking() {
-        assert!(!pk_capable(V2Kernel::FMLut, V2Config::new(128, 3)));
-        assert!(pk_capable(V2Kernel::FMLut, V2Config::new(128, 4)));
-        assert!(!pk_capable(V2Kernel::Warp, V2Config::new(32, 1)));
-        assert!(pk_capable(V2Kernel::Warp, V2Config::new(64, 1)));
-        assert!(!pk_capable(V2Kernel::MRow, V2Config::new(128, 3)));
-        assert!(pk_capable(V2Kernel::MRow, V2Config::new(128, 2)));
-        assert!(pk_capable(V2Kernel::MRow2, V2Config::new(128, 3)));
-        assert!(!pk_capable(V2Kernel::MRowQ, V2Config::new(128, 2)));
-    }
-
-    #[test]
-    fn the_decode_block_is_marker_wrapped_and_swappable() {
-        let src = source(V2Config::default());
-        let swapped = with_decode(&src, "// gone").expect("markers present");
-        assert!(!swapped.contains("fn nv2_i8map("));
-        assert!(!swapped.contains("fn nv2_dec4("));
-        assert!(!swapped.contains("fn nv2_mdec4("));
-        assert!(swapped.contains("fn nv2_ue4m3("));
-        assert!(swapped.contains(MROW_ENTRY));
-        assert!(with_decode("no markers", "x").is_none());
-    }
-
-    #[test]
-    fn the_int_path_keeps_the_swar_map_and_the_float_path_does_not() {
-        let src = source(V2Config::default());
-        let warp = src.split_once("fn gemv_nvfp4_warp(").expect("warp").1;
-        let warp = warp.split_once("\nconst NV2_SECTION").expect("warp end").0;
-        assert!(warp.contains("nv2_iblock"));
-        let fdec = src.split_once("fn gemv_nvfp4_fdec(").expect("fdec").1;
-        let fdec = fdec.split_once("\nconst NV2_SECTION").expect("fdec end").0;
-        assert!(fdec.contains("nv2_fblock"));
-        assert!(!fdec.contains("nv2_iblock"));
+        {
+            let src = source(V2Config::default());
+            let warp = src.split_once("fn gemv_nvfp4_warp(").expect("warp").1;
+            let warp = warp.split_once("\nconst NV2_SECTION").expect("warp end").0;
+            assert!(warp.contains("nv2_iblock"));
+            let fdec = src.split_once("fn gemv_nvfp4_fdec(").expect("fdec").1;
+            let fdec = fdec.split_once("\nconst NV2_SECTION").expect("fdec end").0;
+            assert!(fdec.contains("nv2_fblock"));
+            assert!(!fdec.contains("nv2_iblock"));
+        }
     }
 }

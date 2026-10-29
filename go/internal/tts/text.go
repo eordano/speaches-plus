@@ -28,7 +28,6 @@ var (
 	mdItalicUnderRe = regexp.MustCompile(`_(.*?)_`)
 	whitespaceRe    = regexp.MustCompile(`\s+`)
 	newlineRe       = regexp.MustCompile(`[\r\n]+`)
-	sentenceSplitRe = regexp.MustCompile(`(?:[.!?])\s+`)
 )
 
 func StripEmojis(s string) string {

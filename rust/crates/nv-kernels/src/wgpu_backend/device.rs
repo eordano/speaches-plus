@@ -204,12 +204,14 @@ impl WgpuContext {
             && caps.subgroup_min_size < caps.subgroup_max_size
             && caps.subgroup_min_size <= qualify::COOP_SUBGROUP_SIZE
             && qualify::COOP_SUBGROUP_SIZE <= caps.subgroup_max_size
-            && std::env::var_os("NV_WGPU_REQUIRED_SUBGROUP_SIZE").is_none()
+            && !nv_config::env_arm_present_at_all_reread_every_call("NV_WGPU_REQUIRED_SUBGROUP_SIZE")
         {
-            std::env::set_var(
-                "NV_WGPU_REQUIRED_SUBGROUP_SIZE",
-                qualify::COOP_SUBGROUP_SIZE.to_string(),
-            );
+            unsafe {
+                std::env::set_var(
+                    "NV_WGPU_REQUIRED_SUBGROUP_SIZE",
+                    qualify::COOP_SUBGROUP_SIZE.to_string(),
+                )
+            };
         }
 
         let mut base = wgpu::Features::empty();

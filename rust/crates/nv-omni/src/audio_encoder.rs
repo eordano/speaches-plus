@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{LayerNorm, Module};
 
+use crate::weights::{load_1d, load_2d, load_lin_bias};
 use nv_layers::attn::{sdpa, AttnConfig};
 use nv_layers::conv::Conv2d;
 use nv_layers::linear::Linear;
@@ -595,38 +596,6 @@ fn mel_to_hz(m: f32) -> f32 {
     }
 }
 
-fn load_1d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    dim: usize,
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("{name}: expected [{}], got {:?}", dim, d);
-    }
-    Ok(w)
-}
-
-fn load_2d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    shape: (usize, usize),
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != shape.0 || d[1] != shape.1 {
-        anyhow::bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
-    }
-    Ok(w)
-}
-
 fn load_nd(
     weights: &nv_weights::WeightLoader,
     name: &str,
@@ -653,18 +622,6 @@ fn load_ln(
     Ok(LayerNorm::new(w, b, 1e-5))
 }
 
-fn load_lin_bias(
-    weights: &nv_weights::WeightLoader,
-    prefix: &str,
-    out_f: usize,
-    in_f: usize,
-    dtype: DType,
-) -> Result<Linear> {
-    let w = load_2d(weights, &format!("{prefix}.weight"), (out_f, in_f), dtype)?;
-    let b = load_1d(weights, &format!("{prefix}.bias"), out_f, dtype)?;
-    Linear::new(w, Some(b))
-}
-
 use candle_core::IndexOp;
 
 #[cfg(test)]
@@ -689,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn output_length_law_matches_conv_stack_over_range() {
+    fn the_length_law_matches_the_conv_stack_sinusoids_match_whisper_and_forward_follows_the_law() {
         for frames in 1..=350usize {
             let got = audio_tokens_for_mel_frames(frames);
             let chunk = 100usize;
@@ -711,15 +668,7 @@ mod tests {
         }
         assert_eq!(audio_tokens_for_mel_frames(300), 39);
         assert_eq!(audio_tokens_for_mel_frames(100), 13);
-    }
-
-    #[test]
-    fn conv_freq_out_is_16_for_128_bins() {
         assert_eq!(conv_freq_out(128), 16);
-    }
-
-    #[test]
-    fn whisper_sinusoid_spot_values() {
         let t = whisper_sinusoids(4, 8, DType::F32, &Device::Cpu).unwrap();
         let v: Vec<f32> = t.flatten_all().unwrap().to_vec1().unwrap();
         let half = 4usize;
@@ -732,12 +681,20 @@ mod tests {
                 assert!((v[pos * 8 + half + i] - ang.cos()).abs() < 1e-5);
             }
         }
-    }
 
-    #[test]
-    fn forward_shape_matches_output_length_law() {
+        let samples = vec![0.01f32; 16_000];
+        let (mel, frames) = whisper_log_mel_128(&samples).unwrap();
+        assert_eq!(frames, 100);
+        assert_eq!(mel.len(), 128 * frames);
+        assert!(mel.iter().all(|x| x.is_finite()));
         let cfg = tiny_cfg();
         let enc = AudioEncoder::new(&cfg, &Device::Cpu).unwrap();
+        let mel = Tensor::from_vec(mel, (128, frames), &Device::Cpu).unwrap();
+        let out = enc.forward(&mel).unwrap();
+        assert_eq!(
+            out.dims(),
+            &[audio_tokens_for_mel_frames(frames), cfg.output_dim]
+        );
         let frames = 250usize;
         let mel = Tensor::zeros((128, frames), DType::F32, &Device::Cpu).unwrap();
         let out = enc.forward(&mel).unwrap();
@@ -747,12 +704,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mel_shape_is_128_by_frames() {
-        let samples = vec![0.01f32; 16_000];
-        let (mel, frames) = whisper_log_mel_128(&samples).unwrap();
-        assert_eq!(frames, 100);
-        assert_eq!(mel.len(), 128 * frames);
-        assert!(mel.iter().all(|x| x.is_finite()));
-    }
 }

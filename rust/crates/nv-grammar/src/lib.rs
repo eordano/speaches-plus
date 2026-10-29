@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use regex_automata::{
     dfa::{dense, Automaton, StartKind},
     util::primitives::StateID,
@@ -8,15 +8,129 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+mod json;
+mod pattern;
+mod ranges;
+mod schema;
+
 type Dfa = dense::DFA<Vec<u32>>;
+
+const ANY_JSON_VALUE_BYTE_NO_JSON_TEXT_CAN_CONTAIN: u8 = 0x01;
+const ANY_JSON_OBJECT_BYTE_NO_JSON_TEXT_CAN_CONTAIN: u8 = 0x02;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct State {
+    dfa: StateID,
+    json: Option<json::Json>,
+}
+
+fn marker(object_only: bool) -> u8 {
+    if object_only {
+        ANY_JSON_OBJECT_BYTE_NO_JSON_TEXT_CAN_CONTAIN
+    } else {
+        ANY_JSON_VALUE_BYTE_NO_JSON_TEXT_CAN_CONTAIN
+    }
+}
+
+fn live(dfa: &Dfa, s: StateID) -> Option<StateID> {
+    (!dfa.is_dead_state(s)).then_some(s)
+}
+
+fn resume(
+    dfa: &Dfa,
+    json_markers: bool,
+    at: StateID,
+    j: json::Json,
+    step: json::Step,
+    b: u8,
+) -> Option<State> {
+    let after = || live(dfa, dfa.next_state(at, marker(j.object_only)));
+    match step {
+        json::Step::Next(json) => Some(State {
+            dfa: at,
+            json: Some(json),
+        }),
+        json::Step::Done => Some(State {
+            dfa: after()?,
+            json: None,
+        }),
+        json::Step::DoneBeforeThisByte => step_state(
+            dfa,
+            json_markers,
+            State {
+                dfa: after()?,
+                json: None,
+            },
+            b,
+        ),
+        json::Step::Reject => None,
+    }
+}
+
+fn step_state(dfa: &Dfa, json_markers: bool, st: State, b: u8) -> Option<State> {
+    if json_markers && (b == marker(false) || b == marker(true)) {
+        return None;
+    }
+    if let Some(j) = st.json {
+        return resume(dfa, json_markers, st.dfa, j, j.step(b), b);
+    }
+    if let Some(ns) = live(dfa, dfa.next_state(st.dfa, b)) {
+        return Some(State {
+            dfa: ns,
+            json: None,
+        });
+    }
+    if !json_markers {
+        return None;
+    }
+    [false, true]
+        .into_iter()
+        .filter(|&o| live(dfa, dfa.next_state(st.dfa, marker(o))).is_some())
+        .find_map(|o| {
+            let j = json::Json::start(o);
+            resume(dfa, json_markers, st.dfa, j, j.step(b), b)
+        })
+}
+
+fn terminates(dfa: &Dfa, st: State) -> bool {
+    let at = match st.json {
+        None => st.dfa,
+        Some(j) if j.complete() => dfa.next_state(st.dfa, marker(j.object_only)),
+        Some(_) => return false,
+    };
+    dfa.is_match_state(dfa.next_eoi_state(at))
+}
+
+fn start_state(dfa: &Dfa) -> Result<State> {
+    let s = dfa
+        .start_state_forward(&Input::new("").anchored(Anchored::Yes))
+        .map_err(|e| anyhow::anyhow!("dfa start: {e}"))?;
+    Ok(State { dfa: s, json: None })
+}
 
 fn build_anchored_dfa_uncached(pattern: &str) -> Result<Dfa> {
     let anchored = format!(r"\A(?:{pattern})\z");
     dense::Builder::new()
-        .configure(dense::Config::new().start_kind(StartKind::Anchored))
+        .configure(
+            dense::Config::new()
+                .start_kind(StartKind::Anchored)
+                .dfa_size_limit(Some(DFA_SIZE_LIMIT_64_MIB_REFUSES_SCHEMAS_THAT_EXPLODE_WHEN_DETERMINIZED))
+                .determinize_size_limit(Some(DFA_SIZE_LIMIT_64_MIB_REFUSES_SCHEMAS_THAT_EXPLODE_WHEN_DETERMINIZED)),
+        )
         .build(&anchored)
-        .with_context(|| format!("build anchored dfa for /{anchored}/"))
+        .with_context(|| {
+            format!(
+                "the grammar does not compile to an automaton within {} MiB (or is not a valid \
+                 regular expression); simplify it: fewer optional properties, smaller \
+                 maxItems/maxLength, shorter alternations",
+                DFA_SIZE_LIMIT_64_MIB_REFUSES_SCHEMAS_THAT_EXPLODE_WHEN_DETERMINIZED >> 20
+            )
+        })
 }
+
+pub const DFA_SIZE_LIMIT_64_MIB_REFUSES_SCHEMAS_THAT_EXPLODE_WHEN_DETERMINIZED: usize = 64 << 20;
+pub const DFA_CACHE_256_PATTERNS_THEN_CLEARED_SO_DISTINCT_SCHEMAS_CANNOT_GROW_MEMORY_FOREVER: usize = 256;
+pub const ROW_CACHE_4096_MASK_ROWS_THEN_CLEARED_A_ROW_IS_ONE_BIT_PER_VOCAB_TOKEN: usize = 4096;
 
 fn build_anchored_dfa(pattern: &str) -> Result<Arc<Dfa>> {
     use std::sync::Mutex;
@@ -27,10 +141,11 @@ fn build_anchored_dfa(pattern: &str) -> Result<Arc<Dfa>> {
         return Ok(d.clone());
     }
     let dfa = Arc::new(build_anchored_dfa_uncached(pattern)?);
-    cache
-        .lock()
-        .unwrap()
-        .insert(pattern.to_string(), dfa.clone());
+    let mut c = cache.lock().unwrap();
+    if c.len() >= DFA_CACHE_256_PATTERNS_THEN_CLEARED_SO_DISTINCT_SCHEMAS_CANNOT_GROW_MEMORY_FOREVER {
+        c.clear();
+    }
+    c.insert(pattern.to_string(), dfa.clone());
     Ok(dfa)
 }
 
@@ -38,11 +153,14 @@ fn build_anchored_dfa(pattern: &str) -> Result<Arc<Dfa>> {
 pub enum GrammarSpec {
     JsonSchema(Value),
     Regex(String),
+    CompiledRegex(String),
 }
 
 pub fn schema_to_regex(schema: &Value) -> Result<String> {
     let mut out = String::new();
-    emit_node(schema, &mut out).context("compile json schema to regex")?;
+    schema::Compiler::new(schema)
+        .node(schema, "#", &mut out)
+        .context("compile json schema to regex")?;
     Ok(out)
 }
 
@@ -54,114 +172,15 @@ pub fn choice_to_regex(choices: &[String]) -> String {
     format!("({})", alts.join("|"))
 }
 
-pub fn json_value_regex(max_depth: usize) -> String {
-    let leaf = format!("({STRING}|{NUMBER}|true|false|null)");
-    let mut value = leaf.clone();
-    for _ in 0..max_depth {
-        let member = format!("{STRING}{WS}:{WS}{value}");
-        let object = format!(r"\{{{WS}({member}({WS},{WS}{member})*)?{WS}\}}");
-        let array = format!(r"\[{WS}({value}({WS},{WS}{value})*)?{WS}\]");
-        value = format!("({leaf}|{object}|{array})");
+pub fn grammar_to_regex(spec: &GrammarSpec) -> Result<String> {
+    match spec {
+        GrammarSpec::JsonSchema(s) => schema_to_regex(s),
+        GrammarSpec::Regex(r) | GrammarSpec::CompiledRegex(r) => Ok(r.clone()),
     }
-    value
 }
 
-pub fn json_object_regex(max_depth: usize) -> String {
-    let value = json_value_regex(max_depth);
-    let member = format!("{STRING}{WS}:{WS}{value}");
-    format!(r"\{{{WS}({member}({WS},{WS}{member})*)?{WS}\}}")
-}
-
-const WS: &str = r"[ \t\n]{0,20}";
-const STRING: &str = r#""([^"\\\x00-\x1f]|\\["\\/bfnrt]|\\u[0-9a-fA-F]{4})*""#;
-
-const INTEGER: &str = r"-?(0|[1-9][0-9]{0,19})";
-const NUMBER: &str = r"-?(0|[1-9][0-9]{0,19})(\.[0-9]{1,17})?([eE][-+]?[0-9]{1,4})?";
-
-fn emit_node(node: &Value, out: &mut String) -> Result<()> {
-    if let Some(en) = node.get("enum").and_then(|v| v.as_array()) {
-        let alts: Vec<String> = en
-            .iter()
-            .map(|v| regex_escape(&serde_json::to_string(v).unwrap_or_default()))
-            .collect();
-        out.push('(');
-        out.push_str(&alts.join("|"));
-        out.push(')');
-        return Ok(());
-    }
-    if let Some(c) = node.get("const") {
-        out.push_str(&regex_escape(&serde_json::to_string(c).unwrap_or_default()));
-        return Ok(());
-    }
-
-    let ty = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match ty {
-        "string" => out.push_str(STRING),
-        "integer" => out.push_str(INTEGER),
-        "number" => out.push_str(NUMBER),
-        "boolean" => out.push_str("(true|false)"),
-        "null" => out.push_str("null"),
-        "object" => emit_object(node, out)?,
-        "array" => emit_array(node, out)?,
-        "" => bail!("schema node missing 'type' (and no enum/const): {node}"),
-        other => bail!("unsupported schema type '{other}'"),
-    }
-    Ok(())
-}
-
-fn emit_object(node: &Value, out: &mut String) -> Result<()> {
-    let props = node
-        .get("properties")
-        .and_then(|v| v.as_object())
-        .context("object schema needs 'properties'")?;
-    let required: Vec<&str> = node
-        .get("required")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_else(|| props.keys().map(|s| s.as_str()).collect());
-
-    out.push_str(r"\{");
-    out.push_str(WS);
-    for (i, key) in required.iter().enumerate() {
-        let sub = props
-            .get(*key)
-            .with_context(|| format!("required key '{key}' not in properties"))?;
-        if i > 0 {
-            out.push_str(WS);
-            out.push(',');
-            out.push_str(WS);
-        }
-        out.push('"');
-        out.push_str(&regex_escape(key));
-        out.push('"');
-        out.push_str(WS);
-        out.push(':');
-        out.push_str(WS);
-        emit_node(sub, out)?;
-    }
-    out.push_str(WS);
-    out.push_str(r"\}");
-    Ok(())
-}
-
-fn emit_array(node: &Value, out: &mut String) -> Result<()> {
-    let items = node.get("items").context("array schema needs 'items'")?;
-    let mut item = String::new();
-    emit_node(items, &mut item)?;
-    out.push_str(r"\[");
-    out.push_str(WS);
-    out.push_str("((");
-    out.push_str(&item);
-    out.push_str(")(");
-    out.push_str(WS);
-    out.push(',');
-    out.push_str(WS);
-    out.push('(');
-    out.push_str(&item);
-    out.push_str("))*)?");
-    out.push_str(WS);
-    out.push_str(r"\]");
-    Ok(())
+pub fn check_grammar(spec: &GrammarSpec) -> Result<()> {
+    build_anchored_dfa(&grammar_to_regex(spec)?).map(|_| ())
 }
 
 fn regex_escape(s: &str) -> String {
@@ -177,47 +196,42 @@ fn regex_escape(s: &str) -> String {
 
 pub struct JsonConstraint {
     dfa: Arc<Dfa>,
-    state: StateID,
+    json_markers: bool,
+    state: State,
     dead: bool,
 }
 
 impl JsonConstraint {
     pub fn from_schema(schema: &Value) -> Result<Self> {
-        Self::from_regex(&schema_to_regex(schema)?)
+        Self::from_compiled_regex(&schema_to_regex(schema)?)
     }
 
     pub fn from_regex(pattern: &str) -> Result<Self> {
+        Self::new(pattern, false)
+    }
+
+    pub fn from_compiled_regex(pattern: &str) -> Result<Self> {
+        Self::new(pattern, true)
+    }
+
+    fn new(pattern: &str, json_markers: bool) -> Result<Self> {
         let dfa = build_anchored_dfa(pattern)?;
-        let state = dfa
-            .start_state_forward(&Input::new("").anchored(Anchored::Yes))
-            .map_err(|e| anyhow::anyhow!("dfa start: {e}"))?;
+        let state = start_state(&dfa)?;
         Ok(Self {
             dfa,
+            json_markers,
             state,
             dead: false,
         })
     }
 
-    fn peek(&self, state: StateID, byte: u8) -> Option<StateID> {
-        let ns = self.dfa.next_state(state, byte);
-        if self.dfa.is_dead_state(ns) {
-            None
-        } else {
-            Some(ns)
-        }
-    }
-
     pub fn can_terminate(&self) -> bool {
-        if self.dead {
-            return false;
-        }
-        let eoi = self.dfa.next_eoi_state(self.state);
-        self.dfa.is_match_state(eoi)
+        !self.dead && terminates(&self.dfa, self.state)
     }
 
     pub fn advance_str(&mut self, s: &str) -> bool {
         for &b in s.as_bytes() {
-            match self.peek(self.state, b) {
+            match step_state(&self.dfa, self.json_markers, self.state, b) {
                 Some(ns) => self.state = ns,
                 None => {
                     self.dead = true;
@@ -234,7 +248,7 @@ impl JsonConstraint {
         }
         let mut st = self.state;
         for &b in s.as_bytes() {
-            match self.peek(st, b) {
+            match step_state(&self.dfa, self.json_markers, st, b) {
                 Some(ns) => st = ns,
                 None => return false,
             }
@@ -251,6 +265,7 @@ pub struct VocabBytes {
     bytes: Vec<Box<[u8]>>,
     is_eos: Vec<bool>,
     oov_eos: Vec<u32>,
+    eos: Vec<u32>,
 }
 
 impl VocabBytes {
@@ -271,6 +286,9 @@ impl VocabBytes {
         }
         oov_eos.sort_unstable();
         oov_eos.dedup();
+        let mut eos = eos_ids.to_vec();
+        eos.sort_unstable();
+        eos.dedup();
         Self {
             bytes: token_bytes
                 .into_iter()
@@ -278,6 +296,7 @@ impl VocabBytes {
                 .collect(),
             is_eos,
             oov_eos,
+            eos,
         }
     }
 
@@ -294,6 +313,14 @@ impl VocabBytes {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Checkpoint {
+    state: State,
+    dead: bool,
+    defer_until: Vec<u32>,
+    defer_matched: usize,
+}
+
 struct StateRow {
     allowed: Vec<u64>,
     can_terminate: bool,
@@ -301,10 +328,11 @@ struct StateRow {
 
 pub struct GuidedDecoder {
     dfa: Arc<Dfa>,
+    json_markers: bool,
     vocab: Arc<VocabBytes>,
-    state: StateID,
+    state: State,
 
-    rows: HashMap<StateID, Arc<StateRow>>,
+    rows: HashMap<State, Arc<StateRow>>,
 
     computed: usize,
     dead: bool,
@@ -319,7 +347,7 @@ struct RowEntry {
     _vocab: Arc<VocabBytes>,
 }
 
-type RowKey = (usize, usize, StateID);
+type RowKey = (usize, usize, bool, State);
 
 fn row_cache() -> &'static std::sync::Mutex<HashMap<RowKey, RowEntry>> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<RowKey, RowEntry>>> =
@@ -343,23 +371,31 @@ fn contiguous_suffix_match_len(seq: &[u32], matched: usize, id: u32) -> usize {
 
 impl GuidedDecoder {
     pub fn from_schema(schema: &Value, vocab: Arc<VocabBytes>) -> Result<Self> {
-        Self::from_regex(&schema_to_regex(schema)?, vocab)
+        Self::from_compiled_regex(&schema_to_regex(schema)?, vocab)
     }
 
     pub fn from_grammar(spec: &GrammarSpec, vocab: Arc<VocabBytes>) -> Result<Self> {
         match spec {
             GrammarSpec::JsonSchema(s) => Self::from_schema(s, vocab),
             GrammarSpec::Regex(r) => Self::from_regex(r, vocab),
+            GrammarSpec::CompiledRegex(r) => Self::from_compiled_regex(r, vocab),
         }
     }
 
     pub fn from_regex(pattern: &str, vocab: Arc<VocabBytes>) -> Result<Self> {
+        Self::new(pattern, false, vocab)
+    }
+
+    pub fn from_compiled_regex(pattern: &str, vocab: Arc<VocabBytes>) -> Result<Self> {
+        Self::new(pattern, true, vocab)
+    }
+
+    fn new(pattern: &str, json_markers: bool, vocab: Arc<VocabBytes>) -> Result<Self> {
         let dfa = build_anchored_dfa(pattern)?;
-        let state = dfa
-            .start_state_forward(&Input::new("").anchored(Anchored::Yes))
-            .map_err(|e| anyhow::anyhow!("dfa start: {e}"))?;
+        let state = start_state(&dfa)?;
         Ok(Self {
             dfa,
+            json_markers,
             vocab,
             state,
             rows: HashMap::new(),
@@ -372,6 +408,22 @@ impl GuidedDecoder {
 
     pub fn is_dead(&self) -> bool {
         self.dead
+    }
+
+    pub fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            state: self.state,
+            dead: self.dead,
+            defer_until: self.defer_until.clone(),
+            defer_matched: self.defer_matched,
+        }
+    }
+
+    pub fn rollback(&mut self, cp: &Checkpoint) {
+        self.state = cp.state;
+        self.dead = cp.dead;
+        self.defer_until.clone_from(&cp.defer_until);
+        self.defer_matched = cp.defer_matched;
     }
 
     pub fn set_defer_until_token(&mut self, close_id: u32) {
@@ -417,21 +469,17 @@ impl GuidedDecoder {
         true
     }
 
-    fn walk(&self, mut st: StateID, bytes: &[u8]) -> Option<StateID> {
+    fn walk(&self, mut st: State, bytes: &[u8]) -> Option<State> {
         if bytes.is_empty() {
             return None;
         }
         for &b in bytes {
-            let ns = self.dfa.next_state(st, b);
-            if self.dfa.is_dead_state(ns) {
-                return None;
-            }
-            st = ns;
+            st = step_state(&self.dfa, self.json_markers, st, b)?;
         }
         Some(st)
     }
 
-    fn compute_row(&self, state: StateID) -> StateRow {
+    fn compute_row(&self, state: State) -> StateRow {
         let n = self.vocab.len();
         let nwords = n.div_ceil(64);
         let mut allowed = vec![0u64; nwords];
@@ -443,10 +491,9 @@ impl GuidedDecoder {
                 allowed[id >> 6] |= 1u64 << (id & 63);
             }
         }
-        let eoi = self.dfa.next_eoi_state(state);
         StateRow {
             allowed,
-            can_terminate: self.dfa.is_match_state(eoi),
+            can_terminate: terminates(&self.dfa, state),
         }
     }
 
@@ -457,6 +504,7 @@ impl GuidedDecoder {
         let key: RowKey = (
             Arc::as_ptr(&self.dfa) as usize,
             Arc::as_ptr(&self.vocab) as usize,
+            self.json_markers,
             self.state,
         );
         if let Some(hit) = row_cache()
@@ -471,6 +519,9 @@ impl GuidedDecoder {
         let r = Arc::new(self.compute_row(self.state));
         self.computed += 1;
         if let Ok(mut c) = row_cache().lock() {
+            if c.len() >= ROW_CACHE_4096_MASK_ROWS_THEN_CLEARED_A_ROW_IS_ONE_BIT_PER_VOCAB_TOKEN {
+                c.clear();
+            }
             c.entry(key).or_insert_with(|| RowEntry {
                 row: r.clone(),
                 _dfa: self.dfa.clone(),
@@ -482,11 +533,7 @@ impl GuidedDecoder {
     }
 
     pub fn can_terminate(&self) -> bool {
-        if self.dead {
-            return false;
-        }
-        let eoi = self.dfa.next_eoi_state(self.state);
-        self.dfa.is_match_state(eoi)
+        !self.dead && terminates(&self.dfa, self.state)
     }
 
     pub fn apply_mask(&mut self, logits: &mut [f32]) {
@@ -495,6 +542,11 @@ impl GuidedDecoder {
             return;
         }
         if self.deferred() {
+            for &id in &self.vocab.eos {
+                if let Some(logit) = logits.get_mut(id as usize) {
+                    *logit = f32::NEG_INFINITY;
+                }
+            }
             return;
         }
         let row = self.row();
@@ -566,181 +618,8 @@ mod tests {
     use serde_json::json;
 
     fn full_match(pattern: &str, s: &str) -> bool {
-        let mut c = JsonConstraint::from_regex(pattern).unwrap();
+        let mut c = JsonConstraint::from_compiled_regex(pattern).unwrap();
         c.advance_str(s) && c.can_terminate()
-    }
-
-    #[test]
-    fn scalar_types() {
-        assert!(full_match(
-            &schema_to_regex(&json!({"type":"integer"})).unwrap(),
-            "-42"
-        ));
-        assert!(!full_match(
-            &schema_to_regex(&json!({"type":"integer"})).unwrap(),
-            "4.2"
-        ));
-        assert!(full_match(
-            &schema_to_regex(&json!({"type":"number"})).unwrap(),
-            "3.14"
-        ));
-        assert!(full_match(
-            &schema_to_regex(&json!({"type":"boolean"})).unwrap(),
-            "true"
-        ));
-        assert!(full_match(
-            &schema_to_regex(&json!({"type":"string"})).unwrap(),
-            "\"hi\""
-        ));
-        assert!(!full_match(
-            &schema_to_regex(&json!({"type":"string"})).unwrap(),
-            "hi"
-        ));
-    }
-
-    #[test]
-    fn enum_constraint() {
-        let re = schema_to_regex(&json!({"enum":["red","green",2]})).unwrap();
-        assert!(full_match(&re, "\"red\""));
-        assert!(full_match(&re, "2"));
-        assert!(!full_match(&re, "\"blue\""));
-    }
-
-    #[test]
-    fn json_object_grammar_accepts_and_rejects() {
-        let re = json_object_regex(3);
-
-        let v = vocab(&["x", ""], &[1]);
-        assert!(
-            GuidedDecoder::from_regex(&re, v).is_ok(),
-            "json_object DFA builds"
-        );
-        assert!(full_match(&re, r#"{"a":1}"#));
-        assert!(full_match(
-            &re,
-            r#"{"a": "hi", "b": [1, 2, 3], "c": {"d": true}}"#
-        ));
-        assert!(full_match(&re, "{}"));
-        assert!(!full_match(&re, r#"{"a":1}x"#), "trailing junk rejected");
-        assert!(
-            !full_match(&re, "[1,2,3]"),
-            "top-level array is not an object"
-        );
-        assert!(!full_match(&re, "42"), "scalar is not an object");
-    }
-
-    #[test]
-    fn no_content_tokens_allowed_after_complete_object() {
-        let schema =
-            json!({"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]});
-
-        let v = vocab(&["{", "\"a\"", ":", "1", "}", "\n", "x", "{", ""], &[8]);
-        let mut d = GuidedDecoder::from_schema(&schema, v).unwrap();
-        for t in [0u32, 1, 2, 3, 4] {
-            assert!(d.advance(t), "advance token {t} of {{\"a\":1}}");
-        }
-        assert!(d.can_terminate(), "object is complete");
-        let allowed = masked_allowed(&mut d, 9);
-        assert!(!allowed[5], "newline after }} must be masked");
-        assert!(!allowed[6], "letter after }} must be masked");
-        assert!(!allowed[7], "another {{ after }} must be masked");
-        assert!(allowed[8], "eos must be allowed");
-    }
-
-    #[test]
-    fn weather_tool_args_schema_builds() {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "location": {"type": "string"},
-                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-            },
-            "required": ["location", "unit"]
-        });
-        let re = schema_to_regex(&schema).expect("schema->regex");
-        eprintln!("weather regex = {re}");
-
-        let v = vocab(
-            &[
-                "{",
-                "\"",
-                "location",
-                "\":",
-                "\"Paris\"",
-                ",",
-                "unit",
-                "\"celsius\"",
-                "}",
-                "",
-            ],
-            &[9],
-        );
-        let d = GuidedDecoder::from_schema(&schema, v);
-        assert!(d.is_ok(), "from_schema failed: {:?}", d.err());
-        assert!(full_match(&re, r#"{"location":"Paris","unit":"celsius"}"#));
-    }
-
-    #[test]
-    fn object_required_fields() {
-        let schema = json!({
-            "type":"object",
-            "properties":{"name":{"type":"string"},"age":{"type":"integer"}},
-            "required":["name","age"]
-        });
-        let re = schema_to_regex(&schema).unwrap();
-        assert!(full_match(&re, r#"{"name":"Ada","age":36}"#));
-        assert!(full_match(&re, "{ \"name\" : \"Ada\" , \"age\" : 36 }"));
-        assert!(
-            !full_match(&re, r#"{"name":"Ada"}"#),
-            "missing required age"
-        );
-        assert!(
-            !full_match(&re, r#"{"age":36,"name":"Ada"}"#),
-            "wrong key order"
-        );
-    }
-
-    #[test]
-    fn nested_array_of_objects() {
-        let schema = json!({
-            "type":"array",
-            "items":{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}
-        });
-        let re = schema_to_regex(&schema).unwrap();
-        assert!(full_match(&re, "[]"));
-        assert!(full_match(&re, r#"[{"x":1}]"#));
-        assert!(full_match(&re, r#"[{"x":1},{"x":2}]"#));
-        assert!(!full_match(&re, r#"[{"x":1} {"x":2}]"#), "missing comma");
-    }
-
-    #[test]
-    fn incremental_prefix_and_terminate() {
-        let schema =
-            json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]});
-        let mut c = JsonConstraint::from_schema(&schema).unwrap();
-        assert!(!c.can_terminate());
-        assert!(c.advance_str(r#"{"ok":"#));
-        assert!(!c.can_terminate(), "incomplete object");
-        assert!(!c.accepts_str("9"));
-        assert!(c.accepts_str("true"));
-        assert!(c.advance_str("true}"));
-        assert!(c.can_terminate());
-    }
-
-    #[test]
-    fn token_mask_filters_vocab() {
-        let c = JsonConstraint::from_schema(&json!({"type":"boolean"})).unwrap();
-        let vocab = ["tr", "fa", "xy", "true", "9", "{"];
-        let mask = c.token_mask(&vocab);
-        assert_eq!(mask, vec![true, true, false, true, false, false]);
-    }
-
-    #[test]
-    fn dead_after_invalid() {
-        let mut c = JsonConstraint::from_schema(&json!({"type":"integer"})).unwrap();
-        assert!(!c.advance_str("x"));
-        assert!(!c.can_terminate());
-        assert!(!c.accepts_str("1"));
     }
 
     fn vocab(strs: &[&str], eos: &[u32]) -> Arc<VocabBytes> {
@@ -754,41 +633,312 @@ mod tests {
         logits.iter().map(|&x| x.is_finite()).collect()
     }
 
-    #[test]
-    fn deferred_grammar_arms_after_think_close() {
-        let v = vocab(&["true", "false", "blah", "</think>", ""], &[4]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap();
-        d.set_defer_until_token(3);
+    fn boolean_decoder(v: Arc<VocabBytes>) -> GuidedDecoder {
+        GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap()
+    }
 
-        let a = masked_allowed(&mut d, 5);
-        assert_eq!(a, vec![true; 5], "no constraint while thinking");
+    const DEEP_REPLY: &str = r#"{"route": "change", "say": "Gold.", "ops": [{"op": "spawn", "position": {"at": "speaker", "offset": [0, 0.5, -1e2]}, "do": [{"op": "play", "tags": ["a", "b"]}]}]}"#;
+
+    #[test]
+    fn schema_regexes_accept_and_reject_the_table() {
+        let weather = json!({
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+            },
+            "required": ["location", "unit"]
+        });
+        let cases: [(Value, &[&str], &[&str]); 8] = [
+            (json!({"type":"integer"}), &["-42"], &["4.2"]),
+            (json!({"type":"number"}), &["3.14"], &[]),
+            (json!({"type":"boolean"}), &["true"], &[]),
+            (json!({"type":"string"}), &["\"hi\""], &["hi"]),
+            (json!({"enum":["red","green",2]}), &["\"red\"", "2"], &["\"blue\""]),
+            (
+                json!({"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}),
+                &[r#"{"name":"Ada","age":36}"#, "{ \"name\" : \"Ada\" , \"age\" : 36 }"],
+                &[r#"{"name":"Ada"}"#, r#"{"age":36,"name":"Ada"}"#],
+            ),
+            (
+                json!({"type":"array","items":{"type":"object","properties":{"x":{"type":"integer"}},"required":["x"]}}),
+                &["[]", r#"[{"x":1}]"#, r#"[{"x":1},{"x":2}]"#],
+                &[r#"[{"x":1} {"x":2}]"#],
+            ),
+            (weather.clone(), &[r#"{"location":"Paris","unit":"celsius"}"#], &[r#"{"location":"Paris","unit":"kelvin"}"#]),
+        ];
+        for (schema, ok, bad) in cases {
+            let re = schema_to_regex(&schema).unwrap();
+            for s in ok {
+                assert!(full_match(&re, s), "{schema} must accept {s}");
+            }
+            for s in bad {
+                assert!(!full_match(&re, s), "{schema} must reject {s}");
+            }
+        }
+        let v = vocab(&["{", "\"", "location", "\":", "\"Paris\"", ",", "unit", "\"celsius\"", "}", ""], &[9]);
+        assert!(GuidedDecoder::from_schema(&weather, v).is_ok());
+    }
+
+    #[test]
+    fn json_object_mode_is_any_object_at_any_depth_with_bounded_runs_nesting_and_string_bytes() {
+        let re = schema_to_regex(&json!({"type": "object"})).unwrap();
+        assert!(GuidedDecoder::from_compiled_regex(&re, vocab(&["x", ""], &[1])).is_ok());
+        for ok in [
+            r#"{"a":1}"#,
+            r#"{"a": "hi", "b": [1, 2, 3], "c": {"d": true}}"#,
+            "{}",
+            DEEP_REPLY,
+            r#"{"a":[[[[[[[[[[null]]]]]]]]]]}"#,
+            "{\n\t\"a\" : [ ] , \"b\" : { } }",
+        ] {
+            assert!(full_match(&re, ok), "{ok}");
+        }
+        for bad in [
+            r#"{"a":1}x"#,
+            "[1,2,3]",
+            "42",
+            r#"{"a":1,}"#,
+            r#"{"a":[1,]}"#,
+            r#"{"a" 1}"#,
+            r#"{"a":01}"#,
+            r#"{"a":tru}"#,
+            r#"{"a":[1}"#,
+            r#"{"a":{"b":1]}"#,
+            r#"{"a":1}}"#,
+            r#"{"a":"x"#,
+            r#"{a:1}"#,
+            r#"{"a":1.}"#,
+            r#"{"a":-}"#,
+        ] {
+            assert!(!full_match(&re, bad), "{bad}");
+        }
+        assert!(full_match(&re, &format!("{{{}}}", " ".repeat(20))));
+        assert!(!full_match(&re, &format!("{{{}}}", " ".repeat(21))));
+        assert!(full_match(&re, &format!(r#"{{"a":{}}}"#, "9".repeat(20))));
+        assert!(!full_match(&re, &format!(r#"{{"a":{}}}"#, "9".repeat(21))));
+        let nested = |n: usize| format!("{{\"a\":{}{}}}", "[".repeat(n), "]".repeat(n));
+        assert!(full_match(&re, &nested(63)));
+        assert!(!full_match(&re, &nested(64)), "nesting stops at the u64 stack width");
+        assert!(full_match(&re, r#"{"a":"\u00e9 \"q\" \\ é 中 🌍"}"#));
+        assert!(!full_match(&re, "{\"a\":\"x\ny\"}"));
+        assert!(!full_match(&re, r#"{"a":"\x"}"#));
+        assert!(!full_match(&re, r#"{"a":"\u12"}"#));
+        let mut d = GuidedDecoder::from_compiled_regex(
+            &re,
+            Arc::new(VocabBytes::new(
+                vec![b"{\"a\":\"".to_vec(), vec![0xff], vec![0xc3], vec![0xa9]],
+                &[],
+            )),
+        )
+        .unwrap();
+        assert!(d.advance(0));
+        assert_eq!(
+            masked_allowed(&mut d, 4),
+            vec![false, false, true, false],
+            "only a valid utf-8 lead byte may follow"
+        );
+        assert!(d.advance(2));
+        assert_eq!(
+            masked_allowed(&mut d, 4),
+            vec![false, false, false, true],
+            "then its continuation"
+        );
+    }
+
+    #[test]
+    fn free_json_inside_a_schema_meets_the_schema_on_both_sides() {
+        let reply = json!({
+            "type": "object",
+            "properties": {
+                "route": {"enum": ["change", "none"]},
+                "say": {"type": "string"},
+                "ops": {"type": "array", "items": {"type": "object"}}
+            },
+            "required": ["route", "say", "ops"]
+        });
+        let re = schema_to_regex(&reply).unwrap();
+        assert!(full_match(&re, DEEP_REPLY));
+        assert!(
+            !full_match(&re, &DEEP_REPLY.replace("change", "other")),
+            "the enum still holds"
+        );
+        assert!(
+            !full_match(&re, r#"{"route": "none", "say": "", "ops": [1]}"#),
+            "items stay objects"
+        );
+
+        let any_x =
+            schema_to_regex(&json!({"type": "object", "properties": {"x": {}}, "required": ["x"]}))
+                .unwrap();
+        for ok in [
+            r#"{"x":12}"#,
+            r#"{"x": 12 }"#,
+            r#"{"x":-0.5e+3}"#,
+            r#"{"x":[1,{"y":null}]}"#,
+        ] {
+            assert!(full_match(&any_x, ok), "{ok}");
+        }
+        assert!(!full_match(&any_x, r#"{"x":12 3}"#));
+
+        let any = schema_to_regex(&json!({})).unwrap();
+        assert!(
+            full_match(&any, "42"),
+            "a number ending the output completes the value"
+        );
+        assert!(full_match(&any, "\"s\""));
+        assert!(!full_match(&any, "4 2"));
+
+        let any_items = schema_to_regex(&json!({"type": "array"})).unwrap();
+        assert!(full_match(&any_items, r#"[1, "a", {"b": [true]}]"#));
+    }
+
+    #[test]
+    fn the_json_machine_agrees_with_serde_json_on_every_one_byte_edit() {
+        let re = schema_to_regex(&json!({"type": "object"})).unwrap();
+        let deep =
+            serde_json::to_string(&serde_json::from_str::<Value>(DEEP_REPLY).unwrap()).unwrap();
+        let corpus = [
+            "{}",
+            r#"{"a":1}"#,
+            r#"{"a":[1,2.5,-3e2,0],"b":{"c":null,"d":[true,false,""]}}"#,
+            &deep,
+        ];
+        let mut checked = 0;
+        for doc in corpus {
+            let b = doc.as_bytes();
+            for i in 0..=b.len() {
+                let mut edits: Vec<Vec<u8>> = b"{}[],:\"01-.eE+a "
+                    .iter()
+                    .map(|c| [&b[..i], &[*c], &b[i..]].concat())
+                    .collect();
+                if i < b.len() {
+                    edits.push([&b[..i], &b[i + 1..]].concat());
+                }
+                for e in edits {
+                    let Ok(s) = String::from_utf8(e) else {
+                        continue;
+                    };
+                    if s.trim() != s {
+                        continue;
+                    }
+                    let serde = serde_json::from_str::<serde_json::Map<String, Value>>(&s).is_ok();
+                    assert_eq!(full_match(&re, &s), serde, "{s}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 3000, "{checked}");
+    }
+
+    #[test]
+    fn guided_tokens_that_straddle_the_schema_and_free_json_advance_and_mask() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"ops": {"type": "array", "items": {"type": "object"}}},
+            "required": ["ops"]
+        });
+        let toks = [
+            r#"{"ops":"#,
+            "[",
+            "{",
+            r#""a""#,
+            ":",
+            "[0",
+            ",0]",
+            "}",
+            "]",
+            "}",
+            "x",
+            "",
+        ];
+        let n = toks.len();
+        let mut d = GuidedDecoder::from_schema(&schema, vocab(&toks, &[n as u32 - 1])).unwrap();
+        for t in [0u32, 1] {
+            assert!(d.advance(t), "{}", toks[t as usize]);
+        }
+        let allowed = masked_allowed(&mut d, n);
+        assert!(
+            allowed[2] && allowed[8],
+            "an op object or the end of the list"
+        );
+        assert!(!allowed[3] && !allowed[10], "no bare key, no junk");
+        for t in [2u32, 3, 4, 5, 6] {
+            assert!(d.advance(t), "{}", toks[t as usize]);
+        }
+        assert!(!d.can_terminate());
+        let allowed = masked_allowed(&mut d, n);
+        assert!(
+            allowed[7] && !allowed[8],
+            "the free object closes with }} before the list can"
+        );
+        for t in [7u32, 8, 9] {
+            assert!(d.advance(t), "{}", toks[t as usize]);
+        }
+        assert!(d.can_terminate());
+        let allowed = masked_allowed(&mut d, n);
+        assert!(allowed[n - 1], "eos once the whole reply is complete");
+        assert!(
+            !allowed[2] && !allowed[9] && !allowed[10],
+            "no content token after the complete object: no brace, no junk"
+        );
+    }
+
+    #[test]
+    fn json_constraint_prefix_terminate_mask_and_death() {
+        let schema =
+            json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]});
+        let mut c = JsonConstraint::from_schema(&schema).unwrap();
+        assert!(!c.can_terminate());
+        assert!(c.advance_str(r#"{"ok":"#));
+        assert!(!c.can_terminate(), "incomplete object");
+        assert!(!c.accepts_str("9"));
+        assert!(c.accepts_str("true"));
+        assert!(c.advance_str("true}"));
+        assert!(c.can_terminate());
+
+        let c = JsonConstraint::from_schema(&json!({"type":"boolean"})).unwrap();
+        let mask = c.token_mask(&["tr", "fa", "xy", "true", "9", "{"]);
+        assert_eq!(mask, vec![true, true, false, true, false, false]);
+
+        let mut c = JsonConstraint::from_schema(&json!({"type":"integer"})).unwrap();
+        assert!(!c.advance_str("x"));
+        assert!(!c.can_terminate());
+        assert!(!c.accepts_str("1"), "dead after an invalid byte");
+    }
+
+    #[test]
+    fn deferral_arms_after_the_close_token_and_its_edges_are_pinned() {
+        let v = vocab(&["true", "false", "blah", "</think>", ""], &[4]);
+        let mut d = boolean_decoder(v);
+        d.set_defer_until_token(3);
+        assert_eq!(
+            masked_allowed(&mut d, 5),
+            vec![true, true, true, true, false],
+            "the thought is free text, but EOS before the close marker would end the request with \
+             no structured answer, so only EOS is masked while thinking"
+        );
         assert!(d.advance(2), "CoT tokens pass without walking the DFA");
         assert!(d.advance(2));
         assert!(d.deferred());
-
         assert!(d.advance(3), "</think> arms the grammar");
         assert!(!d.deferred());
-        let a = masked_allowed(&mut d, 5);
         assert_eq!(
-            a,
+            masked_allowed(&mut d, 5),
             vec![true, true, false, false, false],
             "post-think tokens are constrained"
         );
         assert!(d.advance(0));
         assert!(d.can_terminate());
-    }
 
-    #[test]
-    fn deferral_edge_semantics_are_pinned() {
-        let v = vocab(&["true", "false", "blah", "</think>", ""], &[4]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v.clone()).unwrap();
+        let v = vocab(&["true", "false", "blah", "</think>", ""], &[4, 6]);
+        let mut d = boolean_decoder(v.clone());
         d.set_defer_until_token(3);
-
-        let mut logits = vec![0.0f32; 8];
-        d.apply_mask(&mut logits);
-        assert!(
-            logits.iter().all(|x| x.is_finite()),
-            "while deferred nothing is masked, padding tail included"
+        assert_eq!(
+            masked_allowed(&mut d, 8),
+            vec![true, true, true, true, false, true, false, true],
+            "while deferred only the EOS ids are masked, the one past the tokenizer vocab \
+             included; the rest of the padding tail stays as free as the thought"
         );
         assert!(d.advance(4), "EOS passes through during deferral");
         assert!(
@@ -796,7 +946,6 @@ mod tests {
             "out-of-vocab id during deferral does not kill"
         );
         assert!(!d.is_dead());
-
         assert!(d.advance(3), "arm");
         assert!(
             !d.advance(3),
@@ -804,7 +953,7 @@ mod tests {
         );
         assert!(d.is_dead());
 
-        let mut d2 = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap();
+        let mut d2 = boolean_decoder(v);
         d2.set_defer_until_token(3);
         assert!(d2.advance(3));
         assert!(
@@ -832,14 +981,13 @@ mod tests {
     const HARMONY_CLOSE: [u32; 4] = [3, 4, 5, 6];
 
     fn harmony_decoder() -> GuidedDecoder {
-        let mut d =
-            GuidedDecoder::from_schema(&json!({"type":"boolean"}), harmony_vocab()).unwrap();
+        let mut d = boolean_decoder(harmony_vocab());
         d.set_defer_until_sequence(&HARMONY_CLOSE);
         d
     }
 
     #[test]
-    fn a_close_sequence_arms_only_when_the_whole_of_it_is_contiguous() {
+    fn a_close_sequence_arms_only_when_contiguous_resumes_on_a_repeated_head_and_survives_eos() {
         let mut d = harmony_decoder();
         for (i, t) in HARMONY_CLOSE.iter().take(3).enumerate() {
             assert!(d.advance(*t));
@@ -858,14 +1006,12 @@ mod tests {
             Some(HARMONY_CLOSE[0]),
             "the broken match restarts at the head rather than sticking mid-sequence"
         );
-
         assert!(d.advance(HARMONY_CLOSE[3]));
         assert!(
             d.deferred(),
             "every token of the sequence was emitted, but with prose in the middle: a close \
              marker split by thought is not the model closing its thought"
         );
-
         for t in HARMONY_CLOSE {
             assert!(d.advance(t));
         }
@@ -876,32 +1022,41 @@ mod tests {
             "post-close tokens are constrained"
         );
 
-        let mut empty =
-            GuidedDecoder::from_schema(&json!({"type":"boolean"}), harmony_vocab()).unwrap();
+        let mut empty = boolean_decoder(harmony_vocab());
         empty.set_defer_until_sequence(&[]);
         assert!(
             !empty.deferred(),
             "an empty close sequence is no deferral at all, not a grammar that never arms"
         );
-    }
 
-    #[test]
-    fn a_close_sequence_whose_head_repeats_resumes_at_the_longest_live_match() {
-        let mut d =
-            GuidedDecoder::from_schema(&json!({"type":"boolean"}), harmony_vocab()).unwrap();
-        d.set_defer_until_sequence(&[3, 3, 4]);
+        let mut repeated_head = boolean_decoder(harmony_vocab());
+        repeated_head.set_defer_until_sequence(&[3, 3, 4]);
         for t in [3u32, 3, 3, 4] {
-            assert!(d.advance(t));
+            assert!(repeated_head.advance(t));
         }
         assert!(
-            !d.deferred(),
+            !repeated_head.deferred(),
             "the last three tokens were the close sequence; resetting all progress on the \
              repeated head loses a real close"
+        );
+
+        let mut d = harmony_decoder();
+        assert!(d.advance(HARMONY_CLOSE[0]));
+        assert!(d.advance(7), "EOS passes through during deferral");
+        assert!(!d.is_dead());
+        assert!(
+            d.deferred(),
+            "EOS is not part of the model's close marker, so it cannot arm the grammar"
+        );
+        assert_eq!(
+            d.defer_token(),
+            Some(HARMONY_CLOSE[0]),
+            "half a close marker must not survive EOS"
         );
     }
 
     #[test]
-    fn the_forced_close_emits_the_sequence_one_token_per_step_and_then_arms() {
+    fn the_forced_close_walks_the_sequence_and_reports_a_token_the_row_cannot_hold() {
         let mut d = harmony_decoder();
         for (i, want) in HARMONY_CLOSE.iter().enumerate() {
             let mut logits = vec![0.0f32; 8];
@@ -932,10 +1087,7 @@ mod tests {
             vec![true, true, false, false, false, false, false, false],
             "the schema constrains the tokens the reserve left room for"
         );
-    }
 
-    #[test]
-    fn a_close_token_the_logits_row_cannot_hold_is_reported_before_the_head_looks_forceable() {
         let d = harmony_decoder();
         let last = HARMONY_CLOSE[HARMONY_CLOSE.len() - 1] as usize;
         assert_eq!(
@@ -948,14 +1100,12 @@ mod tests {
             Some(HARMONY_CLOSE[HARMONY_CLOSE.len() - 1]),
             "a model whose lm_head is narrower than the tokenizer can never emit this close token"
         );
-
         let mut logits = vec![0.0f32; last];
         assert!(
             d.mask_to_defer_token(&mut logits),
             "the HEAD of the sequence is in range, so the per-step bool reads healthy while the \
              sequence as a whole is already impossible: only the whole-sequence check catches it"
         );
-
         let mut narrow = vec![0.0f32; HARMONY_CLOSE[0] as usize];
         assert!(
             !d.mask_to_defer_token(&mut narrow),
@@ -969,57 +1119,55 @@ mod tests {
     }
 
     #[test]
-    fn eos_inside_a_close_sequence_breaks_it_without_killing_the_decoder() {
-        let mut d = harmony_decoder();
-        assert!(d.advance(HARMONY_CLOSE[0]));
-        assert!(d.advance(7), "EOS passes through during deferral");
-        assert!(!d.is_dead());
-        assert!(
-            d.deferred(),
-            "EOS is not part of the model's close marker, so it cannot arm the grammar"
-        );
+    fn the_padding_tail_stays_masked_and_only_an_out_of_vocab_eos_is_spared_once_terminable() {
+        let mut d = boolean_decoder(vocab(&["true", "false", ""], &[2]));
         assert_eq!(
-            d.defer_token(),
-            Some(HARMONY_CLOSE[0]),
-            "half a close marker must not survive EOS"
-        );
-    }
-
-    #[test]
-    fn padded_lm_head_tail_is_masked() {
-        let v = vocab(&["true", "false", ""], &[2]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap();
-        let a = masked_allowed(&mut d, 8);
-        assert_eq!(
-            a,
+            masked_allowed(&mut d, 8),
             vec![true, true, false, false, false, false, false, false],
             "logits past the tokenizer vocab are padding and never legal"
         );
+
+        let mut d = boolean_decoder(vocab(&["tr", "ue"], &[5]));
+        assert!(!masked_allowed(&mut d, 8)[5], "oov eos masked while grammar incomplete");
+        assert!(d.advance(0));
+        assert!(!masked_allowed(&mut d, 8)[5], "still masked mid-token");
+        assert!(d.advance(1));
+        assert!(d.can_terminate());
+        assert!(masked_allowed(&mut d, 8)[5], "oov eos allowed once grammar can terminate");
+
+        let mut d = boolean_decoder(vocab(&["true"], &[5]));
+        assert_eq!(
+            &masked_allowed(&mut d, 8)[1..],
+            &[false; 7],
+            "incomplete: entire tail masked, oov eos included"
+        );
+        assert!(d.advance(0));
+        assert_eq!(
+            masked_allowed(&mut d, 8),
+            vec![false, false, false, false, false, true, false, false],
+            "complete: only the oov eos is spared in the tail"
+        );
+        assert!(d.advance(5), "oov eos accepted after completion");
+        assert!(!d.is_dead());
+        assert!(!d.advance(6), "a non-eos oov id still kills");
+        assert!(d.is_dead());
     }
 
     #[test]
-    fn token_index_masks_and_advances_boolean() {
-        let v = vocab(&["tr", "ue", "fa", "lse", "true", "9", "{", ""], &[7]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap();
-
+    fn token_index_masks_and_advances_booleans_and_forces_object_keys() {
+        let mut d = boolean_decoder(vocab(&["tr", "ue", "fa", "lse", "true", "9", "{", ""], &[7]));
         let a = masked_allowed(&mut d, 8);
         assert_eq!(a, vec![true, false, true, false, true, false, false, false]);
         assert!(!d.can_terminate(), "nothing emitted yet");
-
         assert!(d.advance(0));
         let a = masked_allowed(&mut d, 8);
         assert!(a[1], "ue continues 'tr'");
         assert!(!a[2], "fa cannot follow tr");
         assert!(!a[7], "eos masked: 'tr' incomplete");
-
         assert!(d.advance(1));
         assert!(d.can_terminate());
-        let a = masked_allowed(&mut d, 8);
-        assert!(a[7], "eos allowed once 'true' complete");
-    }
+        assert!(masked_allowed(&mut d, 8)[7], "eos allowed once 'true' complete");
 
-    #[test]
-    fn token_index_object_keys_are_forced() {
         let v = vocab(&["{", "\"", "ok", "no", "\":", "true", "}", ""], &[7]);
         let mut d = GuidedDecoder::from_schema(
             &json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}),
@@ -1037,19 +1185,14 @@ mod tests {
     }
 
     #[test]
-    fn token_index_caches_state_rows() {
-        let v = vocab(&["1", "2", "3", ""], &[3]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"integer"}), v).unwrap();
+    fn state_rows_are_computed_once_shared_across_decoders_and_keyed_by_vocab() {
+        let mut d = GuidedDecoder::from_schema(&json!({"type":"integer"}), vocab(&["1", "2", "3", ""], &[3])).unwrap();
         let _ = masked_allowed(&mut d, 4);
         let _ = masked_allowed(&mut d, 4);
         assert_eq!(d.rows.len(), 1, "row computed once per state");
-    }
 
-    #[test]
-    fn state_rows_are_shared_across_decoders() {
         let v = vocab(&["a", "ab", "b", ""], &[3]);
         let pat = "a(ab|b)*";
-
         let mut cold = GuidedDecoder::from_regex(pat, v.clone()).unwrap();
         let _ = masked_allowed(&mut cold, 4);
         assert!(cold.advance(0));
@@ -1058,7 +1201,6 @@ mod tests {
             cold.computed > 0,
             "cold decoder must have computed at least one row"
         );
-
         let mut warm = GuidedDecoder::from_regex(pat, v).unwrap();
         let _ = masked_allowed(&mut warm, 4);
         assert!(warm.advance(0));
@@ -1068,59 +1210,22 @@ mod tests {
             "warm decoder recomputed {} row(s): the process-wide cache is not being hit",
             warm.computed
         );
-    }
 
-    #[test]
-    fn out_of_vocab_eos_masked_until_terminable() {
-        let v = vocab(&["tr", "ue"], &[5]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap();
-
-        let a = masked_allowed(&mut d, 8);
-        assert!(!a[5], "oov eos masked while grammar incomplete");
-        assert!(d.advance(0));
-        assert!(!masked_allowed(&mut d, 8)[5], "still masked mid-token");
-        assert!(d.advance(1));
-        assert!(d.can_terminate());
-        let a = masked_allowed(&mut d, 8);
-        assert!(a[5], "oov eos allowed once grammar can terminate");
-    }
-
-    #[test]
-    fn out_of_vocab_eos_advance_is_terminal_not_dead() {
-        let v = vocab(&["true"], &[5]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap();
-        assert!(d.advance(0));
-        assert!(d.can_terminate());
-        assert!(d.advance(5), "oov eos accepted after completion");
-        assert!(!d.is_dead());
-        assert!(!d.advance(6), "a non-eos oov id still kills");
-        assert!(d.is_dead());
-    }
-
-    #[test]
-    fn padding_tail_stays_masked_around_oov_eos() {
-        let v = vocab(&["true"], &[5]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap();
-
-        let a = masked_allowed(&mut d, 8);
-        assert_eq!(
-            &a[1..],
-            &[false; 7],
-            "incomplete: entire tail masked, oov eos included"
-        );
-        assert!(d.advance(0));
-        let a = masked_allowed(&mut d, 8);
-        assert_eq!(
-            a,
-            vec![false, false, false, false, false, true, false, false],
-            "complete: only the oov eos is spared in the tail"
+        let pat = "c(cd|d)*";
+        let mut a = GuidedDecoder::from_regex(pat, vocab(&["c", "cd", "d", ""], &[3])).unwrap();
+        let _ = masked_allowed(&mut a, 4);
+        assert!(a.computed > 0);
+        let mut b = GuidedDecoder::from_regex(pat, vocab(&["c", "cd", "d", "zz", ""], &[4])).unwrap();
+        let _ = masked_allowed(&mut b, 5);
+        assert!(
+            b.computed > 0,
+            "a different vocab reused a cached row -- the key is unsound"
         );
     }
 
     #[test]
-    fn a_dead_grammar_admits_no_token_rather_than_freeing_the_row() {
-        let v = vocab(&["true", "false", "blah", ""], &[3]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap();
+    fn a_dead_grammar_admits_no_token_not_even_the_out_of_vocab_eos() {
+        let mut d = boolean_decoder(vocab(&["true", "false", "blah", ""], &[3]));
         assert!(
             !d.advance(2),
             "'blah' is not a prefix of any boolean literal, so it must kill the grammar"
@@ -1135,12 +1240,8 @@ mod tests {
              whole row leaves no legal token and every generation loop turns that into an error"
         );
         assert!(!d.can_terminate());
-    }
 
-    #[test]
-    fn death_masks_the_out_of_vocab_eos_a_live_row_would_spare() {
-        let v = vocab(&["true"], &[5]);
-        let mut d = GuidedDecoder::from_schema(&json!({"type":"boolean"}), v).unwrap();
+        let mut d = boolean_decoder(vocab(&["true"], &[5]));
         assert!(d.advance(0));
         assert!(
             masked_allowed(&mut d, 8)[5],
@@ -1157,19 +1258,96 @@ mod tests {
     }
 
     #[test]
-    fn state_rows_do_not_cross_vocabs() {
-        let pat = "c(cd|d)*";
-        let v1 = vocab(&["c", "cd", "d", ""], &[3]);
-        let mut a = GuidedDecoder::from_regex(pat, v1).unwrap();
-        let _ = masked_allowed(&mut a, 4);
-        assert!(a.computed > 0);
-
-        let v2 = vocab(&["c", "cd", "d", "zz", ""], &[4]);
-        let mut b = GuidedDecoder::from_regex(pat, v2).unwrap();
-        let _ = masked_allowed(&mut b, 5);
+    fn marker_bytes_open_free_json_only_in_compiled_regexes_and_are_never_output() {
+        let mut digit_free =
+            GuidedDecoder::from_regex("[^0-9]*", vocab(&["5", "a", "\"x\"", "{}", ""], &[4])).unwrap();
+        assert_eq!(
+            masked_allowed(&mut digit_free, 5),
+            vec![false, true, true, true, true],
+            "[^0-9]* forbids every digit; its class also admits U+0001 and U+0002, and reading \
+             those as the any-JSON markers let a JSON number through where the caller's regex \
+             forbids it"
+        );
         assert!(
-            b.computed > 0,
-            "a different vocab reused a cached row -- the key is unsound"
+            !digit_free.advance(0),
+            "a digit leaves the request regex, so advancing it must kill the decoder"
+        );
+        assert!(digit_free.is_dead());
+
+        let choice = GrammarSpec::Regex(choice_to_regex(&["\u{1}".into(), "\u{2}".into()]));
+        let mut control_choice =
+            GuidedDecoder::from_grammar(&choice, vocab(&["5", "{}", "\u{1}", "\u{2}", ""], &[4]))
+                .unwrap();
+        assert_eq!(
+            masked_allowed(&mut control_choice, 5),
+            vec![false, false, true, true, false],
+            "a guided_choice of U+0001 and U+0002 admits exactly those two strings, not any JSON \
+             value or object in their place"
+        );
+
+        let parameterless_tool_args =
+            schema_to_regex(&json!({"type": "object", "properties": {}})).unwrap();
+        let call = format!("<call>{parameterless_tool_args}</call>");
+        let shared_vocab_so_a_row_cached_with_markers_would_be_reused =
+            vocab(&["<call>", "{}", "{\"a\":[1]}", "</call>", ""], &[4]);
+        let v = || shared_vocab_so_a_row_cached_with_markers_would_be_reused.clone();
+        let mut compiled =
+            GuidedDecoder::from_grammar(&GrammarSpec::CompiledRegex(call.clone()), v()).unwrap();
+        assert!(compiled.advance(0));
+        let allowed = masked_allowed(&mut compiled, 5);
+        assert!(
+            allowed[1] && allowed[2],
+            "the compiler's any-object marker inside an assembled regex still admits any object"
+        );
+        assert!(compiled.advance(2) && compiled.advance(3) && compiled.can_terminate());
+        let mut request = GuidedDecoder::from_grammar(&GrammarSpec::Regex(call), v()).unwrap();
+        assert!(request.advance(0));
+        assert_eq!(
+            masked_allowed(&mut request, 5),
+            vec![false; 5],
+            "the same text sent as a request regex is read literally: its \\x02 is the byte U+0002, \
+             so the caller's regex alone decides what is legal, even where the process-wide row \
+             cache already holds the compiled reading of the same DFA state"
+        );
+
+        let call = GrammarSpec::CompiledRegex(format!(
+            r#"<tool_call>\{{"name": "ping", "arguments": {parameterless_tool_args}\}}</tool_call>"#
+        ));
+        let toks = [r#"<tool_call>{"name": "ping", "arguments": "#, "{}", "\u{2}", "}</tool_call>", ""];
+        let mut required_call = GuidedDecoder::from_grammar(&call, vocab(&toks, &[4])).unwrap();
+        assert!(required_call.advance(0));
+        assert_eq!(
+            masked_allowed(&mut required_call, 5),
+            vec![false, true, false, false, false],
+            "a parameterless required tool call takes a JSON object as its arguments; the raw \
+             byte U+0002 is the compiler's any-object marker, not an object, and emitting it \
+             would hand the client unparsable arguments"
+        );
+        let before = required_call.checkpoint();
+        assert!(
+            !required_call.advance(2),
+            "advancing the raw marker byte must kill the grammar, not step over the marker"
+        );
+        required_call.rollback(&before);
+        assert!(required_call.advance(1) && required_call.advance(3) && required_call.can_terminate());
+
+        let free_x = json!({"type": "object", "properties": {"x": {}}, "required": ["x"]});
+        let toks = ["{\"x\":", "1", "\u{1}", "\u{2}", "}", ""];
+        let mut free_value = GuidedDecoder::from_schema(&free_x, vocab(&toks, &[5])).unwrap();
+        assert!(free_value.advance(0));
+        assert_eq!(
+            masked_allowed(&mut free_value, 6),
+            vec![true, true, false, false, false, false],
+            "a free JSON value may be a nested object or a number, but neither marker byte stands \
+             in for one"
+        );
+        let mut json_object_mode =
+            GuidedDecoder::from_schema(&json!({"type": "object"}), vocab(&["{}", "\u{2}", "\u{1}", ""], &[3]))
+                .unwrap();
+        assert_eq!(
+            masked_allowed(&mut json_object_mode, 4),
+            vec![true, false, false, false],
+            "json_object mode answers with an object, never with the marker byte it compiles to"
         );
     }
 }

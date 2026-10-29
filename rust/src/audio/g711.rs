@@ -104,23 +104,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ulaw_decode_is_total_over_byte_space() {
+    fn g711_decode_is_total_over_byte_space_and_silence_decodes_to_zero() {
         for b in 0u16..=0xFF {
             let v = ulaw_decode_byte(b as u8) as i32;
             assert!(v.abs() <= 32_124, "ulaw_decode({b:02x}) = {v} out of range");
         }
-    }
-
-    #[test]
-    fn alaw_decode_is_total_over_byte_space() {
-        for b in 0u16..=0xFF {
-            let v = alaw_decode_byte(b as u8) as i32;
-            assert!(v.abs() <= 32_256, "alaw_decode({b:02x}) = {v} out of range");
+        {
+            for b in 0u16..=0xFF {
+                let v = alaw_decode_byte(b as u8) as i32;
+                assert!(v.abs() <= 32_256, "alaw_decode({b:02x}) = {v} out of range");
+            }
+        }
+        {
+            assert!(ulaw_decode_byte(0xFF).abs() < 16);
+        }
+        {
+            assert!(alaw_decode_byte(0xD5).abs() < 16);
         }
     }
 
     #[test]
-    fn ulaw_encode_is_total_over_i16_space() {
+    fn g711_encode_is_total_over_i16_space_within_spec_error() {
         let mut max_rel_err = 0.0f32;
         for s in i16::MIN..=i16::MAX {
             if s == i16::MIN {
@@ -142,69 +146,27 @@ mod tests {
             max_rel_err < 0.13,
             "max relative error {max_rel_err} exceeds μ-law spec"
         );
-    }
+        {
+            let mut max_rel_err = 0.0f32;
+            for s in i16::MIN..=i16::MAX {
+                let encoded = alaw_encode_sample(s);
+                let decoded = alaw_decode_byte(encoded);
 
-    #[test]
-    fn alaw_encode_is_total_over_i16_space() {
-        let mut max_rel_err = 0.0f32;
-        for s in i16::MIN..=i16::MAX {
-            let encoded = alaw_encode_sample(s);
-            let decoded = alaw_decode_byte(encoded);
-
-            if s == i16::MIN {
-                continue;
-            }
-            if (s.abs() as i32) > 256 {
-                if decoded != 0 {
-                    assert_eq!(decoded.signum(), s.signum(), "sign for {s}");
+                if s == i16::MIN {
+                    continue;
                 }
-                let err = (decoded as f32 - s as f32).abs() / s.abs() as f32;
-                if err > max_rel_err {
-                    max_rel_err = err;
+                if (s.abs() as i32) > 256 {
+                    if decoded != 0 {
+                        assert_eq!(decoded.signum(), s.signum(), "sign for {s}");
+                    }
+                    let err = (decoded as f32 - s as f32).abs() / s.abs() as f32;
+                    if err > max_rel_err {
+                        max_rel_err = err;
+                    }
                 }
             }
+            assert!(max_rel_err < 0.13, "max relative error {max_rel_err}");
         }
-        assert!(max_rel_err < 0.13, "max relative error {max_rel_err}");
-    }
-
-    #[test]
-    fn ulaw_round_trip_preserves_sign_and_magnitude() {
-        for s in [-32_000i16, -8_000, -1_000, 0, 1_000, 8_000, 32_000] {
-            let encoded = ulaw_encode_sample(s);
-            let decoded = ulaw_decode_byte(encoded);
-            if s == 0 {
-                assert!(decoded.abs() <= ULAW_BIAS as i16 / 2);
-            } else {
-                assert_eq!(decoded.signum(), s.signum(), "sign for {s}");
-                let err = (decoded as f32 - s as f32).abs() / s.abs() as f32;
-                assert!(err < 0.13, "relative error {err} for {s}");
-            }
-        }
-    }
-
-    #[test]
-    fn alaw_round_trip_preserves_sign_and_magnitude() {
-        for s in [-32_000i16, -8_000, -1_000, 0, 1_000, 8_000, 32_000] {
-            let encoded = alaw_encode_sample(s);
-            let decoded = alaw_decode_byte(encoded);
-            if s == 0 {
-                assert!(decoded.abs() <= 16);
-            } else {
-                assert_eq!(decoded.signum(), s.signum(), "sign for {s}");
-                let err = (decoded as f32 - s as f32).abs() / s.abs() as f32;
-                assert!(err < 0.13, "relative error {err} for {s}");
-            }
-        }
-    }
-
-    #[test]
-    fn ulaw_silence_decodes_to_zero() {
-        assert!(ulaw_decode_byte(0xFF).abs() < 16);
-    }
-
-    #[test]
-    fn alaw_silence_decodes_to_zero() {
-        assert!(alaw_decode_byte(0xD5).abs() < 16);
     }
 
     #[test]

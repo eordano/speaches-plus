@@ -58,6 +58,7 @@ mod marlin_zero_drop_lifecycle;
 pub use nv_config::{
     env_arm_opt_in_eq_some_1_cached_first_read_wins,
     env_arm_opt_in_set_to_anything_but_0_cached_first_read_wins,
+    env_arm_opt_out_default_on_unless_eq_some_0_cached_first_read_wins,
     env_arm_present_at_all_cached_first_read_wins,
 };
 pub mod laguna_prefix;
@@ -66,10 +67,31 @@ pub mod laguna_prefix_diagnostics;
 pub mod nvfp4_host;
 pub mod paged_fp8;
 pub mod prefix_reuse;
+pub mod session_lru;
+pub mod spec_pick;
 pub mod qwen3;
+pub mod voxtral;
+pub(crate) mod voxtral_cpu;
+pub mod voxtral_tekken;
+pub mod voxtral_tts;
+pub mod voxtral_tts_codec;
+pub mod voxtral_tts_cpu;
+#[cfg(feature = "wgpu")]
+pub mod voxtral_tts_codec_wgpu;
+#[cfg(feature = "wgpu")]
+pub mod voxtral_tts_wgpu;
+#[cfg(feature = "cuda")]
+pub mod voxtral_graph;
+#[cfg(feature = "cuda")]
+pub mod voxtral_tts_graph;
+pub mod voxtral_train;
+#[cfg(feature = "wgpu")]
+pub mod voxtral_wgpu;
 #[cfg(feature = "wgpu")]
 pub mod qwen3_5_dense_wgpu;
 pub mod qwen3_5_moe;
+#[cfg(feature = "cuda")]
+pub mod qwen4_exp;
 #[cfg(feature = "wgpu")]
 pub mod qwen3_5_moe_wgpu;
 #[cfg(feature = "cuda")]

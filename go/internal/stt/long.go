@@ -91,60 +91,6 @@ func TranscribeLong(t Transcriber, samples []float32, sampleRate int) (string, e
 	return strings.Join(texts, " "), nil
 }
 
-func TranscribeFullLong(t FullTranscriber, samples []float32, sampleRate int) (Result, error) {
-	if peakAmplitude(samples) < silencePeakThreshold {
-		return Result{}, nil
-	}
-	chunkSamples := whisperChunkSecs * sampleRate
-	if len(samples) <= chunkSamples {
-		return t.TranscribeFull(samples, sampleRate)
-	}
-	chunks := chunkAudio(samples, sampleRate)
-	var allSegments []Segment
-	var texts []string
-	var lpSum, lpWeight, nspSum, nspWeight float64
-	for _, c := range chunks {
-		if peakAmplitude(c.data) < silencePeakThreshold {
-			continue
-		}
-		res, err := t.TranscribeFull(c.data, sampleRate)
-		if err != nil {
-			return Result{}, err
-		}
-		text := strings.TrimSpace(res.Text)
-		if text == "" && len(res.Segments) == 0 {
-			continue
-		}
-		if text != "" {
-			texts = append(texts, text)
-		}
-		durMs := float64(len(c.data)*1000) / float64(sampleRate)
-		if res.AvgLogprob != nil && !nan32(*res.AvgLogprob) {
-			lpSum += float64(*res.AvgLogprob) * durMs
-			lpWeight += durMs
-		}
-		if res.NoSpeechProb != nil && !nan32(*res.NoSpeechProb) {
-			nspSum += float64(*res.NoSpeechProb) * durMs
-			nspWeight += durMs
-		}
-		shifted := shiftSegments(res.Segments, c.offsetMs)
-		allSegments = append(allSegments, shifted...)
-	}
-	result := Result{
-		Text:     strings.Join(texts, " "),
-		Segments: allSegments,
-	}
-	if lpWeight > 0 {
-		v := float32(lpSum / lpWeight)
-		result.AvgLogprob = &v
-	}
-	if nspWeight > 0 {
-		v := float32(nspSum / nspWeight)
-		result.NoSpeechProb = &v
-	}
-	return result, nil
-}
-
 func TranscribeSegmentsLong(t SegmentTranscriber, samples []float32, sampleRate int) (Result, error) {
 	if peakAmplitude(samples) < silencePeakThreshold {
 		return Result{}, nil

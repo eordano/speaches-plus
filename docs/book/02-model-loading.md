@@ -8,10 +8,10 @@ and the code says so in its error strings.
 ## Two environment variables, and why the plural exists
 
 `registry_from_env` (`chat_engine/build.rs`) has two arms.
-**`NV_CHAT_MODEL_DIRS`** (plural, checked first) is split on `,` or `:`,
+`NV_CHAT_MODEL_DIRS` (plural, checked first) is split on `,` or `:`,
 trimmed, empties dropped, and handed to `build_registry_strict` with the
-non-panicking `try_load_engine_dir`. **`NV_CHAT_MODEL_DIR`** (singular, the
-fallback) loads exactly one directory through the *panicking* `load_engine_dir`
+non-panicking `try_load_engine_dir`. `NV_CHAT_MODEL_DIR` (singular, the
+fallback) loads exactly one directory through the panicking `load_engine_dir`
 and wraps it in `ChatRegistry::single`. `main.rs` calls `registry_from_env()` on
 a CUDA build and `chat_engine_wgpu::registry_from_env_with_wgpu()` under the
 `wgpu` feature, which can extend or replace the CUDA plan
@@ -20,7 +20,7 @@ a CUDA build and `chat_engine_wgpu::registry_from_env_with_wgpu()` under the
 The plural is not sugar for the singular. One process holds one CUDA context and
 one set of weights in VRAM, so serving more than one model means loading them
 all at boot — there is no lazy load, no unload, no swap. Once multiple models
-share a boot, **a single bad directory must not kill the others**, which is the
+share a boot, a single bad directory must not kill the others, which is the
 entire reason the plural arm uses a different loader. The singular arm keeps the
 older, stricter contract: you asked for one model, you get it or the process
 dies. On a build without the `cuda` feature both variables produce a warning and
@@ -33,24 +33,24 @@ an absent subsystem.
 `ChatRegistry` is `engines: Arc<HashMap<String, Arc<dyn ChatEngine>>>` plus a
 `default_id` and an `order` vector. `from_engines` returns `None` for an empty
 vector — that `Option` is what makes "no chat" a representable state rather than
-a stub engine. **The default model is `engines[0].model_id()`**, the first entry
+a stub engine. The default model is `engines[0].model_id()`, the first entry
 that actually loaded. `order` keeps first-insertion order for `/v1/models`; a
 duplicate id is pushed once, but `HashMap::insert` replaces the value, so the
-*last* engine with that id is served.
+last engine with that id is served.
 
 `resolve(model)` is `resolve_with(model, allow_unknown_model())`: `None` or
 `Some("")` gives the default engine (making `model` optional for a single-model
 deployment); then an exact id hit; then `model_ids::canonical_model_id(m)`
 followed by a second exact lookup; then, only if
-`NV_CHAT_ALLOW_UNKNOWN_MODEL` is truthy **and exactly one engine is loaded**,
+`NV_CHAT_ALLOW_UNKNOWN_MODEL` is truthy and exactly one engine is loaded,
 the default engine with a one-shot-per-id warning; otherwise `None`, which
 `chat.rs` turns into a 404 `model_not_found` (06-serving-surface.md).
 
-**The escape hatch is deliberately crippled.** It never fires with more than one
+The escape hatch is deliberately crippled. It never fires with more than one
 engine (`the_escape_hatch_never_fires_with_more_than_one_engine`), because with
 two models loaded "serve whatever we have" is not a defensible reading of a
 typo. Even single-engine, the warning spells out the cost: the response echoes
-the *served* id, so a client typo becomes indistinguishable from a hit. The
+the served id, so a client typo becomes indistinguishable from a hit. The
 default — off — is OpenAI's behaviour, and once an adapter registry exists this
 arm becomes a correctness bug (the private status ledger).
 
@@ -75,7 +75,7 @@ without a GPU: `registry_policy_tests` drives it with closures over fake paths,
 pinning that one bad directory aborts even when the others are good.
 
 `try_load_engine_dir` and `load_engine_dir` are the same call with different
-failure contracts. **Both refuse to substitute a stub engine** — the panic text
+failure contracts. Both refuse to substitute a stub engine — the panic text
 says "Refusing to start with a stub chat engine". `try_load_engine_dir` also
 spawns a background thread building a throwaway `nv_grammar::JsonConstraint` so
 the grammar machinery's one-time initialisation happens off the first request's
@@ -88,17 +88,19 @@ critical path.
 `model.safetensors`, `model.safetensors.index.json`, or any `*.safetensors`.
 
 A GGUF-only directory fails here, before `detect_family` runs — it ships no
-`config.json`. **The wgpu engine does serve one end to end** (`gguf_config_json`
+`config.json`. The wgpu engine does serve one end to end (`gguf_config_json`
 synthesizes an HF-shape config, `classify_wgpu_model` routes it to
 `WgpuModelKind::Gemma4Moe`, `build_decoder_with_lora` constructs
 `Gemma4MoeWgpu::from_gguf`); CUDA refuses with a message naming the gap and
 pointing at wgpu. Wiring the CUDA seam needs its own `LoadedModel` variant and
 decode loop — `Gemma4` and `Gemma4Moe` are distinct structs with distinct decode
 paths, so `Gemma4` cannot consume a GGUF MoE checkpoint "unchanged". The GGUF
-ships no `tokenizer.json` either, but the flake-pinned gemma-4 E4B
-`tokenizer.json` is a verified id-for-id drop-in (all 262144 pieces exact,
-controls `<|turn>`=105 / `<turn|>`=106 included), proven both ways by
-`nv-models/tests/gguf_tokenizer_identity.rs`.
+ships no `tokenizer.json`, `tokenizer_config.json` or chat template either:
+`ensure_serving_sidecars` (`chat_engine_wgpu.rs`) synthesizes the missing ones
+beside it from that GGUF's own metadata (`nv_weights::gguf::ensure_gguf_sidecars`),
+never overwrites a sidecar already present, and never borrows another size's,
+because the chat template differs between gemma-4 sizes (the suite covering
+sidecar synthesis: `gguf_sidecar_synthesis`).
 
 `try_load_inner` (CUDA only) then, in order: reads `config.json` as a string;
 `detect_family`; `ChatTemplate::load` (an `Option` — absence is logged, not
@@ -111,7 +113,7 @@ fatal); opens CUDA device 0 and disables CUDA event tracking on its stream;
 
 `detect_family(&raw_cfg)` reads `architectures` (an array) first, lowercases each
 entry, and prefix-matches; failing that it tries `model_type` the same way.
-**The match order is load-bearing**: `qwen3omni` and `qwen3_5moe`/`qwen3.5moe`
+The match order is load-bearing: `qwen3omni` and `qwen3_5moe`/`qwen3.5moe`
 are tested before `qwen3_5`/`qwen3.5`, which is tested before `qwen3`, because a
 shorter prefix would otherwise swallow the longer architecture and route it to
 the dense loader. Recognised prefixes are `qwen3omni`/`qwen3_omni`,
@@ -127,7 +129,7 @@ footprint, so wgpu stays the default), and `qwen3_5_dense_family` requires
 `Qwen3_5DenseConfig` and asserting `model.dense_intermediate()` matches
 `config.intermediate_size`.
 
-**An unrecognised architecture is not guessed at**: `detect_family` bails with
+An unrecognised architecture is not guessed at: `detect_family` bails with
 the list of prefixes it accepts, and that error either skips one directory
 (plural arm) or panics the boot (singular arm). There is no "try the closest
 loader" path — every family arm assumes a specific config schema, tensor-name
@@ -168,7 +170,7 @@ KV env, then the global one, then falls back through `kv_max_seq_len_resolved` t
 is always clamped to `max_position_embeddings`, so an env can only lower the
 ceiling, never invent context the checkpoint does not have.
 `kv_max_seq_len_for_gemma4` is the exception that defaults to the checkpoint's
-full `max_position_embeddings`, because Gemma4 *is* modelled: fitting the KV
+full `max_position_embeddings`, because Gemma4 is modelled: fitting the KV
 budget against `NV_VRAM_BUDGET_GIB` is the `vram_plan` solver's job, and it
 refuses to boot a plan that would OOM, naming the smallest changes that would fit
 in ranked order rather than failing later inside an allocation. The Gemma4 arm
@@ -188,7 +190,7 @@ is a hard error**, because with no index nothing arbitrates which copy is
 authoritative. Shards that are Git-LFS pointers (≤1024 bytes, starting with
 `version https://git-lfs.github.com/spec/`) are skipped with a note and their
 tensors dropped, so a partially-fetched checkpoint fails at the first missing
-tensor *by name* rather than at a safetensors header parse of ASCII text.
+tensor by name rather than at a safetensors header parse of ASCII text.
 
 Each shard is `mmap`ed once; `load_shard` records `(dtype, shape, offset_start,
 offset_end)` per tensor, and `get(name, dtype)` slices the mapping, builds the
@@ -218,7 +220,7 @@ generic path.** The Gemma4 projection loader tests for `{module}.weight` and
 `{module}.weight_scale_2`; a compressed-tensors pack-quantized checkpoint has
 neither (its payload is `{module}.weight_packed`), so the loader falls back to
 the plain bf16 name — also absent — and fails with `tensor not found: …`.
-Loaders that *do* understand that layout name it explicitly: `nv_layers::moe`
+Loaders that do understand that layout name it explicitly: `nv_layers::moe`
 probes `{module}.weight_packed`, and `gemma4_e4b::dequant_pack_quantized`
 handles the w4a16 pack-quantized E4B checkpoint. **Support for a checkpoint is a
 property of the (family loader × naming convention) pair, not of the format
@@ -239,7 +241,7 @@ unquantized, the loader goes looking for bf16 `.weight` tensors it does not
 have, and the failure surfaces as a missing-tensor error one layer from its
 cause.
 
-What *is* rejected is a config that would change numerics behind your back.
+What is rejected is a config that would change numerics behind your back.
 `validate()` refuses NVFP4 with any `group_size` other than `NVFP4_GROUP_SIZE`
 (= `nv_quant::nvfp4::BLOCK_SIZE`), naming MXFP4 in the message, because that
 field was once parsed and never read while the block size stayed hardcoded — a
@@ -251,7 +253,7 @@ ignored module loads unquantized.
 
 `load_quantized_weight` pulls the packed payload with `raw_bytes` and hunts the
 scale under several candidate names. The FP8 arm calls `fp8_weight_scale_rows()`
-**at load time**, canonicalising `weight_scale` to one f32 per output row and
+at load time, canonicalising `weight_scale` to one f32 per output row and
 refusing anything neither per-tensor nor per-row (a per-column or block-wise
 grid is a different numeric contract and is not averaged into one), along with
 non-finite and non-positive scales. **Doing this at load rather than at the
@@ -297,7 +299,7 @@ and `eos_token` come from `tokenizer_config.json` and are injected alongside
 object; invalid values logged and ignored), then per-request
 `chat_template_kwargs`.
 
-**Three predicates read the template rather than a hardcoded model list**:
+Three predicates read the template rather than a hardcoded model list:
 `declares_thinking_switch()` (source mentions `enable_thinking`),
 `uses_tool_responses()`, and `supports_tools()` — the last renders a probe
 conversation twice, with and without a synthetic tool, and reports whether the
@@ -305,25 +307,24 @@ output differed, so a template that ignores `tools` reports `false` and
 `render_official_with_kwargs` falls back to flattening tools into a synthetic
 system message with a warning.
 
-### The built-in renderer and why it is refused by default
+### The built-in renderer and why a model-backed engine refuses it
 
 `ChatEngine::render_chat` tries `official_template()` first; if it is absent or
 errors, it calls `note_builtin_fallback(reason)` and falls through to
 `render_prompt`, dispatched per family (`render_chat_prompt` — ChatML — for
 Qwen3, `render_gemma4_prompt`, `render_qwen3_5_moe_prompt`,
 `render_laguna_prompt`). `render_chat_checked_kwargs` wraps that: if a fallback
-note was set *and* the template is required, it returns an error the handler
+note was set and the template is required, it returns an error the handler
 turns into a 500 `chat_template_missing` rather than serving a wrongly-shaped
-prompt. `template_required_for(model_id)` resolves the policy:
-`NV_REQUIRE_CHAT_TEMPLATE` truthy means required always;
-`NV_ALLOW_CHATML_FALLBACK` truthy or `NV_REQUIRE_CHAT_TEMPLATE` explicitly off
-means not required; otherwise required iff a template load was attempted for
-that model id, so model-backed engines are strict and test/echo engines are not.
-**The reason for the default is mechanical, not aesthetic**: ChatML's
+prompt. `template_required_for(model_id)` is the whole policy: the template is
+required iff a template load was attempted for that model id, so model-backed
+engines are strict and test/echo engines keep the built-in renderer. No env var
+changes it.
+The reason is mechanical, not aesthetic: ChatML's
 `<|im_start|>role … <|im_end|>` is not Gemma-4's `<|turn>role … <turn|>` and it
 does not emit Qwen3.6's `<think>` opener, and feeding a model control tokens it
-was not trained on changes both what it generates and when it stops. The
-fallback is an opt-in escape hatch, not a graceful degradation.
+was not trained on changes both what it generates and when it stops. For a
+model-backed engine the fallback is not a graceful degradation; it is refused.
 
 ### Reasoning / think splitting
 

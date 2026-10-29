@@ -509,101 +509,98 @@ mod tests {
     const SPIRV_MAGIC: u32 = 0x0723_0203;
 
     #[test]
-    fn every_checked_in_blob_is_word_aligned_spirv_with_a_consistent_name() {
-        for b in blobs() {
-            assert!(
-                b.bytes.len() >= 20 && b.bytes.len().is_multiple_of(4),
-                "{}: not a SPIR-V module",
-                b.name
-            );
-            let magic = u32::from_le_bytes([b.bytes[0], b.bytes[1], b.bytes[2], b.bytes[3]]);
-            assert_eq!(magic, SPIRV_MAGIC, "{}: bad SPIR-V magic", b.name);
-            let wq = match b.wq {
-                SpvWq::Nvfp4Block16 => "w4a16",
-                SpvWq::Fp8RowscalePlain => "w8a16",
-            };
-            let out = match b.out {
-                SpvOut::F32 => "f32",
-                SpvOut::Bf16Alpha => "y16",
-            };
-            let bl = b.blocking;
-            assert_eq!(
-                b.name,
-                format!(
-                    "mulmm_{wq}_{out}_bm{}_bn{}_bk{}_wm{}_wn{}",
-                    bl.bm, bl.bn, bl.bk, bl.wm, bl.wn
-                ),
-                "blob name must encode its own compile defines or the blob cannot be rebuilt"
-            );
-        }
-    }
-
-    #[test]
-    fn every_blocking_fits_the_hardware_it_names() {
-        for b in blobs() {
-            let bl = b.blocking;
-            assert!(bl.wm.is_multiple_of(ACC_TILE_M) && bl.wm > 0, "{}", b.name);
-            assert!(bl.wn.is_multiple_of(ACC_TILE_N) && bl.wn > 0, "{}", b.name);
-            assert!(bl.bm.is_multiple_of(bl.wm), "{}", b.name);
-            assert!(bl.bn.is_multiple_of(bl.wn), "{}", b.name);
-            assert!(bl.bk.is_multiple_of(ACC_TILE_M), "{}", b.name);
-            assert!(
-                bl.workgroup_size() <= 1024,
-                "{}: workgroup over the API ceiling",
-                b.name
-            );
-            assert!(
-                bl.stage_bytes(b.out) <= 48 * 1024,
-                "{}: staged tiles exceed the 48K workgroup shared budget",
-                b.name
-            );
-            assert!(
-                bl.acc_lane_dwords() <= 128,
-                "{}: accumulator dwords per lane exceed the budget the WGSL path proved \
-                 (ACC_LANE_DWORD_BUDGET)",
-                b.name
-            );
-        }
-    }
-
-    #[test]
-    fn the_default_blocking_ships_for_every_format_and_output_combination() {
-        for wq in [SpvWq::Nvfp4Block16, SpvWq::Fp8RowscalePlain] {
-            for out in [SpvOut::F32, SpvOut::Bf16Alpha] {
+    fn every_checked_in_blob_is_spirv_named_for_a_blocking_that_fits_the_hardware_and_the_default_ships(
+    ) {
+        {
+            for b in blobs() {
                 assert!(
-                    blob(wq, out, DEFAULT_BLOCKING).is_some(),
-                    "{wq:?}/{out:?} missing DEFAULT_BLOCKING"
+                    b.bytes.len() >= 20 && b.bytes.len().is_multiple_of(4),
+                    "{}: not a SPIR-V module",
+                    b.name
+                );
+                let magic = u32::from_le_bytes([b.bytes[0], b.bytes[1], b.bytes[2], b.bytes[3]]);
+                assert_eq!(magic, SPIRV_MAGIC, "{}: bad SPIR-V magic", b.name);
+                let wq = match b.wq {
+                    SpvWq::Nvfp4Block16 => "w4a16",
+                    SpvWq::Fp8RowscalePlain => "w8a16",
+                };
+                let out = match b.out {
+                    SpvOut::F32 => "f32",
+                    SpvOut::Bf16Alpha => "y16",
+                };
+                let bl = b.blocking;
+                assert_eq!(
+                    b.name,
+                    format!(
+                        "mulmm_{wq}_{out}_bm{}_bn{}_bk{}_wm{}_wn{}",
+                        bl.bm, bl.bn, bl.bk, bl.wm, bl.wn
+                    ),
+                    "blob name must encode its own compile defines or the blob cannot be rebuilt"
                 );
             }
         }
-        assert_eq!(DEFAULT_BLOCKING.subgroups(), 4);
-        assert_eq!(DEFAULT_BLOCKING.workgroup_size(), 128);
-    }
-
-    #[test]
-    fn params_layout_matches_the_std140_uniform_block() {
-        assert_eq!(std::mem::size_of::<SpirvGemmParams>(), 32);
-        assert_eq!(std::mem::offset_of!(SpirvGemmParams, n_rows), 0);
-        assert_eq!(std::mem::offset_of!(SpirvGemmParams, k_elems), 4);
-        assert_eq!(std::mem::offset_of!(SpirvGemmParams, m_rows), 8);
-        assert_eq!(std::mem::offset_of!(SpirvGemmParams, y_stride), 12);
-        assert_eq!(std::mem::offset_of!(SpirvGemmParams, alpha), 16);
-    }
-
-    #[test]
-    fn a_ragged_extent_is_refused_rather_than_left_unwritten() {
-        check_shape(32, 128, 256, DEFAULT_BLOCKING).expect("aligned shape");
-        for (m, n, k) in [(24u32, 128u32, 256u32), (32, 124, 256), (32, 128, 250)] {
-            assert!(
-                check_shape(m, n, k, DEFAULT_BLOCKING).is_err(),
-                "must refuse M={m} N={n} K={k}"
-            );
+        {
+            for b in blobs() {
+                let bl = b.blocking;
+                assert!(bl.wm.is_multiple_of(ACC_TILE_M) && bl.wm > 0, "{}", b.name);
+                assert!(bl.wn.is_multiple_of(ACC_TILE_N) && bl.wn > 0, "{}", b.name);
+                assert!(bl.bm.is_multiple_of(bl.wm), "{}", b.name);
+                assert!(bl.bn.is_multiple_of(bl.wn), "{}", b.name);
+                assert!(bl.bk.is_multiple_of(ACC_TILE_M), "{}", b.name);
+                assert!(
+                    bl.workgroup_size() <= 1024,
+                    "{}: workgroup over the API ceiling",
+                    b.name
+                );
+                assert!(
+                    bl.stage_bytes(b.out) <= 48 * 1024,
+                    "{}: staged tiles exceed the 48K workgroup shared budget",
+                    b.name
+                );
+                assert!(
+                    bl.acc_lane_dwords() <= 128,
+                    "{}: accumulator dwords per lane exceed the budget the WGSL path proved \
+                     (ACC_LANE_DWORD_BUDGET)",
+                    b.name
+                );
+            }
+        }
+        {
+            for wq in [SpvWq::Nvfp4Block16, SpvWq::Fp8RowscalePlain] {
+                for out in [SpvOut::F32, SpvOut::Bf16Alpha] {
+                    assert!(
+                        blob(wq, out, DEFAULT_BLOCKING).is_some(),
+                        "{wq:?}/{out:?} missing DEFAULT_BLOCKING"
+                    );
+                }
+            }
+            assert_eq!(DEFAULT_BLOCKING.subgroups(), 4);
+            assert_eq!(DEFAULT_BLOCKING.workgroup_size(), 128);
         }
     }
 
     #[test]
-    fn grid_covers_the_matrix_with_n_on_x_and_m_on_y() {
-        let g = DEFAULT_BLOCKING;
-        assert_eq!((17408u32.div_ceil(g.bn), 256u32.div_ceil(g.bm)), (272, 2));
+    fn params_layout_shape_check_and_grid_match_the_std140_kernel_contract() {
+        {
+            assert_eq!(std::mem::size_of::<SpirvGemmParams>(), 32);
+            assert_eq!(std::mem::offset_of!(SpirvGemmParams, n_rows), 0);
+            assert_eq!(std::mem::offset_of!(SpirvGemmParams, k_elems), 4);
+            assert_eq!(std::mem::offset_of!(SpirvGemmParams, m_rows), 8);
+            assert_eq!(std::mem::offset_of!(SpirvGemmParams, y_stride), 12);
+            assert_eq!(std::mem::offset_of!(SpirvGemmParams, alpha), 16);
+        }
+        {
+            check_shape(32, 128, 256, DEFAULT_BLOCKING).expect("aligned shape");
+            for (m, n, k) in [(24u32, 128u32, 256u32), (32, 124, 256), (32, 128, 250)] {
+                assert!(
+                    check_shape(m, n, k, DEFAULT_BLOCKING).is_err(),
+                    "must refuse M={m} N={n} K={k}"
+                );
+            }
+        }
+        {
+            let g = DEFAULT_BLOCKING;
+            assert_eq!((17408u32.div_ceil(g.bn), 256u32.div_ceil(g.bm)), (272, 2));
+        }
     }
 }

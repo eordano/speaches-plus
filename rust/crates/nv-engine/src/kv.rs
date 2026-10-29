@@ -180,7 +180,7 @@ mod tests {
     use super::{checked_block_offset, KvKind};
 
     #[test]
-    fn block_offset_matches_manual_layout() {
+    fn block_offset_matches_manual_layout_and_rejects_out_of_range_or_overflowing_geometry() {
         let (num_layers, num_blocks, block_elems) = (2usize, 4usize, 4 * 16 * 64usize);
         let off = checked_block_offset(1, num_layers, KvKind::V, 2, num_blocks, block_elems)
             .expect("in range");
@@ -190,10 +190,7 @@ mod tests {
             checked_block_offset(0, num_layers, KvKind::K, 0, num_blocks, block_elems).unwrap(),
             0
         );
-    }
 
-    #[test]
-    fn block_offset_rejects_out_of_range() {
         let (num_layers, num_blocks, block_elems) = (2usize, 4usize, 8usize);
         assert!(
             checked_block_offset(2, num_layers, KvKind::K, 0, num_blocks, block_elems).is_err()
@@ -205,10 +202,6 @@ mod tests {
             checked_block_offset(0, num_layers, KvKind::K, u32::MAX, num_blocks, block_elems)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn block_offset_rejects_overflowing_geometry() {
         assert!(checked_block_offset(0, 1, KvKind::K, 0, usize::MAX, 2).is_err());
     }
 }

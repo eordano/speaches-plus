@@ -176,13 +176,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_too_short_input() {
-        let s = vec![0.0f32; SPK_MEL_MIN_SAMPLES - 1];
-        assert!(log_mel_24k(&s).is_err());
-    }
-
-    #[test]
-    fn frame_count_matches_stft_formula() {
+    fn frame_count_matches_the_stft_formula_silence_hits_the_floor_and_short_input_is_refused() {
+        assert!(log_mel_24k(&vec![0.0f32; SPK_MEL_MIN_SAMPLES - 1]).is_err());
         let n = 24_000usize;
         let s = vec![0.0f32; n];
         let (mel, frames) = log_mel_24k(&s).unwrap();
@@ -190,12 +185,6 @@ mod tests {
         let expected = (n + 2 * pad - SPK_MEL_N_FFT) / SPK_MEL_HOP + 1;
         assert_eq!(frames, expected);
         assert_eq!(mel.len(), SPK_MEL_N_MELS * frames);
-    }
-
-    #[test]
-    fn silence_hits_log_floor() {
-        let s = vec![0.0f32; 24_000];
-        let (mel, _) = log_mel_24k(&s).unwrap();
         let floor = (1e-5f64).ln() as f32;
         for &v in &mel {
             assert!(
@@ -206,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_tone_peaks_in_expected_mel_band() {
+    fn a_pure_tone_peaks_in_its_mel_band_and_amplitude_moves_the_energy() {
         let sr = SPK_MEL_SAMPLE_RATE as f64;
         let hz = 440.0f64;
         let s: Vec<f32> = (0..24_000)
@@ -227,6 +216,17 @@ mod tests {
             peak.abs_diff(expected) <= 2,
             "440 Hz peak at mel bin {peak}, expected near {expected}"
         );
+        let mk = |amp: f32| -> Vec<f32> {
+            (0..24_000)
+                .map(|i| (2.0 * std::f64::consts::PI * 300.0 * i as f64 / sr).sin() as f32 * amp)
+                .collect()
+        };
+        let (quiet, frames) = log_mel_24k(&mk(0.01)).unwrap();
+        let (loud, _) = log_mel_24k(&mk(0.8)).unwrap();
+        let mid = frames / 2;
+        let q: f32 = (0..SPK_MEL_N_MELS).map(|m| quiet[m * frames + mid]).sum();
+        let l: f32 = (0..SPK_MEL_N_MELS).map(|m| loud[m * frames + mid]).sum();
+        assert!(l > q, "louder tone must raise summed log-mel: {l} <= {q}");
     }
 
     #[test]
@@ -248,19 +248,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tone_amplitude_moves_mel_energy() {
-        let sr = SPK_MEL_SAMPLE_RATE as f64;
-        let mk = |amp: f32| -> Vec<f32> {
-            (0..24_000)
-                .map(|i| (2.0 * std::f64::consts::PI * 300.0 * i as f64 / sr).sin() as f32 * amp)
-                .collect()
-        };
-        let (quiet, frames) = log_mel_24k(&mk(0.01)).unwrap();
-        let (loud, _) = log_mel_24k(&mk(0.8)).unwrap();
-        let mid = frames / 2;
-        let q: f32 = (0..SPK_MEL_N_MELS).map(|m| quiet[m * frames + mid]).sum();
-        let l: f32 = (0..SPK_MEL_N_MELS).map(|m| loud[m * frames + mid]).sum();
-        assert!(l > q, "louder tone must raise summed log-mel: {l} <= {q}");
-    }
 }

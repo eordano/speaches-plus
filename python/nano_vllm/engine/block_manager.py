@@ -104,12 +104,6 @@ class BlockManager:
         target_blocks = (seq.num_cached_tokens + n + self.block_size - 1) // self.block_size
         return max(0, target_blocks - len(seq.block_table))
 
-    def can_append(self, seq: Sequence) -> bool:
-        return self.can_append_n(seq, 1)
-
-    def may_append(self, seq: Sequence):
-        self.may_append_n(seq, 1)
-
     def can_append_n(self, seq: Sequence, n: int) -> bool:
         return len(self.free_block_ids) >= self._new_blocks_needed(seq, n)
 

@@ -15,7 +15,7 @@ use nv_weights::WeightLoader;
 
 fn main() -> Result<()> {
     anyhow::ensure!(
-        std::env::var("NV_DBG_LAYERNORMS").is_err(),
+        !nv_config::env_arm_present_at_all_reread_every_call("NV_DBG_LAYERNORMS"),
         "NV_DBG_LAYERNORMS requires a retired per-layer debug API; unset it to run the public greedy diagnostic"
     );
     let args: Vec<String> = std::env::args().collect();

@@ -37,7 +37,6 @@ export class Timeline {
     store.subscribe('tweaks', () => { this.refreshGutterHeights(); dirty(); });
   }
 
-  // ── scheduling ─────────────────────────────────────────────────────────
   requestDraw() {
     if (this._dirty) return;
     this._dirty = true;
@@ -71,15 +70,13 @@ export class Timeline {
     new ResizeObserver(resize).observe(this.mmCanvas);
     requestAnimationFrame(resize);
   }
-  resize() { this.bindResize(); }   // legacy compat for code that calls tl.resize()
+  resize() { this.bindResize(); }
 
-  // ── coordinate helpers ─────────────────────────────────────────────────
   tlPxWidth()  { return this.tlCanvas.getBoundingClientRect().width; }
   tlPxHeight() { return this.tlCanvas.getBoundingClientRect().height; }
   msToPx(ms)   { return (ms - this.store.state.view.t0) * this.store.state.view.pxPerMs; }
   pxToMs(px)   { return this.store.state.view.t0 + px / this.store.state.view.pxPerMs; }
 
-  // ── lane geometry ──────────────────────────────────────────────────────
   laneHeight(laneId) {
     const base = this.store.state.tweaks.density === 'compact' ? 32 : 42;
     if (laneId === 'tts_chunk') {
@@ -106,10 +103,9 @@ export class Timeline {
   }
   isLaneHidden(laneId) { return this.store.state.hiddenLanes.has(laneId); }
 
-  // ── gutter (lane labels) ───────────────────────────────────────────────
   renderGutter() {
     const palette = this.store.state.tweaks.palette;
-    const pal = (palette && (palette in (window.PALETTES || {}))) ? window.PALETTES[palette] : null;  // shim guard
+    const pal = (palette && (palette in (window.PALETTES || {}))) ? window.PALETTES[palette] : null;
     this.gutter.innerHTML = '';
     LANES.forEach(lane => {
       const div = document.createElement('div');
@@ -149,7 +145,6 @@ export class Timeline {
     });
   }
 
-  // ── master draw ────────────────────────────────────────────────────────
   draw() {
     this.refreshGutter();
     this.drawRuler();
@@ -157,7 +152,6 @@ export class Timeline {
     this.drawMinimap();
   }
 
-  // ── ruler ──────────────────────────────────────────────────────────────
   drawRuler() {
     const c = this.rulerCanvas, ctx = c.getContext('2d');
     ctx.setTransform(this._dpr, 0, 0, this._dpr, 0, 0);
@@ -171,7 +165,6 @@ export class Timeline {
     const t0 = Math.floor(s.view.t0 / msPerTick) * msPerTick;
     const t1 = s.view.t0 + w / s.view.pxPerMs;
 
-    // Turn shading.
     for (const turn of s.turns) {
       const x0 = this.msToPx(turn.t0), x1 = this.msToPx(turn.t1);
       if (x1 < 0 || x0 > w) continue;
@@ -181,7 +174,6 @@ export class Timeline {
       ctx.beginPath(); ctx.moveTo(x0 + 0.5, 0); ctx.lineTo(x0 + 0.5, h); ctx.stroke();
     }
 
-    // Tick marks + labels.
     ctx.font = '11px ui-monospace, "SF Mono", Consolas, monospace';
     ctx.textBaseline = 'middle';
     for (let t = t0; t <= t1 + msPerTick; t += msPerTick) {
@@ -214,7 +206,6 @@ export class Timeline {
     }
   }
 
-  // ── lane rows + bands + ticks + sparkline + playhead ───────────────────
   drawLaneRows() {
     const c = this.tlCanvas, ctx = c.getContext('2d');
     ctx.setTransform(this._dpr, 0, 0, this._dpr, 0, 0);
@@ -233,7 +224,6 @@ export class Timeline {
       }
     }
 
-    // Striped row backgrounds.
     for (let i = 0; i < LANES.length; i++) {
       ctx.fillStyle = i % 2 ? '#1A1A1A' : '#181818';
       ctx.fillRect(0, laneY[i], w, laneH[i]);
@@ -244,7 +234,6 @@ export class Timeline {
       ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
     }
 
-    // Turn shading across lanes.
     for (const turn of s.turns) {
       const x0 = this.msToPx(turn.t0), x1 = this.msToPx(turn.t1);
       if (x1 < 0 || x0 > w) continue;
@@ -256,7 +245,6 @@ export class Timeline {
       ctx.setLineDash([]);
     }
 
-    // Playback range highlight.
     if (s.playback.range) {
       const rx0 = this.msToPx(s.playback.range.t0);
       const rx1 = this.msToPx(s.playback.range.t1);
@@ -269,7 +257,6 @@ export class Timeline {
       ctx.setLineDash([]);
     }
 
-    // Vertical grid (matches ruler ticks).
     const msPerTick = niceStep(120 / s.view.pxPerMs);
     const gridT0 = Math.floor(s.view.t0 / msPerTick) * msPerTick;
     const gridT1 = s.view.t0 + w / s.view.pxPerMs;
@@ -281,7 +268,6 @@ export class Timeline {
 
     this.drawAudioSparkline(ctx, w, laneY, laneH);
 
-    // Bands.
     for (const band of s.bands) {
       if (this.isLaneHidden(band.lane)) continue;
       const laneIdx = LANES.findIndex(l => l.id === band.lane);
@@ -294,7 +280,6 @@ export class Timeline {
       this.drawBand(ctx, band, x0, x1, top, rowH, col);
     }
 
-    // Ticks for non-band events.
     const visT0 = s.view.t0;
     const visT1 = s.view.t0 + w / s.view.pxPerMs;
     for (const e of s.events) {
@@ -311,7 +296,6 @@ export class Timeline {
 
     this.drawLlmTokenLabels(ctx, w, visT0, visT1, laneY);
 
-    // Cursor + selection + playhead overlays.
     if (s.cursorMs != null) {
       const x = Math.round(this.msToPx(s.cursorMs)) + 0.5;
       ctx.strokeStyle = CURSOR_STROKE_LANES;
@@ -371,7 +355,6 @@ export class Timeline {
     ctx.font = '11px ui-monospace, monospace';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = '#F2EDE4';
-    // Sticky labels (STT/LLM/TTS) track the left viewport edge.
     const sticky = (band.lane === 'stt' && band.kind === 'utterance')
                 || (band.lane === 'llm' && band.kind === 'response')
                 || (band.lane === 'tts_chunk');
@@ -402,7 +385,7 @@ export class Timeline {
       ctx.lineTo(x + 0.5, y + laneH - 6);
       ctx.stroke();
       ctx.lineWidth = 1;
-    } else { // lollipop
+    } else {
       const cy = y + laneH / 2 + 4;
       ctx.strokeStyle = col + 'AA';
       ctx.beginPath();
@@ -504,7 +487,6 @@ export class Timeline {
     ctx.stroke();
   }
 
-  // ── minimap ────────────────────────────────────────────────────────────
   drawMinimap() {
     const c = this.mmCanvas, ctx = c.getContext('2d');
     ctx.setTransform(this._dpr, 0, 0, this._dpr, 0, 0);
@@ -550,7 +532,6 @@ export class Timeline {
     ctx.lineWidth = 1;
   }
 
-  // ── hit testing ────────────────────────────────────────────────────────
   hitTest(px, py) {
     const s = this.store.state;
     let laneIdx = -1, laneY = 0, laneH = 0;
@@ -600,7 +581,6 @@ export class Timeline {
     return band ? pickBandEndpoint(band, tMs) : null;
   }
 
-  // ── view actions ───────────────────────────────────────────────────────
   zoomAtPx(px, factor) {
     const s = this.store.state;
     const t = this.pxToMs(px);

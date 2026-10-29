@@ -1,4 +1,13 @@
-use anyhow::{Context, Result};
+use crate::dispatch_pass;
+use anyhow::{anyhow, bail, ensure, Context, Result};
+use bytemuck::{bytes_of, cast_slice};
+use half::bf16;
+use nv_weights::WeightLoader;
+use pollster::block_on;
+use std::env;
+use std::sync::Arc;
+use std::time::Instant;
+use wgpu::{BindGroup, Buffer, CommandBuffer, ComputePipeline, ErrorFilter};
 
 use nv_kernels::wgpu_backend::dispatch;
 use nv_kernels::wgpu_backend::kernels as wk;
@@ -6,7 +15,11 @@ use nv_kernels::wgpu_backend::{compose, WgpuContext};
 
 use crate::gemma4::LayerType;
 use crate::gemma4_moe::Gemma4MoeConfig;
-use crate::qwen3_5_moe_wgpu::{staging_flush_enabled, VramReport};
+use crate::pod;
+use crate::qwen3_5_moe_wgpu::VramReport;
+use crate::wgpu_ledger::env_flag;
+use crate::wgpu_ledger::hazard_tracked_storage_ids;
+use crate::wgpu_ledger::{spliced_chunk, ChunkRowSplice};
 
 pub const W4_GS: usize = 32;
 
@@ -15,29 +28,20 @@ const MAX_TOPK: usize = 16;
 const MAX_HEAD_DIM: usize = 512;
 const STAGING_FLUSH_BYTES: u64 = 256 << 20;
 
-const GEMV_BF16_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16.wgsl");
+const GEMV_BF16_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/g4m_gemv_bf16.wgsl");
 
 const GEMV_BF16_RPNORM_SGLAT_WGSL: &str =
     include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_rpnorm_sglat.wgsl");
-
-const GEMV_BF16_SGLAT_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_sglat.wgsl");
 
 const GEMV_BF16_V2_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_v2.wgsl");
 
 const GEMV_BF16_DNRP_SGLAT_WGSL: &str =
     include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_dnrp_sglat.wgsl");
 
-const GEMV_W4E_SGLAT_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_w4e_sglat.wgsl");
-
-const GEMV_W4E_SGLAT_XV4_WGSL: &str =
-    include_str!("../../nv-kernels/wgsl/g4m_gemv_w4e_sglat_xv4.wgsl");
-
 const GEMV_BF16_LEGACY_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_legacy.wgsl");
 
 const GEMV_BF16_TAILFOLD_WGSL: &str =
     include_str!("../../nv-kernels/wgsl/g4m_gemv_bf16_tailfold.wgsl");
-
-const GEMV_I8_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_i8.wgsl");
 
 const GEMV_I8_V4_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_i8_v4.wgsl");
 
@@ -48,9 +52,9 @@ const GEMV_I8_GU_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_i8_gu
 const GEMV_I8_DNRP_SGLAT_WGSL: &str =
     include_str!("../../nv-kernels/wgsl/g4m_gemv_i8_dnrp_sglat.wgsl");
 
-const GEMV_W4E_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_gemv_w4e.wgsl");
+const GEMV_W4E_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/g4m_gemv_w4e.wgsl");
 
-const ATTN_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_attn.wgsl");
+const ATTN_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/g4m_attn.wgsl");
 
 const ATTN_SGLAT_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_attn_sglat.wgsl");
 
@@ -64,7 +68,7 @@ const FLASH_REDUCE_SG_SHUFFLE_XOR_CHAIN_16_8_4_2_1_IS_BIT_IDENTICAL_TO_THE_LDS_B
 
 const FLASH_QKVFOLD_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_flash_qkvfold.wgsl");
 
-const PROP_NORM_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_prop_norm.wgsl");
+const PROP_NORM_WGSL: &str = nv_kernels::wgsl!("../../nv-kernels/wgsl/g4m_prop_norm.wgsl");
 
 const PROP_NORM_SGLAT_WGSL: &str = include_str!("../../nv-kernels/wgsl/g4m_prop_norm_sglat.wgsl");
 
@@ -185,51 +189,69 @@ fn pm_verify_argmax_stage2(
 fn prefill_wgsl(m: usize) -> String {
     use std::fmt::Write as _;
     let mut b = String::from(PREFILL_HEAD_WGSL);
-    b.push_str("\n@compute @workgroup_size(256)\nfn pm_gemm_bf16(\n");
-    b.push_str("    @builtin(workgroup_id) wid: vec3<u32>,\n");
-    b.push_str("    @builtin(local_invocation_id) lid: vec3<u32>\n) {\n");
-    b.push_str("    let tid = lid.x;\n");
-    b.push_str("    let half = tid >> 7u;\n");
-    b.push_str("    let lane = tid & 127u;\n");
-    b.push_str("    let pair = wid.x + wid.y * pb_p.groups_x;\n");
-    b.push_str("    let row = pair * 2u + half;\n");
-    b.push_str("    let live = row < pb_p.n_rows;\n");
-    b.push_str("    let wbase = select(0u, row * pb_p.w_row_words, live);\n");
-    b.push_str("    let kw = select(0u, pb_p.k_words, live);\n");
+    b.push_str(
+        "
+@compute @workgroup_size(256)
+fn pm_gemm_bf16(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>
+) {
+    let tid = lid.x;
+    let half = tid >> 7u;
+    let lane = tid & 127u;
+    let pair = wid.x + wid.y * pb_p.groups_x;
+    let row = pair * 2u + half;
+    let live = row < pb_p.n_rows;
+    let wbase = select(0u, row * pb_p.w_row_words, live);
+    let kw = select(0u, pb_p.k_words, live);
+",
+    );
     for t in 0..m {
         writeln!(b, "    var acc{t} = 0.0;").unwrap();
     }
-    b.push_str("    for (var i = lane; i < kw; i = i + 128u) {\n");
-    b.push_str("        let ww = pb_w[wbase + i];\n");
-    b.push_str("        let wl = bf16_lo(ww);\n");
-    b.push_str("        let wh = bf16_hi(ww);\n");
+    b.push_str(
+        "    for (var i = lane; i < kw; i = i + 128u) {
+        let ww = pb_w[wbase + i];
+        let wl = bf16_lo(ww);
+        let wh = bf16_hi(ww);
+",
+    );
     for t in 0..m {
         writeln!(
             b,
-            "        let xw{t} = pb_x[{t}u * pb_p.x_stride_words + i];"
+            "        let xw{t} = pb_x[{t}u * pb_p.x_stride_words + i];
+        acc{t} = fma(wl, bf16_lo(xw{t}), acc{t});
+        acc{t} = fma(wh, bf16_hi(xw{t}), acc{t});"
         )
         .unwrap();
-        writeln!(b, "        acc{t} = fma(wl, bf16_lo(xw{t}), acc{t});").unwrap();
-        writeln!(b, "        acc{t} = fma(wh, bf16_hi(xw{t}), acc{t});").unwrap();
     }
     b.push_str("    }\n");
     for t in 0..m {
         writeln!(b, "    pb_red[tid] = acc{t};").unwrap();
-        b.push_str("    workgroupBarrier();\n");
-        b.push_str("    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {\n");
-        b.push_str("        if (lane < stride) {\n");
-        b.push_str("            pb_red[tid] = pb_red[tid] + pb_red[tid + stride];\n");
-        b.push_str("        }\n        workgroupBarrier();\n    }\n");
-        b.push_str("    if (pb_p.out_f32 == 1u) {\n");
-        b.push_str("        if (lane == 0u && live) {\n");
+        b.push_str(
+            "    workgroupBarrier();
+    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
+        if (lane < stride) {
+            pb_red[tid] = pb_red[tid] + pb_red[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    if (pb_p.out_f32 == 1u) {
+        if (lane == 0u && live) {
+",
+        );
         writeln!(
             b,
             "            pb_y[{t}u * pb_p.y_stride_words + pb_p.y_off_words + row] = bitcast<u32>(pb_red[tid] * pb_p.alpha);"
         )
         .unwrap();
         b.push_str("        }\n    } else if (tid == 0u) {\n");
-        writeln!(b, "        let lo{t} = pb_red[0] * pb_p.alpha;").unwrap();
-        writeln!(b, "        var hi{t} = 0.0;").unwrap();
+        writeln!(
+            b,
+            "        let lo{t} = pb_red[0] * pb_p.alpha;
+        var hi{t} = 0.0;"
+        )
+        .unwrap();
         b.push_str("        if (row + 1u < pb_p.n_rows) {\n");
         writeln!(b, "            hi{t} = pb_red[128] * pb_p.alpha;").unwrap();
         b.push_str("        }\n");
@@ -244,345 +266,291 @@ fn prefill_wgsl(m: usize) -> String {
     b
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfGatherParams {
-    row_off: u32,
-    n_rows: u32,
-    hidden_words: u32,
-    vocab: u32,
-    scale: f32,
-    m: u32,
-    pad0: u32,
-    pad1: u32,
-}
+pod! {
+    struct PfGatherParams {
+        row_off: u32,
+        n_rows: u32,
+        hidden_words: u32,
+        vocab: u32,
+        scale: f32,
+        m: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfSpliceParams {
-    hidden_words: u32,
-    m: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct PfSpliceParams {
+        hidden_words: u32,
+        m: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfVerifyArgmaxParams {
-    n: u32,
-    groups: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct PfVerifyArgmaxParams {
+        n: u32,
+        groups: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfNormParams {
-    hidden: u32,
-    words: u32,
-    eps: f32,
-    m: u32,
-}
+    struct PfNormParams {
+        hidden: u32,
+        words: u32,
+        eps: f32,
+        m: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfGemmParams {
-    n_rows: u32,
-    k_words: u32,
-    groups_x: u32,
-    out_f32: u32,
-    w_row_words: u32,
-    x_stride_words: u32,
-    y_stride_words: u32,
-    y_off_words: u32,
-    alpha: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct PfGemmParams {
+        n_rows: u32,
+        k_words: u32,
+        groups_x: u32,
+        out_f32: u32,
+        w_row_words: u32,
+        x_stride_words: u32,
+        y_stride_words: u32,
+        y_off_words: u32,
+        alpha: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfRopeParams {
-    n_rows: u32,
-    head_dim: u32,
-    src_stride: u32,
-    rot_half: u32,
-    has_rope: u32,
-    tok_src_stride: u32,
-    tok_dst_stride: u32,
-    pad0: u32,
-    eps: f32,
-    pad1: u32,
-    pad2: u32,
-    pad3: u32,
-}
+    struct PfRopeParams {
+        n_rows: u32,
+        head_dim: u32,
+        src_stride: u32,
+        rot_half: u32,
+        has_rope: u32,
+        tok_src_stride: u32,
+        tok_dst_stride: u32,
+        pad0: u32,
+        eps: f32,
+        pad1: u32,
+        pad2: u32,
+        pad3: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfKvParams {
-    words: u32,
-    m: u32,
-    ring: u32,
-    pad1: u32,
-}
+    struct PfKvParams {
+        words: u32,
+        m: u32,
+        ring: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfAttnParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    max_seq: u32,
-    group: u32,
-    window: u32,
-    m: u32,
-    ring: u32,
-    scale: f32,
-    pad1: u32,
-    pad2: u32,
-    pad3: u32,
-}
+    struct PfAttnParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        max_seq: u32,
+        group: u32,
+        window: u32,
+        m: u32,
+        ring: u32,
+        scale: f32,
+        pad1: u32,
+        pad2: u32,
+        pad3: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfRouterParams {
-    n_experts: u32,
-    k: u32,
-    m: u32,
-    pad0: u32,
-}
+    struct PfRouterParams {
+        n_experts: u32,
+        k: u32,
+        m: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfW4Params {
-    n_rows: u32,
-    groups: u32,
-    groups_x: u32,
-    w_e_stride_words: u32,
-    s_e_stride_elems: u32,
-    x_slot_stride_words: u32,
-    y_slot_stride_words: u32,
-    x_tok_stride_words: u32,
-    k_top: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct PfW4Params {
+        n_rows: u32,
+        groups: u32,
+        groups_x: u32,
+        w_e_stride_words: u32,
+        s_e_stride_elems: u32,
+        x_slot_stride_words: u32,
+        y_slot_stride_words: u32,
+        x_tok_stride_words: u32,
+        k_top: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfMulParams {
-    row_words: u32,
-    m: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct PfMulParams {
+        row_words: u32,
+        m: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct PfCombineParams {
-    hidden_words: u32,
-    k: u32,
-    slot_stride_words: u32,
-    m: u32,
-}
+    struct PfCombineParams {
+        hidden_words: u32,
+        k: u32,
+        slot_stride_words: u32,
+        m: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GemvBf16Params {
-    pub n_rows: u32,
-    pub k_words: u32,
-    pub groups_x: u32,
-    pub out_f32: u32,
-    pub w_row_words: u32,
-    pub x_off_words: u32,
-    pub y_off_words: u32,
+    pub struct GemvBf16Params {
+        pub n_rows: u32,
+        pub k_words: u32,
+        pub groups_x: u32,
+        pub out_f32: u32,
+        pub w_row_words: u32,
+        pub x_off_words: u32,
+        pub y_off_words: u32,
 
-    pub wide: u32,
-    pub alpha: f32,
-    pub pad1: u32,
-    pub pad2: u32,
-    pub pad3: u32,
-}
+        pub wide: u32,
+        pub alpha: f32,
+        pub pad1: u32,
+        pub pad2: u32,
+        pub pad3: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GemvI8Params {
-    pub n_rows: u32,
-    pub k_words: u32,
-    pub groups_x: u32,
-    pub out_f32: u32,
-    pub w_row_words: u32,
-    pub x_off_words: u32,
-    pub y_off_words: u32,
-    pub s_row_elems: u32,
-    pub alpha: f32,
-    pub pad1: u32,
-    pub pad2: u32,
-    pub pad3: u32,
-}
+    pub struct GemvI8Params {
+        pub n_rows: u32,
+        pub k_words: u32,
+        pub groups_x: u32,
+        pub out_f32: u32,
+        pub w_row_words: u32,
+        pub x_off_words: u32,
+        pub y_off_words: u32,
+        pub s_row_elems: u32,
+        pub alpha: f32,
+        pub pad1: u32,
+        pub pad2: u32,
+        pub pad3: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct NormParams {
-    hidden: u32,
-    words: u32,
-    eps: f32,
-    scale: f32,
-}
+    struct NormParams {
+        hidden: u32,
+        words: u32,
+        eps: f32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ResScaleParams {
-    n: u32,
-    n_words: u32,
-    scale: f32,
-    cap: f32,
-    inv_cap: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct ResScaleParams {
+        n: u32,
+        n_words: u32,
+        scale: f32,
+        cap: f32,
+        inv_cap: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct NormRopeParams {
-    n_rows: u32,
-    head_dim: u32,
-    src_stride: u32,
-    rot_half: u32,
-    has_rope: u32,
-    n_q: u32,
-    n_kv: u32,
-    eps: f32,
-}
+    struct NormRopeParams {
+        n_rows: u32,
+        head_dim: u32,
+        src_stride: u32,
+        rot_half: u32,
+        has_rope: u32,
+        n_q: u32,
+        n_kv: u32,
+        eps: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct KvWriteParams {
-    words: u32,
-    ring: u32,
-    k_off_words: u32,
-    pad2: u32,
-}
+    struct KvWriteParams {
+        words: u32,
+        ring: u32,
+        k_off_words: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct KvFp8ParamsMirroringNvKernelsKvFp8UniformLayout {
-    n_tokens: u32,
-    n_kv: u32,
-    head_dim: u32,
-    ring: u32,
-    pairs: u32,
-    start: u32,
-    slots: u32,
-    reserved: u32,
-}
+    struct KvFp8ParamsMirroringNvKernelsKvFp8UniformLayout {
+        n_tokens: u32,
+        n_kv: u32,
+        head_dim: u32,
+        ring: u32,
+        pairs: u32,
+        start: u32,
+        slots: u32,
+        reserved: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct AttnDecodeParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    max_seq: u32,
-    group: u32,
-    window: u32,
-    ring: u32,
-    scale: f32,
-}
+    struct AttnDecodeParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        max_seq: u32,
+        group: u32,
+        window: u32,
+        ring: u32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct FlashDecodeParams {
-    n_heads: u32,
-    n_kv: u32,
-    head_dim: u32,
-    splits: u32,
-    total: u32,
-    start: u32,
-    ring: u32,
-    scale: f32,
-}
+    struct FlashDecodeParams {
+        n_heads: u32,
+        n_kv: u32,
+        head_dim: u32,
+        splits: u32,
+        total: u32,
+        start: u32,
+        ring: u32,
+        scale: f32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RouterParams {
-    n_experts: u32,
-    k: u32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct RouterParams {
+        n_experts: u32,
+        k: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct RouterChainParams {
-    n_experts: u32,
-    k: u32,
-    words: u32,
-    hidden: u32,
-    eps: f32,
-    alpha: f32,
-    pad0: u32,
-    pad1: u32,
-}
+    struct RouterChainParams {
+        n_experts: u32,
+        k: u32,
+        words: u32,
+        hidden: u32,
+        eps: f32,
+        alpha: f32,
+        pad0: u32,
+        pad1: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct WordsParams {
-    n_words: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct WordsParams {
+        n_words: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GemvW4Params {
-    n_rows: u32,
-    groups: u32,
-    groups_x: u32,
-    w_e_stride_words: u32,
-    s_e_stride_elems: u32,
-    x_slot_stride_words: u32,
-    y_slot_stride_words: u32,
-    k_top: u32,
-    n_experts: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct GemvW4Params {
+        n_rows: u32,
+        groups: u32,
+        groups_x: u32,
+        w_e_stride_words: u32,
+        s_e_stride_elems: u32,
+        x_slot_stride_words: u32,
+        y_slot_stride_words: u32,
+        k_top: u32,
+        n_experts: u32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct CombineParams {
-    hidden_words: u32,
-    k: u32,
-    slot_stride_words: u32,
-    pad0: u32,
-}
+    struct CombineParams {
+        hidden_words: u32,
+        k: u32,
+        slot_stride_words: u32,
+        pad0: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct GatherParams {
-    row_off: u32,
-    n_rows: u32,
-    hidden_words: u32,
-    vocab: u32,
-    scale: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
-}
+    struct GatherParams {
+        row_off: u32,
+        n_rows: u32,
+        hidden_words: u32,
+        vocab: u32,
+        scale: f32,
+        pad0: u32,
+        pad1: u32,
+        pad2: u32,
+    }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct ArgmaxParams {
-    n: u32,
-    groups: u32,
-    pad0: u32,
-    pad1: u32,
+    struct ArgmaxParams {
+        n: u32,
+        groups: u32,
+        pad0: u32,
+        pad1: u32,
+    }
 }
 
 #[derive(Clone)]
@@ -657,7 +625,7 @@ pub fn quantize_w4_host(w: &[u16], n: usize, k: usize) -> HostW4Mat {
             } else {
                 1.0
             };
-            let scale_b = half::bf16::from_f32(scale);
+            let scale_b = bf16::from_f32(scale);
             scales[r * groups + g] = scale_b.to_bits();
             let inv = 1.0 / scale_b.to_f32();
             for j in 0..W4_GS {
@@ -729,7 +697,7 @@ pub fn quantize_i8_host_group(w: &[u16], n: usize, k: usize, gs: usize) -> HostI
                         } else {
                             1.0
                         };
-                        let scale_b = half::bf16::from_f32(scale);
+                        let scale_b = bf16::from_f32(scale);
                         s_chunk[rr * groups + g] = scale_b.to_bits();
                         let inv = 1.0 / scale_b.to_f32();
                         for j in 0..gs {
@@ -763,17 +731,12 @@ pub fn dequantize_i8_row(m: &HostI8Mat, r: usize) -> Vec<f32> {
 #[doc(hidden)]
 pub mod bench {
     pub const GEMV_BF16_ENTRY: &str = "g4m_gemv_bf16";
-    pub const GEMV_I8_ENTRY: &str = "g4m_gemv_i8";
 
     pub const GEMV_BF16_V4_ENTRY: &str = "g4m_gemv_bf16";
     pub const GEMV_I8_V4_ENTRY: &str = "g4m_gemv_i8_v4";
 
     pub fn gemv_bf16_source() -> String {
         nv_kernels::wgpu_backend::compose(super::GEMV_BF16_WGSL)
-    }
-
-    pub fn gemv_i8_source() -> String {
-        nv_kernels::wgpu_backend::compose(super::GEMV_I8_WGSL)
     }
 
     pub fn gemv_bf16_v4_source() -> String {
@@ -840,22 +803,18 @@ pub fn dequantize_w4_expert(stack: &HostW4Stack, e: usize) -> Vec<f32> {
     out
 }
 
-fn bf16_bits(x: f32) -> u16 {
-    half::bf16::from_f32(x).to_bits()
-}
-
-use crate::gemma4_wgpu_shared::{pack_pairs, rope_tables};
+use crate::gemma4_wgpu_shared::{bf16_bits, pack_pairs, rope_tables};
 
 fn load_bf16<S: nv_weights::TensorSource>(w: &S, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
     let t = w
         .get(name, candle_core::DType::BF16)
         .with_context(|| format!("load {name}"))?;
-    anyhow::ensure!(
+    ensure!(
         t.dims() == shape,
         "{name}: shape {:?} != {shape:?}",
         t.dims()
     );
-    let v: Vec<half::bf16> = t.flatten_all()?.to_vec1()?;
+    let v: Vec<bf16> = t.flatten_all()?.to_vec1()?;
     Ok(v.into_iter().map(|x| x.to_bits()).collect())
 }
 
@@ -872,7 +831,7 @@ fn load_f32_vec<S: nv_weights::TensorSource>(w: &S, name: &str, dim: usize) -> R
         .get(name, candle_core::DType::F32)
         .with_context(|| format!("load {name}"))?;
     let v: Vec<f32> = t.flatten_all()?.to_vec1()?;
-    anyhow::ensure!(v.len() == dim, "{name}: len {} != {dim}", v.len());
+    ensure!(v.len() == dim, "{name}: len {} != {dim}", v.len());
     Ok(v)
 }
 
@@ -883,7 +842,7 @@ pub trait CompressedTensorsRawBytes {
     ) -> Option<(Vec<u8>, Vec<usize>)>;
 }
 
-impl CompressedTensorsRawBytes for nv_weights::WeightLoader {
+impl CompressedTensorsRawBytes for WeightLoader {
     fn raw_bytes_and_shape_because_tensor_source_get_has_no_f8e4m3_dtype(
         &self,
         name: &str,
@@ -916,41 +875,41 @@ pub fn compressed_tensors_nvfp4_parts<S: CompressedTensorsRawBytes>(
     k: usize,
 ) -> Result<CtNvfp4Parts> {
     let group = nv_quant::nvfp4::BLOCK_SIZE;
-    anyhow::ensure!(
+    ensure!(
         k.is_multiple_of(group),
         "{module}: in_features {k} must be a multiple of the nvfp4 group size {group}"
     );
     let read = |suffix: &str| -> Result<(Vec<u8>, Vec<usize>)> {
         let name = format!("{module}.{suffix}");
         w.raw_bytes_and_shape_because_tensor_source_get_has_no_f8e4m3_dtype(&name)
-            .ok_or_else(|| anyhow::anyhow!("tensor not found: {name}"))
+            .ok_or_else(|| anyhow!("tensor not found: {name}"))
     };
     let (packed, ps) = read("weight_packed")?;
-    anyhow::ensure!(
+    ensure!(
         ps == [n, k / 2],
         "{module}.weight_packed: shape {ps:?} != [{n}, {}]",
         k / 2
     );
-    anyhow::ensure!(
+    ensure!(
         packed.len() == n * k / 2,
         "{module}.weight_packed: {} bytes != {}",
         packed.len(),
         n * k / 2
     );
     let (scales, ss) = read("weight_scale")?;
-    anyhow::ensure!(
+    ensure!(
         ss == [n, k / group],
         "{module}.weight_scale: shape {ss:?} != [{n}, {}]",
         k / group
     );
-    anyhow::ensure!(
+    ensure!(
         scales.len() == n * k / group,
         "{module}.weight_scale: {} bytes != {}",
         scales.len(),
         n * k / group
     );
     let (gs, _) = read("weight_global_scale")?;
-    anyhow::ensure!(
+    ensure!(
         gs.len() == 4,
         "{module}.weight_global_scale: {} bytes != 4 (one f32)",
         gs.len()
@@ -1163,24 +1122,12 @@ pub fn host_layer_from_loader<S: nv_weights::TensorSource + CompressedTensorsRaw
 
 #[derive(Clone)]
 struct Pass {
-    pipeline: std::sync::Arc<wgpu::ComputePipeline>,
-    bind: wgpu::BindGroup,
+    pipeline: Arc<ComputePipeline>,
+    bind: BindGroup,
     grid: (u32, u32, u32),
     label: String,
     bind_bytes: u64,
     storage_binds_are_what_wgpu_tracks_for_hazards_uniforms_never_transition: Vec<(u32, bool)>,
-}
-
-fn wgsl_binding_is_storage_read_write_a_read_only_binding_can_never_raise_a_hazard(
-    source: &str,
-    binding: u32,
-) -> bool {
-    let needle = format!("@binding({binding})");
-    source
-        .match_indices(&needle)
-        .filter_map(|(i, _)| source[i..].split(';').next())
-        .find(|decl| decl.contains("var<"))
-        .is_none_or(|decl| decl.contains("read_write"))
 }
 
 pub fn barrier_cause_raw_waw_is_a_true_dependency_war_alone_can_be_an_artifact_of_a_wide_binding_access_mode(
@@ -1290,7 +1237,7 @@ struct Builder {
     passes: Vec<Pass>,
     prefill_passes: Vec<Pass>,
     to_prefill: bool,
-    buffers: Vec<wgpu::Buffer>,
+    buffers: Vec<Buffer>,
     alloc: std::collections::BTreeMap<String, (usize, u64)>,
     alloc_total: u64,
     since_flush: u64,
@@ -1302,7 +1249,7 @@ struct Builder {
     depthgate_flash1_pass_indices_sliding_the_window_caps_the_scan_so_the_band_is_keyed_on_min_total_window:
         Vec<usize>,
     foldgate_alt_flash1_passes_one_deep_twin_per_full_attention_flash1_in_the_same_order: Vec<Pass>,
-    storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds: Vec<wgpu::Buffer>,
+    storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds: Vec<Buffer>,
     flash_scratch_bytes_per_full_attention_layer_sized_at_its_own_split_count: Vec<u64>,
     flash_scratch_bytes_per_sliding_layer_sized_at_its_own_split_count_not_the_max_of_the_two:
         Vec<u64>,
@@ -1344,23 +1291,23 @@ impl Builder {
     }
 
     fn flush_staging_if_due(&mut self) {
-        if staging_flush_enabled() && self.since_flush >= STAGING_FLUSH_BYTES {
+        if self.since_flush >= STAGING_FLUSH_BYTES {
             self.flush_staging();
         }
     }
 
-    fn store(&mut self, label: &str, b: wgpu::Buffer) -> wgpu::Buffer {
+    fn store(&mut self, label: &str, b: Buffer) -> Buffer {
         self.record(label, b.size());
         self.buffers.push(b.clone());
         b
     }
 
-    fn zeros(&mut self, label: &str, bytes: u64) -> wgpu::Buffer {
+    fn zeros(&mut self, label: &str, bytes: u64) -> Buffer {
         let b = dispatch::storage_zeroed(self.ctx, label, bytes.next_multiple_of(16));
         self.store(label, b)
     }
 
-    fn upload_u32(&mut self, label: &str, data: &[u32]) -> wgpu::Buffer {
+    fn upload_u32(&mut self, label: &str, data: &[u32]) -> Buffer {
         let b = if data.len().is_multiple_of(4) {
             dispatch::storage_from_slice(self.ctx, label, data)
         } else {
@@ -1373,19 +1320,19 @@ impl Builder {
         b
     }
 
-    fn upload_i32(&mut self, label: &str, data: &[i32]) -> wgpu::Buffer {
+    fn upload_i32(&mut self, label: &str, data: &[i32]) -> Buffer {
         let b = dispatch::storage_from_slice(self.ctx, label, data);
         self.store(label, b)
     }
 
-    fn upload_f32(&mut self, label: &str, data: &[f32]) -> wgpu::Buffer {
+    fn upload_f32(&mut self, label: &str, data: &[f32]) -> Buffer {
         let b = dispatch::storage_from_slice(self.ctx, label, data);
         let b = self.store(label, b);
         self.flush_staging_if_due();
         b
     }
 
-    fn uni<T: bytemuck::Pod>(&mut self, label: &str, v: T) -> wgpu::Buffer {
+    fn uni<T: bytemuck::Pod>(&mut self, label: &str, v: T) -> Buffer {
         let b = dispatch::uniform_from(self.ctx, label, &v);
         self.store(label, b)
     }
@@ -1395,25 +1342,17 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<Pass> {
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
-        let mut storage_ids: Vec<(u32, bool)> = binds
-            .iter()
-            .filter(|(_, buf)| buf.usage().contains(wgpu::BufferUsages::STORAGE))
-            .map(|(slot, buf)| {
-                let w =
-                    wgsl_binding_is_storage_read_write_a_read_only_binding_can_never_raise_a_hazard(
-                        source, *slot,
-                    );
-                (self.intern_storage_buffer(buf), w)
-            })
-            .collect();
-        storage_ids.sort_unstable();
-        storage_ids.dedup();
+        let storage_ids = hazard_tracked_storage_ids(
+            &mut self.storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds,
+            source,
+            binds.iter().map(|(slot, buf)| (*slot, *buf)),
+        );
         Ok(Pass {
             pipeline,
             bind,
@@ -1429,33 +1368,25 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer, u64)],
+        binds: &[(u32, &Buffer, u64)],
         grid: (u32, u32, u32),
     ) -> Result<Pass> {
         let align = self.ctx.device.limits().min_storage_buffer_offset_alignment as u64;
         for (slot, _, off) in binds {
-            anyhow::ensure!(
+            ensure!(
                 off.is_multiple_of(align.max(1)),
                 "{label}::{entry} binding {slot} offset {off} misses the device's \
                  min_storage_buffer_offset_alignment {align}"
             );
         }
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group_offsets(self.ctx, &pipeline, binds);
-        let mut storage_ids: Vec<(u32, bool)> = binds
-            .iter()
-            .filter(|(_, buf, _)| buf.usage().contains(wgpu::BufferUsages::STORAGE))
-            .map(|(slot, buf, _)| {
-                let w =
-                    wgsl_binding_is_storage_read_write_a_read_only_binding_can_never_raise_a_hazard(
-                        source, *slot,
-                    );
-                (self.intern_storage_buffer(buf), w)
-            })
-            .collect();
-        storage_ids.sort_unstable();
-        storage_ids.dedup();
+        let storage_ids = hazard_tracked_storage_ids(
+            &mut self.storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds,
+            source,
+            binds.iter().map(|(slot, buf, _)| (*slot, *buf)),
+        );
         Ok(Pass {
             pipeline,
             bind,
@@ -1471,7 +1402,7 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
         let pass = self.built_pass(label, source, entry, binds, grid)?;
@@ -1484,18 +1415,6 @@ impl Builder {
         Ok(())
     }
 
-    fn intern_storage_buffer(&mut self, buf: &wgpu::Buffer) -> u32 {
-        let reg =
-            &mut self.storage_buffer_registry_indexes_every_hazard_tracked_buffer_the_graph_binds;
-        match reg.iter().position(|b| b == buf) {
-            Some(i) => i as u32,
-            None => {
-                reg.push(buf.clone());
-                (reg.len() - 1) as u32
-            }
-        }
-    }
-
     fn grid1(&self, invocations: u64, wg: u32) -> (u32, u32, u32) {
         dispatch::workgroup_count_1d(self.ctx, invocations, wg)
     }
@@ -1506,8 +1425,8 @@ impl Builder {
         load: GemvLoad,
         k: usize,
         x_off_words: usize,
-        w: &wgpu::Buffer,
-        x: &wgpu::Buffer,
+        w: &Buffer,
+        x: &Buffer,
     ) -> u32 {
         assert!(
             w.size().is_multiple_of(16) && x.size().is_multiple_of(16),
@@ -1539,12 +1458,9 @@ struct Sources {
     gemv_bf16_tailfold: String,
     gemv_bf16_rpnorm_sglat: String,
     gemv_bf16_dnrp_sglat: String,
-    gemv_bf16_sglat: String,
     gemv_bf16_v2: String,
     prop_norm_x2_topk_sglat: String,
     gemv_w4: String,
-    gemv_w4_sglat: String,
-    gemv_w4_sglat_xv4: String,
     attn: String,
     attn_sglat: String,
     flash: String,
@@ -1604,12 +1520,9 @@ impl Sources {
             gemv_bf16_tailfold: compose(GEMV_BF16_TAILFOLD_WGSL),
             gemv_bf16_rpnorm_sglat: compose(GEMV_BF16_RPNORM_SGLAT_WGSL),
             gemv_bf16_dnrp_sglat: compose(GEMV_BF16_DNRP_SGLAT_WGSL),
-            gemv_bf16_sglat: compose(GEMV_BF16_SGLAT_WGSL),
             gemv_bf16_v2: compose(GEMV_BF16_V2_WGSL),
             prop_norm_x2_topk_sglat: compose(PROP_NORM_X2_TOPK_SGLAT_WGSL),
             gemv_w4: compose(GEMV_W4E_WGSL),
-            gemv_w4_sglat: compose(GEMV_W4E_SGLAT_WGSL),
-            gemv_w4_sglat_xv4: compose(GEMV_W4E_SGLAT_XV4_WGSL),
             attn: compose(ATTN_WGSL),
             attn_sglat: compose(ATTN_SGLAT_WGSL),
             flash: compose(&format!(
@@ -1636,14 +1549,14 @@ impl Sources {
 }
 
 struct Bf16Gpu {
-    w: wgpu::Buffer,
+    w: Buffer,
     n: usize,
     k: usize,
 }
 
 struct ExpertGpu {
-    w: wgpu::Buffer,
-    scales: wgpu::Buffer,
+    w: Buffer,
+    scales: Buffer,
     n: usize,
     k: usize,
 }
@@ -1665,15 +1578,14 @@ fn upload_experts(b: &mut Builder, label: &str, st: &HostW4Stack) -> ExpertGpu {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_w4(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     e: &ExpertGpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
+    sel: &Buffer,
     slots: usize,
     x_per_slot: bool,
 ) -> Result<()> {
@@ -1719,7 +1631,7 @@ enum GemvLoad {
 }
 
 pub fn gemv_wide_enabled(label: &str) -> bool {
-    match std::env::var("NV_G4MOE_GEMV_WIDE") {
+    match env::var("NV_G4MOE_GEMV_WIDE") {
         Err(_) => false,
         Ok(v) if v == "0" || v.is_empty() => false,
         Ok(v) if v == "1" => true,
@@ -1732,38 +1644,36 @@ pub const G4MOE_LMHEAD_I8_V4_SHIPS_ON_SIGNED_OFF_2026_09_04_ROWS_G4MOE_I8_DENSE_
 
 pub fn lmhead_i8_entry_default_v4_after_the_three_class_quality_cert_passed() -> Option<&'static str>
 {
-    match std::env::var("NV_G4MOE_LMHEAD_I8_QUALITY_UNGATED") {
+    match env::var("NV_G4MOE_LMHEAD_I8_QUALITY_UNGATED") {
         Err(_) => {
             G4MOE_LMHEAD_I8_V4_SHIPS_ON_SIGNED_OFF_2026_09_04_ROWS_G4MOE_I8_DENSE_125P0_VS_117P7_118P0_TOK_S_AT_256_250W_COMPOSED_136P3_THREE_CLASS_CERT_IN_PPL_GEMMA4_MOE_PASSED_MEAN_NLL_DELTA_0P0035_NATS_AND_ZERO_RESTORES_THE_BF16_HEAD
                 .then_some("g4m_gemv_i8_v4")
         }
         Ok(v) => match v.as_str() {
             "" | "0" => None,
-            "1" => Some("g4m_gemv_i8"),
             "v4" => Some("g4m_gemv_i8_v4"),
             other => panic!(
-                "NV_G4MOE_LMHEAD_I8_QUALITY_UNGATED={other}: 0 keeps the bf16 head, \
-                 1 routes g4m_gemv_i8, v4 routes g4m_gemv_i8_v4"
+                "NV_G4MOE_LMHEAD_I8_QUALITY_UNGATED={other}: 0 keeps the bf16 head the verify \
+                 epilogue needs, v4 routes g4m_gemv_i8_v4"
             ),
         },
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_bf16_alpha(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Bf16Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     out_f32: bool,
     y_off_words: usize,
     alpha: f32,
     load: GemvLoad,
 ) -> Result<()> {
     let mut wide = b.wide_flag(label, load, w.k, 0, &w.w, x);
-    let v2 = gemv_v2_active_implies_the_vec4_wide_layout(b.ctx, label, load, w.k, 0);
+    let v2 = gemv_v2_active_implies_the_vec4_wide_layout(b.ctx, load, w.k, 0);
     if v2 {
         wide = 1;
     }
@@ -1777,8 +1687,6 @@ fn push_gemv_bf16_alpha(
             "g4m_gemv_bf16_acc4_ilp_reorders_the_wide_dot_sum",
             b.grid1(w.n.div_ceil(2) as u64, 1),
         )
-    } else if gemv_sglat_active(b.ctx, label) {
-        ("g4m_gemv_bf16_sglat", b.grid1(w.n.div_ceil(2) as u64, 1))
     } else {
         ("g4m_gemv_bf16", b.grid1(w.n.div_ceil(2) as u64, 1))
     };
@@ -1797,9 +1705,7 @@ fn push_gemv_bf16_alpha(
             ..Default::default()
         },
     );
-    let src = if entry == "g4m_gemv_bf16_sglat" {
-        &s.gemv_bf16_sglat
-    } else if entry == GEMV_BF16_V2_ENTRY {
+    let src = if entry == GEMV_BF16_V2_ENTRY {
         &s.gemv_bf16_v2
     } else {
         &s.gemv_bf16
@@ -1813,14 +1719,13 @@ fn push_gemv_bf16_alpha(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_bf16(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Bf16Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     out_f32: bool,
     y_off_words: usize,
 ) -> Result<()> {
@@ -1839,8 +1744,8 @@ fn push_gemv_bf16(
 }
 
 struct AttnI8Gpu {
-    q: wgpu::Buffer,
-    scales: wgpu::Buffer,
+    q: Buffer,
+    scales: Buffer,
     n: usize,
     k: usize,
     gs: usize,
@@ -1870,10 +1775,10 @@ fn push_gemv_attn_i8(
     s: &Sources,
     label: &str,
     w: &AttnI8Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         w.k.is_multiple_of(16),
         "g4m_gemv_i8_v4 reads one vec4 of 16 int8 elems per k-word, so k={} must be a \
          multiple of 16",
@@ -1919,10 +1824,10 @@ fn push_gemv_i8_gu_gelu(
     label: &str,
     wg: &AttnI8Gpu,
     wu: &AttnI8Gpu,
-    x: &wgpu::Buffer,
-    act: &wgpu::Buffer,
+    x: &Buffer,
+    act: &Buffer,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         wg.n == wu.n && wg.k == wu.k && wg.gs == wu.gs,
         "fused i8 gate/up gemv needs twin shapes, got {}x{} g{} vs {}x{} g{}",
         wg.n,
@@ -1932,7 +1837,7 @@ fn push_gemv_i8_gu_gelu(
         wu.k,
         wu.gs
     );
-    anyhow::ensure!(
+    ensure!(
         wg.gs == 32 && wg.k.is_multiple_of(16),
         "g4m_gemv_i8_v4_gu_gelu reads one vec4 of 16 int8 elems per k-word with one scale \
          per two words, so gs must be 32 (got {}) and k={} a multiple of 16",
@@ -1978,16 +1883,16 @@ fn push_gemv_i8_down_rpnorm(
     s: &Sources,
     cfg: &Gemma4MoeConfig,
     wd: &AttnI8Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     pre: &RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv,
-    x_router: &wgpu::Buffer,
+    x_router: &Buffer,
 ) -> Result<()> {
     let hidden = cfg.base.hidden_size;
     let hidden_words = hidden / 2;
     let eps = cfg.base.rms_norm_eps as f32;
     let n_e = cfg.num_experts;
-    anyhow::ensure!(
+    ensure!(
         wd.gs == 32 && wd.k.is_multiple_of(16),
         "g4m_gemv_i8_down_rpnorm_sglat reads one vec4 of 16 int8 elems per k-word with one \
          scale per two words, so gs must be 32 (got {}) and k={} a multiple of 16",
@@ -1995,7 +1900,7 @@ fn push_gemv_i8_down_rpnorm(
         wd.k
     );
     let dn_grid = b.grid1(wd.n.div_ceil(2) as u64, 1);
-    anyhow::ensure!(
+    ensure!(
         dn_grid.1 == 1 && dn_grid.2 == 1,
         "the i8 dnrp twin appends the router workgroups on grid x like its bf16 original, \
          so the down grid must stay one-dimensional; got {dn_grid:?}"
@@ -2054,18 +1959,17 @@ fn push_gemv_i8_down_rpnorm(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_bf16_gu_gelu(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     wg: &Bf16Gpu,
     wu: &Bf16Gpu,
-    x: &wgpu::Buffer,
-    act: &wgpu::Buffer,
+    x: &Buffer,
+    act: &Buffer,
     wide_label_of_the_unfused_gate_class: &str,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         wg.n == wu.n && wg.k == wu.k,
         "fused gate/up gemv needs twin shapes, got {}x{} vs {}x{}",
         wg.n,
@@ -2100,8 +2004,6 @@ fn push_gemv_bf16_gu_gelu(
     );
     let (src, entry) = if mlpgu_fusedx_enabled() {
         (&s.gemv_bf16, "g4m_gemv_bf16_gu_gelu_fusedx")
-    } else if gemv_sglat_active(b.ctx, label) {
-        (&s.gemv_bf16_sglat, "g4m_gemv_bf16_gu_gelu_sglat")
     } else {
         (&s.gemv_bf16, "g4m_gemv_bf16_gu_gelu")
     };
@@ -2114,20 +2016,19 @@ fn push_gemv_bf16_gu_gelu(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_w4_gu_gelu(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     eg: &ExpertGpu,
     eu: &ExpertGpu,
-    x: &wgpu::Buffer,
-    act: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
+    x: &Buffer,
+    act: &Buffer,
+    sel: &Buffer,
     slots: usize,
-    rank: Option<(&wgpu::Buffer, &wgpu::Buffer, usize)>,
+    rank: Option<(&Buffer, &Buffer, usize)>,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         eg.n == eu.n && eg.k == eu.k,
         "fused w4 gate/up gemv needs twin shapes, got {}x{} vs {}x{}",
         eg.n,
@@ -2152,13 +2053,7 @@ fn push_gemv_w4_gu_gelu(
     } else if base_entry == "g4m_gemv_w4_r8" {
         ("g4m_gemv_w4_r8_gu_gelu", 8)
     } else if gu_fusedx_enabled() {
-        if gemv_sglat_active(b.ctx, label) && w4_xv4_enabled() {
-            ("g4m_gemv_w4_gu_gelu_fusedx_sglat_xv4", 2)
-        } else if gemv_sglat_active(b.ctx, label) {
-            ("g4m_gemv_w4_gu_gelu_fusedx_sglat", 2)
-        } else {
-            ("g4m_gemv_w4_gu_gelu_fusedx", 2)
-        }
+        ("g4m_gemv_w4_gu_gelu_fusedx", 2)
     } else {
         ("g4m_gemv_w4_gu_gelu", 2)
     };
@@ -2178,7 +2073,7 @@ fn push_gemv_w4_gu_gelu(
             ..Default::default()
         },
     );
-    let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![
+    let mut binds: Vec<(u32, &Buffer)> = vec![
         (10, &eg.w),
         (11, &eg.scales),
         (12, x),
@@ -2191,31 +2086,24 @@ fn push_gemv_w4_gu_gelu(
         Some((logits, _, _)) => binds.push((20, logits)),
         None => binds.push((16, sel)),
     }
-    let src = if entry.ends_with("_sglat_xv4") {
-        &s.gemv_w4_sglat_xv4
-    } else if entry.ends_with("_sglat") {
-        &s.gemv_w4_sglat
-    } else {
-        &s.gemv_w4
-    };
+    let src = &s.gemv_w4;
     b.push(label, src, entry, &binds, (grid.0, grid.1, slots as u32))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_gemv_w4_down_combine(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     ed: &ExpertGpu,
-    act: &wgpu::Buffer,
-    out: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
-    wts: &wgpu::Buffer,
+    act: &Buffer,
+    out: &Buffer,
+    sel: &Buffer,
+    wts: &Buffer,
     k_top: usize,
-    rank: Option<(&wgpu::Buffer, &wgpu::Buffer, usize)>,
+    rank: Option<(&Buffer, &Buffer, usize)>,
 ) -> Result<()> {
     let groups = ed.k / W4_GS;
-    anyhow::ensure!(
+    ensure!(
         w4_gemv_entry(groups, ed.n) == "g4m_gemv_w4_r8",
         "g4m_gemv_w4_r8_down_combine mirrors the r8 row walk only; the caller must fall \
          back to the unfused down+combine pair for the pair-entry shape"
@@ -2229,13 +2117,7 @@ fn push_gemv_w4_down_combine(
     } else if coal {
         ("g4m_gemv_w4_r8_down_combine_coal", 8)
     } else if expar {
-        if gemv_sglat_active(b.ctx, label) && w4_xv4_enabled() {
-            ("g4m_gemv_w4_down_combine_expar_sglat_xv4", 2)
-        } else if gemv_sglat_active(b.ctx, label) {
-            ("g4m_gemv_w4_down_combine_expar_sglat", 2)
-        } else {
-            ("g4m_gemv_w4_down_combine_expar", 2)
-        }
+        ("g4m_gemv_w4_down_combine_expar", 2)
     } else {
         ("g4m_gemv_w4_r8_down_combine", 8)
     };
@@ -2255,7 +2137,7 @@ fn push_gemv_w4_down_combine(
             ..Default::default()
         },
     );
-    let mut binds: Vec<(u32, &wgpu::Buffer)> = vec![
+    let mut binds: Vec<(u32, &Buffer)> = vec![
         (10, &ed.w),
         (11, &ed.scales),
         (12, act),
@@ -2274,24 +2156,17 @@ fn push_gemv_w4_down_combine(
             binds.push((19, wts));
         }
     }
-    let src = if entry.ends_with("_sglat_xv4") {
-        &s.gemv_w4_sglat_xv4
-    } else if entry.ends_with("_sglat") {
-        &s.gemv_w4_sglat
-    } else {
-        &s.gemv_w4
-    };
+    let src = &s.gemv_w4;
     b.push(label, src, entry, &binds, (grid.0, grid.1, 1))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_norm(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
 ) -> Result<()> {
@@ -2313,15 +2188,14 @@ fn push_norm(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_norm_residual(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
-    res: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    res: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
 ) -> Result<()> {
@@ -2344,11 +2218,7 @@ fn push_norm_residual(
 }
 
 pub fn router_topk_entry(n_experts: usize, top_k: usize) -> &'static str {
-    let forced_serial = matches!(
-        std::env::var("NV_G4MOE_ROUTER_TOPK").ok().as_deref(),
-        Some("serial") | Some("0")
-    );
-    if !forced_serial && n_experts <= 256 && top_k <= MAX_TOPK {
+    if n_experts <= 256 && top_k <= MAX_TOPK {
         "g4m_router_topk_par"
     } else {
         "g4m_router_topk"
@@ -2382,11 +2252,7 @@ fn upload_bf16_unless_w4_resident_sheds_it_prefill_and_bf16_decode_consumers_are
 }
 
 pub fn w4_gemv_entry(groups: usize, n_rows: usize) -> &'static str {
-    let forced_wide = matches!(
-        std::env::var("NV_G4MOE_W4_GEMV").ok().as_deref(),
-        Some("wide") | Some("0")
-    );
-    if !forced_wide && groups <= 32 && n_rows.is_multiple_of(8) {
+    if groups <= 32 && n_rows.is_multiple_of(8) {
         "g4m_gemv_w4_r8"
     } else {
         "g4m_gemv_w4"
@@ -2396,26 +2262,11 @@ pub fn w4_gemv_entry(groups: usize, n_rows: usize) -> &'static str {
 pub const PREFILL_M_MAX: usize = 64;
 
 pub fn prefill_m() -> usize {
-    match std::env::var("NV_G4MOE_WGPU_PREFILL_M")
-        .or_else(|_| std::env::var("NV_WGPU_PREFILL_M"))
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-    {
-        Some(0) | Some(1) => 0,
-        Some(m) => m.clamp(2, PREFILL_M_MAX),
-        None => 8,
-    }
-}
-
-pub const G4MOE_SLIDING_KV_RING_DEFAULT_ON: bool = true;
-
-pub fn sliding_kv_ring_enabled() -> bool {
-    match std::env::var("NV_G4MOE_KV_RING") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_SLIDING_KV_RING_DEFAULT_ON,
+    let rows = |k| env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    match rows("NV_G4MOE_WGPU_PREFILL_M") {
+        Some(0 | 1) => 0,
+        Some(m) => m.min(PREFILL_M_MAX),
+        None => rows("NV_WGPU_PREFILL_M").map_or(8, |m| m.clamp(2, PREFILL_M_MAX)),
     }
 }
 
@@ -2428,7 +2279,7 @@ pub const G4MOE_FLASH_SPLITS_32_IS_THE_MEASURED_KNEE_AT_DEPTH: u32 = 32;
 pub const G4MOE_FLASH_SPLITS_MAX_256_BOUNDS_STAGE2_SERIAL_SCAN_AND_SCRATCH: u32 = 256;
 
 pub fn flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build() -> u32 {
-    match std::env::var("NV_G4MOE_FLASH_SPLITS") {
+    match env::var("NV_G4MOE_FLASH_SPLITS") {
         Ok(v) => {
             let n: u32 = v.trim().parse().unwrap_or_else(|_| {
                 panic!("NV_G4MOE_FLASH_SPLITS={v}: expected an integer split count")
@@ -2461,7 +2312,7 @@ pub const FLASH_SLIDING_SPLITS_UNSET_TRACKS_THE_FULL_ATTENTION_COUNT_SO_ADDING_T
 pub fn flash_sliding_splits_the_ring_capped_scan_gains_no_stage1_rows_from_extra_splits_and_pays_every_one_in_stage2(
     full_attention_splits: u32,
 ) -> u32 {
-    let Ok(v) = std::env::var(G4MOE_FLASH_SLIDING_SPLITS_ENV) else {
+    let Ok(v) = env::var(G4MOE_FLASH_SLIDING_SPLITS_ENV) else {
         return full_attention_splits;
     };
     let t = v.trim();
@@ -2516,11 +2367,11 @@ pub const FLASH_DEPTHGATE_BAND3_SPLITS_32_IS_512_WORKGROUPS_THE_MEASURED_RESIDEN
     u32 = G4MOE_FLASH_SPLITS_32_IS_THE_MEASURED_KNEE_AT_DEPTH;
 
 pub fn flash_depthgate_enabled_a_shallow_tuned_split_pin_starves_the_grid_at_depth() -> bool {
-    matches!(std::env::var(G4MOE_FLASH_DEPTHGATE_ENV).as_deref(), Ok("1"))
+    matches!(env::var(G4MOE_FLASH_DEPTHGATE_ENV).as_deref(), Ok("1"))
 }
 
 fn flash_depthgate_forced_deep_splits_env_overrides_the_band_above_the_knee() -> Option<u32> {
-    let v = std::env::var(G4MOE_FLASH_DEPTHGATE_SPLITS_ENV).ok()?;
+    let v = env::var(G4MOE_FLASH_DEPTHGATE_SPLITS_ENV).ok()?;
     let n: u32 = v.trim().parse().unwrap_or_else(|_| {
         panic!("{G4MOE_FLASH_DEPTHGATE_SPLITS_ENV}={v}: expected an integer split count")
     });
@@ -2568,8 +2419,6 @@ pub fn flash_depthgate_scratch_splits_must_cover_every_band_the_gate_can_pick(
     }
 }
 
-pub const G4MOE_FLASH_FOLDGATE_ENV: &str = "NV_G4MOE_FLASH_FOLDGATE";
-
 pub const FOLDGATE_KNEE_TOKENS_10240_IS_THE_MEASURED_SIGN_CROSS_EVERY_FOLD_ARM_LOSS_SITS_SHALLOWER_AND_BOTH_STANDING_TARGETS_16K_AND_196K_SIT_DEEPER:
     u32 = 10240;
 
@@ -2581,22 +2430,8 @@ pub const FOLDGATE_DEEP_SPLITS_64_RESTORES_512_WORKGROUPS_UNDER_FOLD_2_AND_IS_A_
 pub const FOLDGATE_DEEP_SACC_128_KEEPS_THE_FOLDED_WORKGROUP_UNDER_A_THIRD_OF_48KB_SO_THREE_BLOCKS_PLACE_PER_SM_AND_IS_DIGIT_IDENTICAL_TO_SACC_512_ON_REAL_WEIGHTS:
     u32 = 128;
 
-pub const FOLDGATE_SWAPS_ONLY_FULL_ATTENTION_BECAUSE_SPELLING_THE_FOLD_THROUGH_THE_SHARED_DEPTHGATE_SPLITS_ENV_TAXES_SLIDING: &str =
-    "NV_G4MOE_FLASH_FOLDGATE=1 swaps the FULL-ATTENTION flash1 passes to the fold-2 / splits-64 \
-     / sacc-128 arm once the whole-context depth reaches the knee, and leaves every sliding pass \
-     on its own shallow pin or depthgate band; forcing the fold's 64 splits onto both kinds via \
-     NV_G4MOE_FLASH_DEPTHGATE_SPLITS was measured +7.2% on the sliding kind at 1024, and at 256 \
-     the sliding split override alone was two thirds of the fold arm's whole control-band loss";
-
 pub const G4MOE_FLASH_FOLDGATE_DEFAULT_ON_SIGNED_OFF_2026_09_01_ROWS_G4MOE_FOLDGATE_PLUS_22_3_PCT_AT_196608_QUALITY_EQUAL_TO_THE_REASSOCIATION_NULL_AT_256_16384_196608_AND_0_RESTORES_THE_PRE_FLIP_CONTROL:
     bool = true;
-
-pub fn flash_foldgate_enabled_full_attention_swaps_to_the_fold2_arm_at_depth_while_sliding_keeps_its_own_band(
-) -> bool {
-    env_flag(G4MOE_FLASH_FOLDGATE_ENV).unwrap_or(
-        G4MOE_FLASH_FOLDGATE_DEFAULT_ON_SIGNED_OFF_2026_09_01_ROWS_G4MOE_FOLDGATE_PLUS_22_3_PCT_AT_196608_QUALITY_EQUAL_TO_THE_REASSOCIATION_NULL_AT_256_16384_196608_AND_0_RESTORES_THE_PRE_FLIP_CONTROL,
-    )
-}
 
 fn flash_foldgate_active_this_build_unset_default_requires_sg32_flash_decode_no_qkvfold_no_kv_fp8_a_dividing_fold_and_fitting_storage_otherwise_prior_defaults_silently(
     ctx: &WgpuContext,
@@ -2604,29 +2439,24 @@ fn flash_foldgate_active_this_build_unset_default_requires_sg32_flash_decode_no_
     full_attention_n_q: usize,
     full_attention_n_kv: usize,
 ) -> bool {
-    match env_flag(G4MOE_FLASH_FOLDGATE_ENV) {
-        Some(v) => v,
-        None => {
-            G4MOE_FLASH_FOLDGATE_DEFAULT_ON_SIGNED_OFF_2026_09_01_ROWS_G4MOE_FOLDGATE_PLUS_22_3_PCT_AT_196608_QUALITY_EQUAL_TO_THE_REASSOCIATION_NULL_AT_256_16384_196608_AND_0_RESTORES_THE_PRE_FLIP_CONTROL
-                && flash_decode_enabled()
-                && ctx.caps.subgroup
-                && ctx.subgroup_width() == Some(32)
-                && !qkvfold_enabled()
-                && !kv_fp8_enabled()
-                && flash_gqa_fold_fits_this_layer(
-                    FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC,
-                    full_attention_n_q,
-                    full_attention_n_kv,
-                )
-                && ctx.caps.workgroup_storage_fits(
-                    flash_workgroup_bytes_qsh512_sm8_sl8_plus_red256_only_when_wb_plus_sacc_8_warps_by_chunk(
-                        flash_sg,
-                        FOLDGATE_DEEP_SACC_128_KEEPS_THE_FOLDED_WORKGROUP_UNDER_A_THIRD_OF_48KB_SO_THREE_BLOCKS_PLACE_PER_SM_AND_IS_DIGIT_IDENTICAL_TO_SACC_512_ON_REAL_WEIGHTS,
-                        FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC,
-                    ),
-                )
-        }
-    }
+    G4MOE_FLASH_FOLDGATE_DEFAULT_ON_SIGNED_OFF_2026_09_01_ROWS_G4MOE_FOLDGATE_PLUS_22_3_PCT_AT_196608_QUALITY_EQUAL_TO_THE_REASSOCIATION_NULL_AT_256_16384_196608_AND_0_RESTORES_THE_PRE_FLIP_CONTROL
+        && flash_decode_enabled()
+        && ctx.caps.subgroup
+        && ctx.subgroup_width() == Some(32)
+        && !qkvfold_enabled()
+        && !kv_fp8_enabled()
+        && flash_gqa_fold_fits_this_layer(
+            FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC,
+            full_attention_n_q,
+            full_attention_n_kv,
+        )
+        && ctx.caps.workgroup_storage_fits(
+            flash_workgroup_bytes_qsh512_sm8_sl8_plus_red256_only_when_wb_plus_sacc_8_warps_by_chunk(
+                flash_sg,
+                FOLDGATE_DEEP_SACC_128_KEEPS_THE_FOLDED_WORKGROUP_UNDER_A_THIRD_OF_48KB_SO_THREE_BLOCKS_PLACE_PER_SM_AND_IS_DIGIT_IDENTICAL_TO_SACC_512_ON_REAL_WEIGHTS,
+                FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC,
+            ),
+        )
 }
 
 pub fn foldgate_deep_at_these_whole_context_tokens(tokens: u32) -> bool {
@@ -2654,25 +2484,14 @@ const FLASH_QKVFOLD_WORKGROUP_BYTES_ADDS_BUF512_KCUR256_VCUR256_U32: u32 =
     FLASH_WORKGROUP_BYTES_QSH512_RED256_SM8_SL8_SACC4096_F32 + (512 + 256 + 256) * 4;
 
 pub fn flash_decode_enabled() -> bool {
-    match std::env::var("NV_G4MOE_FLASH_DECODE") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_FLASH_DECODE_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_FLASH_DECODE").unwrap_or(G4MOE_FLASH_DECODE_DEFAULT_ON)
 }
 
 pub const G4MOE_FLASH_SG_DEFAULT_OFF_UNTIL_A_ROUND_PUBLISHES_ITS_LADDER: bool = false;
 
 pub fn flash_sg_reduce_enabled() -> bool {
-    match std::env::var("NV_G4MOE_FLASH_SG") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_FLASH_SG_DEFAULT_OFF_UNTIL_A_ROUND_PUBLISHES_ITS_LADDER,
-    }
+    env_flag("NV_G4MOE_FLASH_SG")
+        .unwrap_or(G4MOE_FLASH_SG_DEFAULT_OFF_UNTIL_A_ROUND_PUBLISHES_ITS_LADDER)
 }
 
 pub const FLASH_SACC_CHUNK_ENV: &str = "NV_G4MOE_FLASH_SACC";
@@ -2682,7 +2501,7 @@ pub const FLASH_SACC_CHUNK_512_IS_THE_SHIPPED_WHOLE_HEAD_DIM_STAGING_AT_16KB_PER
 
 pub fn flash_sacc_chunk_head_dim_slice_staged_per_warp_read_once_at_build() -> u32 {
     let hd_max = MAX_HEAD_DIM as u32;
-    match std::env::var(FLASH_SACC_CHUNK_ENV) {
+    match env::var(FLASH_SACC_CHUNK_ENV) {
         Ok(v) => {
             let t = v.trim();
             if t.is_empty() {
@@ -2810,7 +2629,7 @@ pub const FLASH_GQA_FOLD_1_IS_THE_SHIPPED_ONE_WORKGROUP_PER_QUERY_HEAD_DISPATCH:
 pub const FLASH_GQA_FOLD_MAX_8_IS_THE_FULL_ATTENTION_GROUP_AND_128_ACCUMULATORS_PER_THREAD: u32 = 8;
 
 pub fn flash_gqa_fold_query_heads_per_workgroup_read_once_at_build() -> u32 {
-    match std::env::var(FLASH_GQA_FOLD_ENV) {
+    match env::var(FLASH_GQA_FOLD_ENV) {
         Ok(v) => {
             let t = v.trim();
             if t.is_empty() {
@@ -2864,7 +2683,7 @@ pub const FLASH_SLIDING_FOLD_HALVES_A_GRID_THE_RING_IS_TOO_SHORT_TO_REFILL_AND_I
 pub fn flash_sliding_fold_the_ring_is_too_short_for_kv_reuse_to_pay_for_the_grid_it_deletes(
     full_attention_fold: u32,
 ) -> u32 {
-    let Ok(v) = std::env::var(G4MOE_FLASH_SLIDING_FOLD_ENV) else {
+    let Ok(v) = env::var(G4MOE_FLASH_SLIDING_FOLD_ENV) else {
         return full_attention_fold;
     };
     let t = v.trim();
@@ -2922,8 +2741,12 @@ pub fn flash_stage1_fold_source(fold: u32) -> String {
         hd_max * fold
     )
     .unwrap();
-    writeln!(b, "@compute @workgroup_size(256)").unwrap();
-    writeln!(b, "fn {entry}(").unwrap();
+    writeln!(
+        b,
+        "@compute @workgroup_size(256)
+fn {entry}("
+    )
+    .unwrap();
     b.push_str(
         "    @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
@@ -2957,8 +2780,12 @@ pub fn flash_stage1_fold_source(fold: u32) -> String {
     )
     .unwrap();
     for j in 0..fold {
-        writeln!(b, "    var m{j} = gf_neg_inf();").unwrap();
-        writeln!(b, "    var l{j} = 0.0;").unwrap();
+        writeln!(
+            b,
+            "    var m{j} = gf_neg_inf();
+    var l{j} = 0.0;"
+        )
+        .unwrap();
         for i in 0..accs {
             writeln!(b, "    var a{j}_{i} = 0.0;").unwrap();
         }
@@ -3041,16 +2868,24 @@ pub fn flash_stage1_fold_source(fold: u32) -> String {
 ",
     );
     for j in 0..fold {
-        writeln!(b, "            let mn{j} = max(m{j}, sc{j});").unwrap();
-        writeln!(b, "            let cr{j} = gf_exp(m{j} - mn{j});").unwrap();
-        writeln!(b, "            let wt{j} = gf_exp(sc{j} - mn{j});").unwrap();
-        writeln!(b, "            l{j} = fma(l{j}, cr{j}, wt{j});").unwrap();
+        writeln!(
+            b,
+            "            let mn{j} = max(m{j}, sc{j});
+            let cr{j} = gf_exp(m{j} - mn{j});
+            let wt{j} = gf_exp(sc{j} - mn{j});
+            l{j} = fma(l{j}, cr{j}, wt{j});"
+        )
+        .unwrap();
     }
     for i in 0..accs {
-        writeln!(b, "            {{").unwrap();
-        writeln!(b, "                let d = lane + {i}u * GF_LANES;").unwrap();
-        writeln!(b, "                if (d < hd) {{").unwrap();
-        writeln!(b, "                    let vx = gf_v_bf16(vbase + d);").unwrap();
+        writeln!(
+            b,
+            "            {{
+                let d = lane + {i}u * GF_LANES;
+                if (d < hd) {{
+                    let vx = gf_v_bf16(vbase + d);"
+        )
+        .unwrap();
         for j in 0..fold {
             writeln!(
                 b,
@@ -3058,8 +2893,12 @@ pub fn flash_stage1_fold_source(fold: u32) -> String {
             )
             .unwrap();
         }
-        writeln!(b, "                }}").unwrap();
-        writeln!(b, "            }}").unwrap();
+        writeln!(
+            b,
+            "                }}
+            }}"
+        )
+        .unwrap();
     }
     for j in 0..fold {
         writeln!(b, "            m{j} = mn{j};").unwrap();
@@ -3084,242 +2923,106 @@ pub fn flash_stage1_fold_source(fold: u32) -> String {
     b
 }
 
-pub const G4MOE_FLASH_SLIDING_DEFAULT_ON: bool = true;
-
-pub fn flash_sliding_enabled() -> bool {
-    if !flash_decode_enabled() {
-        return false;
-    }
-    match std::env::var("NV_G4MOE_FLASH_SLIDING") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_FLASH_SLIDING_DEFAULT_ON,
-    }
-}
-
 pub const G4MOE_ASSIST_FLASH_VERIFY_ENV: &str = "NV_G4MOE_ASSIST_FLASH_VERIFY";
 
 pub fn assist_flash_verify_enabled_the_verify_rows_ride_the_decode_flash_kernels_so_the_assistant_drafter_keeps_flash_decode(
 ) -> bool {
-    matches!(
-        std::env::var(G4MOE_ASSIST_FLASH_VERIFY_ENV).as_deref(),
-        Ok("1")
-    )
-}
-
-pub const G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON:
-    bool = true;
-
-fn env_flag(name: &str) -> Option<bool> {
-    std::env::var(name).ok().map(|v| {
-        let t = v.trim();
-        !t.is_empty() && t != "0"
-    })
+    matches!(env::var(G4MOE_ASSIST_FLASH_VERIFY_ENV).as_deref(), Ok("1"))
 }
 
 fn champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(
     ctx: &WgpuContext,
 ) -> bool {
-    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON
-        && ctx.caps.subgroup
-        && ctx.subgroup_width() == Some(32)
+    ctx.caps.subgroup && ctx.subgroup_width() == Some(32)
 }
-
-pub const G4MOE_GROUPED_GEMV_DEFAULT_ON: bool =
-    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON;
 
 pub const GROUPED_NORM_CHAIN_MAX_HIDDEN_WORDS_PN_BUF: usize = 2048;
 
-pub fn grouped_gemv_enabled() -> bool {
-    env_flag("NV_G4MOE_GROUPED_GEMV").unwrap_or(G4MOE_GROUPED_GEMV_DEFAULT_ON)
-}
-
 fn grouped_gemv_active(ctx: &WgpuContext) -> bool {
-    env_flag("NV_G4MOE_GROUPED_GEMV").unwrap_or_else(|| {
-        champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(ctx)
-    })
+    champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(ctx)
 }
 
 pub const G4MOE_TOPK_FOLD_DEFAULT_ON: bool = false;
 
 pub fn topk_fold_enabled() -> bool {
-    match std::env::var("NV_G4MOE_TOPK_FOLD") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_TOPK_FOLD_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_TOPK_FOLD").unwrap_or(G4MOE_TOPK_FOLD_DEFAULT_ON)
 }
 
 pub const G4MOE_HEAD_ONE_SHARD_LETS_THE_EMBED_TABLE_BIND_WHOLE_INSTEAD_OF_AT_A_1_GIB_CEILING_DEFAULT_ON:
     bool = false;
 
 pub fn head_one_shard_enabled() -> bool {
-    match std::env::var("NV_G4MOE_HEAD_ONE_SHARD") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => {
+    env_flag("NV_G4MOE_HEAD_ONE_SHARD").unwrap_or({
             G4MOE_HEAD_ONE_SHARD_LETS_THE_EMBED_TABLE_BIND_WHOLE_INSTEAD_OF_AT_A_1_GIB_CEILING_DEFAULT_ON
-        }
-    }
+        })
 }
 
 pub const G4MOE_LMHEAD_TIGHT_GRID_SEPARATES_THE_IDLE_WORKGROUP_LEVER_FROM_THE_BARRIER_LEVER_DEFAULT_ON:
     bool = false;
 
 pub fn lmhead_tight_grid_enabled() -> bool {
-    match std::env::var("NV_G4MOE_LMHEAD_TIGHT_GRID") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => {
-            G4MOE_LMHEAD_TIGHT_GRID_SEPARATES_THE_IDLE_WORKGROUP_LEVER_FROM_THE_BARRIER_LEVER_DEFAULT_ON
-        }
-    }
-}
-
-pub const G4MOE_RPNORM_DEFAULT_ON: bool =
-    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON;
-
-pub fn rpnorm_enabled() -> bool {
-    env_flag("NV_G4MOE_RPNORM").unwrap_or(G4MOE_RPNORM_DEFAULT_ON)
+    env_flag("NV_G4MOE_LMHEAD_TIGHT_GRID").unwrap_or({
+        G4MOE_LMHEAD_TIGHT_GRID_SEPARATES_THE_IDLE_WORKGROUP_LEVER_FROM_THE_BARRIER_LEVER_DEFAULT_ON
+    })
 }
 
 fn rpnorm_active(ctx: &WgpuContext) -> bool {
-    env_flag("NV_G4MOE_RPNORM").unwrap_or_else(|| {
-        champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(ctx)
-            && grouped_gemv_active(ctx)
-            && !router_chain_enabled()
-    })
+    champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(ctx)
+        && !router_chain_enabled()
 }
 
-pub const G4MOE_RPFUSE_RIDES_THE_ROUTER_NORM_GEMV_ON_THE_MLP_DOWN_DISPATCH_DEFAULT_ON: bool =
-    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON;
-
-pub fn rpfuse_enabled() -> bool {
-    env_flag("NV_G4MOE_RPFUSE")
-        .unwrap_or(G4MOE_RPFUSE_RIDES_THE_ROUTER_NORM_GEMV_ON_THE_MLP_DOWN_DISPATCH_DEFAULT_ON)
-}
-
-fn rpfuse_active(ctx: &WgpuContext) -> bool {
-    env_flag("NV_G4MOE_RPFUSE").unwrap_or_else(|| {
-        champion_defaults_qualify_subgroup_width_32_otherwise_prior_defaults_silently(ctx)
-            && grouped_gemv_active(ctx)
-            && rpnorm_active(ctx)
-            && !router_chain_enabled()
-            && !topk_fold_enabled()
-    })
-}
-
-pub const G4MOE_TOPK_NX2_RIDES_THE_ROUTER_TOPK_ON_THE_NORMX2_DISPATCH_DEFAULT_ON: bool =
-    G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON;
-
-pub const TOPK_PAR_TIE_RULE_HIGHER_LOGIT_OUTRANKS_AND_EQUAL_LOGITS_RANK_BY_LOWER_EXPERT_INDEX:
-    &str = "w > v || (w == v && j < lid)";
-
-pub fn topk_nx2_enabled() -> bool {
-    env_flag("NV_G4MOE_TOPK_NX2")
-        .unwrap_or(G4MOE_TOPK_NX2_RIDES_THE_ROUTER_TOPK_ON_THE_NORMX2_DISPATCH_DEFAULT_ON)
+fn rpfuse_active_yields_to_every_arm_its_fused_down_has_no_twin_for(ctx: &WgpuContext) -> bool {
+    rpnorm_active(ctx)
+        && !topk_fold_enabled()
+        && !w4_resident_enabled()
+        && !bf16_r8_enabled()
+        && !bf16_acc4_enabled()
 }
 
 fn topk_nx2_active(ctx: &WgpuContext, n_experts: usize, top_k: usize) -> bool {
-    env_flag("NV_G4MOE_TOPK_NX2").unwrap_or_else(|| {
-        rpfuse_active(ctx) && router_topk_entry(n_experts, top_k) == "g4m_router_topk_par"
-    })
+    rpfuse_active_yields_to_every_arm_its_fused_down_has_no_twin_for(ctx)
+        && router_topk_entry(n_experts, top_k) == "g4m_router_topk_par"
 }
 
 pub const G4MOE_BF16_R8_DEFAULT_ON: bool = false;
 
 pub fn bf16_r8_enabled() -> bool {
-    match std::env::var("NV_G4MOE_BF16_R8") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_BF16_R8_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_BF16_R8").unwrap_or(G4MOE_BF16_R8_DEFAULT_ON)
 }
 
 pub const G4MOE_BF16_ACC4_MEASURED_NO_WALL_CHANGE_DEFAULT_OFF: bool = false;
 
 pub fn bf16_acc4_enabled() -> bool {
-    match std::env::var("NV_G4MOE_BF16_ACC4") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_BF16_ACC4_MEASURED_NO_WALL_CHANGE_DEFAULT_OFF,
-    }
+    env_flag("NV_G4MOE_BF16_ACC4").unwrap_or(G4MOE_BF16_ACC4_MEASURED_NO_WALL_CHANGE_DEFAULT_OFF)
 }
 
 pub const G4MOE_MLPGU_FUSEDX_MEASURED_NEGATIVE_BF16_TWO_MAT_STREAMS_DEFAULT_OFF: bool = false;
 
 pub fn mlpgu_fusedx_enabled() -> bool {
-    match std::env::var("NV_G4MOE_MLPGU_FUSEDX") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_MLPGU_FUSEDX_MEASURED_NEGATIVE_BF16_TWO_MAT_STREAMS_DEFAULT_OFF,
-    }
+    env_flag("NV_G4MOE_MLPGU_FUSEDX")
+        .unwrap_or(G4MOE_MLPGU_FUSEDX_MEASURED_NEGATIVE_BF16_TWO_MAT_STREAMS_DEFAULT_OFF)
 }
 
 pub const G4MOE_GU_FUSEDX_DEFAULT_ON: bool = false;
 
 pub fn gu_fusedx_enabled() -> bool {
-    match std::env::var("NV_G4MOE_GU_FUSEDX") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_GU_FUSEDX_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_GU_FUSEDX").unwrap_or(G4MOE_GU_FUSEDX_DEFAULT_ON)
 }
 
 pub const G4MOE_DOWN_EXPAR_DEFAULT_ON: bool = false;
 
 pub fn down_expar_enabled() -> bool {
-    match std::env::var("NV_G4MOE_DOWN_EXPAR") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_DOWN_EXPAR_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_DOWN_EXPAR").unwrap_or(G4MOE_DOWN_EXPAR_DEFAULT_ON)
 }
 
 pub const G4MOE_NORM_LAT_DEFAULT_ON: bool = false;
 
 pub fn norm_lat_enabled() -> bool {
-    match std::env::var("NV_G4MOE_NORM_LAT") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_NORM_LAT_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_NORM_LAT").unwrap_or(G4MOE_NORM_LAT_DEFAULT_ON)
 }
 
 fn norm_lat_active(ctx: &WgpuContext) -> bool {
     norm_lat_enabled() && ctx.caps.subgroup && ctx.subgroup_width() == Some(32)
-}
-
-pub const G4MOE_W4_XV4_STACKS_ON_GEMV_SGLAT_DEFAULT_ON: bool = false;
-
-pub fn w4_xv4_enabled() -> bool {
-    match std::env::var("NV_G4MOE_W4_XV4") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_W4_XV4_STACKS_ON_GEMV_SGLAT_DEFAULT_ON,
-    }
 }
 
 pub const G4MOE_ATTN_I8_SHIPS_ON_SIGNED_OFF_2026_09_04_ROWS_G4MOE_I8_DENSE_128P9_VS_117P7_118P0_TOK_S_AT_256_250W_COMPOSED_136P3_THREE_CLASS_CERT_IN_PPL_GEMMA4_MOE_PASSED_MAX_CLASS_NLL_DELTA_0P0069_NATS_AND_ZERO_RESTORES_THE_BF16_DECODE_GEMVS:
@@ -3331,7 +3034,7 @@ pub const ATTN_I8_GROUP_32_IS_THE_GOW_RECIPE_G16_HALVES_THE_QUANT_STEP_AT_DOUBLE
 pub const ATTN_I8_G16_TOKEN: &str = "g16";
 
 pub fn attn_i8_group_elems() -> usize {
-    match std::env::var("NV_G4MOE_ATTN_I8") {
+    match env::var("NV_G4MOE_ATTN_I8") {
         Ok(v) if v.split(',').any(|c| c == ATTN_I8_G16_TOKEN) => 16,
         _ => {
             ATTN_I8_GROUP_32_IS_THE_GOW_RECIPE_G16_HALVES_THE_QUANT_STEP_AT_DOUBLE_THE_SCALE_STREAM
@@ -3340,7 +3043,7 @@ pub fn attn_i8_group_elems() -> usize {
 }
 
 pub fn attn_i8_site_enabled(label: &str) -> bool {
-    match std::env::var("NV_G4MOE_ATTN_I8") {
+    match env::var("NV_G4MOE_ATTN_I8") {
         Err(_) => {
             G4MOE_ATTN_I8_SHIPS_ON_SIGNED_OFF_2026_09_04_ROWS_G4MOE_I8_DENSE_128P9_VS_117P7_118P0_TOK_S_AT_256_250W_COMPOSED_136P3_THREE_CLASS_CERT_IN_PPL_GEMMA4_MOE_PASSED_MAX_CLASS_NLL_DELTA_0P0069_NATS_AND_ZERO_RESTORES_THE_BF16_DECODE_GEMVS
         }
@@ -3362,7 +3065,7 @@ fn attn_i8_site_active_unset_env_qualifies_like_the_champion_defaults_so_non_gro
     ctx: &WgpuContext,
     label: &str,
 ) -> bool {
-    if std::env::var("NV_G4MOE_ATTN_I8").is_err() {
+    if !nv_config::env_arm_present_at_all_reread_every_call("NV_G4MOE_ATTN_I8") {
         return G4MOE_ATTN_I8_SHIPS_ON_SIGNED_OFF_2026_09_04_ROWS_G4MOE_I8_DENSE_128P9_VS_117P7_118P0_TOK_S_AT_256_250W_COMPOSED_136P3_THREE_CLASS_CERT_IN_PPL_GEMMA4_MOE_PASSED_MAX_CLASS_NLL_DELTA_0P0069_NATS_AND_ZERO_RESTORES_THE_BF16_DECODE_GEMVS
             && grouped_gemv_active(ctx)
             && !kv_fp8_enabled()
@@ -3390,75 +3093,19 @@ pub fn mlp_i8_enabled() -> bool {
     )
 }
 
-pub const G4MOE_GEMV_SGLAT_UNSET_ROUTES_AT_OPROJ_ONLY_ROW_R3_111_1_TOK_S_BROADER_LABEL_SETS_DILUTE:
-    &str = "at-oproj";
-
-pub fn gemv_sglat_enabled(label: &str) -> bool {
-    match std::env::var("NV_G4MOE_GEMV_SGLAT") {
-        Err(_) => {
-            !gemv_v2_enabled(label)
-                && G4MOE_FUSION_CHAMPION_ROWS_G4MOE_FUSION_R1_R2_R2C_R3_111_1_VS_87_3_TOK_S_AT_256_TF_PPL_31_9_ACC_0_5254_BOTH_ARMS_DEFAULT_ON
-                && label.contains(
-                    G4MOE_GEMV_SGLAT_UNSET_ROUTES_AT_OPROJ_ONLY_ROW_R3_111_1_TOK_S_BROADER_LABEL_SETS_DILUTE,
-                )
-        }
-        Ok(v) => {
-            let t = v.trim();
-            if t.is_empty() || t == "0" {
-                false
-            } else if t == "1" {
-                true
-            } else {
-                t.split(',').any(|c| !c.is_empty() && label.contains(c))
-            }
-        }
-    }
-}
-
-fn gemv_sglat_active(ctx: &WgpuContext, label: &str) -> bool {
-    gemv_sglat_enabled(label) && ctx.caps.subgroup && ctx.subgroup_width() == Some(32)
-}
-
-pub const G4MOE_GEMV_V2_DEFAULT_ON_SIGNED_OFF_2026_09_01_ROWS_G4MOE_GEMVQ_118_7_AND_118_8_VS_113_9_TOK_S_PLUS_4_2_PCT_ABOVE_THE_NULL_FLOOR_DELTA_NLL_MINUS_0_0014_NATS_33X_UNDER_THE_TCTILE_CERT_BAND_AND_0_RESTORES_THE_PRE_FLIP_ARM:
-    bool = true;
-
 fn gemv_v2_unset_default_yields_to_an_explicitly_requested_rival_bf16_gemv_arm() -> bool {
-    [
-        "NV_G4MOE_GEMV_SGLAT",
-        "NV_G4MOE_BF16_R8",
-        "NV_G4MOE_BF16_ACC4",
-    ]
-    .into_iter()
-    .any(|k| env_flag(k) == Some(true))
-}
-
-pub fn gemv_v2_enabled(label: &str) -> bool {
-    match std::env::var("NV_G4MOE_GEMV_V2") {
-        Err(_) => {
-            G4MOE_GEMV_V2_DEFAULT_ON_SIGNED_OFF_2026_09_01_ROWS_G4MOE_GEMVQ_118_7_AND_118_8_VS_113_9_TOK_S_PLUS_4_2_PCT_ABOVE_THE_NULL_FLOOR_DELTA_NLL_MINUS_0_0014_NATS_33X_UNDER_THE_TCTILE_CERT_BAND_AND_0_RESTORES_THE_PRE_FLIP_ARM
-                && !gemv_v2_unset_default_yields_to_an_explicitly_requested_rival_bf16_gemv_arm()
-        }
-        Ok(v) => {
-            let t = v.trim();
-            if t.is_empty() || t == "0" {
-                false
-            } else if t == "1" {
-                true
-            } else {
-                t.split(',').any(|c| !c.is_empty() && label.contains(c))
-            }
-        }
-    }
+    ["NV_G4MOE_BF16_R8", "NV_G4MOE_BF16_ACC4"]
+        .into_iter()
+        .any(|k| env_flag(k) == Some(true))
 }
 
 fn gemv_v2_active_implies_the_vec4_wide_layout(
     ctx: &WgpuContext,
-    label: &str,
     load: GemvLoad,
     k: usize,
     x_off_words: usize,
 ) -> bool {
-    gemv_v2_enabled(label)
+    !gemv_v2_unset_default_yields_to_an_explicitly_requested_rival_bf16_gemv_arm()
         && ctx.caps.subgroup
         && ctx.subgroup_width() == Some(32)
         && load == GemvLoad::Wide
@@ -3471,13 +3118,7 @@ const GEMV_BF16_V2_ENTRY: &str = "g4m_gemv_bf16_v2_row_per_sg32_dual_vec4_zero_b
 pub const G4MOE_PREENC_DEFAULT_ON: bool = false;
 
 pub fn preenc_enabled() -> bool {
-    match std::env::var("NV_G4MOE_PREENC") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_PREENC_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_PREENC").unwrap_or(G4MOE_PREENC_DEFAULT_ON)
 }
 
 pub const G4MOE_W4_COAL_DEFAULT_ON: bool = false;
@@ -3485,129 +3126,88 @@ pub const G4MOE_W4_COAL_DEFAULT_ON: bool = false;
 pub const W4_COAL_XBUF_WORDS_3072_BOUNDS_THE_PRELOADED_ACTIVATION_SLOTS: usize = 3072;
 
 pub fn w4_coal_enabled() -> bool {
-    match std::env::var("NV_G4MOE_W4_COAL") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_W4_COAL_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_W4_COAL").unwrap_or(G4MOE_W4_COAL_DEFAULT_ON)
 }
 
 pub const G4MOE_FOLD_CHAIN_DEFAULT_ON: bool = false;
 
 pub fn fold_chain_enabled() -> bool {
-    match std::env::var("NV_G4MOE_FOLD_CHAIN") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_FOLD_CHAIN_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_FOLD_CHAIN").unwrap_or(G4MOE_FOLD_CHAIN_DEFAULT_ON)
 }
 
 pub const G4MOE_TAILFOLD_MEASURED_NEGATIVE_PROLOGUE_REDUNDANCY_SCALES_WITH_3072_QKVPROJ_WGS_DEFAULT_OFF:
     bool = false;
 
 pub fn tailfold_enabled() -> bool {
-    match std::env::var("NV_G4MOE_TAILFOLD") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_TAILFOLD_MEASURED_NEGATIVE_PROLOGUE_REDUNDANCY_SCALES_WITH_3072_QKVPROJ_WGS_DEFAULT_OFF,
-    }
+    env_flag("NV_G4MOE_TAILFOLD").unwrap_or(G4MOE_TAILFOLD_MEASURED_NEGATIVE_PROLOGUE_REDUNDANCY_SCALES_WITH_3072_QKVPROJ_WGS_DEFAULT_OFF)
 }
 
 pub const G4MOE_QKVFOLD_MEASURED_NEGATIVE_SERIAL_TREE_PROLOGUE_DOUBLES_STAGE1_DEFAULT_OFF: bool =
     false;
 
 pub fn qkvfold_enabled() -> bool {
-    match std::env::var("NV_G4MOE_QKVFOLD") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_QKVFOLD_MEASURED_NEGATIVE_SERIAL_TREE_PROLOGUE_DOUBLES_STAGE1_DEFAULT_OFF,
-    }
+    env_flag("NV_G4MOE_QKVFOLD")
+        .unwrap_or(G4MOE_QKVFOLD_MEASURED_NEGATIVE_SERIAL_TREE_PROLOGUE_DOUBLES_STAGE1_DEFAULT_OFF)
 }
 
 pub const G4MOE_ROUTER_CHAIN_DEFAULT_ON: bool = false;
 
 pub fn router_chain_enabled() -> bool {
-    match std::env::var("NV_G4MOE_ROUTER_CHAIN") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_ROUTER_CHAIN_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_ROUTER_CHAIN").unwrap_or(G4MOE_ROUTER_CHAIN_DEFAULT_ON)
 }
 
 pub const G4MOE_KV_FP8_DEFAULT_ON: bool = false;
 
 pub fn kv_fp8_enabled() -> bool {
-    match std::env::var("NV_G4MOE_KV_FP8") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_KV_FP8_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_KV_FP8").unwrap_or(G4MOE_KV_FP8_DEFAULT_ON)
 }
 
 pub const G4MOE_KIND_LABELS_DEFAULT_ON: bool = false;
 
 pub fn layer_kind_decode_labels_enabled() -> bool {
-    match std::env::var("NV_G4MOE_KIND_LABELS") {
-        Ok(v) => {
-            let t = v.trim();
-            !t.is_empty() && t != "0"
-        }
-        Err(_) => G4MOE_KIND_LABELS_DEFAULT_ON,
-    }
+    env_flag("NV_G4MOE_KIND_LABELS").unwrap_or(G4MOE_KIND_LABELS_DEFAULT_ON)
 }
 
 struct PfScratch {
     m: usize,
-    tok: wgpu::Buffer,
-    pos: wgpu::Buffer,
-    splice_rows: wgpu::Buffer,
-    splice_mask: wgpu::Buffer,
-    res_a: wgpu::Buffer,
-    res_b: wgpu::Buffer,
-    normed: wgpu::Buffer,
-    attn_out: wgpu::Buffer,
-    attn_post: wgpu::Buffer,
-    normed_mlp: wgpu::Buffer,
-    dense_out: wgpu::Buffer,
-    h1: wgpu::Buffer,
-    moe_in: wgpu::Buffer,
-    moe_out: wgpu::Buffer,
-    h2: wgpu::Buffer,
-    ffw_sum: wgpu::Buffer,
-    combined: wgpu::Buffer,
-    q_raw: wgpu::Buffer,
-    k_raw: wgpu::Buffer,
-    v_raw: wgpu::Buffer,
-    q: wgpu::Buffer,
-    k: wgpu::Buffer,
-    v: wgpu::Buffer,
-    scores: wgpu::Buffer,
-    attn_f32: wgpu::Buffer,
-    attn_bf16: wgpu::Buffer,
-    mlp_g: wgpu::Buffer,
-    mlp_u: wgpu::Buffer,
-    mlp_act: wgpu::Buffer,
-    rnormed: wgpu::Buffer,
-    router_in: wgpu::Buffer,
-    rlogits: wgpu::Buffer,
-    ids: wgpu::Buffer,
-    wts: wgpu::Buffer,
-    y_gate: wgpu::Buffer,
-    y_up: wgpu::Buffer,
-    moe_act: wgpu::Buffer,
-    y_down: wgpu::Buffer,
+    tok: Buffer,
+    pos: Buffer,
+    splice_rows: Buffer,
+    splice_mask: Buffer,
+    res_a: Buffer,
+    res_b: Buffer,
+    normed: Buffer,
+    attn_out: Buffer,
+    attn_post: Buffer,
+    normed_mlp: Buffer,
+    dense_out: Buffer,
+    h1: Buffer,
+    moe_in: Buffer,
+    moe_out: Buffer,
+    h2: Buffer,
+    ffw_sum: Buffer,
+    combined: Buffer,
+    q_raw: Buffer,
+    k_raw: Buffer,
+    v_raw: Buffer,
+    q: Buffer,
+    k: Buffer,
+    v: Buffer,
+    scores: Buffer,
+    attn_f32: Buffer,
+    attn_bf16: Buffer,
+    mlp_g: Buffer,
+    mlp_u: Buffer,
+    mlp_act: Buffer,
+    rnormed: Buffer,
+    router_in: Buffer,
+    rlogits: Buffer,
+    ids: Buffer,
+    wts: Buffer,
+    y_gate: Buffer,
+    y_up: Buffer,
+    moe_act: Buffer,
+    y_down: Buffer,
 }
 
 fn alloc_pf_scratch(b: &mut Builder, cfg: &Gemma4MoeConfig, max_seq: usize, m: usize) -> PfScratch {
@@ -3668,15 +3268,14 @@ fn alloc_pf_scratch(b: &mut Builder, cfg: &Gemma4MoeConfig, max_seq: usize, m: u
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_gemm_bf16(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Bf16Gpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_stride_words: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_stride_words: usize,
     out_f32: bool,
     alpha: f32,
@@ -3708,23 +3307,22 @@ fn pf_gemm_bf16(
 }
 
 struct LmHeadChunk<'a> {
-    w: &'a wgpu::Buffer,
+    w: &'a Buffer,
     row_off: usize,
     n_rows: usize,
-    i8: Option<&'a (wgpu::Buffer, wgpu::Buffer)>,
+    i8: Option<&'a (Buffer, Buffer)>,
     wide: u32,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_lmhead_row(
     b: &mut Builder,
     s: &Sources,
     gemv_i8_src: &str,
     lmhead_i8: Option<&'static str>,
     c: &LmHeadChunk,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_off_words: usize,
-    y: &wgpu::Buffer,
+    y: &Buffer,
     y_off_words: usize,
     hidden: usize,
 ) -> Result<()> {
@@ -3748,11 +3346,7 @@ fn push_lmhead_row(
             "the int8 lm_head is wired for the single-row decode activation only; \
              the verify epilogue stays off while it is selected"
         );
-        let kw = if entry == "g4m_gemv_i8_v4" {
-            hidden / 16
-        } else {
-            hidden / 4
-        };
+        let kw = hidden / 16;
         let p = b.uni(
             "g4m-lmhead-i8-p",
             GemvI8Params {
@@ -3778,7 +3372,6 @@ fn push_lmhead_row(
     }
     let v2 = gemv_v2_active_implies_the_vec4_wide_layout(
         b.ctx,
-        "g4m-lmhead",
         GemvLoad::Wide,
         hidden,
         x_off_words,
@@ -3816,14 +3409,13 @@ fn push_lmhead_row(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_norm(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
     m: usize,
@@ -3846,15 +3438,14 @@ fn pf_norm(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_norm_residual(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x: &wgpu::Buffer,
-    res: &wgpu::Buffer,
-    w: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    res: &Buffer,
+    w: &Buffer,
+    y: &Buffer,
     hidden: usize,
     eps: f32,
     m: usize,
@@ -3886,10 +3477,10 @@ pub struct LoadReport {
 struct PfState {
     m: usize,
     passes: Vec<Pass>,
-    tok: wgpu::Buffer,
-    pos: wgpu::Buffer,
-    splice_rows: wgpu::Buffer,
-    splice_mask: wgpu::Buffer,
+    tok: Buffer,
+    pos: Buffer,
+    splice_rows: Buffer,
+    splice_mask: Buffer,
     splice_mask_live: bool,
     validated: bool,
 }
@@ -3899,14 +3490,14 @@ pub use crate::gemma4_wgpu::VERIFY_ROWS_MAX_IS_THE_LONGEST_CHAIN_THE_SPEC_LOOP_S
 struct VerifyState {
     rows: usize,
     passes: Vec<Pass>,
-    logits: wgpu::Buffer,
-    tokens: wgpu::Buffer,
+    logits: Buffer,
+    tokens: Buffer,
     validated: bool,
 }
 
 struct VfRowUniforms {
-    fd: Option<(wgpu::Buffer, FlashDecodeParams)>,
-    sl: Option<(wgpu::Buffer, FlashDecodeParams)>,
+    fd: Option<(Buffer, FlashDecodeParams)>,
+    sl: Option<(Buffer, FlashDecodeParams)>,
 }
 
 struct VfSub {
@@ -3932,11 +3523,6 @@ struct VerifyFlashState {
 
 pub use crate::gemma4_wgpu::EmbedRowSplice;
 
-struct ChunkRowSplice<'a> {
-    rel_pos: usize,
-    row_words: &'a [u32],
-}
-
 pub struct Gemma4MoeWgpu {
     ctx: &'static WgpuContext,
     config: Gemma4MoeConfig,
@@ -3950,14 +3536,14 @@ pub struct Gemma4MoeWgpu {
     verify_flash: Option<VerifyFlashState>,
     head_start: usize,
     preenc: bool,
-    pending_cb: Option<(PendingCbBandKey, wgpu::CommandBuffer)>,
+    pending_cb: Option<(PendingCbBandKey, CommandBuffer)>,
     preenc_replays: usize,
     preenc_band_discards: usize,
-    _buffers: Vec<wgpu::Buffer>,
-    tok_buf: wgpu::Buffer,
-    pos_buf: wgpu::Buffer,
-    flash_fd: Option<(wgpu::Buffer, FlashDecodeParams)>,
-    flash_sl: Option<(wgpu::Buffer, FlashDecodeParams, u32)>,
+    _buffers: Vec<Buffer>,
+    tok_buf: Buffer,
+    pos_buf: Buffer,
+    flash_fd: Option<(Buffer, FlashDecodeParams)>,
+    flash_sl: Option<(Buffer, FlashDecodeParams, u32)>,
     depthgate_flash1_passes: Vec<usize>,
     depthgate_flash1_sliding_passes: Vec<usize>,
     depthgate_on: bool,
@@ -3967,9 +3553,9 @@ pub struct Gemma4MoeWgpu {
     foldgate_deep_active: bool,
     flash_scratch_bytes_full: Vec<u64>,
     flash_scratch_bytes_sliding: Vec<u64>,
-    token_out: wgpu::Buffer,
-    logits: wgpu::Buffer,
-    state_buffers: Vec<(wgpu::Buffer, u64)>,
+    token_out: Buffer,
+    logits: Buffer,
+    state_buffers: Vec<(Buffer, u64)>,
     vocab: usize,
     vram: VramReport,
     load: LoadReport,
@@ -3989,8 +3575,8 @@ pub struct AssistantKvTapGeometry {
 }
 
 struct AssistantKvTap {
-    kc: wgpu::Buffer,
-    vc: wgpu::Buffer,
+    kc: Buffer,
+    vc: Buffer,
     fp8: bool,
     geom: AssistantKvTapGeometry,
 }
@@ -4000,8 +3586,8 @@ struct AssistantTaps {
     full_layer: Option<usize>,
     sliding: Option<AssistantKvTap>,
     full: Option<AssistantKvTap>,
-    decode_prenorm_hidden: wgpu::Buffer,
-    verify_prenorm_hidden: Option<wgpu::Buffer>,
+    decode_prenorm_hidden: Buffer,
+    verify_prenorm_hidden: Option<Buffer>,
 }
 
 fn unpack_bf16_pairs_to_f32(words: &[u32]) -> Vec<f32> {
@@ -4089,14 +3675,14 @@ impl Gemma4MoeWgpu {
         class: Option<&str>,
         k: usize,
     ) -> Result<u32> {
-        anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
-        anyhow::ensure!(self.pos < self.max_seq, "kv cache full at {}", self.pos);
+        ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+        ensure!(self.pos < self.max_seq, "kv cache full at {}", self.pos);
         self.ctx
             .queue
-            .write_buffer(&self.tok_buf, 0, bytemuck::bytes_of(&(token as i32)));
+            .write_buffer(&self.tok_buf, 0, bytes_of(&(token as i32)));
         self.ctx
             .queue
-            .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(self.pos as i32)));
+            .write_buffer(&self.pos_buf, 0, bytes_of(&(self.pos as i32)));
         self.write_flash_total_uniform_mirroring_gemma4_wgpu_write_pos_uniforms();
 
         let extra: Vec<&Pass> = match class {
@@ -4107,7 +3693,7 @@ impl Gemma4MoeWgpu {
                 .collect(),
             None => Vec::new(),
         };
-        anyhow::ensure!(
+        ensure!(
             class.is_none() || !extra.is_empty(),
             "no decode pass is labelled {class:?}"
         );
@@ -4116,22 +3702,18 @@ impl Gemma4MoeWgpu {
         {
             let mut pass = enc.begin_compute_pass(&Default::default());
             for p in &self.passes {
-                pass.set_pipeline(&p.pipeline);
-                pass.set_bind_group(0, &p.bind, &[]);
-                pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                dispatch_pass!(pass, p);
             }
             for _ in 0..k {
                 for p in &extra {
-                    pass.set_pipeline(&p.pipeline);
-                    pass.set_bind_group(0, &p.bind, &[]);
-                    pass.dispatch_workgroups(p.grid.0, p.grid.1, p.grid.2);
+                    dispatch_pass!(pass, p);
                 }
             }
         }
         self.ctx.queue.submit([enc.finish()]);
         self.pos += 1;
-        let t: Vec<u32> = dispatch::read_back(self.ctx, &self.token_out, 1)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let t: Vec<u32> =
+            dispatch::read_back(self.ctx, &self.token_out, 1).map_err(|e| anyhow!("{e}"))?;
         Ok(t[0])
     }
 
@@ -4140,7 +3722,7 @@ impl Gemma4MoeWgpu {
     }
 
     pub fn read_logits(&self) -> Result<Vec<f32>> {
-        dispatch::read_back(self.ctx, &self.logits, self.vocab).map_err(|e| anyhow::anyhow!("{e}"))
+        dispatch::read_back(self.ctx, &self.logits, self.vocab).map_err(|e| anyhow!("{e}"))
     }
 
     pub fn max_seq(&self) -> usize {
@@ -4161,7 +3743,7 @@ impl Gemma4MoeWgpu {
         &mut self,
         pos: usize,
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             pos <= self.max_seq,
             "synthetic fill pos {pos} past max_seq {}; ring wrap and window start are pure functions of pos, so pos alone is the cache-depth state",
             self.max_seq
@@ -4193,18 +3775,18 @@ impl Gemma4MoeWgpu {
         weights: &S,
         max_seq: usize,
     ) -> Result<Self> {
-        let ctx = WgpuContext::shared().map_err(|e| anyhow::anyhow!("wgpu context: {e}"))?;
+        let ctx = WgpuContext::shared().map_err(|e| anyhow!("wgpu context: {e}"))?;
         let mut pf_m = prefill_m();
         if pf_m > max_seq {
             pf_m = 0;
         }
         if w4_resident_enabled() {
-            anyhow::ensure!(
+            ensure!(
                 pf_m == 0,
                 "{G4MOE_W4_RESIDENT_ENV}=1 sheds the bf16 operands the m-row prefill GEMMs \
                  read -- set NV_G4MOE_WGPU_PREFILL_M=0"
             );
-            anyhow::ensure!(
+            ensure!(
                 attn_i8_site_active_unset_env_qualifies_like_the_champion_defaults_so_non_grouped_and_tailfold_and_kvfp8_builds_keep_bf16_silently(ctx, "g4m-at-qkvproj")
                     && attn_i8_site_active_unset_env_qualifies_like_the_champion_defaults_so_non_grouped_and_tailfold_and_kvfp8_builds_keep_bf16_silently(ctx, "g4m-at-oproj"),
                 "{G4MOE_W4_RESIDENT_ENV}=1 sheds the stacked bf16 qkvw and the bf16 oproj \
@@ -4212,14 +3794,9 @@ impl Gemma4MoeWgpu {
                  default (and unset NV_G4MOE_TAILFOLD/NV_G4MOE_KV_FP8, which silently \
                  disarm the int8 sites)"
             );
-            anyhow::ensure!(
-                !rpfuse_active(ctx),
-                "{G4MOE_W4_RESIDENT_ENV}=1 has no w4 twin for the rpfuse down+router \
-                 dispatch -- set NV_G4MOE_RPFUSE=0"
-            );
         }
         let flash_sg = flash_sg_reduce_enabled();
-        anyhow::ensure!(
+        ensure!(
             !flash_sg || (ctx.caps.subgroup && ctx.subgroup_width() == Some(32)),
             "NV_G4MOE_FLASH_SG=1 replaces the flash stage1 LDS butterfly with a \
              subgroupShuffleXor chain over lanes 16/8/4/2/1, which is bit-identical only at \
@@ -4229,7 +3806,7 @@ impl Gemma4MoeWgpu {
         );
         let sacc_chunk = flash_sacc_chunk_head_dim_slice_staged_per_warp_read_once_at_build();
         let flash_fold = flash_gqa_fold_query_heads_per_workgroup_read_once_at_build();
-        anyhow::ensure!(
+        ensure!(
             flash_fold == 1 || (ctx.caps.subgroup && ctx.subgroup_width() == Some(32)),
             "NV_G4MOE_FLASH_FOLD={flash_fold} calls the stage1 row reduction once per folded \
              query head, which only pays with the subgroup chain; this adapter reports \
@@ -4245,36 +3822,6 @@ impl Gemma4MoeWgpu {
                 config.base.num_attention_heads,
                 config.base.num_kv_heads_for(LayerType::FullAttention),
             );
-        anyhow::ensure!(
-            !foldgate || (ctx.caps.subgroup && ctx.subgroup_width() == Some(32)),
-            "NV_G4MOE_FLASH_FOLDGATE=1 swaps in a fold-2 stage1 whose row reduction runs once per \
-             folded query head, which only pays with the subgroup chain; this adapter reports \
-             subgroup={} width={:?}",
-            ctx.caps.subgroup,
-            ctx.subgroup_width()
-        );
-        anyhow::ensure!(
-            !foldgate || !qkvfold_enabled(),
-            "NV_G4MOE_FLASH_FOLDGATE=1 swaps the plain bf16 flash1 pass; the qkvfold entry fuses \
-             the qkv norm into stage1 and has no fold-2 twin -- unset NV_G4MOE_QKVFOLD"
-        );
-        anyhow::ensure!(
-            !foldgate || !kv_fp8_enabled(),
-            "NV_G4MOE_FLASH_FOLDGATE=1 has no fp8 fold-2 stage1 entry -- unset NV_G4MOE_KV_FP8"
-        );
-        anyhow::ensure!(
-            !foldgate
-                || ctx.caps.workgroup_storage_fits(
-                    flash_workgroup_bytes_qsh512_sm8_sl8_plus_red256_only_when_wb_plus_sacc_8_warps_by_chunk(
-                        flash_sg,
-                        FOLDGATE_DEEP_SACC_128_KEEPS_THE_FOLDED_WORKGROUP_UNDER_A_THIRD_OF_48KB_SO_THREE_BLOCKS_PLACE_PER_SM_AND_IS_DIGIT_IDENTICAL_TO_SACC_512_ON_REAL_WEIGHTS,
-                        FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC,
-                    )
-                ),
-            "NV_G4MOE_FLASH_FOLDGATE=1: the fold-2 sacc-128 deep workgroup does not fit this \
-             device's workgroup storage of {} bytes",
-            ctx.caps.max_compute_workgroup_storage_size
-        );
         let full_splits = flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build();
         eprintln!(
             "[g4m-wgpu] flash stage1: reduce={} sacc slice {sacc_chunk} gqa fold full {flash_fold} \
@@ -4295,71 +3842,65 @@ impl Gemma4MoeWgpu {
         );
         let s = Sources::new(pf_m, flash_sg, sacc_chunk, flash_fold, foldgate);
         let base = &config.base;
-        let sliding_ring_rows: Option<usize> = if sliding_kv_ring_enabled() {
-            let rows = sliding_kv_ring_rows_window_plus_prefill_chunk_plus_headroom(
+        let ring_rows =
+            sliding_kv_ring_rows_window_plus_prefill_chunk_plus_headroom(base.sliding_window, pf_m);
+        let sliding_ring_rows: Option<usize> = if max_seq > ring_rows {
+            eprintln!(
+                "[g4m-wgpu] sliding kv ring: {ring_rows} rows/layer (window {} + chunk {} + headroom) instead of {max_seq}",
                 base.sliding_window,
-                pf_m,
+                pf_m.max(1)
             );
-            if max_seq > rows {
-                eprintln!(
-                    "[g4m-wgpu] sliding kv ring: {rows} rows/layer (window {} + chunk {} + headroom) instead of {max_seq}",
-                    base.sliding_window,
-                    pf_m.max(1)
-                );
-                Some(rows)
-            } else {
-                eprintln!(
-                    "[g4m-wgpu] sliding kv ring off: max_seq {max_seq} <= ring {rows}, full-depth rows are already smaller"
-                );
-                None
-            }
+            Some(ring_rows)
         } else {
+            eprintln!(
+                "[g4m-wgpu] sliding kv ring off: max_seq {max_seq} <= ring {ring_rows}, full-depth rows are already smaller"
+            );
             None
         };
-        let t_build = std::time::Instant::now();
+        let t_build = Instant::now();
         let mut quantize_s = 0f64;
 
-        anyhow::ensure!(max_seq > 0, "max_seq must be positive");
-        anyhow::ensure!(
+        ensure!(max_seq > 0, "max_seq must be positive");
+        ensure!(
             base.hidden_size.is_multiple_of(2 * W4_GS),
             "hidden_size {} must be a multiple of {}",
             base.hidden_size,
             2 * W4_GS
         );
-        anyhow::ensure!(
+        ensure!(
             config.moe_intermediate_size.is_multiple_of(2 * W4_GS),
             "moe_intermediate_size {} must be a multiple of {}",
             config.moe_intermediate_size,
             2 * W4_GS
         );
-        anyhow::ensure!(
+        ensure!(
             config.num_experts <= 256,
             "router top-k kernel caps num_experts at 256, got {}",
             config.num_experts
         );
-        anyhow::ensure!(
+        ensure!(
             config.top_k_experts <= MAX_TOPK,
             "top_k_experts {} exceeds {MAX_TOPK}",
             config.top_k_experts
         );
         for kind in [LayerType::SlidingAttention, LayerType::FullAttention] {
             let hd = base.head_dim_for(kind);
-            anyhow::ensure!(
+            ensure!(
                 hd.is_multiple_of(2) && hd <= MAX_HEAD_DIM,
                 "head_dim {hd} must be even and <= {MAX_HEAD_DIM}"
             );
             let n_kv = base.num_kv_heads_for(kind);
-            anyhow::ensure!(
+            ensure!(
                 base.num_attention_heads.is_multiple_of(n_kv),
                 "attention heads {} must be a multiple of kv heads {n_kv}",
                 base.num_attention_heads
             );
         }
-        anyhow::ensure!(
+        ensure!(
             base.hidden_size.is_multiple_of(2) && base.intermediate_size.is_multiple_of(2),
             "hidden/intermediate must be even"
         );
-        anyhow::ensure!(
+        ensure!(
             base.tie_word_embeddings,
             "gemma4-moe wgpu expects tied embeddings"
         );
@@ -4397,21 +3938,20 @@ impl Gemma4MoeWgpu {
 
         let tok_buf = b.upload_u32("g4m-tok", &[0u32]);
         let pos_buf = b.upload_u32("g4m-pos", &[0u32]);
-        let flash_fd: Option<(wgpu::Buffer, FlashDecodeParams)> =
-            flash_decode_enabled().then(|| {
-                let p = FlashDecodeParams {
-                    n_heads: base.num_attention_heads as u32,
-                    n_kv: base.num_kv_heads_for(LayerType::FullAttention) as u32,
-                    head_dim: base.head_dim_for(LayerType::FullAttention) as u32,
-                    splits: flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build(),
-                    total: 0,
-                    start: 0,
-                    ring: 0,
-                    scale: 1.0,
-                };
-                (b.uni("g4m-at-fl-p", p), p)
-            });
-        let flash_sl: Option<(wgpu::Buffer, FlashDecodeParams, u32)> = (flash_sliding_enabled()
+        let flash_fd: Option<(Buffer, FlashDecodeParams)> = flash_decode_enabled().then(|| {
+            let p = FlashDecodeParams {
+                n_heads: base.num_attention_heads as u32,
+                n_kv: base.num_kv_heads_for(LayerType::FullAttention) as u32,
+                head_dim: base.head_dim_for(LayerType::FullAttention) as u32,
+                splits: flash_splits_grid_y_scratch_rows_and_stage1_stride_read_once_at_build(),
+                total: 0,
+                start: 0,
+                ring: 0,
+                scale: 1.0,
+            };
+            (b.uni("g4m-at-fl-p", p), p)
+        });
+        let flash_sl: Option<(Buffer, FlashDecodeParams, u32)> = (flash_decode_enabled()
             && (0..base.num_hidden_layers)
                 .any(|i| base.layer_kind(i) == LayerType::SlidingAttention))
         .then(|| {
@@ -4434,17 +3974,17 @@ impl Gemma4MoeWgpu {
         let pf = (pf_m > 0).then(|| alloc_pf_scratch(&mut b, &config, max_seq, pf_m));
 
         let vf_rows: usize = if assist_flash_verify_enabled_the_verify_rows_ride_the_decode_flash_kernels_so_the_assistant_drafter_keeps_flash_decode() {
-            anyhow::ensure!(
+            ensure!(
                 pf_m > 0,
                 "{G4MOE_ASSIST_FLASH_VERIFY_ENV}=1 needs the m-row prefill graph; chunked \
                  prefill is disabled in this build"
             );
-            anyhow::ensure!(
+            ensure!(
                 flash_decode_enabled(),
                 "{G4MOE_ASSIST_FLASH_VERIFY_ENV}=1 with NV_G4MOE_FLASH_DECODE=0 has no flash \
                  decode stream for the verify rows to be consistent with; unset one of the two"
             );
-            anyhow::ensure!(
+            ensure!(
                 !kv_fp8_enabled() && !qkvfold_enabled(),
                 "{G4MOE_ASSIST_FLASH_VERIFY_ENV}=1 replays the plain bf16 flash decode kernels \
                  per verify row; NV_G4MOE_KV_FP8 and NV_G4MOE_QKVFOLD change the decode-stream \
@@ -4453,7 +3993,7 @@ impl Gemma4MoeWgpu {
             let align = ctx.device.limits().min_storage_buffer_offset_alignment as u64;
             for kind in [LayerType::SlidingAttention, LayerType::FullAttention] {
                 let row_bytes = (base.num_attention_heads * base.head_dim_for(kind) * 2) as u64;
-                anyhow::ensure!(
+                ensure!(
                     row_bytes.is_multiple_of(align.max(1)),
                     "{G4MOE_ASSIST_FLASH_VERIFY_ENV}=1 binds per-row q/attn views at byte \
                      offset row*{row_bytes}, which misses this device's \
@@ -4489,8 +4029,8 @@ impl Gemma4MoeWgpu {
         } else {
             "g4m-embed"
         };
-        type I8Chunk = Option<(wgpu::Buffer, wgpu::Buffer)>;
-        let mut embed_chunks: Vec<(wgpu::Buffer, usize, usize, I8Chunk)> = Vec::new();
+        type I8Chunk = Option<(Buffer, Buffer)>;
+        let mut embed_chunks: Vec<(Buffer, usize, usize, I8Chunk)> = Vec::new();
         let mut off = 0usize;
         while off < vocab {
             let rows = (chunk_rows.min(vocab - off)) & !1usize;
@@ -4500,7 +4040,7 @@ impl Gemma4MoeWgpu {
                 &pack_pairs(&embed[off * hidden..(off + rows) * hidden]),
             );
             let i8_chunk = lmhead_i8.map(|_| {
-                let t_q = std::time::Instant::now();
+                let t_q = Instant::now();
                 let q = quantize_i8_host(&embed[off * hidden..(off + rows) * hidden], rows, hidden);
                 quantize_s += t_q.elapsed().as_secs_f64();
                 (
@@ -4554,7 +4094,7 @@ impl Gemma4MoeWgpu {
             off += rows;
         }
         drop(embed);
-        anyhow::ensure!(
+        ensure!(
             !head_one_shard_enabled() || embed_chunks.len() == 1,
             "NV_G4MOE_HEAD_ONE_SHARD=1 must leave the {} B embed/lm-head table in ONE shard so \
              g4m-gather and g4m-lmhead are one dispatch each; it split into {} because this \
@@ -4591,56 +4131,29 @@ impl Gemma4MoeWgpu {
             b.to_prefill = false;
         }
 
-        let mut state_buffers: Vec<(wgpu::Buffer, u64)> = Vec::new();
+        let mut state_buffers: Vec<(Buffer, u64)> = Vec::new();
         let mut rope_cache: RopeTableCache = RopeTableCache::new();
 
         let grouped = grouped_gemv_active(ctx);
-        anyhow::ensure!(
+        ensure!(
             !grouped || hidden_words <= GROUPED_NORM_CHAIN_MAX_HIDDEN_WORDS_PN_BUF,
-            "NV_G4MOE_GROUPED_GEMV=1: the fused norm chain stages {hidden_words} hidden words \
+            "the grouped gemv's fused norm chain stages {hidden_words} hidden words \
              in a {GROUPED_NORM_CHAIN_MAX_HIDDEN_WORDS_PN_BUF}-word workgroup array"
         );
         let fold = fold_chain_enabled();
-        anyhow::ensure!(
+        ensure!(
             !fold || grouped,
-            "NV_G4MOE_FOLD_CHAIN=1 extends the grouped tailnorm entry; set NV_G4MOE_GROUPED_GEMV=1 too"
+            "NV_G4MOE_FOLD_CHAIN=1 extends the grouped tailnorm entry, and this adapter runs no \
+             grouped gemv (it needs subgroups of width 32)"
         );
-        let rpfuse = rpfuse_active(ctx);
+        let rpfuse = rpfuse_active_yields_to_every_arm_its_fused_down_has_no_twin_for(ctx);
         let topk_nx2 = topk_nx2_active(ctx, config.num_experts, config.top_k_experts);
-        anyhow::ensure!(
-            !rpfuse
-                || (grouped
-                    && rpnorm_active(ctx)
-                    && !router_chain_enabled()
-                    && !topk_fold_enabled()
-                    && ctx.caps.subgroup
-                    && ctx.subgroup_width() == Some(32)),
-            "NV_G4MOE_RPFUSE=1 rides the rpnorm router gemv on the mlp-down dispatch: it needs \
-             NV_G4MOE_GROUPED_GEMV=1 + NV_G4MOE_RPNORM=1, no router-chain/topk-fold, and its \
-             subgroupShuffleXor reductions need subgroup width 32"
-        );
-        anyhow::ensure!(
-            !topk_nx2 || rpfuse,
-            "NV_G4MOE_TOPK_NX2=1 needs the router logits written before the normx2 dispatch, \
-             which only NV_G4MOE_RPFUSE=1 provides"
-        );
-        anyhow::ensure!(
-            !topk_nx2
-                || router_topk_entry(config.num_experts, config.top_k_experts)
-                    == "g4m_router_topk_par",
-            "NV_G4MOE_TOPK_NX2=1 inlines the parallel-rank topk (tie rule \
-             {TOPK_PAR_TIE_RULE_HIGHER_LOGIT_OUTRANKS_AND_EQUAL_LOGITS_RANK_BY_LOWER_EXPERT_INDEX}) \
-             into the normx2 entry; {} experts / top-{} must route g4m_router_topk_par and \
-             NV_G4MOE_ROUTER_TOPK must not force serial",
-            config.num_experts,
-            config.top_k_experts
-        );
         let mut pending_tail: Option<TailFoldDeferredUntilNextLayersInputNormWeightIsUploaded> =
             None;
         let push_tail_normnext = |b: &mut Builder,
                                   pt: TailFoldDeferredUntilNextLayersInputNormWeightIsUploaded,
-                                  next_norm_w: &wgpu::Buffer,
-                                  normed_out: &wgpu::Buffer|
+                                  next_norm_w: &Buffer,
+                                  normed_out: &Buffer|
          -> Result<()> {
             let p = b.uni(
                 "g4m-pn-p",
@@ -4684,7 +4197,7 @@ impl Gemma4MoeWgpu {
         let mut tap_full_kv: Option<AssistantKvTap> = None;
 
         for li in 0..base.num_hidden_layers {
-            let t_layer = std::time::Instant::now();
+            let t_layer = Instant::now();
             let layer = host_layer_from_loader(&config, weights, li)?;
             quantize_s += t_layer.elapsed().as_secs_f64();
             let (r_in, r_out) = if li % 2 == 0 {
@@ -4817,7 +4330,7 @@ impl Gemma4MoeWgpu {
                 &layer,
                 &normed_mlp,
                 &dense_out,
-                rp_pre.as_ref().map(|p| (p, r_in as &wgpu::Buffer)),
+                rp_pre.as_ref().map(|p| (p, r_in as &Buffer)),
             )?;
             let h1 = b.zeros("g4m-h1", (hidden_words * 4) as u64);
             let post_ffw1_w = b.upload_u32("g4m-ln", &pack_pairs(&layer.post_ffw_ln_1));
@@ -5213,8 +4726,7 @@ impl Gemma4MoeWgpu {
         let head_start = b.passes.len();
         let logits_bf16 = b.zeros("g4m-logits-bf16", (vocab * 2) as u64);
         let gemv_i8_src = match lmhead_i8 {
-            Some("g4m_gemv_i8_v4") => compose(GEMV_I8_V4_WGSL),
-            Some(_) => compose(GEMV_I8_WGSL),
+            Some(_) => compose(GEMV_I8_V4_WGSL),
             None => String::new(),
         };
         let mut head_chunks: Vec<LmHeadChunk> = Vec::with_capacity(embed_chunks.len());
@@ -5437,13 +4949,13 @@ impl Gemma4MoeWgpu {
         let dense_gemv_wide = (wide_gemvs, narrow_gemvs);
 
         let verify_flash: Option<VerifyFlashState> = if vf_rows > 0 {
-            anyhow::ensure!(
+            ensure!(
                 verify.is_some(),
                 "{G4MOE_ASSIST_FLASH_VERIFY_ENV}=1 but this build has no verify epilogue \
                  (int8 lm_head, an attn-i8 site, or an odd hidden width); the arm would \
                  silently verify nothing"
             );
-            anyhow::ensure!(
+            ensure!(
                 !vf_subs.is_empty(),
                 "{G4MOE_ASSIST_FLASH_VERIFY_ENV}=1 but no attention layer decodes through \
                  flash; the substituted verify list would be the pm list under a new name"
@@ -5467,7 +4979,7 @@ impl Gemma4MoeWgpu {
                     continue;
                 }
                 let sub = subs.next().expect("peek proved a sub at this index");
-                anyhow::ensure!(
+                ensure!(
                     prefill_passes[i].label.starts_with("g4m-pf-attn")
                         && prefill_passes[i + 1].label.starts_with("g4m-pf-pack"),
                     "verify-flash substitution expected pm_attn+pack at {i}, found {} then {}",
@@ -5492,12 +5004,12 @@ impl Gemma4MoeWgpu {
                 }
                 i += 2;
             }
-            anyhow::ensure!(
+            ensure!(
                 subs.next().is_none(),
                 "a verify-flash substitution index never matched its pm_attn pass"
             );
             for r in 0..vf_rows {
-                anyhow::ensure!(
+                ensure!(
                     foldgate_deep_flash1_twins_by_row[r].is_empty()
                         || foldgate_deep_flash1_twins_by_row[r].len()
                             == full_flash1_idx_by_row[r].len(),
@@ -5507,7 +5019,7 @@ impl Gemma4MoeWgpu {
                     full_flash1_idx_by_row[r].len()
                 );
             }
-            anyhow::ensure!(
+            ensure!(
                 row_of_flash_pass.len() == passes.len(),
                 "every verify pass needs a row tag or the pad-row skip would drop the wrong pass"
             );
@@ -5611,7 +5123,7 @@ impl Gemma4MoeWgpu {
             dense_gemv_wide,
             assistant_taps,
         };
-        anyhow::ensure!(
+        ensure!(
             model.foldgate_alt_flash1.is_empty()
                 || model.foldgate_alt_flash1.len() == model.depthgate_flash1_passes.len(),
             "the foldgate built {} deep twins for {} full-attention flash1 passes; a mismatched \
@@ -5619,7 +5131,7 @@ impl Gemma4MoeWgpu {
             model.foldgate_alt_flash1.len(),
             model.depthgate_flash1_passes.len()
         );
-        let t_warm = std::time::Instant::now();
+        let t_warm = Instant::now();
         let warm_m = model.prefill_chunk_len();
         if warm_m > 0 && warm_m <= max_seq {
             model
@@ -5766,7 +5278,7 @@ impl Gemma4MoeWgpu {
             if let Some(sp) = full_splits {
                 p.splits = sp;
             }
-            self.ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
+            self.ctx.queue.write_buffer(buf, 0, bytes_of(&p));
         }
         if let Some((buf, base, window)) = &self.flash_sl {
             let mut p = *base;
@@ -5775,13 +5287,13 @@ impl Gemma4MoeWgpu {
             if let Some(sp) = depthgate_sliding_splits {
                 p.splits = sp;
             }
-            self.ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
+            self.ctx.queue.write_buffer(buf, 0, bytes_of(&p));
         }
     }
 
     fn step_inner(&mut self, token: u32, full: bool) -> Result<()> {
-        anyhow::ensure!((token as usize) < self.vocab, "token {token} out of vocab");
-        anyhow::ensure!(
+        ensure!((token as usize) < self.vocab, "token {token} out of vocab");
+        ensure!(
             self.pos < self.max_seq,
             "kv cache full at {} (max_seq {})",
             self.pos,
@@ -5789,10 +5301,10 @@ impl Gemma4MoeWgpu {
         );
         self.ctx
             .queue
-            .write_buffer(&self.tok_buf, 0, bytemuck::bytes_of(&(token as i32)));
+            .write_buffer(&self.tok_buf, 0, bytes_of(&(token as i32)));
         self.ctx
             .queue
-            .write_buffer(&self.pos_buf, 0, bytemuck::bytes_of(&(self.pos as i32)));
+            .write_buffer(&self.pos_buf, 0, bytes_of(&(self.pos as i32)));
         self.write_flash_total_uniform_mirroring_gemma4_wgpu_write_pos_uniforms();
 
         let need_scope = if full {
@@ -5801,11 +5313,7 @@ impl Gemma4MoeWgpu {
             !self.validated && !self.prefix_validated
         };
         let scope = if need_scope {
-            Some(
-                self.ctx
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-            )
+            Some(self.ctx.device.push_error_scope(ErrorFilter::Validation))
         } else {
             None
         };
@@ -5819,13 +5327,13 @@ impl Gemma4MoeWgpu {
             &self.passes[..self.head_start]
         };
         if dispatch::profile::enabled() && self.ctx.caps.timestamp_query {
-            let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = passes
+            let raw: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = passes
                 .iter()
                 .map(|p| (p.pipeline.as_ref(), &p.bind, p.grid))
                 .collect();
             let labels: Vec<String> = passes.iter().map(|p| p.label.clone()).collect();
             dispatch::submit_profiled_slices(self.ctx, &raw, &labels)
-                .map_err(|e| anyhow::anyhow!("profiled submit: {e}"))?;
+                .map_err(|e| anyhow!("profiled submit: {e}"))?;
         } else {
             let ready = match self.pending_cb.take() {
                 Some((k, cb)) if k == band_key => Some(cb),
@@ -5860,8 +5368,8 @@ impl Gemma4MoeWgpu {
             }
         }
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gemma4_moe_wgpu decode step validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gemma4_moe_wgpu decode step validation: {e}");
             }
             if full {
                 self.validated = true;
@@ -5894,37 +5402,35 @@ impl Gemma4MoeWgpu {
         let pos0 = self.pos;
         let hidden_words = self.config.base.hidden_size / 2;
         let Some(pf) = self.prefill.as_mut() else {
-            anyhow::bail!("chunked prefill is disabled on this graph");
+            bail!("chunked prefill is disabled on this graph");
         };
         let m = pf.m;
-        anyhow::ensure!(
+        ensure!(
             tokens.len() == m,
             "prefill_chunk wants exactly {m} tokens, got {}",
             tokens.len()
         );
-        anyhow::ensure!(
+        ensure!(
             (1..=m).contains(&live),
             "prefill live rows {live} out of 1..={m}"
         );
         for &t in tokens {
-            anyhow::ensure!((t as usize) < vocab, "token {t} out of vocab");
+            ensure!((t as usize) < vocab, "token {t} out of vocab");
         }
-        anyhow::ensure!(pos0 + m <= max_seq, "kv cache full at {pos0} + {m}");
+        ensure!(pos0 + m <= max_seq, "kv cache full at {pos0} + {m}");
 
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let poss: Vec<i32> = (0..m).map(|i| (pos0 + i) as i32).collect();
-        ctx.queue
-            .write_buffer(&pf.tok, 0, bytemuck::cast_slice(&ids));
-        ctx.queue
-            .write_buffer(&pf.pos, 0, bytemuck::cast_slice(&poss));
+        ctx.queue.write_buffer(&pf.tok, 0, cast_slice(&ids));
+        ctx.queue.write_buffer(&pf.pos, 0, cast_slice(&poss));
         let mut mask = vec![0u32; m.max(4)];
         for sp in splices {
-            anyhow::ensure!(
+            ensure!(
                 sp.rel_pos < live,
                 "embed-row splice at {} is past the {live} live rows",
                 sp.rel_pos
             );
-            anyhow::ensure!(
+            ensure!(
                 sp.row_words.len() == hidden_words,
                 "embed-row splice has {} words, want {hidden_words}",
                 sp.row_words.len()
@@ -5933,12 +5439,12 @@ impl Gemma4MoeWgpu {
             ctx.queue.write_buffer(
                 &pf.splice_rows,
                 (sp.rel_pos * hidden_words * 4) as u64,
-                bytemuck::cast_slice(sp.row_words),
+                cast_slice(sp.row_words),
             );
         }
         if !splices.is_empty() || pf.splice_mask_live {
             ctx.queue
-                .write_buffer(&pf.splice_mask, 0, bytemuck::cast_slice(&mask));
+                .write_buffer(&pf.splice_mask, 0, cast_slice(&mask));
         }
         pf.splice_mask_live = !splices.is_empty();
         Ok(())
@@ -5959,12 +5465,12 @@ impl Gemma4MoeWgpu {
         let scope = if pf.validated {
             None
         } else {
-            Some(ctx.device.push_error_scope(wgpu::ErrorFilter::Validation))
+            Some(ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         run_pass_list(ctx, &pf.passes)?;
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gemma4_moe_wgpu prefill chunk validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gemma4_moe_wgpu prefill chunk validation: {e}");
             }
             pf.validated = true;
         }
@@ -5974,7 +5480,7 @@ impl Gemma4MoeWgpu {
 
     pub fn prefill_chunk(&mut self, tokens: &[u32]) -> Result<()> {
         let m = self.prefill_chunk_len();
-        anyhow::ensure!(m > 0, "chunked prefill is disabled on this graph");
+        ensure!(m > 0, "chunked prefill is disabled on this graph");
         self.prefill_chunk_masked(tokens, m, &[])
     }
 
@@ -5983,7 +5489,7 @@ impl Gemma4MoeWgpu {
     }
 
     pub fn advance(&mut self, n: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.pos + n <= self.max_seq,
             "advance {n} past max_seq {} at {}",
             self.max_seq,
@@ -5994,7 +5500,7 @@ impl Gemma4MoeWgpu {
     }
 
     pub fn truncate_to(&mut self, pos: usize) -> Result<()> {
-        anyhow::ensure!(pos <= self.pos, "truncate_to {pos} beyond pos {}", self.pos);
+        ensure!(pos <= self.pos, "truncate_to {pos} beyond pos {}", self.pos);
         self.pos = pos;
         Ok(())
     }
@@ -6042,7 +5548,7 @@ impl Gemma4MoeWgpu {
                         vf.passes[*i].grid.1 = sp;
                     }
                 }
-                ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
+                ctx.queue.write_buffer(buf, 0, bytes_of(&p));
             }
             if let Some((buf, base)) = &vf.row_uniforms[r].sl {
                 let mut p = *base;
@@ -6059,7 +5565,7 @@ impl Gemma4MoeWgpu {
                         vf.passes[*i].grid.1 = sp;
                     }
                 }
-                ctx.queue.write_buffer(buf, 0, bytemuck::bytes_of(&p));
+                ctx.queue.write_buffer(buf, 0, bytes_of(&p));
             }
         }
     }
@@ -6069,7 +5575,7 @@ impl Gemma4MoeWgpu {
     }
 
     pub fn verify_chain(&mut self, batch: &[u32]) -> Result<Vec<u32>> {
-        anyhow::ensure!(
+        ensure!(
             self.verify_flash.is_some() || !flash_decode_enabled(),
             "verify_chain's m-row pm_attn rows argmax-mismatch the flash decode stream on real \
              weights at final_logit_softcapping near-ties, so the verify surface refuses the \
@@ -6078,14 +5584,14 @@ impl Gemma4MoeWgpu {
              kernels at its own total"
         );
         let rows = self.verify_max_rows();
-        anyhow::ensure!(
+        ensure!(
             rows > 0,
             "verify_chain needs the m-row prefill graph and the bf16 lm_head epilogue; the \
              2026-09-04 i8-dense defaults cap it to zero rows -- set NV_G4MOE_ATTN_I8=0 and \
              NV_G4MOE_LMHEAD_I8_QUALITY_UNGATED=0 for any spec/verify consumer"
         );
         let mb = batch.len();
-        anyhow::ensure!(
+        ensure!(
             (1..=rows).contains(&mb),
             "verify_chain batch {mb} out of 1..={rows}"
         );
@@ -6100,7 +5606,7 @@ impl Gemma4MoeWgpu {
             let scope = if vf.validated {
                 None
             } else {
-                Some(ctx.device.push_error_scope(wgpu::ErrorFilter::Validation))
+                Some(ctx.device.push_error_scope(ErrorFilter::Validation))
             };
             let pad_rows_trimmed: Vec<Pass>;
             let run: &[Pass] = if mb >= vf.rows {
@@ -6117,8 +5623,8 @@ impl Gemma4MoeWgpu {
             };
             run_pass_list(ctx, run)?;
             if let Some(scope) = scope {
-                if let Some(e) = pollster::block_on(scope.pop()) {
-                    anyhow::bail!("gemma4_moe_wgpu flash-verify chain validation: {e}");
+                if let Some(e) = block_on(scope.pop()) {
+                    bail!("gemma4_moe_wgpu flash-verify chain validation: {e}");
                 }
                 vf.validated = true;
             }
@@ -6130,12 +5636,12 @@ impl Gemma4MoeWgpu {
             let scope = if pf.validated {
                 None
             } else {
-                Some(ctx.device.push_error_scope(wgpu::ErrorFilter::Validation))
+                Some(ctx.device.push_error_scope(ErrorFilter::Validation))
             };
             run_pass_list(ctx, &pf.passes)?;
             if let Some(scope) = scope {
-                if let Some(e) = pollster::block_on(scope.pop()) {
-                    anyhow::bail!("gemma4_moe_wgpu verify chain prefill validation: {e}");
+                if let Some(e) = block_on(scope.pop()) {
+                    bail!("gemma4_moe_wgpu verify chain prefill validation: {e}");
                 }
                 pf.validated = true;
             }
@@ -6147,17 +5653,17 @@ impl Gemma4MoeWgpu {
         let scope = if vs.validated {
             None
         } else {
-            Some(ctx.device.push_error_scope(wgpu::ErrorFilter::Validation))
+            Some(ctx.device.push_error_scope(ErrorFilter::Validation))
         };
         run_pass_list(ctx, &vs.passes)?;
         if let Some(scope) = scope {
-            if let Some(e) = pollster::block_on(scope.pop()) {
-                anyhow::bail!("gemma4_moe_wgpu verify chain epilogue validation: {e}");
+            if let Some(e) = block_on(scope.pop()) {
+                bail!("gemma4_moe_wgpu verify chain epilogue validation: {e}");
             }
             vs.validated = true;
         }
         let toks: Vec<u32> = dispatch::read_back(ctx, &vs.tokens, rows)
-            .map_err(|e| anyhow::anyhow!("verify tokens read back: {e}"))?;
+            .map_err(|e| anyhow!("verify tokens read back: {e}"))?;
         Ok(toks[..mb].to_vec())
     }
 
@@ -6165,10 +5671,10 @@ impl Gemma4MoeWgpu {
         let vs = self
             .verify
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("verify epilogue disabled"))?;
-        anyhow::ensure!(row < vs.rows, "verify row {row} out of 0..{}", vs.rows);
+            .ok_or_else(|| anyhow!("verify epilogue disabled"))?;
+        ensure!(row < vs.rows, "verify row {row} out of 0..{}", vs.rows);
         let all: Vec<f32> = dispatch::read_back(self.ctx, &vs.logits, vs.rows * self.vocab)
-            .map_err(|e| anyhow::anyhow!("verify logits read back: {e}"))?;
+            .map_err(|e| anyhow!("verify logits read back: {e}"))?;
         Ok(all[row * self.vocab..(row + 1) * self.vocab].to_vec())
     }
 
@@ -6187,7 +5693,7 @@ impl Gemma4MoeWgpu {
             LayerType::FullAttention => self.assistant_taps.full.as_ref(),
         };
         let tap = tap.context("assistant kv tap missing for this layer kind")?;
-        anyhow::ensure!(
+        ensure!(
             !tap.fp8,
             "assistant kv tap reads the bf16 cache layout; NV_G4MOE_KV_FP8=1 stores e4m3 bytes \
              plus scales -- unset it for assistant drafting"
@@ -6207,15 +5713,15 @@ impl Gemma4MoeWgpu {
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let tap = self.assistant_kv_tap(kind)?;
         let g = tap.geom;
-        anyhow::ensure!(len > 0, "empty assistant kv row read");
-        anyhow::ensure!(
+        ensure!(len > 0, "empty assistant kv row read");
+        ensure!(
             start + len <= self.pos,
             "assistant kv rows {start}+{len} beyond committed {}",
             self.pos
         );
         if g.ring {
             let pad = self.prefill_chunk_len();
-            anyhow::ensure!(
+            ensure!(
                 start + g.cache_rows >= self.pos + pad,
                 "{ASSISTANT_RING_PAD_CLOBBER_SLOTS_ARE_THE_PREFILL_M_ROWS_VERIFY_PADS_PAST_THE_COMMITTED_POS}: \
                  start {start} with ring {} pad {pad} cannot serve committed {}",
@@ -6246,7 +5752,7 @@ impl Gemma4MoeWgpu {
                         slot * words_per_row,
                         span * words_per_row,
                     )
-                    .map_err(|e| anyhow::anyhow!("assistant kv read back: {e}"))?,
+                    .map_err(|e| anyhow!("assistant kv read back: {e}"))?,
                 );
             }
             i += span;
@@ -6265,7 +5771,7 @@ impl Gemma4MoeWgpu {
             &self.assistant_taps.decode_prenorm_hidden,
             self.config.base.hidden_size / 2,
         )
-        .map_err(|e| anyhow::anyhow!("decode prenorm hidden read back: {e}"))?;
+        .map_err(|e| anyhow!("decode prenorm hidden read back: {e}"))?;
         Ok(unpack_bf16_pairs_to_f32(&words))
     }
 
@@ -6274,7 +5780,7 @@ impl Gemma4MoeWgpu {
         row: usize,
     ) -> Result<Vec<f32>> {
         let rows = self.verify_max_rows().min(self.prefill_chunk_len());
-        anyhow::ensure!(
+        ensure!(
             row < rows,
             "verify prenorm hidden row {row} out of 0..{rows}"
         );
@@ -6286,7 +5792,7 @@ impl Gemma4MoeWgpu {
         let hidden_words = self.config.base.hidden_size / 2;
         let words: Vec<u32> =
             dispatch::read_back_at(self.ctx, buf, row * hidden_words, hidden_words)
-                .map_err(|e| anyhow::anyhow!("verify prenorm hidden read back: {e}"))?;
+                .map_err(|e| anyhow!("verify prenorm hidden read back: {e}"))?;
         Ok(unpack_bf16_pairs_to_f32(&words))
     }
 
@@ -6296,26 +5802,25 @@ impl Gemma4MoeWgpu {
         splices: &[EmbedRowSplice],
     ) -> Result<usize> {
         let m = self.prefill_chunk_len();
-        anyhow::ensure!(
+        ensure!(
             m >= 2,
             "embed-row splice prefill requires the m-row prefill graph (NV_G4MOE_WGPU_PREFILL_M >= 2)"
         );
         let hidden = self.config.base.hidden_size;
-        let hidden_words = hidden / 2;
         let mut prev_end = 0usize;
         let mut packed: Vec<Vec<u32>> = Vec::with_capacity(splices.len());
         for sp in splices {
-            anyhow::ensure!(
+            ensure!(
                 !sp.rows_bf16.is_empty() && sp.rows_bf16.len().is_multiple_of(hidden),
                 "embed-row splice rows_bf16 len {} is not a positive multiple of hidden {hidden}",
                 sp.rows_bf16.len()
             );
             let n_slots = sp.rows_bf16.len() / hidden;
-            anyhow::ensure!(
+            ensure!(
                 sp.position >= prev_end,
                 "embed-row splices must be sorted and non-overlapping"
             );
-            anyhow::ensure!(
+            ensure!(
                 sp.position + n_slots <= tokens.len(),
                 "embed-row splice at {} with {n_slots} rows exceeds {} tokens",
                 sp.position,
@@ -6327,29 +5832,13 @@ impl Gemma4MoeWgpu {
         let mut done = 0usize;
         while done < tokens.len() {
             let live = m.min(tokens.len() - done);
-            anyhow::ensure!(
+            ensure!(
                 self.pos + m <= self.max_seq,
                 "kv cache full at {} + {m} (max_seq {})",
                 self.pos,
                 self.max_seq
             );
-            let mut chunk: Vec<u32> = tokens[done..done + live].to_vec();
-            let pad = *chunk.last().expect("non-empty chunk");
-            chunk.resize(m, pad);
-            let chunk_end = done + live;
-            let mut rows: Vec<ChunkRowSplice> = Vec::new();
-            for (si, sp) in splices.iter().enumerate() {
-                let n_slots = sp.rows_bf16.len() / hidden;
-                let lo = sp.position.max(done);
-                let hi = (sp.position + n_slots).min(chunk_end);
-                for abs in lo..hi {
-                    let w0 = (abs - sp.position) * hidden_words;
-                    rows.push(ChunkRowSplice {
-                        rel_pos: abs - done,
-                        row_words: &packed[si][w0..w0 + hidden_words],
-                    });
-                }
-            }
+            let (chunk, rows) = spliced_chunk(tokens, splices, &packed, hidden, m, done, live);
             self.prefill_chunk_masked(&chunk, live, &rows)?;
             done += live;
         }
@@ -6370,7 +5859,7 @@ impl Gemma4MoeWgpu {
     }
 
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<u32> {
-        anyhow::ensure!(!tokens.is_empty(), "prefill needs at least one token");
+        ensure!(!tokens.is_empty(), "prefill needs at least one token");
         let (last, rest) = tokens.split_last().expect("non-empty");
         for t in rest {
             self.prefill_step(*t)?;
@@ -6381,13 +5870,13 @@ impl Gemma4MoeWgpu {
 
 fn run_pass_list(ctx: &'static WgpuContext, passes: &[Pass]) -> Result<()> {
     if dispatch::profile::enabled() && ctx.caps.timestamp_query {
-        let raw: Vec<(&wgpu::ComputePipeline, &wgpu::BindGroup, (u32, u32, u32))> = passes
+        let raw: Vec<(&ComputePipeline, &BindGroup, (u32, u32, u32))> = passes
             .iter()
             .map(|p| (p.pipeline.as_ref(), &p.bind, p.grid))
             .collect();
         let labels: Vec<String> = passes.iter().map(|p| p.label.clone()).collect();
         dispatch::submit_profiled_slices(ctx, &raw, &labels)
-            .map_err(|e| anyhow::anyhow!("profiled submit: {e}"))?;
+            .map_err(|e| anyhow!("profiled submit: {e}"))?;
         return Ok(());
     }
     dispatch::submit_pass_list(
@@ -6424,7 +5913,7 @@ const EMBED_SHARD_CEILING_BYTES: u64 =
     EMBED_SHARD_CEILING_BYTES_IS_A_HARD_1_GIB_NOT_A_DEVICE_LIMIT_AND_SPLITS_A_1_476_GB_TABLE_IN_TWO;
 
 fn row_chunk(ctx: &WgpuContext, hidden: usize) -> usize {
-    if let Some(rows) = std::env::var("NV_G4MOE_ROW_CHUNK")
+    if let Some(rows) = env::var("NV_G4MOE_ROW_CHUNK")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v >= 2)
@@ -6444,15 +5933,15 @@ fn row_chunk(ctx: &WgpuContext, hidden: usize) -> usize {
     ((limit / per_row) as usize).max(2) & !1usize
 }
 
-type RopeTableCache = std::collections::HashMap<(usize, u32, u32), (wgpu::Buffer, wgpu::Buffer)>;
+type RopeTableCache = std::collections::HashMap<(usize, u32, u32), (Buffer, Buffer)>;
 
 struct TailFoldDeferredUntilNextLayersInputNormWeightIsUploaded {
-    moe_out: wgpu::Buffer,
-    post_ffw2_w: wgpu::Buffer,
-    r_out: wgpu::Buffer,
-    r_in: wgpu::Buffer,
-    post_ffw_w: wgpu::Buffer,
-    h1: wgpu::Buffer,
+    moe_out: Buffer,
+    post_ffw2_w: Buffer,
+    r_out: Buffer,
+    r_in: Buffer,
+    post_ffw_w: Buffer,
+    h1: Buffer,
     layer_scalar: f32,
 }
 
@@ -6461,17 +5950,17 @@ struct AttnGpu {
     wk: Bf16Gpu,
     wv: Option<Bf16Gpu>,
     wo: Bf16Gpu,
-    cosb: wgpu::Buffer,
-    sinb: wgpu::Buffer,
-    qn: wgpu::Buffer,
-    kn: wgpu::Buffer,
-    vn: wgpu::Buffer,
-    kc: wgpu::Buffer,
-    vc: wgpu::Buffer,
-    kv_scales: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    cosb: Buffer,
+    sinb: Buffer,
+    qn: Buffer,
+    kn: Buffer,
+    vn: Buffer,
+    kc: Buffer,
+    vc: Buffer,
+    kv_scales: Option<(Buffer, Buffer)>,
     kind: LayerType,
     flash_scratch_shared_with_verify_rows_because_stage1_and_stage2_serialize_within_a_submission:
-        Option<wgpu::Buffer>,
+        Option<Buffer>,
     hd: usize,
     n_q: usize,
     n_kv: usize,
@@ -6487,22 +5976,22 @@ struct MlpGpu {
 }
 
 struct MoeGpu {
-    ones_w: wgpu::Buffer,
-    rsw: wgpu::Buffer,
+    ones_w: Buffer,
+    rsw: Buffer,
     router: Bf16Gpu,
-    pes: wgpu::Buffer,
+    pes: Buffer,
     eg: ExpertGpu,
     eu: ExpertGpu,
     ed: ExpertGpu,
 }
 
 struct RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv {
-    rsw: wgpu::Buffer,
+    rsw: Buffer,
     router: Bf16Gpu,
-    pes: wgpu::Buffer,
-    rlogits: wgpu::Buffer,
-    ids: wgpu::Buffer,
-    wts: wgpu::Buffer,
+    pes: Buffer,
+    rlogits: Buffer,
+    ids: Buffer,
+    wts: Buffer,
 }
 
 fn upload_router_pre(
@@ -6525,25 +6014,20 @@ fn push_gemv_bf16_down_rpnorm(
     s: &Sources,
     cfg: &Gemma4MoeConfig,
     wd: &Bf16Gpu,
-    x: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x: &Buffer,
+    y: &Buffer,
     pre: &RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv,
-    x_router: &wgpu::Buffer,
+    x_router: &Buffer,
 ) -> Result<()> {
     let hidden = cfg.base.hidden_size;
     let hidden_words = hidden / 2;
     let eps = cfg.base.rms_norm_eps as f32;
     let n_e = cfg.num_experts;
-    anyhow::ensure!(
-        !bf16_r8_enabled() && !bf16_acc4_enabled(),
-        "NV_G4MOE_RPFUSE=1 copies the sglat mlp-down body verbatim; the r8/acc4 down \
-         entries have no fused twin"
-    );
     let wide = b.wide_flag("g4m-mlp-down", GemvLoad::Wide, wd.k, 0, &wd.w, x);
     let dn_grid = b.grid1(wd.n.div_ceil(2) as u64, 1);
-    anyhow::ensure!(
+    ensure!(
         dn_grid.1 == 1 && dn_grid.2 == 1,
-        "NV_G4MOE_RPFUSE=1 appends the router workgroups on grid x, so the down grid must \
+        "the rpfuse down dispatch appends the router workgroups on grid x, so the down grid must \
          stay one-dimensional; got {dn_grid:?}"
     );
     let rp_groups = n_e.div_ceil(2) as u32;
@@ -6598,24 +6082,23 @@ fn push_gemv_bf16_down_rpnorm(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_attn(
     b: &mut Builder,
     s: &Sources,
     cfg: &Gemma4MoeConfig,
     layer: &HostLayer,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
-    pos_buf: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
+    pos_buf: &Buffer,
     max_seq: usize,
     sliding_ring_rows: Option<usize>,
-    flash_fd: Option<&wgpu::Buffer>,
-    flash_sl: Option<&wgpu::Buffer>,
+    flash_fd: Option<&Buffer>,
+    flash_sl: Option<&Buffer>,
     rope_tables_shared_across_layers_because_per_layer_copies_cost_gib_at_196k: &mut RopeTableCache,
-    states: &mut Vec<(wgpu::Buffer, u64)>,
+    states: &mut Vec<(Buffer, u64)>,
     tail_fold: Option<(
         &TailFoldDeferredUntilNextLayersInputNormWeightIsUploaded,
-        &wgpu::Buffer,
+        &Buffer,
     )>,
 ) -> Result<AttnGpu> {
     let base = &cfg.base;
@@ -6633,7 +6116,7 @@ fn build_attn(
 
     let fp8 = kv_fp8_enabled();
     let grouped_attn = grouped_gemv_active(b.ctx) && !fp8;
-    anyhow::ensure!(
+    ensure!(
         tail_fold.is_none() || grouped_attn,
         "NV_G4MOE_TAILFOLD=1 folds the deferred tailnorm into the grouped qkvproj gemv; \
          dropping the bundle on the non-grouped path would skip the tailnorm entirely"
@@ -6641,12 +6124,12 @@ fn build_attn(
     let attn_i8_qkv = attn_i8_site_active_unset_env_qualifies_like_the_champion_defaults_so_non_grouped_and_tailfold_and_kvfp8_builds_keep_bf16_silently(b.ctx, "g4m-at-qkvproj");
     let attn_i8_o = attn_i8_site_active_unset_env_qualifies_like_the_champion_defaults_so_non_grouped_and_tailfold_and_kvfp8_builds_keep_bf16_silently(b.ctx, "g4m-at-oproj");
     let attn_i8 = attn_i8_qkv || attn_i8_o;
-    anyhow::ensure!(
+    ensure!(
         !attn_i8 || grouped_attn,
         "NV_G4MOE_ATTN_I8=1 quantizes the stacked qkvproj and the oproj decode gemvs; the \
-         non-grouped q/k/v split path has no int8 route -- set NV_G4MOE_GROUPED_GEMV=1"
+         non-grouped q/k/v split path has no int8 route"
     );
-    anyhow::ensure!(
+    ensure!(
         tail_fold.is_none() || !attn_i8,
         "NV_G4MOE_ATTN_I8=1 has no int8 tailfold qkvproj entry and NV_G4MOE_TAILFOLD is a \
          banked negative -- unset one of the two"
@@ -6718,18 +6201,10 @@ fn build_attn(
     let ring = ring_rows.map(|r| r as u32).unwrap_or(0);
     let cache_rows = ring_rows.unwrap_or(max_seq);
     let fold_kv = fold_chain_enabled() && grouped_attn;
-    let use_flash = match kind {
-        LayerType::FullAttention => flash_decode_enabled(),
-        LayerType::SlidingAttention => flash_sliding_enabled(),
-    };
+    let use_flash = flash_decode_enabled();
     let qkvfold = qkvfold_enabled() && fold_kv && use_flash;
-    let mut caches_written_by_the_fused_qkvnorm: Option<(wgpu::Buffer, wgpu::Buffer)> = None;
-    let mut qkvnorm_deferred_into_flash_stage1: Option<(
-        wgpu::Buffer,
-        wgpu::Buffer,
-        wgpu::Buffer,
-        wgpu::Buffer,
-    )> = None;
+    let mut caches_written_by_the_fused_qkvnorm: Option<(Buffer, Buffer)> = None;
+    let mut qkvnorm_deferred_into_flash_stage1: Option<(Buffer, Buffer, Buffer, Buffer)> = None;
 
     let (q, k, v) = if grouped_attn {
         let has_v = wv.is_some();
@@ -6768,7 +6243,7 @@ fn build_attn(
         match tail_fold {
             Some((pt, next_w)) => {
                 let wide = b.wide_flag("g4m-at-qkvproj", GemvLoad::Wide, wqkv.k, 0, &wqkv.w, x);
-                anyhow::ensure!(
+                ensure!(
                     wide == 1,
                     "NV_G4MOE_TAILFOLD=1 stages the folded normnext vector for the vec4 wide \
                      dot, so the qkvproj gemv must qualify for wide loads"
@@ -6915,9 +6390,9 @@ fn build_attn(
     };
 
     let norm_rope = |label: &str,
-                     src: &wgpu::Buffer,
-                     w: &wgpu::Buffer,
-                     dst: &wgpu::Buffer,
+                     src: &Buffer,
+                     w: &Buffer,
+                     dst: &Buffer,
                      rows: usize,
                      rope: bool,
                      b: &mut Builder|
@@ -6959,7 +6434,7 @@ fn build_attn(
     let (kc, vc, kv_scales) = if let Some((kc, vc)) = caches_written_by_the_fused_qkvnorm.take() {
         (kc, vc, None)
     } else if fp8 {
-        anyhow::ensure!(
+        ensure!(
             hd.is_multiple_of(4),
             "NV_G4MOE_KV_FP8=1: quantize_kv_fp8 packs 4 e4m3 bytes per u32 word, so head_dim \
              must be a multiple of 4; got {hd}"
@@ -7063,7 +6538,7 @@ fn build_attn(
         ""
     };
     let attn_bf16 = b.zeros("g4m-at-obf16", (n_q * hd * 2) as u64);
-    let mut flash_scratch_for_verify: Option<wgpu::Buffer> = None;
+    let mut flash_scratch_for_verify: Option<Buffer> = None;
     if use_flash {
         let fp = match kind {
             LayerType::FullAttention => flash_fd.expect(
@@ -7071,16 +6546,16 @@ fn build_attn(
                  shared flash uniform; the gate must be read once, before the layer loop",
             ),
             LayerType::SlidingAttention => flash_sl.expect(
-                "flash_sliding_enabled() was true for this layer but from_loader allocated no \
+                "flash_decode_enabled() was true for this sliding layer but from_loader allocated no \
                  sliding flash uniform; the gate must be read once, before the layer loop",
             ),
         };
-        anyhow::ensure!(
+        ensure!(
             hd.is_multiple_of(2) && hd <= MAX_HEAD_DIM,
             "flash stage1 guards every 32-lane strip with d < head_dim and stage2 packs \
              bf16 pairs, so head_dim must be even and <= {MAX_HEAD_DIM}, got {hd}"
         );
-        anyhow::ensure!(
+        ensure!(
             kind == LayerType::SlidingAttention || (window == 0 && ring == 0),
             "the shared flash uniform carries start=0 and ring=0, which is only correct for \
              full-attention layers (window {window}, ring {ring})"
@@ -7091,7 +6566,7 @@ fn build_attn(
                 flash_sacc_chunk_head_dim_slice_staged_per_warp_read_once_at_build(),
                 flash_gqa_fold_query_heads_per_workgroup_read_once_at_build(),
             );
-        anyhow::ensure!(
+        ensure!(
             b.ctx.caps.max_compute_invocations_per_workgroup >= 256
                 && b.ctx.caps.max_compute_workgroup_size_x >= 256
                 && b.ctx.caps.workgroup_storage_fits(flash_wg_bytes),
@@ -7140,7 +6615,7 @@ fn build_attn(
             }
         }
         if let Some((qkv_raw_b, wcat_b, nr_p, kvp)) = &qkvnorm_deferred_into_flash_stage1 {
-            anyhow::ensure!(
+            ensure!(
                 b.ctx.caps.workgroup_storage_fits(
                     FLASH_QKVFOLD_WORKGROUP_BYTES_ADDS_BUF512_KCUR256_VCUR256_U32
                 ),
@@ -7168,7 +6643,7 @@ fn build_attn(
                 (n_q as u32, splits, 1),
             )?;
         } else {
-            let mut flash1_binds: Vec<(u32, &wgpu::Buffer)> =
+            let mut flash1_binds: Vec<(u32, &Buffer)> =
                 vec![(0, &q), (1, &kc), (2, &vc), (3, &scratch), (6, fp)];
             let fold =
                 flash_gqa_fold_for_layer_kind_only_full_attention_scans_enough_rows_to_amortise_a_halved_grid(
@@ -7206,18 +6681,6 @@ fn build_attn(
                 if let Some((fg_src, fg_entry)) = &s.flash_foldgate_deep_source_and_entry {
                     let fg_fold =
                         FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC;
-                    anyhow::ensure!(
-                        kv_scales.is_none(),
-                        "NV_G4MOE_FLASH_FOLDGATE=1 has no fp8 fold-2 stage1 entry; unset it or \
-                         NV_G4MOE_KV_FP8. {}",
-                        FOLDGATE_SWAPS_ONLY_FULL_ATTENTION_BECAUSE_SPELLING_THE_FOLD_THROUGH_THE_SHARED_DEPTHGATE_SPLITS_ENV_TAXES_SLIDING
-                    );
-                    anyhow::ensure!(
-                        flash_gqa_fold_fits_this_layer(fg_fold, n_q, n_kv),
-                        "NV_G4MOE_FLASH_FOLDGATE=1 folds {fg_fold} query heads of one KV group \
-                         per workgroup but this full-attention layer has n_q {n_q} / n_kv {n_kv}, \
-                         which the fold does not divide -- unset the env"
-                    );
                     let alt = b.built_pass(
                         &format!("g4m-at-flash1{kind_suffix}-deep"),
                         fg_src,
@@ -7257,7 +6720,7 @@ fn build_attn(
                 scale: 1.0,
             },
         );
-        let mut decode_binds: Vec<(u32, &wgpu::Buffer)> = vec![
+        let mut decode_binds: Vec<(u32, &Buffer)> = vec![
             (20, &q),
             (21, &kc),
             (22, &vc),
@@ -7331,14 +6794,13 @@ fn build_attn(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_attn_prefill(
     b: &mut Builder,
     s: &Sources,
     a: &AttnGpu,
     sc: &PfScratch,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
     max_seq: usize,
     vf_row_uniforms: &[VfRowUniforms],
 ) -> Result<()> {
@@ -7392,9 +6854,9 @@ fn build_attn_prefill(
     };
 
     let norm_rope = |label: &str,
-                     src: &wgpu::Buffer,
-                     w: &wgpu::Buffer,
-                     dst: &wgpu::Buffer,
+                     src: &Buffer,
+                     w: &Buffer,
+                     dst: &Buffer,
                      rows: usize,
                      rope: bool,
                      b: &mut Builder|
@@ -7508,7 +6970,7 @@ fn build_attn_prefill(
             ..Default::default()
         },
     );
-    let mut pf_attn_binds: Vec<(u32, &wgpu::Buffer)> = vec![
+    let mut pf_attn_binds: Vec<(u32, &Buffer)> = vec![
         (50, &sc.q),
         (51, &a.kc),
         (52, &a.vc),
@@ -7551,12 +7013,8 @@ fn build_attn_prefill(
         grid,
     )?;
 
-    let vf_kind_uses_flash = match a.kind {
-        LayerType::FullAttention => flash_decode_enabled(),
-        LayerType::SlidingAttention => flash_sliding_enabled(),
-    };
-    if !vf_row_uniforms.is_empty() && vf_kind_uses_flash {
-        anyhow::ensure!(
+    if !vf_row_uniforms.is_empty() && flash_decode_enabled() {
+        ensure!(
             a.kv_scales.is_none(),
             "{G4MOE_ASSIST_FLASH_VERIFY_ENV}=1 was refused at build entry for NV_G4MOE_KV_FP8, \
              so an fp8 layer reaching the verify-row flash build is a wiring bug"
@@ -7608,7 +7066,7 @@ fn build_attn_prefill(
                 LayerType::SlidingAttention => {
                     &u.sl
                         .as_ref()
-                        .expect("flash_sliding_enabled() held for this layer, so every verify row carries a sliding uniform")
+                        .expect("flash_decode_enabled() held for this sliding layer, so every verify row carries a sliding uniform")
                         .0
                 }
             };
@@ -7637,7 +7095,7 @@ fn build_attn_prefill(
                 if let Some((fg_src, fg_entry)) = &s.flash_foldgate_deep_source_and_entry {
                     let fg_fold =
                         FOLDGATE_DEEP_FOLD_2_QUERY_HEADS_PER_WORKGROUP_HALVES_FULL_ATTENTION_KV_TRAFFIC;
-                    anyhow::ensure!(
+                    ensure!(
                         flash_gqa_fold_fits_this_layer(fg_fold, n_q, n_kv),
                         "the foldgate deep twin folds {fg_fold} query heads per workgroup but \
                          this full-attention layer has n_q {n_q} / n_kv {n_kv}; the decode \
@@ -7691,11 +7149,11 @@ fn build_mlp(
     s: &Sources,
     cfg: &Gemma4MoeConfig,
     layer: &HostLayer,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
     rp: Option<(
         &RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv,
-        &wgpu::Buffer,
+        &Buffer,
     )>,
 ) -> Result<MlpGpu> {
     let inter = cfg.base.intermediate_size;
@@ -7704,18 +7162,13 @@ fn build_mlp(
     let wd = upload_bf16_unless_w4_resident_sheds_it_prefill_and_bf16_decode_consumers_are_fenced_off_by_the_from_loader_ensures(b, "g4m-mlp-dw", &layer.mlp_down);
     let act = b.zeros("g4m-mlp-act", (inter * 2) as u64);
     if w4_resident_enabled() {
-        anyhow::ensure!(
+        ensure!(
             !mlp_i8_enabled(),
             "{G4MOE_W4_RESIDENT_ENV}=1 and {G4MOE_MLP_I8_ENV}=1 both claim the dense mlp \
              decode gemvs -- arm exactly one"
         );
-        anyhow::ensure!(
-            rp.is_none(),
-            "{G4MOE_W4_RESIDENT_ENV}=1 has no w4 twin for the rpfuse down+router dispatch \
-             -- set NV_G4MOE_RPFUSE=0"
-        );
         let hidden = cfg.base.hidden_size;
-        anyhow::ensure!(
+        ensure!(
             hidden.is_multiple_of(2 * W4_GS) && inter.is_multiple_of(2 * W4_GS),
             "w4-resident dense mlp needs hidden ({hidden}) and intermediate ({inter}) \
              multiples of {}",
@@ -7750,7 +7203,7 @@ fn build_mlp(
     }
     if mlp_i8_enabled() {
         let hidden = cfg.base.hidden_size;
-        anyhow::ensure!(
+        ensure!(
             hidden.is_multiple_of(16) && inter.is_multiple_of(16),
             "i8 dense mlp needs hidden ({hidden}) and intermediate ({inter}) multiples \
              of 16, one vec4 of int8 elems per k-word"
@@ -7825,8 +7278,8 @@ fn build_mlp_prefill(
     s: &Sources,
     mlp: &MlpGpu,
     sc: &PfScratch,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    x: &Buffer,
+    out: &Buffer,
 ) -> Result<()> {
     let m = sc.m;
     let inter = mlp.wg.n;
@@ -7890,15 +7343,14 @@ fn build_mlp_prefill(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_moe(
     b: &mut Builder,
     s: &Sources,
     cfg: &Gemma4MoeConfig,
     layer: &HostLayer,
-    x_router: &wgpu::Buffer,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    x_router: &Buffer,
+    x: &Buffer,
+    out: &Buffer,
     pre: Option<&RouterPreUploadedBeforeTheMlpSoTheDownDispatchCanCarryTheRouterGemv>,
     topk_prefused: bool,
 ) -> Result<MoeGpu> {
@@ -7909,7 +7361,7 @@ fn build_moe(
     let k_top = cfg.top_k_experts;
     let eps = cfg.base.rms_norm_eps as f32;
 
-    anyhow::ensure!(
+    ensure!(
         hidden.is_multiple_of(2 * W4_GS) && inter.is_multiple_of(2 * W4_GS),
         "w4 expert kernel needs hidden ({hidden}) and moe inter ({inter}) multiples of {}",
         2 * W4_GS
@@ -7918,15 +7370,10 @@ fn build_moe(
     let grouped = grouped_gemv_active(b.ctx);
     let chain = router_chain_enabled();
     let rpnorm = rpnorm_active(b.ctx);
-    anyhow::ensure!(
-        !rpnorm || (grouped && !chain && hidden_words <= 2048),
-        "NV_G4MOE_RPNORM=1 replays the grouped norm-mul inside every rproj workgroup and \
+    ensure!(
+        !rpnorm || hidden_words <= 2048,
+        "rpnorm replays the grouped norm-mul inside every rproj workgroup and \
          stages {hidden_words} hidden words in a 2048-word workgroup array"
-    );
-    anyhow::ensure!(
-        pre.is_none() || (grouped && rpnorm && !chain),
-        "the pre-uploaded router bundle exists only for the NV_G4MOE_RPFUSE shape \
-         (grouped + rpnorm, no router-chain)"
     );
     let ones: Vec<u16> = vec![bf16_bits(1.0); hidden];
     let ones_w = b.upload_u32("g4m-moe-ones", &pack_pairs(&ones));
@@ -7936,7 +7383,7 @@ fn build_moe(
         None => b.upload_u32("g4m-moe-rscale", &pack_pairs(&layer.router_scale)),
     };
     if chain {
-        anyhow::ensure!(
+        ensure!(
             2 * n_e <= 256 && k_top <= 16 && hidden_words <= 2048 && hidden_words.is_multiple_of(2),
             "NV_G4MOE_ROUTER_CHAIN=1: the single-workgroup chain dots 2 lanes per expert row \
              ({n_e} experts), stages {hidden_words} hidden words, and holds {k_top} choices"
@@ -8009,7 +7456,7 @@ fn build_moe(
         ),
     };
     let topk_fold = topk_fold_enabled();
-    anyhow::ensure!(
+    ensure!(
         !topk_fold || (grouped && !chain && n_e <= 256 && k_top <= 16),
         "NV_G4MOE_TOPK_FOLD=1 replays the parallel-rank topk inside every expert gemv          workgroup; it rides the grouped fused gu/down entries ({n_e} experts, top-{k_top})"
     );
@@ -8121,7 +7568,7 @@ fn build_moe(
     let act = b.zeros("g4m-moe-act", (k_top * inter * 2) as u64);
     let down_groups = ed.k / W4_GS;
     let fused_down = grouped && w4_gemv_entry(down_groups, ed.n) == "g4m_gemv_w4_r8";
-    anyhow::ensure!(
+    ensure!(
         !topk_fold || fused_down,
         "NV_G4MOE_TOPK_FOLD=1 has no unfused down+combine surface; the down shape must \
          route g4m_gemv_w4_r8"
@@ -8137,7 +7584,7 @@ fn build_moe(
             &act,
             &ids,
             k_top,
-            rank_src.map(|(l, p, ne)| (l as &wgpu::Buffer, p as &wgpu::Buffer, ne)),
+            rank_src.map(|(l, p, ne)| (l as &Buffer, p as &Buffer, ne)),
         )?;
     } else {
         let y_gate = b.zeros("g4m-moe-ygate", (k_top * inter * 2) as u64);
@@ -8172,7 +7619,7 @@ fn build_moe(
             &ids,
             &wts,
             k_top,
-            rank_src.map(|(l, p, ne)| (l as &wgpu::Buffer, p as &wgpu::Buffer, ne)),
+            rank_src.map(|(l, p, ne)| (l as &Buffer, p as &Buffer, ne)),
         )?;
     } else {
         let y_down = b.zeros("g4m-moe-ydown", (k_top * hidden * 2) as u64);
@@ -8207,17 +7654,16 @@ fn build_moe(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn pf_gemv_w4(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     e: &ExpertGpu,
-    x: &wgpu::Buffer,
+    x: &Buffer,
     x_tok_stride_words: usize,
     x_slot_stride_words: usize,
-    y: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
+    y: &Buffer,
+    sel: &Buffer,
     slots: usize,
     k_top: usize,
 ) -> Result<()> {
@@ -8255,16 +7701,15 @@ fn pf_gemv_w4(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_moe_prefill(
     b: &mut Builder,
     s: &Sources,
     cfg: &Gemma4MoeConfig,
     moe: &MoeGpu,
     sc: &PfScratch,
-    x_router: &wgpu::Buffer,
-    x: &wgpu::Buffer,
-    out: &wgpu::Buffer,
+    x_router: &Buffer,
+    x: &Buffer,
+    out: &Buffer,
 ) -> Result<()> {
     let m = sc.m;
     let hidden = cfg.base.hidden_size;

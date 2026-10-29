@@ -1,21 +1,18 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::Context;
 use tracing::{debug, info, warn};
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::interceptor::registry::Registry;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::track::track_local::TrackLocal;
-use webrtc::track::track_remote::TrackRemote;
+use webrtc::data_channel::DataChannel;
+use webrtc::media_stream::track_local::TrackLocal;
+use webrtc::media_stream::track_remote::TrackRemote;
+use webrtc::peer_connection::{
+    register_default_interceptors, MediaEngine, PeerConnection, PeerConnectionBuilder,
+    PeerConnectionEventHandler, RTCConfigurationBuilder, RTCIceConnectionState,
+    RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription, Registry,
+};
 
 use crate::RealtimeQuery;
 
@@ -41,10 +38,10 @@ mod audio_out_ws;
 mod cancel;
 mod diarization;
 mod eou_eager;
-mod eou_integrated;
 mod eou_predicted;
 mod events;
 mod framing;
+#[cfg(test)]
 mod fuzz;
 mod inspector;
 #[cfg(test)]
@@ -150,7 +147,7 @@ mod capabilities_tests {
     use crate::eou::EouKind;
 
     #[test]
-    fn capabilities_eou_kinds_match_rfc_v3_section_6_2() {
+    fn capabilities_partition_spec_kinds_from_extensions_and_carry_the_diarization_and_eou_flags() {
         let caps = capabilities_json();
         let listed: Vec<String> = caps["features"]["eou_kinds"]
             .as_array()
@@ -159,82 +156,75 @@ mod capabilities_tests {
             .map(|v| v.as_str().expect("entry is a string").to_string())
             .collect();
         assert_eq!(listed, vec!["vad", "text", "audio", "fusion"]);
+        {
+            let caps = capabilities_json();
+            let ext: Vec<String> = caps["extensions"]["eou_kinds"]
+                .as_array()
+                .expect("extensions.eou_kinds is an array")
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert!(ext.contains(&"heuristic".to_string()));
+            assert!(ext.contains(&"integrated".to_string()));
+            for k in EouKind::V3_SPEC {
+                assert!(
+                    !ext.contains(&k.as_str().to_string()),
+                    "spec kind {} must not appear in extensions",
+                    k.as_str(),
+                );
+            }
+        }
+        {
+            for k in [EouKind::Vad, EouKind::Text, EouKind::Audio, EouKind::Fusion] {
+                assert!(k.is_v3_spec(), "{} should be spec", k.as_str());
+            }
+            for k in [EouKind::Heuristic, EouKind::Integrated] {
+                assert!(
+                    !k.is_v3_spec(),
+                    "{} must not be claimed as spec",
+                    k.as_str()
+                );
+            }
+        }
+        {
+            let caps = capabilities_json();
+            let diar = &caps["extensions"]["diarization"];
+            for key in [
+                "enabled",
+                "max_speakers_per_chunk",
+                "max_speakers_per_frame",
+                "embedding_dim",
+                "frame_rate_hz",
+                "endpoints",
+            ] {
+                assert!(!diar[key].is_null(), "extensions.diarization.{key} missing");
+            }
+            for key in [
+                "audio_diarization",
+                "audio_embeddings",
+                "transcription_diarized_json",
+                "realtime_event",
+            ] {
+                assert!(
+                    diar["endpoints"][key].is_string(),
+                    "extensions.diarization.endpoints.{key} missing"
+                );
+            }
+
+            assert_eq!(diar["enabled"], serde_json::json!(false));
+        }
+        {
+            let caps = capabilities_json();
+            for key in ["eager_eou", "integrated_eou", "predicted_resp_phase"] {
+                assert_eq!(
+                    caps["extensions"][key],
+                    serde_json::json!(true),
+                    "extensions.{key} must be true"
+                );
+            }
+        }
     }
 
-    #[test]
-    fn extensions_namespace_separates_speaches_kinds() {
-        let caps = capabilities_json();
-        let ext: Vec<String> = caps["extensions"]["eou_kinds"]
-            .as_array()
-            .expect("extensions.eou_kinds is an array")
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        assert!(ext.contains(&"heuristic".to_string()));
-        assert!(ext.contains(&"integrated".to_string()));
-        for k in EouKind::V3_SPEC {
-            assert!(
-                !ext.contains(&k.as_str().to_string()),
-                "spec kind {} must not appear in extensions",
-                k.as_str(),
-            );
-        }
-    }
-
-    #[test]
-    fn is_v3_spec_partition_is_total() {
-        for k in [EouKind::Vad, EouKind::Text, EouKind::Audio, EouKind::Fusion] {
-            assert!(k.is_v3_spec(), "{} should be spec", k.as_str());
-        }
-        for k in [EouKind::Heuristic, EouKind::Integrated] {
-            assert!(
-                !k.is_v3_spec(),
-                "{} must not be claimed as spec",
-                k.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn capabilities_extensions_diarization_block_present() {
-        let caps = capabilities_json();
-        let diar = &caps["extensions"]["diarization"];
-        for key in [
-            "enabled",
-            "max_speakers_per_chunk",
-            "max_speakers_per_frame",
-            "embedding_dim",
-            "frame_rate_hz",
-            "endpoints",
-        ] {
-            assert!(!diar[key].is_null(), "extensions.diarization.{key} missing");
-        }
-        for key in [
-            "audio_diarization",
-            "audio_embeddings",
-            "transcription_diarized_json",
-            "realtime_event",
-        ] {
-            assert!(
-                diar["endpoints"][key].is_string(),
-                "extensions.diarization.endpoints.{key} missing"
-            );
-        }
-
-        assert_eq!(diar["enabled"], serde_json::json!(false));
-    }
-
-    #[test]
-    fn capabilities_extensions_eou_flags_true() {
-        let caps = capabilities_json();
-        for key in ["eager_eou", "integrated_eou", "predicted_resp_phase"] {
-            assert_eq!(
-                caps["extensions"][key],
-                serde_json::json!(true),
-                "extensions.{key} must be true"
-            );
-        }
-    }
 }
 
 fn session_max_duration() -> Duration {
@@ -447,72 +437,36 @@ pub async fn handle_offer(offer_sdp: &str, query: &RealtimeQuery) -> anyhow::Res
     let models = crate::models::get_or_init().context("load models")?;
     let intent = Intent::from_query(query);
 
-    let pc = build_peer_connection().await.context("build PC")?;
-
-    let outbound_audio = if matches!(intent, Intent::Conversation) {
-        let track = audio_out::build_outbound_track();
-        let dyn_track: Arc<dyn TrackLocal + Send + Sync> = track.clone();
-        pc.add_track(dyn_track)
-            .await
-            .context("add outbound track")?;
-        Some(transport::OutboundAudioSpec::Webrtc(track))
+    let outbound_track = if matches!(intent, Intent::Conversation) {
+        Some(audio_out::build_outbound_track()?)
     } else {
         None
     };
+    let outbound_audio = outbound_track
+        .clone()
+        .map(transport::OutboundAudioSpec::Webrtc);
 
     let session = Arc::new(Session::new(query.clone(), models, intent, outbound_audio));
 
-    let session_state_id = session.id.as_str().to_string();
-    let session_state_ref = session.clone();
-    pc.on_peer_connection_state_change(Box::new(move |s| {
-        let id = session_state_id.clone();
-        let session_ref = session_state_ref.clone();
-        Box::pin(async move {
-            debug!(state = ?s, session_id = %id, "PC state");
-            match s {
-                RTCPeerConnectionState::Failed
-                | RTCPeerConnectionState::Closed
-                | RTCPeerConnectionState::Disconnected => {
-                    let reason = match s {
-                        RTCPeerConnectionState::Closed => state::TerminationReason::ClientClosed,
-                        _ => state::TerminationReason::TransportError,
-                    };
-                    session_ref.transition_to_terminated_with(reason).await;
-                    if let Some(sess) = drop_session(&id) {
-                        sess.abort_timeout_task().await;
-                        info!(session_id = %id, ?s, "session dropped");
-                    }
-                }
-                _ => {}
-            }
-        })
-    }));
+    let (gather_tx, mut gather_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let handler = Arc::new(PcEvents {
+        session: Arc::downgrade(&session),
+        session_id: session.id.as_str().to_string(),
+        gather_complete: gather_tx,
+    });
+    let pc = build_peer_connection(handler).await.context("build PC")?;
 
-    let session_dc = session.clone();
-    pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
-        let session = session_dc.clone();
-        Box::pin(async move {
-            info!(label = %dc.label(), "data channel received from client");
-            session.attach_data_channel(dc).await;
-        })
-    }));
-
-    let session_track = session.clone();
-    pc.on_track(Box::new(move |track: Arc<TrackRemote>, _, _| {
-        let session = session_track.clone();
-        Box::pin(async move {
-            let codec = track.codec();
-            info!(
-                kind = ?track.kind(),
-                ssrc = track.ssrc(),
-                mime = %codec.capability.mime_type,
-                clock_rate = codec.capability.clock_rate,
-                channels = codec.capability.channels,
-                "track received"
-            );
-            session.attach_audio_track(track).await;
-        })
-    }));
+    let outbound_sender = match &outbound_track {
+        Some(track) => {
+            let dyn_track: Arc<dyn TrackLocal> = track.track.clone();
+            Some(
+                pc.add_track(dyn_track)
+                    .await
+                    .context("add outbound track")?,
+            )
+        }
+        None => None,
+    };
 
     let normalized = sdp_filter::normalize_offer(offer_sdp);
     let offer = RTCSessionDescription::offer(normalized).context("parse offer SDP")?;
@@ -521,11 +475,23 @@ pub async fn handle_offer(offer_sdp: &str, query: &RealtimeQuery) -> anyhow::Res
         .context("set_remote_description")?;
 
     let answer = pc.create_answer(None).await.context("create_answer")?;
-    let mut gather_complete = pc.gathering_complete_promise().await;
     pc.set_local_description(answer)
         .await
         .context("set_local_description")?;
-    let _ = gather_complete.recv().await;
+    if tokio::time::timeout(ICE_GATHER_TIMEOUT, gather_rx.recv())
+        .await
+        .is_err()
+    {
+        warn!(session_id = %session.id, "ICE gathering incomplete after {ICE_GATHER_TIMEOUT:?}; answering with the candidates gathered so far");
+    }
+
+    if let (Some(track), Some(sender)) = (&outbound_track, &outbound_sender) {
+        let pt = track
+            .bind_negotiated_payload_type(sender)
+            .await
+            .context("outbound payload type")?;
+        debug!(session_id = %session.id, payload_type = pt, "outbound opus negotiated");
+    }
 
     let local = pc
         .local_description()
@@ -542,29 +508,95 @@ pub async fn handle_offer(offer_sdp: &str, query: &RealtimeQuery) -> anyhow::Res
     Ok(local.sdp)
 }
 
+const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct PcEvents {
+    session: Weak<Session>,
+    session_id: String,
+    gather_complete: tokio::sync::mpsc::Sender<()>,
+}
+
+#[async_trait::async_trait]
+impl PeerConnectionEventHandler for PcEvents {
+    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
+        if state == RTCIceGatheringState::Complete {
+            let _ = self.gather_complete.try_send(());
+        }
+    }
+
+    async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
+        debug!(state = ?state, session_id = %self.session_id, "ICE state");
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        debug!(state = ?state, session_id = %self.session_id, "PC state");
+        let reason = match state {
+            RTCPeerConnectionState::Closed => state::TerminationReason::ClientClosed,
+            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Disconnected => {
+                state::TerminationReason::TransportError
+            }
+            _ => return,
+        };
+        let Some(session) = self.session.upgrade() else {
+            return;
+        };
+        session.transition_to_terminated_with(reason).await;
+        if let Some(sess) = drop_session(&self.session_id) {
+            sess.abort_timeout_task().await;
+            info!(session_id = %self.session_id, ?state, "session dropped");
+        }
+    }
+
+    async fn on_data_channel(&self, dc: Arc<dyn DataChannel>) {
+        let Some(session) = self.session.upgrade() else {
+            return;
+        };
+        let label = dc.label().await.unwrap_or_default();
+        info!(label = %label, "data channel received from client");
+        session.attach_data_channel(dc).await;
+    }
+
+    async fn on_track(&self, track: Arc<dyn TrackRemote>) {
+        let Some(session) = self.session.upgrade() else {
+            return;
+        };
+        let ssrc = track.ssrcs().await.first().copied();
+        let codec = match ssrc {
+            Some(ssrc) => track.codec(ssrc).await,
+            None => None,
+        };
+        let kind = track.kind().await;
+        info!(
+            kind = ?kind,
+            ssrc,
+            mime = codec.as_ref().map(|c| c.mime_type.as_str()).unwrap_or(""),
+            clock_rate = codec.as_ref().map(|c| c.clock_rate).unwrap_or(0),
+            channels = codec.as_ref().map(|c| c.channels).unwrap_or(0),
+            "track received"
+        );
+        session.attach_audio_track(track).await;
+    }
+}
+
 pub(crate) fn lookup_session_pub(id: &str) -> Option<Arc<Session>> {
     lookup_session(id)
 }
 
-async fn build_peer_connection() -> anyhow::Result<Arc<RTCPeerConnection>> {
+async fn build_peer_connection(
+    handler: Arc<dyn PeerConnectionEventHandler>,
+) -> anyhow::Result<Arc<dyn PeerConnection>> {
     let mut media = MediaEngine::default();
     media.register_default_codecs().context("register codecs")?;
     let registry = register_default_interceptors(Registry::new(), &mut media)
         .context("register interceptors")?;
-    let api = APIBuilder::new()
+    let pc = PeerConnectionBuilder::new()
+        .with_configuration(RTCConfigurationBuilder::new().build())
         .with_media_engine(media)
         .with_interceptor_registry(registry)
-        .build();
-
-    let pc = api
-        .new_peer_connection(RTCConfiguration::default())
+        .with_handler(handler)
+        .with_udp_addrs(vec!["0.0.0.0:0", "[::]:0"])
+        .build()
         .await
         .context("new_peer_connection")?;
-
-    pc.on_ice_connection_state_change(Box::new(move |s| {
-        debug!(state = ?s, "ICE state");
-        Box::pin(async {})
-    }));
-
     Ok(Arc::new(pc))
 }

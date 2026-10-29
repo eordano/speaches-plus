@@ -4,7 +4,6 @@ use super::parse::{LayoutElement, LayoutPage};
 use super::preprocess::{sample_ink, smart_resize, PixelBudget};
 use crate::deepseek_ocr::preprocess::RgbImage;
 
-pub const TIERED_ENV: &str = "NV_DOTS_TIERED";
 pub const TIERED_MIN_DOWNSCALE_ENV: &str = "NV_DOTS_TIERED_MIN_DOWNSCALE";
 pub const TIERED_MIN_INPUT_PX_ENV: &str = "NV_DOTS_TIERED_MIN_INPUT_PX";
 
@@ -25,13 +24,12 @@ pub const AUTO_ENGAGES_ON_PIXELS_BECAUSE_SINGLE_PASS_VISION_COST_IS_QUADRATIC_IN
      accuracy there. The downscale floor stays as a second trigger for callers running a \
      reduced NV_DOTS_MAX_PIXELS budget, where quality loss precedes the wall argument.";
 
-pub const AUTO_IS_THE_ARBITRATED_SERVING_DEFAULT_AND_ZERO_RESTORES_THE_PRE_FLIP_PATH_EXACTLY: &str =
-    "NV_DOTS_TIERED unset means auto, by arbitration on the 090-093 scale corpus: tiered \
-     wins wall AND neutral CER on every measured input above the threshold (15-100MP pages \
+pub const AUTO_IS_THE_ARBITRATED_SERVING_DEFAULT: &str =
+    "auto is the serving default by arbitration on the 090-093 scale corpus: tiered wins \
+     wall AND neutral CER on every measured input above the threshold (15-100MP pages \
      17.0-27.0 s vs 56.5-60.6 s single-pass; 4K screens 6.6 s at word recall 0.92 vs 31.0 s \
      at 0.67), and the 16-fixture corpus sits under the pixel threshold so its twelve zeros \
-     cannot move -- re-stamped after the flip. NV_DOTS_TIERED=0 is the escape that restores \
-     the always-single-pass path byte-identically; =1 forces tiling on everything.";
+     cannot move. Off and Always are reachable only through the per-request tiering hint.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TierPolicy {
@@ -39,35 +37,6 @@ pub enum TierPolicy {
     #[default]
     Auto,
     Always,
-}
-
-impl TierPolicy {
-    pub fn name(self) -> &'static str {
-        match self {
-            TierPolicy::Off => "0",
-            TierPolicy::Auto => "auto",
-            TierPolicy::Always => "1",
-        }
-    }
-
-    pub fn parse(raw: Option<&str>, default: Self) -> Result<Self> {
-        match raw {
-            None | Some("") => Ok(default),
-            Some("0") | Some("off") => Ok(TierPolicy::Off),
-            Some("auto") => Ok(TierPolicy::Auto),
-            Some("1") | Some("always") => Ok(TierPolicy::Always),
-            Some(other) => anyhow::bail!(
-                "{TIERED_ENV}={other:?} is not a dots.ocr tier policy; use auto (tiered when \
-                 the single-pass downscale falls below the floor), 0/off (single pass \
-                 always), or 1/always (tiered always)"
-            ),
-        }
-    }
-
-    pub fn from_env() -> Result<Self> {
-        let _ = AUTO_IS_THE_ARBITRATED_SERVING_DEFAULT_AND_ZERO_RESTORES_THE_PRE_FLIP_PATH_EXACTLY;
-        Self::parse(std::env::var(TIERED_ENV).ok().as_deref(), Self::default())
-    }
 }
 
 pub fn min_downscale_from_env() -> f64 {
@@ -95,6 +64,7 @@ pub fn engages(w: usize, h: usize, budget: PixelBudget, policy: TierPolicy) -> R
         TierPolicy::Off => Ok(false),
         TierPolicy::Always => Ok(true),
         TierPolicy::Auto => {
+            let _ = AUTO_IS_THE_ARBITRATED_SERVING_DEFAULT;
             let _ = AUTO_ENGAGES_ON_PIXELS_BECAUSE_SINGLE_PASS_VISION_COST_IS_QUADRATIC_IN_PATCHES;
             Ok(w * h > min_input_px_from_env()
                 || single_pass_downscale(w, h, budget)? < min_downscale_from_env())
@@ -117,8 +87,6 @@ pub const SAME_ROW_BOXES_WITHIN_TWO_CELLS_MERGE_OR_A_BOX_EDGE_SPLITS_A_LINE_AND_
      121 entries, and one split edge clipped a digit out of a price; two boxes sharing half \
      their vertical extent within two cells of each other are one line of text.";
 
-pub const SCOUT_INK_BRIDGE_ENV: &str = "NV_DOTS_SCOUT_INK_BRIDGE";
-
 pub const INK_BRIDGE_MAX_GAP_8_CELLS_A_GUTTER_IS_WHITE_AT_EVERY_SAMPLE: usize = 8;
 
 pub const SUB_THRESHOLD_INK_IN_A_SAME_ROW_GAP_IS_A_SPLIT_LINE_NOT_A_GUTTER: &str =
@@ -135,13 +103,7 @@ pub const SUB_THRESHOLD_INK_IN_A_SAME_ROW_GAP_IS_A_SPLIT_LINE_NOT_A_GUTTER: &str
      AFTER the acceptance guards and never feeds classify_sub_threshold, because bridged \
      boxes move the box-count and median-height statistics those verdicts read (the uw49 \
      screen's median crosses the 64 px line under bridged merges) and no routing decision \
-     may move with it. NV_DOTS_SCOUT_INK_BRIDGE=0 restores the two-cell-only law.";
-
-fn ink_bridge_enabled() -> bool {
-    std::env::var(SCOUT_INK_BRIDGE_ENV)
-        .map(|v| v.trim() != "0")
-        .unwrap_or(true)
-}
+     may move with it.";
 
 pub const CLASSICAL_GRID_TARGET_512_CELLS_KEEPS_CC_UNDER_A_MILLISECOND: usize = 512;
 pub const CLASSICAL_INKY_CELL_MIN_SAMPLES_2_REJECTS_LONE_SPECKLES: usize = 2;
@@ -395,9 +357,7 @@ pub fn classical_scout(img: &RgbImage) -> Option<LayoutPage> {
             return None;
         }
     }
-    if ink_bridge_enabled() {
-        bridge_split_lines(&mut sb);
-    }
+    bridge_split_lines(&mut sb);
     let ScoutBoxes { boxes, cell, .. } = sb;
     let elements = boxes
         .into_iter()
@@ -438,8 +398,7 @@ pub const SUB_THRESHOLD_SCREENS_DETOUR_TO_TILING_BECAUSE_NATIVE_READING_DROPS_A_
      height under 4 percent of the page height -- the 070 strips put a text line across a \
      third of their height and the 071 renders read 5-20 percent, while UI glyphs sit at \
      1-3 percent; the corpus guard suite asserts every conformance fixture classifies away \
-     from the detour, because the twelve zeros are not available as collateral. \
-     NV_DOTS_SCREEN_DETOUR=0 pins sub-threshold inputs to the plain single pass.";
+     from the detour, because the twelve zeros are not available as collateral.";
 
 pub const SCREENLIKE_REQUIRES_LANDSCAPE_BECAUSE_SPARSE_PORTRAIT_RENDERS_SHARE_THE_LINE_FRACTION:
     &str = "the 071 invoice render measures the same 0.02 median line fraction as a desktop \
@@ -474,37 +433,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unset_defaults_to_auto_zero_escapes_to_single_pass_and_garbage_is_rejected() {
-        for raw in [None, Some("")] {
-            assert_eq!(
-                TierPolicy::parse(raw, TierPolicy::default()).unwrap(),
-                TierPolicy::Auto,
-                "the arbitrated serving default is auto"
-            );
-        }
-        for raw in [Some("0"), Some("off")] {
-            assert_eq!(
-                TierPolicy::parse(raw, TierPolicy::Auto).unwrap(),
-                TierPolicy::Off,
-                "{raw:?} must restore the pre-flip single-pass path"
-            );
-        }
-        assert_eq!(
-            TierPolicy::parse(Some("auto"), TierPolicy::Off).unwrap(),
-            TierPolicy::Auto
-        );
-        for raw in [Some("1"), Some("always")] {
-            assert_eq!(
-                TierPolicy::parse(raw, TierPolicy::Off).unwrap(),
-                TierPolicy::Always
-            );
-        }
-        let err = TierPolicy::parse(Some("yes"), TierPolicy::Off).unwrap_err();
-        assert!(err.to_string().contains(TIERED_ENV), "{err}");
-    }
-
-    #[test]
-    fn the_16_fixture_corpus_domain_stays_single_pass_under_auto_by_construction() {
+    fn auto_tiering_engages_above_the_px_threshold_or_a_reduced_budget_and_never_on_the_fixture_corpus(
+    ) {
         let budget = PixelBudget::default();
         for (w, h) in [(1400, 1900), (1920, 1080), (1500, 1000)] {
             assert!(
@@ -515,11 +445,6 @@ mod tests {
             assert!(!engages(w, h, budget, TierPolicy::Auto).unwrap());
             assert!(!engages(w, h, budget, TierPolicy::Off).unwrap());
         }
-    }
-
-    #[test]
-    fn screens_from_1440p_up_and_every_scale_fixture_engage_tiering_under_auto() {
-        let budget = PixelBudget::default();
         for (w, h) in [
             (2560, 1440),
             (3840, 2160),
@@ -534,21 +459,12 @@ mod tests {
             assert!(!engages(w, h, budget, TierPolicy::Off).unwrap());
             assert!(engages(w, h, budget, TierPolicy::Always).unwrap());
         }
-    }
-
-    #[test]
-    fn a_reduced_pixel_budget_trips_the_downscale_floor_even_under_the_px_threshold() {
-        let budget = PixelBudget {
+        let reduced = PixelBudget {
             min_pixels: 3136,
             max_pixels: 1_000_000,
         };
-        assert!(engages(1920, 1080, budget, TierPolicy::Auto).unwrap());
-    }
-
-    #[test]
-    fn downscale_saturates_at_one_for_small_inputs() {
-        let d = single_pass_downscale(400, 300, PixelBudget::default()).unwrap();
-        assert_eq!(d, 1.0);
+        assert!(engages(1920, 1080, reduced, TierPolicy::Auto).unwrap());
+        assert_eq!(single_pass_downscale(400, 300, budget).unwrap(), 1.0);
     }
 
     fn lined_block(x: usize, y: usize, b: &[usize; 4], pitch: usize) -> bool {
@@ -556,7 +472,52 @@ mod tests {
     }
 
     #[test]
-    fn classical_scout_boxes_two_separated_text_blocks() {
+    fn classical_scout_boxes_text_blocks_light_or_dark_keeps_busy_print_and_refuses_photos() {
+        let darkui = RgbImage::from_fn(800, 600, |x, y| {
+            if lined_block(x, y, &[100, 100, 700, 300], 20) {
+                [222, 222, 222]
+            } else {
+                [24, 25, 28]
+            }
+        });
+        let page = classical_scout(&darkui).expect("dark theme must scout by bright ink");
+        assert_eq!(page.elements.len(), 1, "{:?}", page.elements);
+        let b = page.elements[0].bbox.unwrap();
+        assert!(b[0] <= 100.0 && b[2] >= 692.0 && b[3] >= 292.0, "{b:?}");
+        let photo = RgbImage::from_fn(400, 400, |x, _| {
+            if (x / 4) % 2 == 0 {
+                [10, 10, 10]
+            } else {
+                [250, 250, 250]
+            }
+        });
+        assert!(
+            classical_scout(&photo).is_none(),
+            "a page that is mostly dark AND mostly bright is a photograph, not a theme"
+        );
+        let solid = RgbImage::filled(400, 400, [20, 20, 20]);
+        let page = classical_scout(&solid).expect("a solid dark page has no bright ink");
+        assert!(
+            page.elements.is_empty(),
+            "no text, no boxes: {:?}",
+            page.elements
+        );
+        let busy = RgbImage::from_fn(1600, 3400, |x, y| {
+            let col = x / 400;
+            let in_col = x % 400 < 300 && x % 400 > 20;
+            let row = y % 100;
+            if in_col && col < 4 && y > 40 && y < 3360 && (20..52).contains(&row) {
+                [0, 0, 0]
+            } else {
+                [255, 255, 255]
+            }
+        });
+        let page = classical_scout(&busy).expect("128 small entries are busy print, not a screen");
+        assert!(
+            page.elements.len() >= CLASSICAL_BUSY_PAGE_MIN_BOXES_96_SITS_BETWEEN_THE_5K_SCREENS_52_FRAGMENTS_AND_THE_GAZETTES_130_ENTRIES,
+            "{} boxes",
+            page.elements.len()
+        );
         let a = [50usize, 60, 350, 160];
         let b = [450usize, 300, 750, 500];
         let img = RgbImage::from_fn(800, 600, |x, y| {
@@ -580,41 +541,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn dark_theme_ui_scouts_by_inverted_ink_and_a_bimodal_photo_page_refuses() {
-        let darkui = RgbImage::from_fn(800, 600, |x, y| {
-            if lined_block(x, y, &[100, 100, 700, 300], 20) {
-                [222, 222, 222]
-            } else {
-                [24, 25, 28]
-            }
-        });
-        let page = classical_scout(&darkui).expect("dark theme must scout by bright ink");
-        assert_eq!(page.elements.len(), 1, "{:?}", page.elements);
-        let b = page.elements[0].bbox.unwrap();
-        assert!(b[0] <= 100.0 && b[2] >= 692.0 && b[3] >= 292.0, "{b:?}");
-
-        let photo = RgbImage::from_fn(400, 400, |x, _| {
-            if (x / 4) % 2 == 0 {
-                [10, 10, 10]
-            } else {
-                [250, 250, 250]
-            }
-        });
-        assert!(
-            classical_scout(&photo).is_none(),
-            "a page that is mostly dark AND mostly bright is a photograph, not a theme"
-        );
-
-        let solid = RgbImage::filled(400, 400, [20, 20, 20]);
-        let page = classical_scout(&solid).expect("a solid dark page has no bright ink");
-        assert!(
-            page.elements.is_empty(),
-            "no text, no boxes: {:?}",
-            page.elements
-        );
-    }
-
     fn split_line_page(with_trickle: bool) -> RgbImage {
         RgbImage::from_fn(800, 600, move |x, y| {
             let line1_left = (96..400).contains(&x) && (96..160).contains(&y);
@@ -630,8 +556,28 @@ mod tests {
     }
 
     #[test]
-    fn a_split_wrapped_line_rejoins_across_a_sub_threshold_ink_gap() {
-        let page = classical_scout(&split_line_page(true)).expect("light page must scout");
+    fn a_split_wrapped_line_rejoins_across_an_ink_gap_after_the_raw_read_but_a_white_gutter_stays_split(
+    ) {
+        let page = classical_scout(&split_line_page(false)).expect("light page must scout");
+        assert_eq!(
+            page.elements.len(),
+            2,
+            "a gap that is white at every sample is a gutter, never a split line: {:?}",
+            page.elements
+        );
+        let img = split_line_page(true);
+        let ScoutRead::Boxes(mut sb) = scout_components(&img) else {
+            panic!("light page must scout");
+        };
+        assert_eq!(
+            sb.boxes.len(),
+            2,
+            "the raw read that feeds the routing guards must keep the two-cell-only law: {:?}",
+            sb.boxes
+        );
+        bridge_split_lines(&mut sb);
+        assert_eq!(sb.boxes.len(), 1, "the bridge must rejoin: {:?}", sb.boxes);
+        let page = classical_scout(&img).expect("light page must scout");
         assert_eq!(
             page.elements.len(),
             1,
@@ -647,69 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn a_white_gutter_of_the_same_width_stays_split() {
-        let page = classical_scout(&split_line_page(false)).expect("light page must scout");
-        assert_eq!(
-            page.elements.len(),
-            2,
-            "a gap that is white at every sample is a gutter, never a split line: {:?}",
-            page.elements
-        );
-    }
-
-    #[test]
-    fn the_bridge_is_a_refinement_after_the_guards_and_the_raw_read_keeps_the_split() {
-        let img = split_line_page(true);
-        let ScoutRead::Boxes(mut sb) = scout_components(&img) else {
-            panic!("light page must scout");
-        };
-        assert_eq!(
-            sb.boxes.len(),
-            2,
-            "the raw read that feeds the routing guards must keep the two-cell-only law: {:?}",
-            sb.boxes
-        );
-        bridge_split_lines(&mut sb);
-        assert_eq!(sb.boxes.len(), 1, "the bridge must rejoin: {:?}", sb.boxes);
-    }
-
-    #[test]
-    fn a_page_of_thin_ui_strips_defers_to_the_model_scout() {
-        let img = RgbImage::from_fn(800, 600, |_, y| {
-            if (100..116).contains(&y) || (200..216).contains(&y) || (300..316).contains(&y) {
-                [0, 0, 0]
-            } else {
-                [255, 255, 255]
-            }
-        });
-        assert!(
-            classical_scout(&img).is_none(),
-            "16px strips are small-glyph fragments and must defer"
-        );
-    }
-
-    #[test]
-    fn a_busy_page_of_small_entries_keeps_the_classical_scout() {
-        let img = RgbImage::from_fn(1600, 3400, |x, y| {
-            let col = x / 400;
-            let in_col = x % 400 < 300 && x % 400 > 20;
-            let row = y % 100;
-            if in_col && col < 4 && y > 40 && y < 3360 && (20..52).contains(&row) {
-                [0, 0, 0]
-            } else {
-                [255, 255, 255]
-            }
-        });
-        let page = classical_scout(&img).expect("128 small entries are busy print, not a screen");
-        assert!(
-            page.elements.len() >= CLASSICAL_BUSY_PAGE_MIN_BOXES_96_SITS_BETWEEN_THE_5K_SCREENS_52_FRAGMENTS_AND_THE_GAZETTES_130_ENTRIES,
-            "{} boxes",
-            page.elements.len()
-        );
-    }
-
-    #[test]
-    fn classical_scout_refuses_nothing_light_and_grey_linework_is_invisible() {
+    fn thin_ui_strips_defer_to_the_model_scout_and_grey_linework_is_invisible() {
         let grey = RgbImage::from_fn(800, 600, |x, y| {
             if lined_block(x, y, &[100, 100, 700, 500], 24) {
                 [176, 176, 176]
@@ -722,6 +606,17 @@ mod tests {
             page.elements.is_empty(),
             "light-grey linework must not read as text ink: {:?}",
             page.elements
+        );
+        let img = RgbImage::from_fn(800, 600, |_, y| {
+            if (100..116).contains(&y) || (200..216).contains(&y) || (300..316).contains(&y) {
+                [0, 0, 0]
+            } else {
+                [255, 255, 255]
+            }
+        });
+        assert!(
+            classical_scout(&img).is_none(),
+            "16px strips are small-glyph fragments and must defer"
         );
     }
 }

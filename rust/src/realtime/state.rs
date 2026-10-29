@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -6,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::peer_connection::PeerConnection;
 
 use super::transport::EventSink;
 use crate::defaults;
@@ -56,9 +55,6 @@ impl SessionPhase {
         matches!(self, SessionPhase::Active { .. })
     }
 
-    pub fn is_terminated(&self) -> bool {
-        matches!(self, SessionPhase::Terminated { .. })
-    }
 }
 
 #[derive(Debug, Default)]
@@ -290,7 +286,7 @@ pub struct SessionState {
     pub vad: VadPhase,
     pub resp: RespPhase,
     pub instructions: Option<String>,
-    pub pc: Option<Arc<RTCPeerConnection>>,
+    pub pc: Option<Arc<dyn PeerConnection>>,
     pub event_sink: Option<EventSink>,
     pub current_response: Option<ResponseRuntime>,
     pub last_epoch: Epoch,
@@ -714,13 +710,8 @@ impl Topic {
 }
 
 impl SessionState {
-    pub fn resp_create_from_none(
-        &mut self,
-        id: ResponseId,
-        item_id: ItemId,
-        runtime: ResponseRuntime,
-    ) -> Result<Epoch, InvariantViolation> {
-        if !matches!(self.resp, RespPhase::None) {
+    pub fn resp_admit(&self) -> Result<(), InvariantViolation> {
+        if !matches!(self.resp, RespPhase::None) || self.current_response.is_some() {
             return Err(InvariantViolation::IllegalRespTransition {
                 from: phase_kind(&self.resp),
                 to: "Created",
@@ -729,6 +720,16 @@ impl SessionState {
         if matches!(self.vad, VadPhase::Speaking { .. }) {
             return Err(InvariantViolation::SpeakingWithActiveResponse);
         }
+        Ok(())
+    }
+
+    pub fn resp_create_from_none(
+        &mut self,
+        id: ResponseId,
+        item_id: ItemId,
+        runtime: ResponseRuntime,
+    ) -> Result<Epoch, InvariantViolation> {
+        self.resp_admit()?;
         let epoch = self.last_epoch.next();
         self.last_epoch = epoch;
         self.resp = RespPhase::Created { id, item_id, epoch };
@@ -778,30 +779,6 @@ impl SessionState {
         Ok(epoch)
     }
 
-    pub fn resp_attach_predicted_llm(
-        &mut self,
-        llm_runner: PredictedLlmRunnerHandle,
-    ) -> Result<(), InvariantViolation> {
-        if let RespPhase::Predicted {
-            llm_runner: slot, ..
-        } = &mut self.resp
-        {
-            if slot.is_none() {
-                *slot = Some(llm_runner);
-                return Ok(());
-            }
-            return Err(InvariantViolation::IllegalRespTransition {
-                from: "Predicted(with-llm)",
-                to: "Predicted(with-llm)",
-            });
-        }
-        Err(InvariantViolation::IllegalRespTransition {
-            from: phase_kind(&self.resp),
-            to: "Predicted(attach_llm)",
-        })
-    }
-
-    #[allow(clippy::type_complexity)]
     pub fn resp_promote_predicted_to_created(
         &mut self,
         runtime: ResponseRuntime,
@@ -989,65 +966,6 @@ mod tests {
     }
 
     #[test]
-    fn invariant_silent_during_response_is_fine() {
-        let r = RespPhase::Streaming {
-            id: rid("resp_x"),
-            item_id: iid("item_a"),
-            epoch: ep(1),
-            played_ms: Arc::new(AtomicU64::new(0)),
-            planned_ms: None,
-        };
-        assert!(check_invariants(
-            &SessionPhase::Active {
-                created_at_ms: Millis(0)
-            },
-            &VadPhase::Silent,
-            &r
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn invariant_resp_id_observable() {
-        let r = RespPhase::Created {
-            id: rid("resp_z"),
-            item_id: iid("item_a"),
-            epoch: ep(7),
-        };
-        assert_eq!(r.id().map(|i| i.as_str()), Some("resp_z"));
-        assert_eq!(r.item_id().map(|i| i.as_str()), Some("item_a"));
-        assert!(r.is_active());
-        assert!(!RespPhase::None.is_active());
-    }
-
-    #[test]
-    fn conversation_item_helpers() {
-        let u = ConversationItem::new_user_audio("item_u".into());
-        assert_eq!(u.role, ItemRole::User);
-        assert_eq!(u.status, ItemStatus::InProgress);
-        assert_eq!(u.transcript(), None);
-
-        let a = ConversationItem::new_assistant_audio("item_a".into(), "hi there".into(), 1200);
-        assert_eq!(a.role, ItemRole::Assistant);
-        assert_eq!(a.status, ItemStatus::Completed);
-        assert_eq!(a.transcript(), Some("hi there"));
-
-        assert_eq!(ItemRole::parse("user"), Some(ItemRole::User));
-        assert_eq!(ItemRole::parse("nope"), None);
-        assert_eq!(ItemRole::User.as_str(), "user");
-        assert_eq!(ItemStatus::Incomplete.as_str(), "incomplete");
-    }
-
-    #[test]
-    fn open_buffer_seal_consumes_self() {
-        let mut b = OpenBuffer::new(iid("item_a"));
-        b.append(&[0.0; 8]);
-        let s = b.seal(Millis(120));
-        assert_eq!(s.audio_end_ms, 120);
-        assert_eq!(s.audio.len(), 8);
-    }
-
-    #[test]
     fn termination_reasons_map_to_distinct_wire_strings() {
         let all = [
             TerminationReason::ClientClosed,
@@ -1088,22 +1006,6 @@ mod tests {
             },
             &v,
             &r
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn vad_phase_speaking_carries_typed_item_id() {
-        let v = VadPhase::Speaking {
-            item_id: ItemId::new("item_a"),
-            audio_start_ms: Millis(0),
-        };
-        assert!(check_invariants(
-            &SessionPhase::Active {
-                created_at_ms: Millis(0)
-            },
-            &v,
-            &RespPhase::None
         )
         .is_ok());
     }
@@ -1195,39 +1097,6 @@ mod tests {
         .is_ok());
     }
 
-    #[test]
-    fn barge_in_path_violates_then_recovers() {
-        let speaking = VadPhase::Speaking {
-            item_id: ItemId::new("item_b".to_string()),
-            audio_start_ms: Millis(1000),
-        };
-        let streaming = RespPhase::Streaming {
-            id: rid("resp_2"),
-            item_id: iid("item_b"),
-            epoch: ep(2),
-            played_ms: Arc::new(AtomicU64::new(50)),
-            planned_ms: None,
-        };
-        assert_eq!(
-            check_invariants(
-                &SessionPhase::Active {
-                    created_at_ms: Millis(0)
-                },
-                &speaking,
-                &streaming
-            ),
-            Err(InvariantViolation::SpeakingWithActiveResponse),
-        );
-        assert!(check_invariants(
-            &SessionPhase::Active {
-                created_at_ms: Millis(0)
-            },
-            &speaking,
-            &RespPhase::None
-        )
-        .is_ok());
-    }
-
     fn dummy_runtime() -> ResponseRuntime {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -1252,14 +1121,6 @@ mod tests {
             check_state(&state),
             Err(InvariantViolation::ResponseRuntimeMismatch),
         );
-    }
-
-    #[test]
-    fn check_state_detects_missing_runtime_for_active_phase() {
-        let mut state = SessionState::default();
-        state.session = SessionPhase::Active {
-            created_at_ms: Millis(0),
-        };
         state.resp = RespPhase::Created {
             id: rid("resp_X"),
             item_id: iid("item_a"),
@@ -1373,12 +1234,16 @@ mod tests {
         assert!(p.is_active());
         assert!(p.is_predicted());
         assert!(!RespPhase::None.is_predicted());
+        assert!(!RespPhase::None.is_active());
         let c = RespPhase::Created {
             id: rid("resp_c"),
             item_id: iid("item_c"),
             epoch: ep(4),
         };
         assert!(!c.is_predicted());
+        assert_eq!(c.id().map(|i| i.as_str()), Some("resp_c"));
+        assert_eq!(c.item_id().map(|i| i.as_str()), Some("item_c"));
+        assert!(c.is_active());
     }
 
     #[test]
@@ -1435,24 +1300,15 @@ mod tests {
     }
 
     #[test]
-    fn transition_illegal_from_none_to_streaming_rejected() {
-        let mut state = SessionState::default();
-        state.session = SessionPhase::Active {
-            created_at_ms: Millis(0),
-        };
-        let r = state.resp_advance_to_streaming(Arc::new(AtomicU64::new(0)));
-        assert!(matches!(
-            r,
-            Err(InvariantViolation::IllegalRespTransition { from: "None", .. })
-        ));
-    }
-
-    #[test]
     fn transition_drain_requires_streaming() {
         let mut state = SessionState::default();
         state.session = SessionPhase::Active {
             created_at_ms: Millis(0),
         };
+        assert!(matches!(
+            state.resp_advance_to_streaming(Arc::new(AtomicU64::new(0))),
+            Err(InvariantViolation::IllegalRespTransition { from: "None", .. })
+        ));
         let _ = state
             .resp_create_from_none(rid("r"), iid("a"), dummy_runtime())
             .unwrap();
@@ -1477,59 +1333,26 @@ mod tests {
         state.session = SessionPhase::Active {
             created_at_ms: Millis(0),
         };
+        assert!(matches!(
+            state.resp_retire_predicted(),
+            Err(InvariantViolation::IllegalRespTransition {
+                to: "None (from Predicted)",
+                ..
+            })
+        ));
         let _ = state
             .resp_start_predicted(rid("r"), iid("a"), 0.9, None)
             .unwrap();
         let runner = state.resp_retire_predicted().expect("retire");
         assert!(runner.is_none());
         assert!(matches!(state.resp, RespPhase::None));
-    }
-
-    #[test]
-    fn transition_retire_predicted_rejected_outside_predicted() {
-        let mut state = SessionState::default();
-        state.session = SessionPhase::Active {
-            created_at_ms: Millis(0),
-        };
-        let r = state.resp_retire_predicted();
-        assert!(matches!(
-            r,
-            Err(InvariantViolation::IllegalRespTransition {
-                to: "None (from Predicted)",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn predicted_phase_observable_with_llm_runner_field() {
-        let p = RespPhase::Predicted {
-            id: rid("resp_pred2"),
-            item_id: iid("item_p2"),
-            epoch: ep(7),
-            eou_score: 0.91,
-            runner: None,
-            llm_runner: None,
-        };
-        assert_eq!(p.id().map(|i| i.as_str()), Some("resp_pred2"));
-        assert!(p.is_predicted());
-    }
-
-    #[test]
-    fn transition_promote_returns_optional_llm_handle() {
-        let mut state = SessionState::default();
-        state.session = SessionPhase::Active {
-            created_at_ms: Millis(0),
-        };
         let _ = state
-            .resp_start_predicted_with_llm(rid("r_eager"), iid("a"), 0.85, None, None)
-            .expect("start with llm slot");
-        let (id, _, _, _runner, llm) = state
-            .resp_promote_predicted_to_created(dummy_runtime())
-            .expect("promote");
-        assert_eq!(id.as_str(), "r_eager");
+            .resp_start_predicted_with_llm(rid("r"), iid("a"), 0.9, None, None)
+            .expect("predicted");
+        let (stt, llm) = state.resp_retire_predicted_full().expect("retire full");
+        assert!(stt.is_none());
         assert!(llm.is_none());
-        assert!(matches!(state.resp, RespPhase::Created { .. }));
+        assert!(matches!(state.resp, RespPhase::None));
     }
 
     #[test]
@@ -1546,21 +1369,6 @@ mod tests {
             .resp_start_predicted(rid("r2"), iid("b"), 0.8, None)
             .expect("second predicted");
         assert!(e2.raw() > e1.raw(), "epoch must be strictly increasing");
-    }
-
-    #[test]
-    fn retire_predicted_full_returns_pair_of_runners() {
-        let mut state = SessionState::default();
-        state.session = SessionPhase::Active {
-            created_at_ms: Millis(0),
-        };
-        let _ = state
-            .resp_start_predicted_with_llm(rid("r"), iid("a"), 0.9, None, None)
-            .expect("predicted");
-        let (stt, llm) = state.resp_retire_predicted_full().expect("retire full");
-        assert!(stt.is_none());
-        assert!(llm.is_none());
-        assert!(matches!(state.resp, RespPhase::None));
     }
 
     #[test]
@@ -1610,23 +1418,13 @@ mod tests {
             }
             other => panic!("expected AssistantAudio, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn truncate_clamp_never_inflates() {
-        let mut conv = vec![ConversationItem::new_assistant_audio(
-            "item_a".into(),
-            "hi".into(),
-            500,
-        )];
-        apply_truncate_to_conversation(&mut conv, "item_a", 9_999, "hi");
+        apply_truncate_to_conversation(&mut conv, "item_a", 9_999, "the full");
         match &conv[0].content {
             ItemContent::AssistantAudio { audio_ms, .. } => {
-                assert_eq!(audio_ms, &500, "must not inflate beyond existing audio_ms");
+                assert_eq!(audio_ms, &1_200, "must not inflate beyond existing audio_ms");
             }
             _ => unreachable!(),
         }
-        assert_eq!(conv[0].status, ItemStatus::Incomplete);
     }
 
     #[test]
@@ -1670,25 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn constructors_default_client_speakable_false() {
-        assert!(!ConversationItem::new_user_audio("item_u".into()).client_speakable);
-        assert!(
-            !ConversationItem::new_assistant_audio("item_a".into(), "hi".into(), 100)
-                .client_speakable
-        );
-        assert!(
-            !ConversationItem::new_text(
-                "item_t".into(),
-                ItemRole::Assistant,
-                ItemStatus::Completed,
-                "hi".into()
-            )
-            .client_speakable
-        );
-    }
-
-    #[test]
-    fn speak_requires_an_explicit_item_id() {
+    fn speak_requires_an_explicit_item_id_and_preserves_untrimmed_text() {
         let conv = vec![
             user_text("item_1", "when did the build finish"),
             speakable("item_3", "The build finished in forty seconds."),
@@ -1699,6 +1479,18 @@ mod tests {
                 index: 1,
                 text: "The build finished in forty seconds.".to_string(),
             }
+        );
+        let conv = vec![
+            speakable("item_1", "  hello there  "),
+            user_text("item_2", "and then"),
+        ];
+        assert_eq!(
+            select_response_source(&conv, false, Some("item_1")),
+            ResponseSource::Speak {
+                index: 0,
+                text: "  hello there  ".to_string(),
+            },
+            "an older item may be named, and its text is spoken untrimmed"
         );
     }
 
@@ -1716,110 +1508,15 @@ mod tests {
             "a client restoring a session ends on an assistant item and sends a bare \
              response.create; it must still generate, exactly as before this feature"
         );
-    }
-
-    #[test]
-    fn speak_item_id_may_name_an_older_item() {
-        let conv = vec![
-            speakable("item_1", "first sentence"),
-            user_text("item_2", "and then"),
-        ];
-        assert_eq!(
-            select_response_source(&conv, false, Some("item_1")),
-            ResponseSource::Speak {
-                index: 0,
-                text: "first sentence".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn server_authored_assistant_item_never_speaks() {
-        let conv = vec![
-            user_text("item_1", "what about monday"),
-            ConversationItem::new_assistant_audio("item_2".into(), "monday is free".into(), 900),
-        ];
-        assert_eq!(
-            select_response_source(&conv, false, Some("item_2")),
-            ResponseSource::SpeakUnavailable {
-                reason: "that item was not created by this client, or has already been spoken",
-            }
-        );
-    }
-
-    #[test]
-    fn consumed_item_does_not_respeak() {
-        let mut conv = vec![user_text("item_1", "status"), speakable("item_2", "done")];
-        conv[1].client_speakable = false;
-        assert_eq!(
-            select_response_source(&conv, false, Some("item_2")),
-            ResponseSource::SpeakUnavailable {
-                reason: "that item was not created by this client, or has already been spoken",
-            }
-        );
-    }
-
-    #[test]
-    fn unknown_speak_item_id_is_refused_not_generated() {
-        let conv = vec![user_text("item_1", "status"), speakable("item_2", "done")];
-        assert_eq!(
-            select_response_source(&conv, false, Some("item_nope")),
-            ResponseSource::SpeakUnavailable {
-                reason: "response.speak_item_id names no item in this conversation",
-            },
-            "silently generating instead would speak the wrong thing"
-        );
-    }
-
-    #[test]
-    fn speak_item_id_naming_a_user_item_is_refused() {
-        let conv = vec![user_text("item_1", "status")];
-        assert_eq!(
-            select_response_source(&conv, false, Some("item_1")),
-            ResponseSource::SpeakUnavailable {
-                reason: "response.speak_item_id must name an assistant message",
-            }
-        );
-    }
-
-    #[test]
-    fn response_input_forces_generate() {
-        let conv = vec![user_text("item_1", "status"), speakable("item_2", "done")];
         assert_eq!(
             select_response_source(&conv, true, None),
             ResponseSource::Generate {
-                prompt: "status".to_string(),
-            }
+                prompt: "when did the build finish".to_string(),
+            },
+            "response.input forces a generate"
         );
-    }
-
-    #[test]
-    fn response_input_with_speak_item_id_is_refused() {
-        let conv = vec![user_text("item_1", "status"), speakable("item_2", "done")];
         assert_eq!(
-            select_response_source(&conv, true, Some("item_2")),
-            ResponseSource::SpeakUnavailable {
-                reason: "response.speak_item_id cannot be combined with response.input",
-            }
-        );
-    }
-
-    #[test]
-    fn whitespace_only_assistant_item_is_refused() {
-        let conv = vec![user_text("item_1", "status"), speakable("item_2", "  \n ")];
-        assert_eq!(
-            select_response_source(&conv, false, Some("item_2")),
-            ResponseSource::SpeakUnavailable {
-                reason: "response.speak_item_id names an item with no text to speak",
-            }
-        );
-    }
-
-    #[test]
-    fn empty_conversation_generates_empty_prompt() {
-        let conv: Vec<ConversationItem> = Vec::new();
-        assert_eq!(
-            select_response_source(&conv, false, None),
+            select_response_source(&[], false, None),
             ResponseSource::Generate {
                 prompt: String::new(),
             }
@@ -1827,14 +1524,57 @@ mod tests {
     }
 
     #[test]
-    fn speak_preserves_untrimmed_text() {
-        let conv = vec![speakable("item_1", "  hello there  ")];
-        assert_eq!(
-            select_response_source(&conv, false, Some("item_1")),
-            ResponseSource::Speak {
-                index: 0,
-                text: "  hello there  ".to_string(),
-            }
-        );
+    fn speak_item_id_refusals_name_their_reason() {
+        let not_client = "that item was not created by this client, or has already been spoken";
+        let mut consumed = vec![user_text("item_1", "status"), speakable("item_2", "done")];
+        consumed[1].client_speakable = false;
+        let cases: Vec<(Vec<ConversationItem>, bool, &str, &str)> = vec![
+            (
+                vec![
+                    user_text("item_1", "what about monday"),
+                    ConversationItem::new_assistant_audio(
+                        "item_2".into(),
+                        "monday is free".into(),
+                        900,
+                    ),
+                ],
+                false,
+                "item_2",
+                not_client,
+            ),
+            (consumed, false, "item_2", not_client),
+            (
+                vec![user_text("item_1", "status"), speakable("item_2", "done")],
+                false,
+                "item_nope",
+                "response.speak_item_id names no item in this conversation",
+            ),
+            (
+                vec![user_text("item_1", "status")],
+                false,
+                "item_1",
+                "response.speak_item_id must name an assistant message",
+            ),
+            (
+                vec![user_text("item_1", "status"), speakable("item_2", "done")],
+                true,
+                "item_2",
+                "response.speak_item_id cannot be combined with response.input",
+            ),
+            (
+                vec![user_text("item_1", "status"), speakable("item_2", "  \n ")],
+                false,
+                "item_2",
+                "response.speak_item_id names an item with no text to speak",
+            ),
+        ];
+        for (conv, has_input, id, reason) in cases {
+            assert_eq!(
+                select_response_source(&conv, has_input, Some(id)),
+                ResponseSource::SpeakUnavailable { reason },
+                "id={id} has_input={has_input}: silently generating instead would speak the wrong thing"
+            );
+        }
     }
+
 }

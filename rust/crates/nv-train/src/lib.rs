@@ -15,11 +15,13 @@ pub mod dots_w4head;
 pub fn w4head_requested_via_env() -> bool {
     std::env::var("NV_DOTS_QLORA_W4HEAD").as_deref() == Ok("1")
 }
+pub mod laya;
+pub mod laya_fixture;
 pub mod qwen38;
+pub mod qwen38_ce;
 pub mod qwen38_fixture;
 pub mod qwen38_gdn_chunked;
 pub mod qwen38_gdn_head;
-pub mod qwen38_ce;
 pub mod train_prof;
 
 struct DetRng(u64);
@@ -892,6 +894,25 @@ pub fn load_jsonl_token_dataset(
     vocab: usize,
     max_seq: usize,
 ) -> Result<Vec<TokenRow>> {
+    load_jsonl_token_dataset_inner(path, base, vocab, max_seq, false)
+}
+
+pub fn load_jsonl_token_dataset_strict(
+    path: &Path,
+    base: &Path,
+    vocab: usize,
+    max_seq: usize,
+) -> Result<Vec<TokenRow>> {
+    load_jsonl_token_dataset_inner(path, base, vocab, max_seq, true)
+}
+
+fn load_jsonl_token_dataset_inner(
+    path: &Path,
+    base: &Path,
+    vocab: usize,
+    max_seq: usize,
+    strict: bool,
+) -> Result<Vec<TokenRow>> {
     use anyhow::Context as _;
     let tokenizer = DatasetTokenizer::for_base(base, vocab)?;
     let raw = std::fs::read_to_string(path)
@@ -933,8 +954,22 @@ pub fn load_jsonl_token_dataset(
             );
         };
         if row.ids.len() > max_seq {
+            anyhow::ensure!(
+                !strict,
+                "{}:{}: example has {} tokens, exceeding sequence limit {}; refusing to truncate",
+                path.display(),
+                lineno + 1,
+                row.ids.len(),
+                max_seq
+            );
             row.ids.truncate(max_seq);
         }
+        anyhow::ensure!(
+            !strict || (row.ids.len() >= 2 && row.completion_start < row.ids.len()),
+            "{}:{}: example has no usable completion; refusing to drop the row",
+            path.display(),
+            lineno + 1
+        );
         if row.ids.len() >= 2 && row.completion_start < row.ids.len() {
             examples.push(row);
         }
@@ -970,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn scaling_is_alpha_over_rank_and_unit_scaling_means_exactly_one() {
+    fn scaling_is_alpha_over_rank_and_a_rank_zero_or_non_matrix_base_is_refused() {
         assert_eq!(LoraConfig::unit_scaling(8).scaling(), 1.0);
         assert_eq!(LoraConfig::unit_scaling(64).scaling(), 1.0);
         let cfg = LoraConfig {
@@ -986,10 +1021,7 @@ mod tests {
             dropout: 0.0,
         };
         assert_eq!(cfg.scaling(), 0.25);
-    }
 
-    #[test]
-    fn a_rank_zero_or_non_matrix_base_is_refused_rather_than_producing_an_adapter() {
         let base = Tensor::zeros((4, 4), DType::F32, &Device::Cpu).unwrap();
         assert!(
             LoraTrainable::new(
@@ -1010,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn b_starts_at_zero_so_an_untrained_adapter_is_the_identity() {
+    fn b_starts_at_zero_a_is_seeded_and_the_window_narrows_b_from_the_offset() {
         let lora = cpu_lora(6, 4, LoraConfig::unit_scaling(2));
         let x = Tensor::ones((3, 4), DType::F32, &Device::Cpu).unwrap();
         let delta = lora_delta(lora.a.as_tensor(), lora.b.as_tensor(), 1.0, &x, None).unwrap();
@@ -1029,10 +1061,7 @@ mod tests {
         )
         .unwrap();
         assert!(a_mag > 0.0, "A must be randomly initialised, got all zeros");
-    }
 
-    #[test]
-    fn the_same_seed_gives_the_same_a_and_a_different_seed_does_not() {
         let base = Tensor::zeros((6, 4), DType::F32, &Device::Cpu).unwrap();
         let cfg = LoraConfig::unit_scaling(2);
         let one = LoraTrainable::new(&base, cfg, 42, &Device::Cpu).unwrap();
@@ -1044,10 +1073,7 @@ mod tests {
             "a seeded init that is not reproducible cannot be compared across runs"
         );
         assert!(max_abs_diff(one.a.as_tensor(), other.a.as_tensor()).unwrap() > 0.0);
-    }
 
-    #[test]
-    fn the_window_narrows_b_from_the_offset_so_a_fused_split_writes_its_own_rows() {
         let dev = Device::Cpu;
         let a = Tensor::ones((2, 3), DType::F32, &dev).unwrap();
         let b = Tensor::from_vec(
@@ -1057,14 +1083,12 @@ mod tests {
         )
         .unwrap();
         let x = Tensor::ones((1, 3), DType::F32, &dev).unwrap();
-
         let full = lora_delta(&a, &b, 1.0, &x, None).unwrap();
         assert_eq!(full.dims(), &[1, 4]);
         assert_eq!(
             full.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             vec![6.0, 12.0, 18.0, 24.0]
         );
-
         let win = lora_delta(&a, &b, 1.0, &x, Some((1, 2))).unwrap();
         assert_eq!(win.dims(), &[1, 2], "the window sets the output width");
         assert_eq!(
@@ -1075,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_adapter_carries_the_tensor_names_a_peft_loader_looks_for() {
+    fn a_saved_adapter_carries_peft_tensor_names_and_modules_disagreeing_on_r_or_alpha_are_refused() {
         let dir = std::env::temp_dir().join(format!("nvtrain-peft-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let q = cpu_lora(
@@ -1141,20 +1165,8 @@ mod tests {
             ]
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn an_adapter_whose_modules_disagree_on_r_or_alpha_is_refused() {
         let dir = std::env::temp_dir().join(format!("nvtrain-mixed-{}", std::process::id()));
-        let a = cpu_lora(
-            4,
-            4,
-            LoraConfig {
-                r: 2,
-                alpha: 4.0,
-                dropout: 0.0,
-            },
-        );
         let b_diff_r = cpu_lora(
             4,
             4,
@@ -1173,41 +1185,31 @@ mod tests {
                 dropout: 0.0,
             },
         );
-
         assert!(
             save_peft(&dir, &[], "m").is_err(),
             "no entries is not an adapter"
         );
-        assert!(save_peft(
-            &dir,
-            &[
-                PeftEntry {
-                    module: "a".into(),
-                    lora: &a
-                },
-                PeftEntry {
-                    module: "b".into(),
-                    lora: &b_diff_r
-                },
-            ],
-            "m"
-        )
-        .is_err());
-        assert!(save_peft(
-            &dir,
-            &[
-                PeftEntry {
-                    module: "a".into(),
-                    lora: &a
-                },
-                PeftEntry {
-                    module: "b".into(),
-                    lora: &b_diff_alpha
-                },
-            ],
-            "m"
-        )
-        .is_err());
+        for other in [&b_diff_r, &b_diff_alpha] {
+            assert!(
+                save_peft(
+                    &dir,
+                    &[
+                        PeftEntry {
+                            module: "a".into(),
+                            lora: &q
+                        },
+                        PeftEntry {
+                            module: "b".into(),
+                            lora: other
+                        },
+                    ],
+                    "m"
+                )
+                .is_err(),
+                "modules that disagree on r or alpha are refused"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
 }

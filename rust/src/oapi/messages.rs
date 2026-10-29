@@ -16,8 +16,8 @@ use crate::oapi::chat::{
     engine_event_error_by_surface, engine_start_error_by_surface, is_busy_shed,
     parse_model_tool_calls, rand_seed, render_chat_checked_kwargs, resolve_guided_think_close,
     resolve_tool_policy, retryable_message, retryable_response, split_thinking,
-    template_required_for, ChatAppState, ChatEngine, ChatEvent, ChatGenerateRequest, ChatMessageIn,
-    ClientDeadline, FunctionCall, FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess,
+    template_required_for, resolve_media_parts, ChatAppState, ChatEngine, ChatEvent, ChatGenerateRequest, ChatMessageIn,
+    ClientDeadline, ContentPart, FunctionCall, FunctionDef, MessageContent, TemplateKwargs, ThinkPostProcess,
     ThinkingStream, Tool, ToolCall, ToolChoice, ToolPolicy, ENGINE_INTERRUPTED, THINK_OPEN,
 };
 
@@ -134,6 +134,35 @@ pub struct MessagesRequest {
     pub tool_choice: Option<ToolChoiceParam>,
     #[serde(default)]
     pub thinking: Option<ThinkingParam>,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable, type = "{ type: \"json_schema\", schema: { [key: string]: unknown } } | null"))]
+    pub output_format: Option<Value>,
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable, type = "{ format?: { type: \"json_schema\", schema: { [key: string]: unknown } } | null } | null"))]
+    pub output_config: Option<Value>,
+}
+
+#[allow(clippy::result_large_err)]
+fn requested_output_format(req: &MessagesRequest) -> Result<Option<nv_grammar::GrammarSpec>, Response> {
+    let Some(fmt) = req
+        .output_format
+        .as_ref()
+        .or_else(|| req.output_config.as_ref().and_then(|c| c.get("format")))
+        .filter(|f| !f.is_null())
+    else {
+        return Ok(None);
+    };
+    let spec = match fmt.get("type").and_then(Value::as_str) {
+        Some("json_schema") => nv_grammar::GrammarSpec::JsonSchema(
+            fmt.get("schema")
+                .cloned()
+                .ok_or_else(|| invalid("output_format.schema: field required"))?,
+        ),
+        other => return Err(invalid(format!("output_format.type: expected json_schema, got {other:?}"))),
+    };
+    nv_grammar::check_grammar(&spec)
+        .map_err(|e| invalid(format!("output_format cannot be enforced by guided decoding: {e:#}")))?;
+    Ok(Some(spec))
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +262,37 @@ fn text_of_blocks(v: &Value, loc: &str) -> Result<String, String> {
             "{loc}: expected a string or an array of content blocks"
         )),
     }
+}
+
+fn image_block_part(b: &Value, loc: &str) -> Result<ContentPart, String> {
+    let src = b.get("source").ok_or_else(|| format!("{loc}: image block missing `source`"))?;
+    let url = match src.get("type").and_then(Value::as_str) {
+        Some("base64") => format!(
+            "data:{};base64,{}",
+            src.get("media_type").and_then(Value::as_str).unwrap_or("image/png"),
+            src.get("data").and_then(Value::as_str).ok_or_else(|| format!("{loc}: base64 image source missing `data`"))?
+        ),
+        Some("url") => src.get("url").and_then(Value::as_str).ok_or_else(|| format!("{loc}: url image source missing `url`"))?.to_string(),
+        _ => return Err(format!("{loc}: image source must be {{type: base64}} or {{type: url}}")),
+    };
+    Ok(ContentPart::Unsupported {
+        kind: "image_url".into(),
+        raw: json!({"type": "image_url", "image_url": {"url": url}}),
+    })
+}
+
+fn push_user_parts(msgs: &mut Vec<ChatMessageIn>, role: &str, buf: &mut String, parts: &mut Vec<ContentPart>) {
+    if parts.is_empty() {
+        return push_text(msgs, role, buf);
+    }
+    if !buf.is_empty() {
+        parts.push(ContentPart::Text { text: std::mem::take(buf) });
+    }
+    msgs.push(ChatMessageIn {
+        role: role.to_string(),
+        content: Some(MessageContent::Parts(std::mem::take(parts))),
+        ..Default::default()
+    });
 }
 
 fn push_text(msgs: &mut Vec<ChatMessageIn>, role: &str, buf: &mut String) {
@@ -340,6 +400,7 @@ fn translate(req: &MessagesRequest) -> Result<Translated, Response> {
                 }
                 Value::Array(blocks) => {
                     let mut buf = String::new();
+                    let mut parts: Vec<ContentPart> = Vec::new();
                     for b in blocks {
                         match b.get("type").and_then(Value::as_str) {
                             Some("text") => {
@@ -351,8 +412,14 @@ fn translate(req: &MessagesRequest) -> Result<Translated, Response> {
                                 }
                                 buf.push_str(t);
                             }
+                            Some("image") if role == "user" => {
+                                if !buf.is_empty() {
+                                    parts.push(ContentPart::Text { text: std::mem::take(&mut buf) });
+                                }
+                                parts.push(image_block_part(b, &loc).map_err(invalid)?);
+                            }
                             Some("tool_result") => {
-                                push_text(&mut messages, role, &mut buf);
+                                push_user_parts(&mut messages, role, &mut buf, &mut parts);
                                 let id = b
                                     .get("tool_use_id")
                                     .and_then(Value::as_str)
@@ -386,8 +453,8 @@ fn translate(req: &MessagesRequest) -> Result<Translated, Response> {
                             Some(other) => {
                                 return Err(invalid(format!(
                                     "{loc}: `{other}` content blocks are not supported by \
-                                         this server; only `text` and `tool_result` are accepted \
-                                         in {role} messages"
+                                         this server; only `text`, `image` (user) and `tool_result` \
+                                         are accepted in {role} messages"
                                 )))
                             }
                             None => {
@@ -395,7 +462,7 @@ fn translate(req: &MessagesRequest) -> Result<Translated, Response> {
                             }
                         }
                     }
-                    push_text(&mut messages, role, &mut buf);
+                    push_user_parts(&mut messages, role, &mut buf, &mut parts);
                 }
                 _ => {
                     return Err(invalid(format!(
@@ -604,8 +671,15 @@ pub async fn handle_messages(
         Err(resp) => return resp,
     };
 
-    let tr = match translate(&req) {
+    let mut tr = match translate(&req) {
         Ok(t) => t,
+        Err(resp) => return resp,
+    };
+    let mm = match resolve_media_parts(engine.as_ref(), std::mem::take(&mut tr.messages)).await {
+        Ok((msgs, media)) => {
+            tr.messages = msgs;
+            media
+        }
         Err(resp) => return resp,
     };
 
@@ -613,11 +687,18 @@ pub async fn handle_messages(
     if let Some(on) = tr.enable_thinking {
         kwargs.insert("enable_thinking".into(), Value::Bool(on));
     }
+    let base_guided = match requested_output_format(&req) {
+        Ok(g) => g,
+        Err(resp) => return resp,
+    };
     let ToolPolicy {
         tools_active,
         force_name,
         guided,
-    } = resolve_tool_policy(&tr.tools, &tr.choice, None);
+    } = match resolve_tool_policy(&tr.tools, &tr.choice, base_guided) {
+        Ok(p) => p,
+        Err(msg) => return invalid(msg),
+    };
     let guided_think_close =
         resolve_guided_think_close(engine.as_ref(), guided.is_some(), &mut kwargs);
 
@@ -642,7 +723,7 @@ pub async fn handle_messages(
         opened: prompt.trim_end().ends_with(THINK_OPEN),
     };
 
-    let gen = ChatGenerateRequest {
+    let gen_req = ChatGenerateRequest {
         prompt,
         max_new_tokens: max_tokens
             .min(crate::oapi::chat::max_max_tokens() as u64)
@@ -663,7 +744,7 @@ pub async fn handle_messages(
         top_logprobs: 0,
         kv_resume: None,
         kv_store: None,
-        mm: None,
+        mm,
     };
 
     let client = ClientDeadline::from_request(None, &headers);
@@ -674,7 +755,7 @@ pub async fn handle_messages(
     if req.stream.unwrap_or(false) {
         run_streaming(
             engine,
-            gen,
+            gen_req,
             id,
             model_id,
             tools_active,
@@ -687,7 +768,7 @@ pub async fn handle_messages(
     } else {
         run_non_streaming(
             engine,
-            gen,
+            gen_req,
             id,
             model_id,
             tools_active,
@@ -700,10 +781,9 @@ pub async fn handle_messages(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_non_streaming(
     engine: Arc<dyn ChatEngine>,
-    gen: ChatGenerateRequest,
+    gen_req: ChatGenerateRequest,
     id: String,
     model: String,
     tools_active: bool,
@@ -712,11 +792,11 @@ async fn run_non_streaming(
     client: Option<ClientDeadline>,
     traj_meta: crate::oapi::trajectory::TrajMeta,
 ) -> Response {
-    let traj_prompt = crate::oapi::trajectory::enabled().then(|| gen.prompt.clone());
-    let traj_seed = gen.seed.unwrap_or(0);
-    let traj_temp = gen.temperature;
+    let traj_prompt = crate::oapi::trajectory::enabled().then(|| gen_req.prompt.clone());
+    let traj_seed = gen_req.seed.unwrap_or(0);
+    let traj_temp = gen_req.temperature;
     let (tx, mut rx) = mpsc::channel::<ChatEvent>(64);
-    if let Err(err) = engine.generate(gen, tx).await {
+    if let Err(err) = engine.generate(gen_req, tx).await {
         warn!(error = %err, "messages engine.generate failed to start");
         return engine_start_error(&err);
     }
@@ -934,10 +1014,9 @@ impl<'a> BlockWriter<'a> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_streaming(
     engine: Arc<dyn ChatEngine>,
-    gen: ChatGenerateRequest,
+    gen_req: ChatGenerateRequest,
     id: String,
     model: String,
     tools_active: bool,
@@ -948,13 +1027,13 @@ async fn run_streaming(
 ) -> Response {
     let (tx_bytes, rx_bytes) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
-    let traj_prompt = crate::oapi::trajectory::enabled().then(|| gen.prompt.clone());
-    let traj_seed = gen.seed.unwrap_or(0);
-    let traj_temp = gen.temperature;
+    let traj_prompt = crate::oapi::trajectory::enabled().then(|| gen_req.prompt.clone());
+    let traj_seed = gen_req.seed.unwrap_or(0);
+    let traj_temp = gen_req.temperature;
     let traj_id = id.clone();
     let traj_model = model.clone();
     let (tx_ev, mut rx_ev) = mpsc::channel::<ChatEvent>(64);
-    if let Err(err) = engine.generate(gen, tx_ev).await {
+    if let Err(err) = engine.generate(gen_req, tx_ev).await {
         warn!(error = %err, "messages engine.generate failed to start");
         return engine_start_error(&err);
     }
@@ -1223,7 +1302,7 @@ pub async fn handle_count_tokens(State(state): State<ChatAppState>, body: Bytes)
         if let Some(on) = tr.enable_thinking {
             kwargs.insert("enable_thinking".into(), Value::Bool(on));
         }
-        let policy = resolve_tool_policy(&tr.tools, &tr.choice, None);
+        let policy = resolve_tool_policy(&tr.tools, &tr.choice, None).map_err(invalid)?;
         let _ = resolve_guided_think_close(engine.as_ref(), policy.guided.is_some(), &mut kwargs);
         let render_tools: &[Tool] = if policy.tools_active { &tr.tools } else { &[] };
         let prompt = render_chat_checked_kwargs(
@@ -1494,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn system_and_text_messages_translate() {
+    fn messages_tool_calls_results_and_image_blocks_translate_in_order() {
         let r = req(json!({
             "model": "m",
             "max_tokens": 16,
@@ -1512,67 +1591,75 @@ mod tests {
         assert_eq!(t.messages[1].text(), "hi");
         assert_eq!(t.messages[2].role, "assistant");
         assert_eq!(t.messages[2].text(), "hello");
+        {
+            let r = req(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "tools": [{"name": "get_weather", "description": "d",
+                           "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
+                "messages": [
+                    {"role": "user", "content": "weather?"},
+                    {"role": "assistant", "content": [
+                        {"type": "text", "text": "checking"},
+                        {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "72F"},
+                    ]},
+                ],
+            }));
+            let t = translate(&r).unwrap();
+            assert_eq!(t.tools.len(), 1);
+            assert_eq!(t.tools[0].function.name, "get_weather");
+            let asst = &t.messages[1];
+            let calls = asst.tool_calls.as_ref().unwrap();
+            assert_eq!(calls[0].id, "toolu_1");
+            assert_eq!(
+                serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap(),
+                json!({"city": "Paris"})
+            );
+            let tool_msg = &t.messages[2];
+            assert_eq!(tool_msg.role, "tool");
+            assert_eq!(tool_msg.tool_call_id.as_deref(), Some("toolu_1"));
+            assert_eq!(tool_msg.text(), "72F");
+        }
+        {
+            let r = req(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}},
+                    {"type": "text", "text": "and"},
+                    {"type": "image", "source": {"type": "url", "url": "data:image/png;base64,BBBB"}},
+                ]}],
+            }));
+            let t = translate(&r).unwrap();
+            let Some(MessageContent::Parts(parts)) = &t.messages[0].content else {
+                panic!("an image block keeps the message as parts");
+            };
+            let urls: Vec<String> = parts
+                .iter()
+                .map(|p| match p {
+                    ContentPart::Text { text } => format!("text:{text}"),
+                    ContentPart::Unsupported { kind, raw } => format!("{kind}:{}", raw["image_url"]["url"].as_str().unwrap()),
+                })
+                .collect();
+            assert_eq!(
+                urls,
+                ["text:look", "image_url:data:image/jpeg;base64,AAAA", "text:and", "image_url:data:image/png;base64,BBBB"]
+            );
+            let bad = req(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "file", "file_id": "x"}}]}],
+            }));
+            assert!(translate(&bad).is_err());
+        }
     }
 
     #[test]
-    fn tool_use_and_result_round_trip() {
-        let r = req(json!({
-            "model": "m",
-            "max_tokens": 16,
-            "tools": [{"name": "get_weather", "description": "d",
-                       "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}],
-            "messages": [
-                {"role": "user", "content": "weather?"},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": "checking"},
-                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}},
-                ]},
-                {"role": "user", "content": [
-                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "72F"},
-                ]},
-            ],
-        }));
-        let t = translate(&r).unwrap();
-        assert_eq!(t.tools.len(), 1);
-        assert_eq!(t.tools[0].function.name, "get_weather");
-        let asst = &t.messages[1];
-        let calls = asst.tool_calls.as_ref().unwrap();
-        assert_eq!(calls[0].id, "toolu_1");
-        assert_eq!(
-            serde_json::from_str::<Value>(&calls[0].function.arguments).unwrap(),
-            json!({"city": "Paris"})
-        );
-        let tool_msg = &t.messages[2];
-        assert_eq!(tool_msg.role, "tool");
-        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("toolu_1"));
-        assert_eq!(tool_msg.text(), "72F");
-    }
-
-    #[test]
-    fn image_blocks_are_rejected() {
-        let r = req(json!({
-            "model": "m",
-            "max_tokens": 16,
-            "messages": [{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}},
-            ]}],
-        }));
-        assert!(translate(&r).is_err());
-    }
-
-    #[test]
-    fn server_tool_types_are_rejected() {
-        let r = req(json!({
-            "model": "m",
-            "max_tokens": 16,
-            "tools": [{"type": "web_search_20260209", "name": "web_search"}],
-            "messages": [{"role": "user", "content": "x"}],
-        }));
-        assert!(translate(&r).is_err());
-    }
-
-    #[test]
-    fn tool_choice_maps() {
+    fn tool_choice_maps_and_server_tool_types_are_rejected() {
         for (tc, want_force) in [
             (json!({"type": "auto"}), false),
             (json!({"type": "any"}), true),
@@ -1588,21 +1675,23 @@ mod tests {
             let t = translate(&r).unwrap();
             let eng = crate::oapi::chat_engine::EchoEngine::new("m", "x");
             let mut kwargs = TemplateKwargs::new();
-            let p = resolve_tool_policy(&t.tools, &t.choice, None);
+            let p = resolve_tool_policy(&t.tools, &t.choice, None).unwrap();
             let _ = resolve_guided_think_close(&eng, p.guided.is_some(), &mut kwargs);
             assert_eq!(p.force_name.is_some(), want_force);
+        }
+        {
+            let r = req(json!({
+                "model": "m",
+                "max_tokens": 16,
+                "tools": [{"type": "web_search_20260209", "name": "web_search"}],
+                "messages": [{"role": "user", "content": "x"}],
+            }));
+            assert!(translate(&r).is_err());
         }
     }
 
     #[test]
-    fn stop_reasons_map() {
-        assert_eq!(map_stop_reason("stop"), "end_turn");
-        assert_eq!(map_stop_reason("length"), "max_tokens");
-        assert_eq!(map_stop_reason("tool_calls"), "tool_use");
-    }
-
-    #[test]
-    fn content_blocks_assemble_in_order() {
+    fn content_blocks_stop_reasons_and_thinking_params_map() {
         let calls = vec![ToolCall {
             index: None,
             id: "toolu_1".into(),
@@ -1617,25 +1706,29 @@ mod tests {
         assert_eq!(blocks[1]["type"], "text");
         assert_eq!(blocks[2]["type"], "tool_use");
         assert_eq!(blocks[2]["input"], json!({"a": 1}));
-    }
-
-    #[test]
-    fn thinking_param_maps() {
-        for (v, want) in [
-            (json!({"type": "adaptive"}), Some(true)),
-            (
-                json!({"type": "enabled", "budget_tokens": 1024}),
-                Some(true),
-            ),
-            (json!({"type": "disabled"}), Some(false)),
-        ] {
-            let r = req(json!({
-                "model": "m",
-                "max_tokens": 16,
-                "thinking": v,
-                "messages": [{"role": "user", "content": "x"}],
-            }));
-            assert_eq!(translate(&r).unwrap().enable_thinking, want);
+        {
+            assert_eq!(map_stop_reason("stop"), "end_turn");
+            assert_eq!(map_stop_reason("length"), "max_tokens");
+            assert_eq!(map_stop_reason("tool_calls"), "tool_use");
+        }
+        {
+            for (v, want) in [
+                (json!({"type": "adaptive"}), Some(true)),
+                (
+                    json!({"type": "enabled", "budget_tokens": 1024}),
+                    Some(true),
+                ),
+                (json!({"type": "disabled"}), Some(false)),
+            ] {
+                let r = req(json!({
+                    "model": "m",
+                    "max_tokens": 16,
+                    "thinking": v,
+                    "messages": [{"role": "user", "content": "x"}],
+                }));
+                assert_eq!(translate(&r).unwrap().enable_thinking, want);
+            }
         }
     }
+
 }

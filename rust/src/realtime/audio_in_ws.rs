@@ -189,36 +189,33 @@ mod fuzz_tests {
     }
 
     #[test]
-    fn ws_audio_in_fuzz_5000_steps_seed_0() {
+    fn ws_audio_in_fuzz_across_seeds() {
         fuzz_one(0, 5000).unwrap();
-    }
-
-    #[test]
-    fn ws_audio_in_fuzz_seed_diversity() {
-        for seed in [1u64, 7, 42, 99, 2024, 0xDEAD_BEEF, 0xC0FFEE] {
-            fuzz_one(seed, 1000).unwrap_or_else(|err| panic!("seed={seed}: {err}"));
+        {
+            for seed in [1u64, 7, 42, 99, 2024, 0xDEAD_BEEF, 0xC0FFEE] {
+                fuzz_one(seed, 1000).unwrap_or_else(|err| panic!("seed={seed}: {err}"));
+            }
         }
     }
 
     #[test]
-    fn ws_audio_in_fuzz_truncated_base64() {
+    fn ws_audio_in_fuzz_truncated_base64_and_extreme_payloads() {
         let mut ing = WsAudioIngest::new("pcm16").unwrap();
         for s in ["A", "AB", "ABC", "ABCD=", "===", "@@@@", "AB CD"] {
             let _ = ing.ingest_b64(s);
         }
+        {
+            let mut ing = WsAudioIngest::new("pcm16").unwrap();
+            let bytes: Vec<u8> = (0..1024 * 1024).map(|i| (i & 0xFF) as u8).collect();
+            let b64 = B64.encode(&bytes);
+            let out = ing.ingest_b64(&b64).unwrap();
+
+            let in_samples = bytes.len() / 2;
+            let expected = (in_samples as f64 * 16_000.0 / 24_000.0).round() as isize;
+            assert!((out.len() as isize - expected).abs() < 4);
+        }
     }
 
-    #[test]
-    fn ws_audio_in_fuzz_extreme_payloads() {
-        let mut ing = WsAudioIngest::new("pcm16").unwrap();
-        let bytes: Vec<u8> = (0..1024 * 1024).map(|i| (i & 0xFF) as u8).collect();
-        let b64 = B64.encode(&bytes);
-        let out = ing.ingest_b64(&b64).unwrap();
-
-        let in_samples = bytes.len() / 2;
-        let expected = (in_samples as f64 * 16_000.0 / 24_000.0).round() as isize;
-        assert!((out.len() as isize - expected).abs() < 4);
-    }
 }
 
 #[cfg(test)]
@@ -234,42 +231,38 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_at_16k_uses_no_resampler() {
+    fn resampling_passes_16k_through_and_rescales_24k_and_8k() {
         let mut ing = WsAudioIngest::new("pcm16_16k").unwrap();
         let in_samples: Vec<i16> = (0..16).collect();
         let out = ing.ingest_b64(&pcm16_b64(&in_samples)).unwrap();
         assert_eq!(out.len(), in_samples.len());
         assert!((out[0] - 0.0).abs() < 1e-6);
         assert!((out[15] - (15.0 / SCALE_I16)).abs() < 1e-6);
+        {
+            let mut ing = WsAudioIngest::new("pcm16").unwrap();
+            let in_samples: Vec<i16> = (0..240).map(|i| (i * 100) as i16).collect();
+            let out = ing.ingest_b64(&pcm16_b64(&in_samples)).unwrap();
+            let expected = (240.0_f64 * (16_000.0 / 24_000.0)).round() as usize;
+            assert!(
+                out.len() as isize - expected as isize <= 2,
+                "got {} samples, expected ~{expected}",
+                out.len()
+            );
+        }
+        {
+            let mut ing = WsAudioIngest::new("pcm16_8k").unwrap();
+            let in_samples: Vec<i16> = (0..80).map(|i| (i * 100) as i16).collect();
+            let out = ing.ingest_b64(&pcm16_b64(&in_samples)).unwrap();
+            assert!(
+                (out.len() as isize - 160).abs() <= 2,
+                "got {}, expected ~160",
+                out.len()
+            );
+        }
     }
 
     #[test]
-    fn resample_24k_to_16k_reduces_sample_count() {
-        let mut ing = WsAudioIngest::new("pcm16").unwrap();
-        let in_samples: Vec<i16> = (0..240).map(|i| (i * 100) as i16).collect();
-        let out = ing.ingest_b64(&pcm16_b64(&in_samples)).unwrap();
-        let expected = (240.0_f64 * (16_000.0 / 24_000.0)).round() as usize;
-        assert!(
-            out.len() as isize - expected as isize <= 2,
-            "got {} samples, expected ~{expected}",
-            out.len()
-        );
-    }
-
-    #[test]
-    fn resample_8k_to_16k_doubles_sample_count() {
-        let mut ing = WsAudioIngest::new("pcm16_8k").unwrap();
-        let in_samples: Vec<i16> = (0..80).map(|i| (i * 100) as i16).collect();
-        let out = ing.ingest_b64(&pcm16_b64(&in_samples)).unwrap();
-        assert!(
-            (out.len() as isize - 160).abs() <= 2,
-            "got {}, expected ~160",
-            out.len()
-        );
-    }
-
-    #[test]
-    fn ulaw_decodes_and_upsamples() {
+    fn g711_ulaw_and_alaw_decode_and_upsample() {
         let mut ing = WsAudioIngest::new("g711_ulaw").unwrap();
 
         let bytes = vec![0xFFu8; 80];
@@ -280,36 +273,33 @@ mod tests {
             out.len()
         );
         assert!(out.iter().all(|&v| v.abs() < 1e-3));
+        {
+            let mut ing = WsAudioIngest::new("g711_alaw").unwrap();
+
+            let bytes = vec![0xD5u8; 80];
+            let out = ing.ingest_b64(&B64.encode(&bytes)).unwrap();
+            assert!(
+                (out.len() as isize - 160).abs() <= 2,
+                "got {}, expected ~160",
+                out.len()
+            );
+            assert!(out.iter().all(|&v| v.abs() < 1e-3));
+        }
     }
 
     #[test]
-    fn alaw_decodes_and_upsamples() {
-        let mut ing = WsAudioIngest::new("g711_alaw").unwrap();
-
-        let bytes = vec![0xD5u8; 80];
-        let out = ing.ingest_b64(&B64.encode(&bytes)).unwrap();
-        assert!(
-            (out.len() as isize - 160).abs() <= 2,
-            "got {}, expected ~160",
-            out.len()
-        );
-        assert!(out.iter().all(|&v| v.abs() < 1e-3));
-    }
-
-    #[test]
-    fn unsupported_format_is_reported() {
+    fn unsupported_formats_and_odd_pcm16_byte_counts_are_reported() {
         let err = WsAudioIngest::new("opus").unwrap_err();
         match err {
             IngestError::Unsupported(s) => assert!(s.contains("opus")),
             other => panic!("expected Unsupported, got {other}"),
         }
+        {
+            let mut ing = WsAudioIngest::new("pcm16").unwrap();
+            let bad = B64.encode([0xAA, 0xBB, 0xCC]);
+            let err = ing.ingest_b64(&bad).unwrap_err();
+            assert!(matches!(err, IngestError::Decode(_)));
+        }
     }
 
-    #[test]
-    fn odd_byte_count_is_reported_for_pcm16() {
-        let mut ing = WsAudioIngest::new("pcm16").unwrap();
-        let bad = B64.encode([0xAA, 0xBB, 0xCC]);
-        let err = ing.ingest_b64(&bad).unwrap_err();
-        assert!(matches!(err, IngestError::Decode(_)));
-    }
 }

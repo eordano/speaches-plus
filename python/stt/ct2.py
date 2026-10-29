@@ -40,7 +40,7 @@ def _select_backend() -> tuple[str, Any, str | None]:
             f"  ct2_bindings._ct2 import error: {native_err}\n"
             f"  ctranslate2 import error:        {pypi_err}\n"
             "Build the local extension (see ct2_bindings/README.md) or "
-            "install the PyPI fallback with: pip install '.[ct2]'"
+            "install the PyPI fallback with: uv pip install '.[ct2]'"
         )
         return _BACKEND_NONE, msg, native_err
 

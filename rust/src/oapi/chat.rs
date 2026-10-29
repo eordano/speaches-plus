@@ -308,9 +308,33 @@ pub(crate) fn resolve_guided_fields(
     guided_regex: Option<&String>,
     guided_choice: Option<&Vec<String>>,
 ) -> Result<Option<nv_grammar::GrammarSpec>, Response> {
+    let Some((spec, param)) =
+        requested_grammar(response_format, guided_json, guided_regex, guided_choice)?
+    else {
+        return Ok(None);
+    };
+    nv_grammar::check_grammar(&spec).map_err(|e| {
+        openai_error(
+            StatusCode::BAD_REQUEST,
+            format!("{param} cannot be enforced by guided decoding: {e:#}"),
+            "invalid_request_error",
+            Some(param),
+            None,
+        )
+    })?;
+    Ok(Some(spec))
+}
+
+#[allow(clippy::result_large_err)]
+fn requested_grammar(
+    response_format: Option<&serde_json::Value>,
+    guided_json: Option<&serde_json::Value>,
+    guided_regex: Option<&String>,
+    guided_choice: Option<&Vec<String>>,
+) -> Result<Option<(nv_grammar::GrammarSpec, &'static str)>, Response> {
     use nv_grammar::GrammarSpec;
     if let Some(schema) = response_format.and_then(extract_response_schema) {
-        return Ok(Some(GrammarSpec::JsonSchema(schema)));
+        return Ok(Some((GrammarSpec::JsonSchema(schema), "response_format")));
     }
 
     if response_format
@@ -318,7 +342,10 @@ pub(crate) fn resolve_guided_fields(
         .and_then(|t| t.as_str())
         == Some("json_object")
     {
-        return Ok(Some(GrammarSpec::Regex(nv_grammar::json_object_regex(3))));
+        return Ok(Some((
+            GrammarSpec::JsonSchema(serde_json::json!({"type": "object"})),
+            "response_format",
+        )));
     }
     if let Some(j) = guided_json {
         let schema = match j {
@@ -333,10 +360,10 @@ pub(crate) fn resolve_guided_fields(
             })?,
             other => other.clone(),
         };
-        return Ok(Some(GrammarSpec::JsonSchema(schema)));
+        return Ok(Some((GrammarSpec::JsonSchema(schema), "guided_json")));
     }
     if let Some(re) = guided_regex {
-        return Ok(Some(GrammarSpec::Regex((*re).clone())));
+        return Ok(Some((GrammarSpec::Regex((*re).clone()), "guided_regex")));
     }
     if let Some(choices) = guided_choice {
         if choices.is_empty() {
@@ -348,9 +375,10 @@ pub(crate) fn resolve_guided_fields(
                 None,
             ));
         }
-        return Ok(Some(GrammarSpec::Regex(nv_grammar::choice_to_regex(
-            choices,
-        ))));
+        return Ok(Some((
+            GrammarSpec::Regex(nv_grammar::choice_to_regex(choices)),
+            "guided_choice",
+        )));
     }
     Ok(None)
 }
@@ -371,7 +399,7 @@ pub(crate) fn resolve_tool_policy(
     tools: &[Tool],
     choice: &ToolChoice,
     base_guided: Option<nv_grammar::GrammarSpec>,
-) -> ToolPolicy {
+) -> Result<ToolPolicy, String> {
     let tools_active = !tools.is_empty() && !matches!(choice, ToolChoice::None);
     let force_name = match choice {
         ToolChoice::Function(n) => Some(n.clone()),
@@ -382,15 +410,17 @@ pub(crate) fn resolve_tool_policy(
     if guided.is_none() {
         if let Some(name) = &force_name {
             if let Some(t) = tools.iter().find(|t| &t.function.name == name) {
-                guided = Some(tool_args_grammar(t));
+                guided = Some(tool_args_grammar(t)?);
             }
+        } else if matches!(choice, ToolChoice::Required) && tools.len() > 1 {
+            guided = Some(required_calls_grammar(tools)?);
         }
     }
-    ToolPolicy {
+    Ok(ToolPolicy {
         tools_active,
         force_name,
         guided,
-    }
+    })
 }
 
 pub(crate) fn resolve_guided_think_close(
@@ -772,46 +802,45 @@ fn emittable_len(s: &str) -> usize {
     i
 }
 
-pub(crate) fn tool_args_grammar(tool: &Tool) -> nv_grammar::GrammarSpec {
-    let params = tool
-        .function
+fn tool_parameters(tool: &Tool) -> serde_json::Value {
+    tool.function
         .parameters
         .clone()
-        .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}}));
-    nv_grammar::GrammarSpec::JsonSchema(sanitize_args_schema(&params))
+        .unwrap_or_else(|| serde_json::json!({"type":"object","properties":{}}))
 }
 
-fn sanitize_args_schema(schema: &serde_json::Value) -> serde_json::Value {
-    use serde_json::{json, Value};
-    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
-        return json!({"type":"object","properties":{},"required":[]});
-    };
-    let mut out_props = serde_json::Map::new();
-    let mut required = Vec::new();
-    for (k, v) in props {
-        out_props.insert(k.clone(), sanitize_value_schema(v));
-        required.push(Value::String(k.clone()));
-    }
-    json!({"type":"object","properties":out_props,"required":required})
+fn unenforceable_tool(tool: &Tool, e: anyhow::Error) -> String {
+    format!(
+        "tools[{:?}].parameters cannot be enforced by guided decoding for a forced tool call: {e:#}",
+        tool.function.name
+    )
 }
 
-fn sanitize_value_schema(v: &serde_json::Value) -> serde_json::Value {
-    use serde_json::json;
-    if v.get("enum").is_some() || v.get("const").is_some() {
-        return v.clone();
+pub(crate) fn tool_args_grammar(tool: &Tool) -> Result<nv_grammar::GrammarSpec, String> {
+    let spec = nv_grammar::GrammarSpec::JsonSchema(tool_parameters(tool));
+    nv_grammar::check_grammar(&spec).map_err(|e| unenforceable_tool(tool, e))?;
+    Ok(spec)
+}
+
+pub(crate) fn required_calls_grammar(tools: &[Tool]) -> Result<nv_grammar::GrammarSpec, String> {
+    let ws = r"[ \t\n]{0,20}";
+    let mut calls = Vec::with_capacity(tools.len());
+    for t in tools {
+        let args = nv_grammar::schema_to_regex(&tool_parameters(t)).map_err(|e| unenforceable_tool(t, e))?;
+        let name = nv_grammar::choice_to_regex(&[serde_json::Value::String(t.function.name.clone()).to_string()]);
+        calls.push(format!(
+            r#"\{{{ws}"name"{ws}:{ws}{name}{ws},{ws}"arguments"{ws}:{ws}{args}{ws}\}}"#
+        ));
     }
-    match v.get("type").and_then(|t| t.as_str()) {
-        Some("object") => sanitize_args_schema(v),
-        Some("array") => {
-            let items = v
-                .get("items")
-                .map(sanitize_value_schema)
-                .unwrap_or_else(|| json!({"type":"string"}));
-            json!({"type":"array","items":items})
-        }
-        Some(t @ ("string" | "integer" | "number" | "boolean" | "null")) => json!({"type":t}),
-        _ => json!({"type":"string"}),
-    }
+    let call = format!("({})", calls.join("|"));
+    let (open, close) = (
+        crate::oapi::tool_parse::HERMES_CALL_OPEN,
+        crate::oapi::tool_parse::HERMES_CALL_CLOSE,
+    );
+    let block = format!(r"{open}\n?{call}\n?{close}");
+    let spec = nv_grammar::GrammarSpec::CompiledRegex(format!(r"{block}(\n{{0,2}}{block})*"));
+    nv_grammar::check_grammar(&spec).map_err(|e| format!("tool_choice=required: {e:#}"))?;
+    Ok(spec)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -848,19 +877,27 @@ pub enum MessageContent {
     Parts(Vec<ContentPart>),
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts-bindings", ts(tag = "type", rename_all = "snake_case"))]
 pub enum ContentPart {
     Text {
         text: String,
     },
     Unsupported {
         kind: String,
-        #[serde(skip)]
         #[cfg_attr(feature = "ts-bindings", ts(skip))]
         raw: serde_json::Value,
     },
+}
+
+impl Serialize for ContentPart {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ContentPart::Text { text } => serde_json::json!({"type": "text", "text": text}).serialize(s),
+            ContentPart::Unsupported { raw, .. } => raw.serialize(s),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for ContentPart {
@@ -895,22 +932,6 @@ pub(crate) fn first_unsupported_part(messages: &[ChatMessageIn]) -> Option<(usiz
             ContentPart::Text { .. } => None,
         })
     })
-}
-
-pub(crate) fn reject_unsupported_parts(messages: &[ChatMessageIn]) -> Option<Response> {
-    let (idx, part_type) = first_unsupported_part(messages)?;
-    let param = format!("messages[{idx}].content");
-    Some(openai_error(
-        StatusCode::BAD_REQUEST,
-        format!(
-            "messages[{idx}].content contains a `{part_type}` part; this endpoint only supports \
-             `text` parts. The request was rejected rather than answered without the \
-             `{part_type}` part."
-        ),
-        kind::INVALID_REQUEST,
-        Some(param.as_str()),
-        Some("unsupported_content_part"),
-    ))
 }
 
 pub(crate) const GEMMA4_IMAGE_MARKER: &str = "<|image>";
@@ -1029,6 +1050,56 @@ async fn bridge_post_file(
             .to_string()),
         Err(_) => Ok(body.trim().to_string()),
     }
+}
+
+pub(crate) async fn resolve_media_parts(
+    engine: &dyn ChatEngine,
+    messages: Vec<ChatMessageIn>,
+) -> Result<(Vec<ChatMessageIn>, Option<crate::oapi::chat_multimodal::MmMedia>), Response> {
+    if first_unsupported_part(&messages).is_none() {
+        return Ok((messages, None));
+    }
+    if !engine.supports_mm_input() {
+        return Ok((bridge_mm_parts(&messages).await?, None));
+    }
+    let messages = if engine.supports_audio_input() {
+        messages
+    } else {
+        bridge_audio_parts_keeping_the_rest(&messages).await?
+    };
+    let (msgs, media) = extract_mm_media(&messages, engine.mm_markers())?;
+    Ok((msgs, Some(media)))
+}
+
+async fn bridge_audio_parts_keeping_the_rest(
+    messages: &[ChatMessageIn],
+) -> Result<Vec<ChatMessageIn>, Response> {
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        let Some(MessageContent::Parts(parts)) = m.content.as_ref() else {
+            out.push(m.clone());
+            continue;
+        };
+        let mut kept = Vec::with_capacity(parts.len());
+        for p in parts {
+            match p {
+                ContentPart::Unsupported { kind, .. } if kind == "input_audio" => {
+                    let one = ChatMessageIn {
+                        content: Some(MessageContent::Parts(vec![p.clone()])),
+                        ..m.clone()
+                    };
+                    let bridged = bridge_mm_parts(std::slice::from_ref(&one)).await?;
+                    kept.push(ContentPart::Text { text: bridged[0].text() });
+                }
+                other => kept.push(other.clone()),
+            }
+        }
+        out.push(ChatMessageIn {
+            content: Some(MessageContent::Parts(kept)),
+            ..m.clone()
+        });
+    }
+    Ok(out)
 }
 
 pub(crate) async fn bridge_mm_parts(
@@ -1288,7 +1359,7 @@ pub struct Delta {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatGenerateRequest {
     pub prompt: String,
     pub max_new_tokens: usize,
@@ -1594,6 +1665,10 @@ pub trait ChatEngine: Send + Sync + 'static {
         false
     }
 
+    fn supports_audio_input(&self) -> bool {
+        self.supports_mm_input()
+    }
+
     fn mm_markers(&self) -> (&'static str, &'static str) {
         (GEMMA4_IMAGE_MARKER, GEMMA4_AUDIO_MARKER)
     }
@@ -1604,11 +1679,20 @@ pub trait ChatEngine: Send + Sync + 'static {
         tx: mpsc::Sender<ChatEvent>,
     ) -> anyhow::Result<()>;
 
+    fn capture_info(&self) -> crate::oapi::capture::CaptureInfo {
+        crate::oapi::capture::CaptureInfo::unavailable(
+            self.model_id(),
+            "engine",
+            "this engine type has no layer capture path",
+        )
+    }
+
     async fn capture_layer(
         &self,
-        _req: crate::oapi::laguna_capture::LayerCaptureRequest,
-    ) -> anyhow::Result<crate::oapi::laguna_capture::LayerCaptureResponse> {
-        anyhow::bail!("layer capture is not available on this engine")
+        _req: crate::oapi::capture::LayerCaptureRequest,
+    ) -> anyhow::Result<crate::oapi::capture::LayerCaptureResponse> {
+        self.capture_info().shape()?;
+        anyhow::bail!("{}", crate::oapi::capture::CAPTURE_NOT_AVAILABLE)
     }
 
     fn render_prompt(&self, messages: &[ChatMessageIn]) -> String {
@@ -1616,6 +1700,14 @@ pub trait ChatEngine: Send + Sync + 'static {
     }
 
     fn official_template(&self) -> Option<&crate::oapi::chat_template::ChatTemplate> {
+        None
+    }
+
+    fn runtime_lora_twin_sharing_these_resident_weights(
+        &self,
+        _adapter_id: &str,
+        _adapter_dir: &std::path::Path,
+    ) -> Option<anyhow::Result<std::sync::Arc<dyn ChatEngine>>> {
         None
     }
 
@@ -1685,56 +1777,8 @@ pub trait ChatEngine: Send + Sync + 'static {
     }
 }
 
-pub const REQUIRE_CHAT_TEMPLATE_ENV: &str = "NV_REQUIRE_CHAT_TEMPLATE";
-
-pub const ALLOW_FALLBACK_ENV: &str = "NV_ALLOW_CHATML_FALLBACK";
-
-pub fn require_official_template_from(raw: Option<&str>) -> bool {
-    matches!(
-        raw.unwrap_or_default().trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-pub fn allow_builtin_fallback_from(raw: Option<&str>) -> bool {
-    require_official_template_from(raw)
-}
-
-fn explicitly_off(raw: Option<&str>) -> bool {
-    matches!(
-        raw.unwrap_or_default().trim().to_ascii_lowercase().as_str(),
-        "0" | "false" | "no" | "off"
-    )
-}
-
-pub fn template_required_from(
-    require_raw: Option<&str>,
-    allow_raw: Option<&str>,
-    model_backed: bool,
-) -> bool {
-    if require_official_template_from(require_raw) {
-        return true;
-    }
-    if allow_builtin_fallback_from(allow_raw) || explicitly_off(require_raw) {
-        return false;
-    }
-    model_backed
-}
-
 pub fn template_required_for(model_id: &str) -> bool {
-    template_required_from(
-        std::env::var(REQUIRE_CHAT_TEMPLATE_ENV).ok().as_deref(),
-        std::env::var(ALLOW_FALLBACK_ENV).ok().as_deref(),
-        crate::oapi::chat_template::load_was_attempted(model_id),
-    )
-}
-
-pub fn require_official_template() -> bool {
-    template_required_from(
-        std::env::var(REQUIRE_CHAT_TEMPLATE_ENV).ok().as_deref(),
-        std::env::var(ALLOW_FALLBACK_ENV).ok().as_deref(),
-        true,
-    )
+    crate::oapi::chat_template::load_was_attempted(model_id)
 }
 
 thread_local! {
@@ -1777,22 +1821,8 @@ pub fn log_missing_official_template(model_id: &str) {
          measured on Gemma-4-31B-IT it ends the turn on 3 of 7 prompts and makes the model \
          role-play both sides, so output quality and stop behaviour are NOT representative. \
          Point the engine at a model directory containing chat_template.jinja (or \
-         tokenizer_config.json:chat_template). Serving it anyway now requires {}=1; {}=1 \
-         refuses even for engines that never loaded a model directory.",
-        ALLOW_FALLBACK_ENV,
-        REQUIRE_CHAT_TEMPLATE_ENV
+         tokenizer_config.json:chat_template)."
     );
-}
-
-pub fn log_chat_template_status(engine: &dyn ChatEngine) {
-    match engine.official_template() {
-        Some(_) => tracing::info!(
-            model = %engine.model_id(),
-            chat_template = "official",
-            "chat prompts render with the model's official chat template"
-        ),
-        None => log_missing_official_template(engine.model_id()),
-    }
 }
 
 pub fn missing_template_message(model_id: &str, reason: &str) -> String {
@@ -1802,8 +1832,8 @@ pub fn missing_template_message(model_id: &str, reason: &str) -> String {
         "refusing to serve model `{model_id}` with the built-in ChatML fallback prompt: {reason}. \
          Searched for chat_template.jinja and tokenizer_config.json:chat_template in {searched}. \
          The fallback is measurably broken on Gemma-4 (3 of 7 prompts never end their turn, the \
-         model role-plays both sides), so it is not served by default. Set {ALLOW_FALLBACK_ENV}=1 \
-         to opt back in to it, or point the engine at a model directory that ships a chat template."
+         model role-plays both sides), so it is not served. Point the engine at a model \
+         directory that ships a chat template."
     )
 }
 
@@ -1857,16 +1887,6 @@ pub fn render_chat_checked_kwargs(
         Some(reason) if required => Err(missing_template_message(engine.model_id(), &reason)),
         _ => Ok(prompt),
     }
-}
-
-pub fn render_chat_strict(
-    engine: &dyn ChatEngine,
-    messages: &[ChatMessageIn],
-    tools: &[Tool],
-    choice: &ToolChoice,
-) -> Result<String, String> {
-    let required = template_required_for(engine.model_id());
-    render_chat_checked(engine, messages, tools, choice, required)
 }
 
 pub(crate) fn tool_choice_directive(choice: &ToolChoice) -> Option<String> {
@@ -1963,19 +1983,27 @@ pub(crate) fn request_template_kwargs(
         out.insert("enable_thinking".into(), serde_json::Value::Bool(on));
     }
     if let Some(effort) = &req.reasoning_effort {
-        if let Err(msg) = crate::oapi::chat_template::validate_reasoning_effort(effort) {
-            return Err(openai_error(
-                StatusCode::BAD_REQUEST,
-                msg,
-                kind::INVALID_REQUEST,
-                Some("reasoning_effort"),
-                None,
-            ));
+        match crate::oapi::chat_template::request_reasoning_effort(effort) {
+            Ok(Some(e)) => {
+                out.insert(
+                    crate::oapi::chat_template::REASONING_EFFORT_KWARG.into(),
+                    serde_json::Value::String(e.into()),
+                );
+            }
+            Ok(None) => {
+                out.entry("enable_thinking".into())
+                    .or_insert(serde_json::Value::Bool(false));
+            }
+            Err(msg) => {
+                return Err(openai_error(
+                    StatusCode::BAD_REQUEST,
+                    msg,
+                    kind::INVALID_REQUEST,
+                    Some("reasoning_effort"),
+                    None,
+                ));
+            }
         }
-        out.insert(
-            crate::oapi::chat_template::REASONING_EFFORT_KWARG.into(),
-            serde_json::Value::String(effort.clone()),
-        );
     }
     match req.chat_template_kwargs.as_ref() {
         None | Some(serde_json::Value::Null) => {}
@@ -2091,26 +2119,12 @@ async fn chat_completions_impl(
     )
     .await;
 
-    let mm_media = if first_unsupported_part(&req.messages).is_some() {
-        if engine.supports_mm_input() {
-            match extract_mm_media(&req.messages, engine.mm_markers()) {
-                Ok((msgs, media)) => {
-                    req.messages = msgs;
-                    Some(media)
-                }
-                Err(resp) => return resp,
-            }
-        } else {
-            match bridge_mm_parts(&req.messages).await {
-                Ok(msgs) => {
-                    req.messages = msgs;
-                    None
-                }
-                Err(resp) => return resp,
-            }
+    let mm_media = match resolve_media_parts(engine.as_ref(), std::mem::take(&mut req.messages)).await {
+        Ok((msgs, media)) => {
+            req.messages = msgs;
+            media
         }
-    } else {
-        None
+        Err(resp) => return resp,
     };
 
     let template_required = template_required_for(engine.model_id());
@@ -2202,7 +2216,18 @@ async fn chat_completions_impl(
         tools_active,
         force_name,
         guided,
-    } = resolve_tool_policy(&tools, &choice, base_guided);
+    } = match resolve_tool_policy(&tools, &choice, base_guided) {
+        Ok(p) => p,
+        Err(msg) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                msg,
+                "invalid_request_error",
+                Some("tools"),
+                None,
+            )
+        }
+    };
     let guided_think_close =
         resolve_guided_think_close(engine.as_ref(), guided.is_some(), &mut extra_kwargs);
     let render_tools: &[Tool] = if tools_active { &tools } else { &[] };
@@ -2250,7 +2275,7 @@ async fn chat_completions_impl(
         );
     }
 
-    let gen = ChatGenerateRequest {
+    let gen_req = ChatGenerateRequest {
         prompt,
         max_new_tokens,
         stop,
@@ -2289,7 +2314,7 @@ async fn chat_completions_impl(
     if stream {
         run_streaming(
             engine,
-            gen,
+            gen_req,
             n,
             base_seed,
             id,
@@ -2305,7 +2330,7 @@ async fn chat_completions_impl(
         .await
     } else {
         run_non_streaming(
-            engine, gen, n, base_seed, id, model_id, created, tpp, think, client, traj_meta,
+            engine, gen_req, n, base_seed, id, model_id, created, tpp, think, client, traj_meta,
         )
         .await
     }
@@ -2342,10 +2367,9 @@ pub(crate) fn rand_seed() -> u64 {
     z ^ (z >> 31)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_non_streaming(
     engine: Arc<dyn ChatEngine>,
-    gen: ChatGenerateRequest,
+    gen_req: ChatGenerateRequest,
     n: u32,
     base_seed: u64,
     id: String,
@@ -2362,7 +2386,7 @@ async fn run_non_streaming(
     let mut total_completion_tokens: u32 = 0;
 
     for i in 0..n {
-        let mut g = gen.clone();
+        let mut g = gen_req.clone();
         g.seed = Some(base_seed.wrapping_add(i as u64));
 
         let (tx, mut rx) = mpsc::channel::<ChatEvent>(64);
@@ -2422,18 +2446,18 @@ async fn run_non_streaming(
                 endpoint: "chat".into(),
                 id: id.clone(),
                 model: model.clone(),
-                prompt: gen.prompt.clone(),
+                prompt: gen_req.prompt.clone(),
                 completion: text.clone(),
                 reasoning: (!engine_reasoning.is_empty()).then(|| engine_reasoning.clone()),
                 finish_reason: finish_reason.clone(),
                 stopped_by: stopped_by.clone(),
-                multimodal: gen.mm.is_some(),
+                multimodal: gen_req.mm.is_some(),
                 label: traj_meta.label.clone(),
                 tag: traj_meta.tag.clone(),
                 prompt_tokens,
                 completion_tokens,
                 seed: base_seed.wrapping_add(i as u64),
-                temperature: gen.temperature,
+                temperature: gen_req.temperature,
             });
         }
         let logprobs = if lp_entries.is_empty() {
@@ -2492,10 +2516,9 @@ async fn run_non_streaming(
     (StatusCode::OK, Json(resp)).into_response()
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_streaming(
     engine: Arc<dyn ChatEngine>,
-    gen: ChatGenerateRequest,
+    gen_req: ChatGenerateRequest,
     n: u32,
     base_seed: u64,
     id: String,
@@ -2510,7 +2533,7 @@ async fn run_streaming(
 ) -> Response {
     let (tx_bytes, rx_bytes) = mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
-    let mut g0 = gen.clone();
+    let mut g0 = gen_req.clone();
     g0.seed = Some(base_seed);
     let (tx_ev0, mut rx_ev0) = mpsc::channel::<ChatEvent>(64);
     if let Err(err) = engine.generate(g0, tx_ev0).await {
@@ -2540,7 +2563,7 @@ async fn run_streaming(
             let mut rx_ev = match rx_first.take() {
                 Some(rx) => rx,
                 None => {
-                    let mut g = gen.clone();
+                    let mut g = gen_req.clone();
                     g.seed = Some(base_seed.wrapping_add(i as u64));
                     let (tx_ev, rx_ev) = mpsc::channel::<ChatEvent>(64);
                     if let Err(err) = engine.generate(g, tx_ev).await {
@@ -2584,7 +2607,7 @@ async fn run_streaming(
             let mut stopped_by: Option<String> = None;
             let mut choice_completion_tokens: u32 = 0;
 
-            let pair_lp = gen.logprobs && !tpp.active && !think.active;
+            let pair_lp = gen_req.logprobs && !tpp.active && !think.active;
             let mut pending_content: Option<String> = None;
             let mut splitter = ThinkingStream::new(think.opened);
             #[allow(clippy::while_let_loop)]
@@ -2856,19 +2879,19 @@ async fn run_streaming(
                         endpoint: "chat".into(),
                         id: id_s.clone(),
                         model: model_s.clone(),
-                        prompt: gen.prompt.clone(),
+                        prompt: gen_req.prompt.clone(),
                         completion: std::mem::take(&mut traj),
                         reasoning: (!traj_reasoning.is_empty())
                             .then(|| std::mem::take(&mut traj_reasoning)),
                         finish_reason: raw_finish,
                         stopped_by: stopped_by.clone(),
-                        multimodal: gen.mm.is_some(),
+                        multimodal: gen_req.mm.is_some(),
                         label: traj_meta.label.clone(),
                         tag: traj_meta.tag.clone(),
                         prompt_tokens,
                         completion_tokens: choice_completion_tokens,
                         seed: base_seed.wrapping_add(i as u64),
-                        temperature: gen.temperature,
+                        temperature: gen_req.temperature,
                     });
                 }
             }
@@ -3036,10 +3059,6 @@ mod tests {
             MAX_MAX_TOKENS,
             "a moved omitted-default never escapes the cap"
         );
-    }
-
-    #[test]
-    fn garbage_or_zero_max_tokens_envs_keep_the_shipped_defaults() {
         for junk in [
             None,
             Some(""),
@@ -3109,10 +3128,7 @@ mod tests {
             ClientDeadline::from_request(None, &deadline_header("soon")).is_none(),
             "a malformed header must fall back to the server default, not 400 or collapse"
         );
-    }
 
-    #[test]
-    fn a_caller_deadline_is_clamped_at_both_ends() {
         assert!(deadline::max_ms() < 99_999_999);
         let absurd =
             ClientDeadline::from_request(None, &deadline_header("99999999")).expect("parsed");
@@ -3263,10 +3279,6 @@ mod tests {
         assert_eq!(spec_decode_header_value(Some("degraded")), "degraded");
         assert_eq!(spec_decode_header_value(None), "off");
         assert_eq!(spec_decode_header_value(Some("something-new")), "unknown");
-    }
-
-    #[test]
-    fn spec_decode_header_is_a_valid_header_name_and_lands_on_a_response() {
         let mut resp = openai_error(
             StatusCode::BAD_REQUEST,
             "x",
@@ -3284,17 +3296,13 @@ mod tests {
     }
 
     #[test]
-    fn chat_message_in_text_handles_string_form() {
+    fn chat_message_in_text_handles_string_form_and_concatenates_parts() {
         let m = ChatMessageIn {
             role: "user".into(),
             content: Some(MessageContent::Text("hello".into())),
             ..Default::default()
         };
         assert_eq!(m.text(), "hello");
-    }
-
-    #[test]
-    fn chat_message_in_text_concatenates_parts() {
         let m = ChatMessageIn {
             role: "user".into(),
             content: Some(MessageContent::Parts(vec![
@@ -3326,15 +3334,15 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_minimal_request() {
+    fn deserialize_request_shapes() {
         let body = r#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#;
         let r: ChatCompletionRequest = serde_json::from_str(body).unwrap();
         assert_eq!(r.messages.len(), 1);
         assert_eq!(r.messages[0].text(), "hi");
-    }
-
-    #[test]
-    fn deserialize_stop_alternatives() {
+        let body = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
+        let r: ChatCompletionRequest = serde_json::from_str(body).unwrap();
+        assert_eq!(r.messages[0].text(), "hi");
+        assert!(first_unsupported_part(&r.messages).is_none());
         let one: ChatCompletionRequest =
             serde_json::from_str(r#"{"messages":[{"role":"user","content":"x"}],"stop":"END"}"#)
                 .unwrap();
@@ -3344,13 +3352,6 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(many.stop, Some(StopField::Many(_))));
-    }
-
-    #[test]
-    fn deserialize_content_parts_array_form() {
-        let body = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
-        let r: ChatCompletionRequest = serde_json::from_str(body).unwrap();
-        assert_eq!(r.messages[0].text(), "hi");
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
@@ -3370,13 +3371,6 @@ mod tests {
     }
 
     #[test]
-    fn text_only_parts_are_not_rejected() {
-        let body = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}"#;
-        let r: ChatCompletionRequest = serde_json::from_str(body).unwrap();
-        assert!(first_unsupported_part(&r.messages).is_none());
-    }
-
-    #[test]
     fn image_and_audio_parts_are_flagged() {
         let img = r#"{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}"#;
         let r: ChatCompletionRequest = serde_json::from_str(img).unwrap();
@@ -3388,22 +3382,6 @@ mod tests {
             first_unsupported_part(&r.messages),
             Some((1, "input_audio"))
         );
-    }
-
-    #[tokio::test]
-    async fn image_part_is_rejected_with_400_naming_the_type() {
-        let body = r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}"#;
-        let r: ChatCompletionRequest = serde_json::from_str(body).unwrap();
-        let resp = reject_unsupported_parts(&r.messages).expect("image_url part must be rejected");
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let v = body_json(resp).await;
-        assert_eq!(v["error"]["type"], "invalid_request_error");
-        assert_eq!(v["error"]["code"], "unsupported_content_part");
-        assert_eq!(v["error"]["param"], "messages[0].content");
-        assert!(v["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("image_url"));
     }
 
     #[tokio::test]
@@ -3445,100 +3423,42 @@ mod tests {
     }
 
     #[test]
-    fn response_serializes_with_expected_shape() {
-        let resp = ChatCompletionResponse {
-            id: "x".into(),
-            object: "chat.completion",
-            created: 7,
-            model: "m".into(),
-            choices: vec![ChatChoice {
-                index: 0,
-                message: ChatMessageOut {
-                    role: "assistant".into(),
-                    content: Some("hello".into()),
-                    reasoning_content: None,
-                    tool_calls: None,
-                },
-                finish_reason: "stop".into(),
-                logprobs: None,
-            }],
-            usage: Usage {
-                prompt_tokens: 1,
-                completion_tokens: 1,
-                total_tokens: 2,
-                prompt_tokens_details: None,
-            },
-            system_fingerprint: Some("fp_00000000".into()),
-        };
-        let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["object"], "chat.completion");
-        assert_eq!(v["choices"][0]["message"]["content"], "hello");
-        assert_eq!(v["usage"]["total_tokens"], 2);
-        assert!(v["choices"][0]["message"]
-            .get("reasoning_content")
-            .is_none());
-    }
-
-    #[test]
-    fn native_tool_call_delimiters_parse_into_a_tool_call() {
-        let raw = "<|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>}<tool_call|>";
-        let p = parse_model_tool_calls(raw, None);
-        assert_eq!(p.tool_calls.len(), 1);
-        assert_eq!(p.tool_calls[0].function.name, "get_weather");
-        assert_eq!(p.tool_calls[0].function.arguments, r#"{"city":"Oslo"}"#);
-    }
-
-    #[test]
-    fn native_tool_call_tolerates_whitespace_after_the_colon() {
-        let raw =
-            "<|tool_call>call:get_weather{<|\"|>city<|\"|>: <|\"|>Oslo<|\"|>, days: 3}<tool_call|>";
-        let p = parse_model_tool_calls(raw, None);
-        assert_eq!(p.tool_calls.len(), 1);
-        assert_eq!(
-            p.tool_calls[0].function.arguments,
-            r#"{"city":"Oslo","days":3}"#
-        );
-    }
-
-    #[test]
-    fn native_tool_call_string_may_contain_structure() {
-        let raw = "<|tool_call>call:f{q:<|\"|>a,b}c{d<|\"|>,n:2}<tool_call|>";
-        let p = parse_model_tool_calls(raw, None);
-        assert_eq!(p.tool_calls.len(), 1);
-        let v: serde_json::Value =
-            serde_json::from_str(&p.tool_calls[0].function.arguments).unwrap();
-        assert_eq!(v["q"], "a,b}c{d");
-        assert_eq!(v["n"], 2);
-    }
-
-    #[test]
-    fn native_tool_call_nested_and_typed_arguments() {
-        let raw = "<|tool_call>call:f{flag:true,ratio:1.5,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],\
-                   where:{lat:1.5,lon:-2}}<tool_call|>";
-        let p = parse_model_tool_calls(raw, None);
-        assert_eq!(p.tool_calls.len(), 1);
-        let v: serde_json::Value =
-            serde_json::from_str(&p.tool_calls[0].function.arguments).unwrap();
-        assert_eq!(v["flag"], true);
-        assert_eq!(v["ratio"], 1.5);
-        assert_eq!(v["tags"][1], "b");
-        assert_eq!(v["where"]["lon"], -2);
-    }
-
-    #[test]
-    fn native_tool_call_two_calls_in_one_message() {
-        let raw = "<|tool_call>call:a{x:1}<tool_call|><|tool_call>call:b{y:2}<tool_call|>";
-        let p = parse_model_tool_calls(raw, None);
-        assert_eq!(p.tool_calls.len(), 2);
-        assert_eq!(p.tool_calls[0].function.name, "a");
-        assert_eq!(p.tool_calls[1].function.name, "b");
-    }
-
-    #[test]
-    fn native_tool_call_empty_arguments() {
-        let p = parse_model_tool_calls("<|tool_call>call:now{}<tool_call|>", None);
-        assert_eq!(p.tool_calls.len(), 1);
-        assert_eq!(p.tool_calls[0].function.arguments, "{}");
+    fn native_tool_call_delimiters_parse_into_tool_calls() {
+        for (raw, want) in [
+            (
+                "<|tool_call>call:get_weather{city:<|\"|>Oslo<|\"|>}<tool_call|>",
+                vec![("get_weather", json!({"city":"Oslo"}))],
+            ),
+            (
+                "<|tool_call>call:get_weather{<|\"|>city<|\"|>: <|\"|>Oslo<|\"|>, days: 3}<tool_call|>",
+                vec![("get_weather", json!({"city":"Oslo","days":3}))],
+            ),
+            (
+                "<|tool_call>call:f{q:<|\"|>a,b}c{d<|\"|>,n:2}<tool_call|>",
+                vec![("f", json!({"q":"a,b}c{d","n":2}))],
+            ),
+            (
+                "<|tool_call>call:f{flag:true,ratio:1.5,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],\
+                 where:{lat:1.5,lon:-2}}<tool_call|>",
+                vec![(
+                    "f",
+                    json!({"flag":true,"ratio":1.5,"tags":["a","b"],"where":{"lat":1.5,"lon":-2}}),
+                )],
+            ),
+            (
+                "<|tool_call>call:a{x:1}<tool_call|><|tool_call>call:b{y:2}<tool_call|>",
+                vec![("a", json!({"x":1})), ("b", json!({"y":2}))],
+            ),
+            ("<|tool_call>call:now{}<tool_call|>", vec![("now", json!({}))]),
+        ] {
+            let p = parse_model_tool_calls(raw, None);
+            assert_eq!(p.tool_calls.len(), want.len(), "{raw}");
+            for (call, (name, args)) in p.tool_calls.iter().zip(want) {
+                assert_eq!(call.function.name, name, "{raw}");
+                let v: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap();
+                assert_eq!(v, args, "{raw}");
+            }
+        }
     }
 
     #[test]
@@ -3562,46 +3482,26 @@ mod tests {
     }
 
     #[test]
-    fn thinking_splits_on_the_close_tag_when_the_prompt_opened_it() {
-        let (r, c) = split_thinking("weighing options\n</think>Four.", true).unwrap();
-        assert_eq!(r, "weighing options");
-        assert_eq!(c, "Four.");
-    }
-
-    #[test]
-    fn thinking_splits_when_the_model_emits_the_open_tag_itself() {
-        let (r, c) = split_thinking("<think>hmm</think>ok", false).unwrap();
-        assert_eq!(r, "hmm");
-        assert_eq!(c, "ok");
-    }
-
-    #[test]
-    fn no_open_tag_and_no_close_tag_leaves_content_untouched() {
-        assert!(split_thinking("just an answer", false).is_none());
-    }
-
-    #[test]
-    fn unclosed_block_opened_by_the_prompt_is_all_reasoning() {
-        let (r, c) = split_thinking("still thinking when we ran out of tokens", true).unwrap();
-        assert_eq!(r, "still thinking when we ran out of tokens");
-        assert!(c.is_empty());
-    }
-
-    #[test]
-    fn unclosed_block_opened_by_the_model_is_all_reasoning() {
-        let (r, c) = split_thinking("<think>hmm, budget gone", false).unwrap();
-        assert_eq!(r, "hmm, budget gone");
-        assert!(c.is_empty());
-    }
-
-    #[test]
-    fn think_only_output_yields_empty_content() {
-        let (r, c) = split_thinking("hmm</think>", true).unwrap();
-        assert_eq!(r, "hmm");
-        assert!(c.is_empty());
-        let (r, c) = split_thinking("<think>hmm</think>", false).unwrap();
-        assert_eq!(r, "hmm");
-        assert!(c.is_empty());
+    fn split_thinking_cases() {
+        let unclosed = "still thinking when we ran out of tokens";
+        for (text, opened, want) in [
+            ("weighing options\n</think>Four.", true, Some(("weighing options", "Four."))),
+            ("<think>hmm</think>ok", false, Some(("hmm", "ok"))),
+            ("just an answer", false, None),
+            (unclosed, true, Some((unclosed, ""))),
+            ("<think>hmm, budget gone", false, Some(("hmm, budget gone", ""))),
+            ("hmm</think>", true, Some(("hmm", ""))),
+            ("<think>hmm</think>", false, Some(("hmm", ""))),
+            ("here is markup: ```\n</think>\n```", false, None),
+            ("a</think>b</think>c", true, Some(("a", "b</think>c"))),
+        ] {
+            let got = split_thinking(text, opened);
+            assert_eq!(
+                got.as_ref().map(|(r, c)| (r.as_str(), c.as_str())),
+                want,
+                "text={text:?} opened={opened}"
+            );
+        }
     }
 
     #[test]
@@ -3612,33 +3512,6 @@ mod tests {
         assert_eq!(c, "Four.");
         let (_, c_split) = split_thinking("weighing options\n</think>\n\nFour.", true).unwrap();
         assert_eq!(c, c_split);
-    }
-
-    #[test]
-    fn unclosed_split_matches_the_streaming_splitter() {
-        for (text, opened) in [
-            ("still thinking when we ran out of tokens", true),
-            ("<think>hmm, budget gone", false),
-        ] {
-            let (r, c) = split_thinking(text, opened).unwrap();
-            let mut s = ThinkingStream::new(opened);
-            let (sr, sc) = drive(&mut s, &[text]);
-            assert_eq!(r, sr.trim());
-            assert_eq!(c, sc);
-        }
-    }
-
-    #[test]
-    fn a_close_tag_in_ordinary_content_does_not_split() {
-        let text = "here is markup: ```\n</think>\n```";
-        assert!(split_thinking(text, false).is_none());
-    }
-
-    #[test]
-    fn only_the_first_close_tag_splits() {
-        let (r, c) = split_thinking("a</think>b</think>c", true).unwrap();
-        assert_eq!(r, "a");
-        assert_eq!(c, "b</think>c");
     }
 
     fn drive(s: &mut ThinkingStream, pieces: &[&str]) -> (String, String) {
@@ -3656,35 +3529,19 @@ mod tests {
     }
 
     #[test]
-    fn streaming_splitter_handles_a_close_tag_split_across_deltas() {
-        let mut s = ThinkingStream::new(true);
-        let (r, c) = drive(&mut s, &["weigh", "ing</th", "ink>Fo", "ur."]);
-        assert_eq!(r, "weighing");
-        assert_eq!(c, "Four.");
-    }
-
-    #[test]
-    fn streaming_splitter_labels_everything_content_when_no_block_opens() {
-        let mut s = ThinkingStream::new(false);
-        let (r, c) = drive(&mut s, &["Fo", "ur.", " </think> is markup"]);
-        assert!(r.is_empty());
-        assert_eq!(c, "Four. </think> is markup");
-    }
-
-    #[test]
-    fn streaming_splitter_detects_a_model_emitted_open_tag() {
-        let mut s = ThinkingStream::new(false);
-        let (r, c) = drive(&mut s, &["<thi", "nk>hmm</think>ok"]);
-        assert_eq!(r, "hmm");
-        assert_eq!(c, "ok");
-    }
-
-    #[test]
-    fn streaming_splitter_keeps_unclosed_reasoning_out_of_content() {
-        let mut s = ThinkingStream::new(true);
-        let (r, c) = drive(&mut s, &["still thinking when we ran out of tokens"]);
-        assert_eq!(r, "still thinking when we ran out of tokens");
-        assert!(c.is_empty());
+    fn streaming_splitter_cases() {
+        let unclosed = "still thinking when we ran out of tokens";
+        let cases: &[(bool, &[&str], &str, &str)] = &[
+            (true, &["weigh", "ing</th", "ink>Fo", "ur."], "weighing", "Four."),
+            (false, &["Fo", "ur.", " </think> is markup"], "", "Four. </think> is markup"),
+            (false, &["<thi", "nk>hmm</think>ok"], "hmm", "ok"),
+            (true, &[unclosed], unclosed, ""),
+        ];
+        for (opened, pieces, want_r, want_c) in cases {
+            let mut s = ThinkingStream::new(*opened);
+            let (r, c) = drive(&mut s, pieces);
+            assert_eq!((r.as_str(), c.as_str()), (*want_r, *want_c), "{pieces:?}");
+        }
     }
 
     fn req_with(kwargs: serde_json::Value) -> ChatCompletionRequest {
@@ -3704,36 +3561,32 @@ mod tests {
         let bad = req_with(json!([1, 2]));
         let err = request_template_kwargs(&bad).expect_err("array must be rejected");
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn chat_template_kwargs_win_over_the_enable_thinking_shorthand() {
-        let body = json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "enable_thinking": true,
-            "chat_template_kwargs": {"enable_thinking": false},
-        });
-        let r: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-        let kw = request_template_kwargs(&r).unwrap();
-        assert_eq!(kw.get("enable_thinking"), Some(&json!(false)));
-    }
-
-    #[test]
-    fn enable_thinking_shorthand_alone_reaches_the_template_kwargs() {
-        let body = json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "enable_thinking": false,
-        });
-        let r: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-        let kw = request_template_kwargs(&r).unwrap();
-        assert_eq!(kw.get("enable_thinking"), Some(&json!(false)));
-    }
-
-    #[test]
-    fn a_request_without_kwargs_renders_exactly_as_before() {
-        let body = json!({"messages": [{"role": "user", "content": "hi"}]});
-        let r: ChatCompletionRequest = serde_json::from_value(body).unwrap();
-        assert!(request_template_kwargs(&r).unwrap().is_empty());
+        for (body, want) in [
+            (
+                json!({
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "enable_thinking": true,
+                    "chat_template_kwargs": {"enable_thinking": false},
+                }),
+                Some(json!(false)),
+            ),
+            (
+                json!({
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "enable_thinking": false,
+                }),
+                Some(json!(false)),
+            ),
+            (json!({"messages": [{"role": "user", "content": "hi"}]}), None),
+        ] {
+            let r: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+            let kw = request_template_kwargs(&r).unwrap();
+            assert_eq!(kw.get("enable_thinking"), want.as_ref());
+            if want.is_none() {
+                assert!(kw.is_empty());
+            }
+        }
     }
 
     #[test]
@@ -3756,10 +3609,7 @@ mod tests {
              not fall back to the built-in renderer mid-request",
         );
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-    }
 
-    #[test]
-    fn chat_template_kwargs_win_over_the_reasoning_effort_shorthand() {
         let body = json!({
             "messages": [{"role": "user", "content": "hi"}],
             "reasoning_effort": "low",
@@ -3768,6 +3618,163 @@ mod tests {
         let r: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         let kw = request_template_kwargs(&r).unwrap();
         assert_eq!(kw.get("reasoning_effort"), Some(&json!("xhigh")));
+    }
+
+    fn tool(name: &str, params: serde_json::Value) -> Tool {
+        serde_json::from_value(serde_json::json!({"type": "function", "function": {"name": name, "parameters": params}})).unwrap()
+    }
+
+    #[test]
+    fn a_required_call_to_a_parameterless_tool_admits_an_empty_object() {
+        let spec = required_calls_grammar(&[tool(
+            "ping",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )])
+        .unwrap();
+        let pieces = [r#"<tool_call>{"name": "ping", "arguments": "#, "{}", "}</tool_call>"];
+        let vocab = std::sync::Arc::new(nv_grammar::VocabBytes::new(
+            pieces.iter().map(|p| p.as_bytes().to_vec()).collect(),
+            &[],
+        ));
+        let mut d = nv_grammar::GuidedDecoder::from_grammar(&spec, vocab).unwrap();
+        assert!(
+            d.advance(0) && d.advance(1) && d.advance(2) && d.can_terminate(),
+            "a tool with no parameters takes any object as its arguments, {{}} first among them: \
+             the call grammar is assembled from schema_to_regex output, so its any-object marker \
+             must be read as one, not as the literal byte U+0002"
+        );
+    }
+
+    fn accepts(spec: &nv_grammar::GrammarSpec, text: &str) -> bool {
+        let mut c = nv_grammar::JsonConstraint::from_regex(&nv_grammar::grammar_to_regex(spec).unwrap()).unwrap();
+        c.advance_str(text) && c.can_terminate()
+    }
+
+    #[tokio::test]
+    async fn an_unenforceable_schema_or_regex_is_a_400_naming_the_field_before_any_engine_runs() {
+        for (rf, gj, gr, word) in [
+            (Some(serde_json::json!({"type": "json_schema", "json_schema": {"schema": {"type": "integer", "multipleOf": 3}}})), None, None, "multipleOf"),
+            (None, Some(serde_json::json!({"type": "string", "format": "iban"})), None, "iban"),
+            (None, None, Some("a(".to_string()), "guided_regex"),
+            (Some(serde_json::json!({"type": "json_schema", "json_schema": {"schema": {"type": ["string", "null"]}}})), None, None, ""),
+        ] {
+            let got = resolve_guided_fields(rf.as_ref(), gj.as_ref(), gr.as_ref(), None);
+            if word.is_empty() {
+                assert!(got.unwrap().is_some(), "a type array is enforced, not a 500");
+                continue;
+            }
+            let resp = got.expect_err(word);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            let body = body_json(resp).await;
+            assert!(body.to_string().contains(word), "{body}");
+        }
+    }
+
+    #[test]
+    fn forced_tool_arguments_follow_the_tools_own_schema_with_optional_parameters_optional() {
+        let weather = tool("get_weather", serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}, "units": {"enum": ["metric", "imperial"]}}, "required": ["city"], "additionalProperties": false}));
+        let p = resolve_tool_policy(std::slice::from_ref(&weather), &ToolChoice::Function("get_weather".into()), None).unwrap();
+        let g = p.guided.expect("a forced call is grammar-constrained");
+        assert!(accepts(&g, r#"{"city": "Tokyo"}"#), "units is optional");
+        assert!(accepts(&g, r#"{"city": "Tokyo", "units": "metric"}"#));
+        assert!(!accepts(&g, r#"{"city": "Tokyo", "units": "kelvin"}"#));
+        let parsed = parse_model_tool_calls(r#"{"city": "Tokyo"}"#, p.force_name.as_deref());
+        assert_eq!(parsed.tool_calls[0].function.name, "get_weather");
+        assert_eq!(parsed.tool_calls[0].function.arguments, r#"{"city": "Tokyo"}"#);
+        let bad = tool("f", serde_json::json!({"type": "object", "properties": {"n": {"type": "integer", "multipleOf": 2}}}));
+        let err = resolve_tool_policy(std::slice::from_ref(&bad), &ToolChoice::Required, None).err().expect("refused");
+        assert!(err.contains("multipleOf") && err.contains("\"f\""), "{err}");
+        let auto = resolve_tool_policy(&[bad], &ToolChoice::Auto, None).unwrap();
+        assert!(auto.guided.is_none(), "auto is never constrained, so its schemas are never compiled");
+    }
+
+    #[test]
+    fn required_over_several_tools_forces_parsable_calls_to_one_of_them() {
+        let tools = [
+            tool("get_weather", serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]})),
+            tool("book_table", serde_json::json!({"type": "object", "properties": {"people": {"type": "integer", "minimum": 1, "maximum": 12}}, "required": ["people"]})),
+        ];
+        let p = resolve_tool_policy(&tools, &ToolChoice::Required, None).unwrap();
+        assert!(p.force_name.is_none());
+        let g = p.guided.expect("required is grammar-constrained");
+        let one = "<tool_call>\n{\"name\": \"book_table\", \"arguments\": {\"people\": 4}}\n</tool_call>";
+        let two = format!("{one}\n<tool_call>\n{{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"Oslo\"}}}}\n</tool_call>");
+        assert!(accepts(&g, one) && accepts(&g, &two));
+        assert!(!accepts(&g, &one.replace('4', "20")), "the named tool's bounds hold");
+        assert!(!accepts(&g, &one.replace("book_table", "drop_db")), "only declared tools");
+        assert!(!accepts(&g, "Sure! <tool_call>"), "no prose before the call");
+        let parsed = parse_model_tool_calls(&two, None);
+        let names: Vec<&str> = parsed.tool_calls.iter().map(|c| c.function.name.as_str()).collect();
+        assert_eq!(names, ["book_table", "get_weather"]);
+        assert_eq!(parsed.tool_calls[1].function.arguments, r#"{"city":"Oslo"}"#);
+        assert!(parsed.content.is_none());
+    }
+
+    #[test]
+    fn json_object_and_open_object_schemas_take_replies_of_any_depth() {
+        let reply = r#"{"route":"change","say":"Gold.","ops":[{"op":"rule","do":[{"op":"spawn","position":{"at":"crystal","offset":[0,0.5,0]}}]}]}"#;
+        let fast_lane_schema = json!({"type": "json_schema", "json_schema": {"name": "reply", "schema": {
+            "type": "object",
+            "required": ["route", "say", "ops"],
+            "properties": {
+                "route": {"type": "string", "enum": ["change", "big", "ask", "none"]},
+                "say": {"type": "string"},
+                "ops": {"type": "array", "items": {"type": "object"}}
+            }
+        }}});
+        for rf in [json!({"type": "json_object"}), fast_lane_schema] {
+            let Some(nv_grammar::GrammarSpec::JsonSchema(schema)) =
+                resolve_guided_fields(Some(&rf), None, None, None)
+                    .ok()
+                    .flatten()
+            else {
+                panic!("{rf} must resolve to a JSON schema grammar");
+            };
+            let mut c = nv_grammar::JsonConstraint::from_schema(&schema).unwrap();
+            assert!(c.advance_str(reply) && c.can_terminate(), "{rf}");
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_none_turns_thinking_off_and_minimal_is_the_templates_low() {
+        let with = |extra: serde_json::Value| -> ChatCompletionRequest {
+            let mut body = json!({"messages": [{"role": "user", "content": "hi"}]});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+        let kw = request_template_kwargs(&with(json!({"reasoning_effort": "none"}))).unwrap();
+        assert_eq!(kw.get("enable_thinking"), Some(&json!(false)));
+        assert_eq!(
+            kw.get("reasoning_effort"),
+            None,
+            "the template never sees an effort it rejects"
+        );
+
+        let kw = request_template_kwargs(&with(json!({"reasoning_effort": "minimal"}))).unwrap();
+        assert_eq!(kw.get("reasoning_effort"), Some(&json!("low")));
+        assert_eq!(kw.get("enable_thinking"), None);
+
+        let kw = request_template_kwargs(&with(
+            json!({"reasoning_effort": "none", "enable_thinking": true}),
+        ))
+        .unwrap();
+        assert_eq!(
+            kw.get("enable_thinking"),
+            Some(&json!(true)),
+            "an explicit switch beats the alias"
+        );
+
+        let kw = request_template_kwargs(&with(
+            json!({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": true}}),
+        ))
+        .unwrap();
+        assert_eq!(
+            kw.get("enable_thinking"),
+            Some(&json!(true)),
+            "template kwargs beat both"
+        );
     }
 
     fn thinking_template(tag: &str) -> std::sync::Arc<crate::oapi::chat_template::ChatTemplate> {

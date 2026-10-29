@@ -37,6 +37,7 @@ const SESSION_APPLIED_KEYS: &[&str] = &[
     "sealed_buffer_retention_count",
     "input_audio_format",
     "output_audio_format",
+    "model",
 ];
 
 const INPUT_AUDIO_TRANSCRIPTION_KEYS: &[&str] = &["model", "language"];
@@ -45,7 +46,6 @@ const SESSION_ACCEPTED_UNAPPLIED_KEYS: &[&str] = &[
     "id",
     "object",
     "type",
-    "model",
     "modalities",
     "output_modalities",
     "audio",
@@ -145,6 +145,7 @@ pub(super) struct StagedSessionUpdate {
     pub sealed_buffer_retention_count: Option<u32>,
     pub input_audio_format: Option<String>,
     pub output_audio_format: Option<String>,
+    pub model: Option<String>,
 }
 
 pub(super) enum StagedInstructions {
@@ -238,6 +239,20 @@ pub(super) fn parse_session_update(
                 ),
             )
         })?);
+    }
+
+    if let Some(v) = session_obj.get("model") {
+        staged.model = Some(match v {
+            Value::String(s) => s.clone(),
+            _ => {
+                return Err((
+                    "session.model",
+                    "model: must be a string naming a chat model the conversation upstream serves"
+                        .into(),
+                )
+                    .into())
+            }
+        });
     }
 
     if let Some(v) = session_obj.get("voice") {
@@ -821,10 +836,6 @@ mod tests {
             parse(json!({"language":null})).unwrap().language,
             Some(None)
         );
-    }
-
-    #[test]
-    fn output_language_rejects_invalid_values_before_applying_voice() {
         for language in [json!("es-XX"), json!(""), json!(3), json!({})] {
             let err = parse(json!({"voice":"em_alex", "language":language}))
                 .err()
@@ -834,79 +845,41 @@ mod tests {
     }
 
     #[test]
-    fn no_speech_prob_threshold_set_value() {
+    fn no_speech_prob_and_avg_logprob_thresholds_stage_set_null_and_absent() {
         let s = parse(json!({"no_speech_prob_threshold": 0.6})).unwrap();
-
         assert_eq!(s.no_speech_prob_threshold, Some(Some(0.6)));
-    }
-
-    #[test]
-    fn no_speech_prob_threshold_explicit_null_disables() {
         let s = parse(json!({"no_speech_prob_threshold": null})).unwrap();
         assert_eq!(s.no_speech_prob_threshold, Some(None));
-    }
-
-    #[test]
-    fn no_speech_prob_threshold_absent_leaves_unchanged() {
         let s = parse(json!({})).unwrap();
         assert_eq!(s.no_speech_prob_threshold, None);
-    }
-
-    #[test]
-    fn no_speech_prob_threshold_rejects_out_of_range() {
-        let e = parse(json!({"no_speech_prob_threshold": 1.5}))
-            .err()
-            .expect("expected err");
-        assert!(e.message.contains("must be in [0,1]"), "{e:?}");
-        let e = parse(json!({"no_speech_prob_threshold": -0.1}))
-            .err()
-            .expect("expected err");
-        assert!(e.message.contains("must be in [0,1]"), "{e:?}");
-    }
-
-    #[test]
-    fn avg_logprob_threshold_accepts_negative_finite() {
+        assert_eq!(s.avg_logprob_threshold, None);
+        for bad in [1.5, -0.1] {
+            let e = parse(json!({"no_speech_prob_threshold": bad}))
+                .err()
+                .expect("expected err");
+            assert!(e.message.contains("must be in [0,1]"), "{e:?}");
+        }
         let s = parse(json!({"avg_logprob_threshold": -1.5})).unwrap();
         assert_eq!(s.avg_logprob_threshold, Some(Some(-1.5)));
-    }
-
-    #[test]
-    fn avg_logprob_threshold_rejects_non_finite() {
         let s = parse(json!({"avg_logprob_threshold": null})).unwrap();
         assert_eq!(s.avg_logprob_threshold, Some(None));
     }
 
     #[test]
-    fn neg_threshold_accepts_explicit_value() {
+    fn turn_detection_thresholds_stage_values_and_reject_out_of_range() {
         let s = parse(json!({"turn_detection": {"neg_threshold": 0.4}})).unwrap();
         let td = s.turn_detection.expect("turn_detection set");
         assert_eq!(td.neg_threshold, Some(Some(0.4)));
-    }
-
-    #[test]
-    fn neg_threshold_explicit_null_means_auto() {
         let s = parse(json!({"turn_detection": {"neg_threshold": null}})).unwrap();
         let td = s.turn_detection.expect("turn_detection set");
-        assert_eq!(td.neg_threshold, Some(None));
-    }
-
-    #[test]
-    fn neg_threshold_rejects_out_of_range() {
+        assert_eq!(td.neg_threshold, Some(None), "explicit null means auto");
         let e = parse(json!({"turn_detection": {"neg_threshold": 1.2}}))
             .err()
             .expect("expected err");
         assert!(e.message.contains("must be in [0,1]"), "{e:?}");
-    }
-
-    #[test]
-    fn min_speech_duration_ms_accepts_zero() {
         let s = parse(json!({"turn_detection": {"min_speech_duration_ms": 0}})).unwrap();
         let td = s.turn_detection.expect("turn_detection set");
         assert_eq!(td.min_speech_duration_ms, Some(0));
-    }
-
-    #[test]
-    fn min_speech_duration_ms_rejects_oversize() {
         let too_big = defaults::buffer::MIN_SPEECH_MS_MAX + 1;
         let e = parse(json!({"turn_detection": {"min_speech_duration_ms": too_big}}))
             .err()
@@ -922,22 +895,20 @@ mod tests {
         assert_eq!(e.code, errcode::SESSION_UPDATE_INVALID);
         assert_eq!(e.param, "session.instrucshuns");
         assert!(e.message.contains("unknown field"), "{e:?}");
-    }
-
-    #[test]
-    fn unknown_turn_detection_field_is_rejected() {
-        let e = parse(json!({"turn_detection": {"treshold": 0.5}}))
-            .err()
-            .expect("expected err");
-        assert_eq!(e.param, "session.turn_detection.treshold");
-    }
-
-    #[test]
-    fn unknown_eou_field_is_rejected() {
-        let e = parse(json!({"turn_detection": {"eou": {"p_treshold": 0.5}}}))
-            .err()
-            .expect("expected err");
-        assert_eq!(e.param, "session.turn_detection.eou.p_treshold");
+        for (body, param) in [
+            (json!({"turn_detection": {"treshold": 0.5}}), "session.turn_detection.treshold"),
+            (
+                json!({"turn_detection": {"eou": {"p_treshold": 0.5}}}),
+                "session.turn_detection.eou.p_treshold",
+            ),
+            (
+                json!({"input_audio_transcription": {"prompt": "x"}}),
+                "session.input_audio_transcription.prompt",
+            ),
+        ] {
+            let e = parse(body).err().expect("expected err");
+            assert_eq!(e.param, param);
+        }
     }
 
     #[test]
@@ -964,13 +935,20 @@ mod tests {
     }
 
     #[test]
-    fn speed_in_kokoro_range_is_staged() {
-        let s = parse(json!({"speed": 1.5})).unwrap();
-        assert_eq!(s.speed, Some(1.5));
+    fn model_is_staged_and_must_be_a_string() {
+        let s = parse(json!({"model": "claude-opus-5-5"})).unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(parse(json!({})).unwrap().model, None);
+        for bad in [json!(null), json!(3), json!({"id": "m"})] {
+            let e = parse(json!({"model": bad})).err().expect("expected err");
+            assert_eq!(e.param, "session.model");
+        }
     }
 
     #[test]
-    fn speed_out_of_kokoro_range_is_rejected() {
+    fn speed_in_kokoro_range_is_staged_and_out_of_range_is_rejected() {
+        let s = parse(json!({"speed": 1.5})).unwrap();
+        assert_eq!(s.speed, Some(1.5));
         for bad in [0.4, 2.5, -1.0] {
             let e = parse(json!({"speed": bad})).err().expect("expected err");
             assert_eq!(e.param, "session.speed");
@@ -985,22 +963,10 @@ mod tests {
         let iat = s.input_audio_transcription.expect("staged");
         assert_eq!(iat.model.as_deref(), Some("whisper"));
         assert_eq!(iat.language.as_deref(), Some("de"));
-    }
-
-    #[test]
-    fn input_audio_transcription_unknown_language_is_rejected() {
         let e = parse(json!({"input_audio_transcription": {"language": "klingon"}}))
             .err()
             .expect("expected err");
         assert_eq!(e.param, "session.input_audio_transcription.language");
-    }
-
-    #[test]
-    fn input_audio_transcription_unknown_key_is_rejected() {
-        let e = parse(json!({"input_audio_transcription": {"prompt": "x"}}))
-            .err()
-            .expect("expected err");
-        assert_eq!(e.param, "session.input_audio_transcription.prompt");
     }
 
     #[test]
@@ -1011,10 +977,6 @@ mod tests {
         assert_eq!(e.code, errcode::SESSION_UPDATE_INVALID);
         assert_eq!(e.param, "session.instructions");
         assert!(e.message.contains("non-null string"), "{e:?}");
-    }
-
-    #[test]
-    fn instructions_empty_string_clears() {
         let s = parse(json!({"instructions": ""})).unwrap();
         assert!(matches!(s.instructions, Some(StagedInstructions::Clear)));
     }
@@ -1026,6 +988,15 @@ mod tests {
             .expect("expected err");
         assert_eq!(e.code, errcode::EOU_KIND_UNSUPPORTED);
         assert_eq!(e.param, "session.turn_detection.eou.kind");
+        let e = parse(json!({"turn_detection": {"eou": {"fusion_rule": "max"}}}))
+            .err()
+            .expect("expected err");
+        assert_eq!(e.code, errcode::EOU_FUSION_RULE_UNSUPPORTED);
+        assert_eq!(e.param, "session.turn_detection.eou.fusion_rule");
+        let e = parse(json!({"turn_detection": {"eou": {"kind": "telepathy"}}}))
+            .err()
+            .expect("expected err");
+        assert_eq!(e.code, errcode::SESSION_UPDATE_INVALID);
     }
 
     #[test]
@@ -1035,20 +1006,4 @@ mod tests {
         assert_eq!(eou.kind, Some(EouKind::Vad));
     }
 
-    #[test]
-    fn eou_fusion_rule_not_bound_to_session_is_unsupported() {
-        let e = parse(json!({"turn_detection": {"eou": {"fusion_rule": "max"}}}))
-            .err()
-            .expect("expected err");
-        assert_eq!(e.code, errcode::EOU_FUSION_RULE_UNSUPPORTED);
-        assert_eq!(e.param, "session.turn_detection.eou.fusion_rule");
-    }
-
-    #[test]
-    fn eou_unsupported_value_still_reported_as_invalid() {
-        let e = parse(json!({"turn_detection": {"eou": {"kind": "telepathy"}}}))
-            .err()
-            .expect("expected err");
-        assert_eq!(e.code, errcode::SESSION_UPDATE_INVALID);
-    }
 }

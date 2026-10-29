@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
@@ -230,28 +228,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn params_keep_the_sixteen_byte_uniform_layout() {
-        assert_eq!(std::mem::size_of::<RopeBwdParams>(), 16);
+    fn params_and_both_directions_follow_the_shader_contract() {
+        {
+            assert_eq!(std::mem::size_of::<RopeBwdParams>(), 16);
+        }
+        {
+            let src = compose(WGSL);
+            assert!(src.contains("fn qlora_rope_fwd("));
+            assert!(src.contains("fn qlora_rope_bwd("));
+        }
     }
 
     #[test]
-    fn source_declares_both_directions() {
-        let src = compose(WGSL);
-        assert!(src.contains("fn qlora_rope_fwd("));
-        assert!(src.contains("fn qlora_rope_bwd("));
-    }
-
-    #[test]
-    fn zero_half_dim_is_rejected_because_the_clamp_would_underflow() {
-        let e = plan(0, 0, 0, 0, 0, 0, 0, 0, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-        let e = plan(0, 0, 0, 0, 0, 0, 0, 4, 0).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn shape_mismatch_is_reported() {
-        let e = plan(10, 10, 1, 8, 8, 1, 1, 4, 2).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+    fn zero_half_dim_and_shape_mismatch_are_rejected() {
+        {
+            let e = plan(0, 0, 0, 0, 0, 0, 0, 0, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+            let e = plan(0, 0, 0, 0, 0, 0, 0, 4, 0).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            let e = plan(10, 10, 1, 8, 8, 1, 1, 4, 2).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
     }
 }

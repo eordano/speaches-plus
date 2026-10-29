@@ -110,7 +110,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn diarizen_v2_topology() {
+    fn powerset_topologies_have_unique_sorted_classes() {
         let dec = PowersetDecoder::new(4, 2);
 
         assert_eq!(dec.num_classes(), 11);
@@ -119,29 +119,25 @@ mod tests {
         assert_eq!(dec.mapping[4], vec![3]);
         assert_eq!(dec.mapping[5], vec![0, 1]);
         assert_eq!(dec.mapping[10], vec![2, 3]);
-    }
-
-    #[test]
-    fn pyannote_3spk_topology() {
-        let dec = PowersetDecoder::new(3, 2);
-        assert_eq!(dec.num_classes(), 7);
-    }
-
-    #[test]
-    fn class_indices_are_unique_and_sorted() {
-        use std::collections::BTreeSet;
-        let dec = PowersetDecoder::new(4, 2);
-        let set: BTreeSet<Vec<usize>> = dec.mapping.iter().cloned().collect();
-        assert_eq!(set.len(), dec.num_classes(), "duplicate class");
-        for combo in &dec.mapping {
-            let mut sorted = combo.clone();
-            sorted.sort();
-            assert_eq!(*combo, sorted, "class indices must be sorted: {:?}", combo);
+        {
+            let dec = PowersetDecoder::new(3, 2);
+            assert_eq!(dec.num_classes(), 7);
+        }
+        {
+            use std::collections::BTreeSet;
+            let dec = PowersetDecoder::new(4, 2);
+            let set: BTreeSet<Vec<usize>> = dec.mapping.iter().cloned().collect();
+            assert_eq!(set.len(), dec.num_classes(), "duplicate class");
+            for combo in &dec.mapping {
+                let mut sorted = combo.clone();
+                sorted.sort();
+                assert_eq!(*combo, sorted, "class indices must be sorted: {:?}", combo);
+            }
         }
     }
 
     #[test]
-    fn argmax_picks_silence() {
+    fn argmax_picks_silence_and_overlap() {
         let dec = PowersetDecoder::new(4, 2);
 
         let logits = SegmentationLogits {
@@ -155,21 +151,20 @@ mod tests {
         };
         let ml = dec.to_multilabel_hard(&logits);
         assert_eq!(ml.row(0), &[0, 0, 0, 0]);
+        {
+            let dec = PowersetDecoder::new(4, 2);
+            let logits = SegmentationLogits {
+                frames: 1,
+                classes: 11,
+                data: {
+                    let mut v = vec![-10.0f32; 11];
+                    v[5] = 0.0;
+                    v
+                },
+            };
+            let ml = dec.to_multilabel_hard(&logits);
+            assert_eq!(ml.row(0), &[1, 1, 0, 0]);
+        }
     }
 
-    #[test]
-    fn argmax_picks_overlap() {
-        let dec = PowersetDecoder::new(4, 2);
-        let logits = SegmentationLogits {
-            frames: 1,
-            classes: 11,
-            data: {
-                let mut v = vec![-10.0f32; 11];
-                v[5] = 0.0;
-                v
-            },
-        };
-        let ml = dec.to_multilabel_hard(&logits);
-        assert_eq!(ml.row(0), &[1, 1, 0, 0]);
-    }
 }

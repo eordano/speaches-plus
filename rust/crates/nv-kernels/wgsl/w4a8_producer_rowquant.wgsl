@@ -145,6 +145,7 @@ fn silu_mul_rowquant_evenodd(@builtin(local_invocation_id) lid: vec3<u32>) {
     for (var i = tid; i < nwords; i = i + wg) {
         let vw = w48p_silu_mul_word(w48p_gate[i], w48p_up[i]);
         w48p_act[i] = vw;
+        #def b2
         m = max(m, w48p_word_amax(vw));
     }
     let d = w48p_silu_scale_from_amax(tid, m);
@@ -164,6 +165,7 @@ fn silu_mul_rowquant_evenodd(@builtin(local_invocation_id) lid: vec3<u32>) {
         );
     }
 }
+        #end
 
 @compute @workgroup_size(W48P_SILU_WG_1024_AMAX_IS_ORDER_FREE_SO_THE_WIDE_REDUCE_STAYS_BIT_EXACT)
 fn silu_mul_rowquant_evenodd_nosmem(@builtin(local_invocation_id) lid: vec3<u32>) {
@@ -173,6 +175,7 @@ fn silu_mul_rowquant_evenodd_nosmem(@builtin(local_invocation_id) lid: vec3<u32>
     var m = 0.0;
     for (var i = tid; i < nwords; i = i + wg) {
         m = max(m, w48p_word_amax(w48p_silu_mul_word(w48p_gate[i], w48p_up[i])));
+    #def b1
     }
     let d = w48p_silu_scale_from_amax(tid, m);
     let dinv = select(0.0, 1.0 / d, d != 0.0);
@@ -191,6 +194,7 @@ fn silu_mul_rowquant_evenodd_nosmem(@builtin(local_invocation_id) lid: vec3<u32>
         );
     }
 }
+    #end
 
 @compute @workgroup_size(W48P_SILU_WG_1024_AMAX_IS_ORDER_FREE_SO_THE_WIDE_REDUCE_STAYS_BIT_EXACT)
 fn silu_mul_rowquant_evenodd_act_bf16_nosmem(@builtin(local_invocation_id) lid: vec3<u32>) {
@@ -202,24 +206,7 @@ fn silu_mul_rowquant_evenodd_act_bf16_nosmem(@builtin(local_invocation_id) lid: 
         let vw = w48p_silu_mul_word(w48p_gate[i], w48p_up[i]);
         w48p_out[i] = vw;
         m = max(m, w48p_word_amax(vw));
-    }
-    let d = w48p_silu_scale_from_amax(tid, m);
-    let dinv = select(0.0, 1.0 / d, d != 0.0);
-    if (tid == 0u) {
-        w48p_xs[0] = d;
-    }
-    let nvec = w48p_p.k_blocks * 2u;
-    for (var g = tid; g < nvec; g = g + wg) {
-        w48p_emit_group(
-            g,
-            w48p_silu_mul_word(w48p_gate[4u * g], w48p_up[4u * g]),
-            w48p_silu_mul_word(w48p_gate[4u * g + 1u], w48p_up[4u * g + 1u]),
-            w48p_silu_mul_word(w48p_gate[4u * g + 2u], w48p_up[4u * g + 2u]),
-            w48p_silu_mul_word(w48p_gate[4u * g + 3u], w48p_up[4u * g + 3u]),
-            dinv
-        );
-    }
-}
+    #use b1
 
 @compute @workgroup_size(W48P_SILU_WG_1024_AMAX_IS_ORDER_FREE_SO_THE_WIDE_REDUCE_STAYS_BIT_EXACT)
 fn silu_mul_rowquant_evenodd_act_bf16(@builtin(local_invocation_id) lid: vec3<u32>) {
@@ -231,22 +218,4 @@ fn silu_mul_rowquant_evenodd_act_bf16(@builtin(local_invocation_id) lid: vec3<u3
         let vw = w48p_silu_mul_word(w48p_gate[i], w48p_up[i]);
         w48p_act[i] = vw;
         w48p_out[i] = vw;
-        m = max(m, w48p_word_amax(vw));
-    }
-    let d = w48p_silu_scale_from_amax(tid, m);
-    let dinv = select(0.0, 1.0 / d, d != 0.0);
-    if (tid == 0u) {
-        w48p_xs[0] = d;
-    }
-    let nvec = w48p_p.k_blocks * 2u;
-    for (var g = tid; g < nvec; g = g + wg) {
-        w48p_emit_group(
-            g,
-            w48p_act[4u * g],
-            w48p_act[4u * g + 1u],
-            w48p_act[4u * g + 2u],
-            w48p_act[4u * g + 3u],
-            dinv
-        );
-    }
-}
+        #use b2

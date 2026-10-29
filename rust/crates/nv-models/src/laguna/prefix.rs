@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use cudarc::driver::{CudaContext, CudaStream, DevicePtr, DeviceRepr};
 use half::bf16;
@@ -82,16 +82,16 @@ pub(crate) fn read_device_slice<T: DeviceRepr + Clone + Default, S: DevicePtr<T>
 
 pub(crate) fn prefix_stream(device: &Device) -> Result<Arc<CudaStream>> {
     let Device::Cuda(dev) = device else {
-        anyhow::bail!("prefix snapshots require CUDA");
+        bail!("prefix snapshots require CUDA");
     };
     let stream = nv_layers::cuda_stream::current_stream(dev);
-    anyhow::ensure!(
+    ensure!(
         stream.cu_stream() == dev.cuda_stream().cu_stream()
             && Arc::ptr_eq(stream.context(), dev.cuda_stream().context()),
         "prefix snapshots require the cache legacy stream"
     );
-    anyhow::ensure!(
-        stream.capture_status().map_err(|e| anyhow::anyhow!(e))?
+    ensure!(
+        stream.capture_status()?
             == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,
         "prefix snapshots cannot copy during CUDA capture"
     );
@@ -109,7 +109,7 @@ pub(crate) fn validate_tensor_rows(
     let end = row0
         .checked_add(rows)
         .context("prefix row range overflows")?;
-    anyhow::ensure!(
+    ensure!(
         dims.len() == 4
             && dims[0] == 1
             && row_elems > 0
@@ -121,14 +121,14 @@ pub(crate) fn validate_tensor_rows(
     );
     let (storage, layout) = tensor.storage_and_layout();
     let candle_core::Storage::Cuda(storage) = &*storage else {
-        anyhow::bail!("prefix tensor is not CUDA");
+        bail!("prefix tensor is not CUDA");
     };
     let slice = storage.as_cuda_slice::<bf16>()?;
     let end = end
         .checked_mul(row_elems)
         .and_then(|n| n.checked_add(layout.start_offset()))
         .context("prefix storage range overflows")?;
-    anyhow::ensure!(
+    ensure!(
         end <= slice.len() && Arc::ptr_eq(slice.context(), stream.context()),
         "prefix tensor storage/context mismatch"
     );
@@ -145,7 +145,7 @@ pub(crate) fn rows_dtoh(
     validate_tensor_rows(stream, src, row0, n_rows, row_elems)?;
     let (storage, layout) = src.storage_and_layout();
     let candle_core::Storage::Cuda(storage) = &*storage else {
-        anyhow::bail!("prefix source is not CUDA");
+        bail!("prefix source is not CUDA");
     };
     let slice = storage.as_cuda_slice::<bf16>()?.slice(
         layout.start_offset() + row0 * row_elems
@@ -161,7 +161,7 @@ pub(crate) fn rows_htod(
     host: &[bf16],
     row_elems: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         row_elems > 0 && host.len().is_multiple_of(row_elems),
         "prefix host buffer is ragged"
     );
@@ -172,7 +172,7 @@ pub(crate) fn rows_htod(
     }
     let (storage, layout) = dst.storage_and_layout();
     let candle_core::Storage::Cuda(storage) = &*storage else {
-        anyhow::bail!("prefix destination is not CUDA");
+        bail!("prefix destination is not CUDA");
     };
     let slice = storage.as_cuda_slice::<bf16>()?.slice(
         layout.start_offset() + row0 * row_elems..layout.start_offset() + (row0 + rows) * row_elems,
@@ -209,11 +209,11 @@ impl LagunaKvCache {
             .ring
             .as_ref()
             .context("BF16 prefix reuse refuses legacy KV storage")?;
-        anyhow::ensure!(
+        ensure!(
             !ring.ring_attn,
             "BF16 prefix reuse refuses ring-attention mode"
         );
-        anyhow::ensure!(
+        ensure!(
             !self.layers.is_empty()
                 && self.layers.len() == self.layer_windows.len()
                 && self.layers.len() == self.layer_caps.len()
@@ -234,7 +234,7 @@ impl LagunaKvCache {
         let re = layout.row_elems()?;
         for (li, (k, v)) in self.layers.iter().enumerate() {
             let cap = if let Some(window) = self.layer_windows[li] {
-                anyhow::ensure!(
+                ensure!(
                     window > 0 && window == ring.s_window,
                     "BF16 prefix ring requires uniform sliding windows"
                 );
@@ -242,7 +242,7 @@ impl LagunaKvCache {
             } else {
                 self.max_seq_len
             };
-            anyhow::ensure!(
+            ensure!(
                 self.layer_caps[li] == cap
                     && cap > 0
                     && k.dims() == [1, cap, self.n_kv, self.head_dim]
@@ -260,7 +260,7 @@ impl LagunaKvCache {
             .ring
             .as_ref()
             .context("BF16 prefix requires ring metadata")?;
-        anyhow::ensure!(
+        ensure!(
             self.current_len > 0
                 && self.current_len <= self.max_seq_len
                 && ring.full_stored == self.current_len
@@ -274,7 +274,7 @@ impl LagunaKvCache {
             } else {
                 ring.full_stored
             };
-            anyhow::ensure!(
+            ensure!(
                 self.layer_stored[li] == stored
                     && window.is_none_or(|window| stored >= window.min(self.current_len)),
                 "BF16 prefix layer {li} is not fully initialized"
@@ -291,7 +291,7 @@ impl LagunaKvCache {
 
     pub fn snapshot_full_bytes(&self, pos: usize) -> Result<usize> {
         let (layout, _) = self.prefix_layout()?;
-        anyhow::ensure!(
+        ensure!(
             self.holds_full_rows(pos),
             "BF16 prefix no longer holds full rows through {pos}"
         );
@@ -380,7 +380,7 @@ impl LagunaKvCache {
         let (layout, stream) = self.prefix_layout()?;
         let target = sliding.pos;
         let re = layout.row_elems()?;
-        anyhow::ensure!(
+        ensure!(
             target > 0
                 && target <= self.max_seq_len
                 && layout.matches(&sliding.layout)
@@ -398,13 +398,13 @@ impl LagunaKvCache {
         );
         for ((k, v), window) in sliding.rows.iter().zip(layout.windows.iter().flatten()) {
             let need = checked_bytes((*window).min(target), re, 1)?;
-            anyhow::ensure!(
+            ensure!(
                 k.len() == need && v.len() == need,
                 "BF16 prefix sliding source length mismatch"
             );
         }
         if let Some(full) = full {
-            anyhow::ensure!(
+            ensure!(
                 full.pos >= target
                     && full.pos <= self.max_seq_len
                     && layout.matches(&full.layout)
@@ -413,14 +413,14 @@ impl LagunaKvCache {
                 "BF16 prefix full snapshot position/layout/bytes/layer mismatch"
             );
             let need = checked_bytes(full.pos, re, 1)?;
-            anyhow::ensure!(
+            ensure!(
                 full.rows
                     .iter()
                     .all(|(k, v)| k.len() == need && v.len() == need),
                 "BF16 prefix full source length mismatch"
             );
         } else {
-            anyhow::ensure!(
+            ensure!(
                 self.holds_full_rows(target),
                 "BF16 prefix resident full rows are unavailable"
             );
@@ -471,8 +471,8 @@ impl LagunaKvCache {
             ];
             let copy = stream.memcpy_htod(&ring.host_meta[..], &mut ring.meta_dev);
             let sync = stream.synchronize();
-            copy.map_err(|e| anyhow::anyhow!(e))?;
-            sync.map_err(|e| anyhow::anyhow!(e))?;
+            copy?;
+            sync?;
             ring.full_stored = target;
             ring.s_stored = sliding.n_rows;
             self.current_len = target;
@@ -531,8 +531,7 @@ mod tests {
         ];
         out.extend(
             stream
-                .clone_dtoh(&ring.meta_dev)
-                .map_err(|e| anyhow::anyhow!(e))?
+                .clone_dtoh(&ring.meta_dev)?
                 .into_iter()
                 .map(|v| v as u32),
         );
@@ -605,9 +604,7 @@ mod tests {
             max_seq_len: 2048,
             ring: Some(LagunaKvRing {
                 dev: dev.clone(),
-                meta_dev: stream
-                    .alloc_zeros::<i32>(4)
-                    .map_err(|e| anyhow::anyhow!(e))?,
+                meta_dev: stream.alloc_zeros::<i32>(4)?,
                 host_meta: Box::new([0; 4]),
                 s_stored: 0,
                 full_stored: 0,

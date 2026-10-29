@@ -10,9 +10,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
+half = { workspace = true }
 nv-config = { workspace = true }
 nv-layers = { workspace = true }
 nv-omni = { workspace = true }
+nv-quant = { workspace = true, optional = true }
 nv-weights = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -23,7 +25,7 @@ tokenizers = { version = "0.23", default-features = false, features = ["unstable
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-nn/cuda", "nv-layers/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "nv-layers/cuda", "dep:nv-quant"]
 metal = ["candle-core/metal", "candle-nn/metal", "nv-layers/metal"]
 stale-examples = []
 

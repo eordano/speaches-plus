@@ -207,7 +207,7 @@ pub fn clip(s: &str, max: usize) -> String {
 pub fn sha256_file(path: &std::path::Path) -> Result<String> {
     use sha2::Digest;
     let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
-    Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+    Ok(hex::encode(sha2::Sha256::digest(bytes)))
 }
 
 pub const TOKEN_CONTEXT_BEFORE: usize = 18;

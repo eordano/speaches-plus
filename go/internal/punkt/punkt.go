@@ -82,10 +82,6 @@ func (t *token) isInitial() bool {
 	return len(runes) == 2 && unicode.IsLetter(runes[0]) && runes[1] == '.'
 }
 
-func (t *token) isNumber() bool {
-	return strings.HasPrefix(t.typ, "##number##")
-}
-
 func isNumeric(s string) bool {
 	runes := []rune(s)
 	i := 0

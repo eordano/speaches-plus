@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -1155,7 +1154,7 @@ mod checker_selftest {
     }
 
     #[test]
-    fn i1_flags_a_late_session_created() {
+    fn i1_and_i2_flag_late_session_created_and_bad_event_ids() {
         let ok = t(vec![
             json!({"type": SESSION_CREATED}),
             json!({"type": ERROR}),
@@ -1167,21 +1166,19 @@ mod checker_selftest {
         assert!(i1_session_created_first(&ok).is_empty());
         assert_eq!(i1_session_created_first(&bad).len(), 1);
         assert!(!i1_session_created_first(&t(vec![json!({"type": ERROR})])).is_empty());
+        {
+            let ok = t(vec![json!({"type": ERROR}), json!({"type": ERROR})]);
+            assert!(i2_event_ids_monotone(&ok).is_empty());
+            let mut inverted = ok.clone();
+            inverted[1]["event_id"] = json!("evt_000000000000000000000000");
+            assert_eq!(i2_event_ids_monotone(&inverted).len(), 1);
+            let missing = vec![json!({"type": ERROR})];
+            assert_eq!(i2_event_ids_monotone(&missing).len(), 1);
+        }
     }
 
     #[test]
-    fn i2_flags_missing_and_inverted_event_ids() {
-        let ok = t(vec![json!({"type": ERROR}), json!({"type": ERROR})]);
-        assert!(i2_event_ids_monotone(&ok).is_empty());
-        let mut inverted = ok.clone();
-        inverted[1]["event_id"] = json!("evt_000000000000000000000000");
-        assert_eq!(i2_event_ids_monotone(&inverted).len(), 1);
-        let missing = vec![json!({"type": ERROR})];
-        assert_eq!(i2_event_ids_monotone(&missing).len(), 1);
-    }
-
-    #[test]
-    fn i3_flags_a_swapped_chain() {
+    fn i3_i4_i5_i13_flag_item_chain_and_reference_order_faults() {
         let ok = t(vec![
             json!({"type": SPEECH_STARTED, "item_id": "i1"}),
             json!({"type": SPEECH_STOPPED, "item_id": "i1"}),
@@ -1193,54 +1190,80 @@ mod checker_selftest {
         let mut bad = ok.clone();
         bad.swap(2, 3);
         assert!(!i3_input_item_chain(&bad).is_empty());
+        {
+            let ok = t(vec![
+                json!({"type": COMMITTED, "item_id": "i1"}),
+                json!({"type": DIARIZATION, "item_id": "i1"}),
+            ]);
+            assert!(i4_no_unannounced_item_refs(&ok).is_empty());
+            let bad = t(vec![
+                json!({"type": SPEECH_STARTED, "item_id": "i1"}),
+                json!({"type": DIARIZATION, "item_id": "i1"}),
+            ]);
+            assert_eq!(i4_no_unannounced_item_refs(&bad).len(), 1);
+        }
+        {
+            let bad = t(vec![
+                json!({"type": TRANSCRIPT_DONE, "item_id": "i1"}),
+                json!({"type": PARTIAL, "item_id": "i1"}),
+            ]);
+            assert_eq!(i5_no_partial_after_completed(&bad).len(), 1);
+            let ok = t(vec![
+                json!({"type": PARTIAL, "item_id": "i1"}),
+                json!({"type": TRANSCRIPT_DONE, "item_id": "i1"}),
+            ]);
+            assert!(i5_no_partial_after_completed(&ok).is_empty());
+        }
+        {
+            let ok = t(vec![
+                json!({"type": ITEM_ADDED, "item": {"id": "i1"}}),
+                json!({"type": TRANSCRIPT_DONE, "item_id": "i1"}),
+                json!({"type": DIARIZATION, "item_id": "i1"}),
+            ]);
+            assert!(i13_diarization_after_transcript(&ok).is_empty());
+            let bad = t(vec![
+                json!({"type": DIARIZATION, "item_id": "i1"}),
+                json!({"type": ITEM_ADDED, "item": {"id": "i1"}}),
+                json!({"type": TRANSCRIPT_DONE, "item_id": "i1"}),
+            ]);
+            assert_eq!(i13_diarization_after_transcript(&bad).len(), 2);
+        }
     }
 
     #[test]
-    fn i4_flags_a_dangling_item_reference() {
-        let ok = t(vec![
-            json!({"type": COMMITTED, "item_id": "i1"}),
-            json!({"type": DIARIZATION, "item_id": "i1"}),
-        ]);
-        assert!(i4_no_unannounced_item_refs(&ok).is_empty());
-        let bad = t(vec![
-            json!({"type": SPEECH_STARTED, "item_id": "i1"}),
-            json!({"type": DIARIZATION, "item_id": "i1"}),
-        ]);
-        assert_eq!(i4_no_unannounced_item_refs(&bad).len(), 1);
-    }
-
-    #[test]
-    fn i5_flags_a_stale_partial() {
-        let bad = t(vec![
-            json!({"type": TRANSCRIPT_DONE, "item_id": "i1"}),
-            json!({"type": PARTIAL, "item_id": "i1"}),
-        ]);
-        assert_eq!(i5_no_partial_after_completed(&bad).len(), 1);
-        let ok = t(vec![
-            json!({"type": PARTIAL, "item_id": "i1"}),
-            json!({"type": TRANSCRIPT_DONE, "item_id": "i1"}),
-        ]);
-        assert!(i5_no_partial_after_completed(&ok).is_empty());
-    }
-
-    #[test]
-    fn i6_flags_missing_created_and_trailing_events() {
+    fn i6_i7_i9_flag_response_bracket_and_post_done_audio_faults() {
         let ok = t(vec![created("r1"), audio("r1"), done("r1")]);
         assert!(i6_response_brackets(&ok).is_empty());
         let no_created = t(vec![audio("r1"), done("r1")]);
         assert_eq!(i6_response_brackets(&no_created).len(), 1);
         let trailing = t(vec![created("r1"), done("r1"), audio("r1")]);
         assert_eq!(i6_response_brackets(&trailing).len(), 1);
-    }
-
-    #[test]
-    fn i7_flags_post_done_events_and_unscoped_audio() {
-        let bad = t(vec![created("r1"), done("r1"), audio("r1")]);
-        assert_eq!(i7_nothing_after_response_done(&bad).len(), 1);
-        let unscoped = t(vec![json!({"type": AUDIO_DELTA, "delta": "x"})]);
-        assert_eq!(i7_nothing_after_response_done(&unscoped).len(), 1);
-        let ok = t(vec![created("r1"), audio("r1"), done("r1")]);
-        assert!(i7_nothing_after_response_done(&ok).is_empty());
+        {
+            let bad = t(vec![created("r1"), done("r1"), audio("r1")]);
+            assert_eq!(i7_nothing_after_response_done(&bad).len(), 1);
+            let unscoped = t(vec![json!({"type": AUDIO_DELTA, "delta": "x"})]);
+            assert_eq!(i7_nothing_after_response_done(&unscoped).len(), 1);
+            let ok = t(vec![created("r1"), audio("r1"), done("r1")]);
+            assert!(i7_nothing_after_response_done(&ok).is_empty());
+        }
+        {
+            let scoped = t(vec![created("r1"), done("r1"), audio("r1")]);
+            assert_eq!(i9_no_audio_after_done(&scoped).len(), 1);
+            let unscoped = t(vec![
+                created("r1"),
+                done("r1"),
+                json!({"type": AUDIO_DELTA, "delta": "x"}),
+            ]);
+            assert_eq!(i9_no_audio_after_done(&unscoped).len(), 1);
+            let next_response = t(vec![
+                created("r1"),
+                done("r1"),
+                created("r2"),
+                audio("r2"),
+                done("r2"),
+            ]);
+            assert!(i9_no_audio_after_done(&next_response).is_empty());
+        }
     }
 
     #[test]
@@ -1252,68 +1275,28 @@ mod checker_selftest {
     }
 
     #[test]
-    fn i9_flags_orphan_audio_including_the_unscoped_case() {
-        let scoped = t(vec![created("r1"), done("r1"), audio("r1")]);
-        assert_eq!(i9_no_audio_after_done(&scoped).len(), 1);
-        let unscoped = t(vec![
-            created("r1"),
-            done("r1"),
-            json!({"type": AUDIO_DELTA, "delta": "x"}),
-        ]);
-        assert_eq!(i9_no_audio_after_done(&unscoped).len(), 1);
-        let next_response = t(vec![
-            created("r1"),
-            done("r1"),
-            created("r2"),
-            audio("r2"),
-            done("r2"),
-        ]);
-        assert!(i9_no_audio_after_done(&next_response).is_empty());
-    }
-
-    #[test]
-    fn i10_flags_two_pacers() {
+    fn i10_i11_i12_flag_pacer_timeline_and_wire_order_faults() {
         assert!(i10_single_pacer(1).is_empty());
         assert_eq!(i10_single_pacer(2).len(), 1);
-    }
-
-    #[test]
-    fn i11_flags_backwards_timelines() {
-        let bad_end = t(vec![
-            json!({"type": SPEECH_STOPPED, "item_id": "i1", "audio_end_ms": 900}),
-            json!({"type": SPEECH_STOPPED, "item_id": "i2", "audio_end_ms": 400}),
-        ]);
-        assert_eq!(i11_timeline_monotone(&bad_end).len(), 1);
-        let mut a = audio("r1");
-        a["played_ms"] = json!(200);
-        let mut b = audio("r1");
-        b["played_ms"] = json!(100);
-        assert_eq!(i11_timeline_monotone(&t(vec![a, b])).len(), 1);
-    }
-
-    #[test]
-    fn i12_flags_wire_order_inversion() {
-        let mut trace = t(vec![json!({"type": ERROR}), json!({"type": ERROR})]);
-        assert!(i12_emit_order_equals_wire_order(&trace).is_empty());
-        trace[1]["harness_seq"] = json!(0u64);
-        trace[0]["harness_seq"] = json!(1u64);
-        assert_eq!(i12_emit_order_equals_wire_order(&trace).len(), 1);
-    }
-
-    #[test]
-    fn i13_flags_early_diarization() {
-        let ok = t(vec![
-            json!({"type": ITEM_ADDED, "item": {"id": "i1"}}),
-            json!({"type": TRANSCRIPT_DONE, "item_id": "i1"}),
-            json!({"type": DIARIZATION, "item_id": "i1"}),
-        ]);
-        assert!(i13_diarization_after_transcript(&ok).is_empty());
-        let bad = t(vec![
-            json!({"type": DIARIZATION, "item_id": "i1"}),
-            json!({"type": ITEM_ADDED, "item": {"id": "i1"}}),
-            json!({"type": TRANSCRIPT_DONE, "item_id": "i1"}),
-        ]);
-        assert_eq!(i13_diarization_after_transcript(&bad).len(), 2);
+        {
+            let bad_end = t(vec![
+                json!({"type": SPEECH_STOPPED, "item_id": "i1", "audio_end_ms": 900}),
+                json!({"type": SPEECH_STOPPED, "item_id": "i2", "audio_end_ms": 400}),
+            ]);
+            assert_eq!(i11_timeline_monotone(&bad_end).len(), 1);
+            let mut a = audio("r1");
+            a["played_ms"] = json!(200);
+            let mut b = audio("r1");
+            b["played_ms"] = json!(100);
+            assert_eq!(i11_timeline_monotone(&t(vec![a, b])).len(), 1);
+        }
+        {
+            let mut trace = t(vec![json!({"type": ERROR}), json!({"type": ERROR})]);
+            assert!(i12_emit_order_equals_wire_order(&trace).is_empty());
+            trace[1]["harness_seq"] = json!(0u64);
+            trace[0]["harness_seq"] = json!(1u64);
+            assert_eq!(i12_emit_order_equals_wire_order(&trace).len(), 1);
+        }
     }
 
     #[test]
@@ -1344,22 +1327,21 @@ mod checker_selftest {
     }
 
     #[test]
-    fn client_supplied_speak_trace_is_clean() {
+    fn client_supplied_speak_trace_is_clean_and_trips_i6_without_response_created() {
         let trace = t(client_supplied_speak_bracket());
         assert!(
             ids_of(&check_trace(&trace)).is_empty(),
             "{}",
             render(&trace)
         );
+        {
+            let mut evs = client_supplied_speak_bracket();
+            evs.remove(2);
+            let trace = t(evs);
+            assert!(ids_of(&check_trace(&trace)).contains("I6"));
+        }
     }
 
-    #[test]
-    fn client_supplied_speak_without_response_created_trips_i6() {
-        let mut evs = client_supplied_speak_bracket();
-        evs.remove(2);
-        let trace = t(evs);
-        assert!(ids_of(&check_trace(&trace)).contains("I6"));
-    }
 }
 
 #[cfg(test)]
@@ -1477,6 +1459,10 @@ mod tier1 {
                 item_id: item(),
                 content_index: 0,
                 transcript: "t".into(),
+                avg_logprob: None,
+                no_speech_prob: None,
+                compression_ratio: None,
+                logprobs: None,
             }),
             TranscriptionDelta(TranscriptionDeltaEvent {
                 item_id: item(),
@@ -1646,65 +1632,6 @@ mod tier1 {
         }
     }
 
-    fn i17_divergences() -> Vec<(&'static str, Topic, Topic)> {
-        all_variants()
-            .iter()
-            .filter_map(|ev| {
-                let a = Topic::classify(ev.type_name());
-                let b = ev.topic();
-                if a == b {
-                    None
-                } else {
-                    Some((ev.type_name(), a, b))
-                }
-            })
-            .collect()
-    }
-
-    #[test]
-    fn i17_topic_classifiers_agree() {
-        let d = i17_divergences();
-        assert!(
-            d.is_empty(),
-            "I17 violated for {} event types:\n{}",
-            d.len(),
-            d.iter()
-                .map(|(t, a, b)| format!("  {t}: classify={a:?} topic()={b:?}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    #[test]
-    fn i17_divergence_is_exactly_the_documented_set() {
-        let got: BTreeSet<&'static str> = i17_divergences().iter().map(|(t, _, _)| *t).collect();
-        let expect: BTreeSet<&'static str> = BTreeSet::new();
-        assert_eq!(
-            got, expect,
-            "I17 divergence set moved; harness expectation is stale"
-        );
-    }
-
-    #[test]
-    fn i17_no_outbound_variant_classifies_as_other() {
-        let stragglers: Vec<&'static str> = all_variants()
-            .iter()
-            .filter(|ev| ev.topic() == Topic::Other)
-            .map(|ev| ev.type_name())
-            .collect();
-        assert!(
-            stragglers.is_empty(),
-            "OutboundEvent::topic() delegates to Topic::classify, whose prefix table has no arm \
-             for {} event type(s):\n{}\nAdd a prefix arm in state::Topic::classify.",
-            stragglers.len(),
-            stragglers
-                .iter()
-                .map(|t| format!("  {t}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
     #[test]
     fn i17_topic_table_is_pinned_per_variant() {
         let expect: &[(&str, Topic)] = &[
@@ -1803,16 +1730,6 @@ mod tier1 {
             missing.len(),
             all_variants().len(),
             missing.join("\n  ")
-        );
-    }
-
-    #[test]
-    fn i2_missing_event_id_surface_is_known() {
-        let missing = missing_event_id();
-        assert_eq!(
-            missing.len(),
-            0,
-            "I2 surface changed (was 0 of 39 types lacking event_id): {missing:?}"
         );
     }
 
@@ -2767,7 +2684,6 @@ mod cancel_energy {
 #[cfg(test)]
 mod client_supplied {
     use super::*;
-    use std::sync::atomic::AtomicBool;
 
     use crate::ids::CounterIdSource;
     use crate::models::Models;
@@ -2777,12 +2693,13 @@ mod client_supplied {
     use super::super::events;
     use super::super::inspector;
     use super::super::pipeline;
-    use super::super::session::Session;
+    use super::super::session::{ResponseLane, Session};
     use super::super::state::{select_response_source, ResponseSource, VadPhase};
     use super::super::wire::OutboundEvent;
     use super::super::Intent;
 
     const SPEAK_TEXT: &str = "The build finished in forty seconds.";
+    const PACER_FRAME_MS: u64 = 20;
     const NO_USER_MESSAGE: &str = "no user message in conversation to respond to";
     const SPEECH_ACTIVE: &str = "cannot create a response while input speech is active";
 
@@ -2970,40 +2887,32 @@ mod client_supplied {
         );
     }
 
-    struct OpenResponse {
-        id: ResponseId,
-        played_ms: Arc<AtomicU64>,
-        transcript_so_far: Arc<TokioMutex<String>>,
-        wire_opened: Arc<AtomicBool>,
-    }
-
     async fn open_response(
         session: &Arc<Session>,
         response_id: &str,
         item_id: &str,
         emit_brackets: bool,
-    ) -> OpenResponse {
-        let played_ms = Arc::new(AtomicU64::new(0));
-        let transcript_so_far = Arc::new(TokioMutex::new(String::new()));
-        let wire_opened = Arc::new(AtomicBool::new(false));
-        let handle = tokio::spawn(async { std::future::pending::<()>().await });
+    ) -> ResponseLane {
+        let mut opened = None;
         session
-            .register_response(
+            .spawn_response_lane(
+                &mut *session.state.lock().await,
                 ResponseId::new(response_id),
-                handle,
-                played_ms.clone(),
                 ItemId::new(item_id),
-                transcript_so_far.clone(),
-                wire_opened.clone(),
+                |lane| {
+                    opened = Some(lane);
+                    std::future::pending::<()>()
+                },
             )
-            .await;
+            .expect("an idle session admits the response");
+        let lane = opened.expect("the lane is handed its parts before it is spawned");
         if emit_brackets {
-            events::emit_response_open_brackets(session, response_id, item_id).await;
-            wire_opened.store(true, Ordering::Release);
-            session.mark_streaming(response_id).await;
-            *transcript_so_far.lock().await = SPEAK_TEXT.to_string();
+            assert!(session.announce_response(&lane).await);
+            session.mark_streaming(response_id, &lane.played_ms).await;
+            *lane.transcript_so_far.lock().await = SPEAK_TEXT.to_string();
             events::emit_audio_transcript_delta(session, response_id, item_id, SPEAK_TEXT).await;
             for _ in 0..2 {
+                lane.played_ms.fetch_add(PACER_FRAME_MS, Ordering::Relaxed);
                 session
                     .emit(OutboundEvent::ResponseOutputAudioDelta(
                         super::super::wire::ResponseOutputAudioDeltaEvent {
@@ -3017,12 +2926,7 @@ mod client_supplied {
                     .await;
             }
         }
-        OpenResponse {
-            id: ResponseId::new(response_id),
-            played_ms,
-            transcript_so_far,
-            wire_opened,
-        }
+        lane
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3048,16 +2952,15 @@ mod client_supplied {
         };
         inbound(&session, assistant_item_create(SPEAK_TEXT)).await;
         let open = open_response(&session, "resp_speak_1", "item_spoken_1", true).await;
-        events::emit_bracket_close(&session, "resp_speak_1", "item_spoken_1", SPEAK_TEXT).await;
-        events::emit_response_done(
-            &session,
-            "resp_speak_1",
-            "completed",
-            Some(SPEAK_TEXT.to_string()),
-            None,
-            2140,
-        )
-        .await;
+        assert!(
+            session
+                .close_response(
+                    "resp_speak_1",
+                    None,
+                    events::completed_response("resp_speak_1", "item_spoken_1", SPEAK_TEXT, 2140),
+                )
+                .await
+        );
         session.clear_response_if_matches(&open.id).await;
         let trace = drain(&mut rx);
         assert_clean(&trace);
@@ -3111,13 +3014,19 @@ mod client_supplied {
             return;
         };
         inbound(&session, assistant_item_create(SPEAK_TEXT)).await;
-        let _open = open_response(&session, "resp_speak_1", "item_spoken_1", true).await;
+        let open = open_response(&session, "resp_speak_1", "item_spoken_1", true).await;
+        let played = open.played_ms.load(Ordering::Relaxed);
         inbound(&session, json!({"type": "response.cancel"})).await;
         let trace = drain(&mut rx);
         assert_clean(&trace);
 
         let done =
             find(&trace, RESPONSE_DONE).expect("a cancelled response still closes its bracket");
+        assert_eq!(
+            done["response"]["audio_end_ms"],
+            json!(played),
+            "response.done reports the audio the lane played, read from the lane's own counter"
+        );
         assert_eq!(done["response"]["status"], json!("cancelled"));
         assert_eq!(
             done["response"]["status_details"]["reason"],
@@ -3130,10 +3039,9 @@ mod client_supplied {
             "cancellation is a normal terminal outcome; portal must not raise chat_err for it: {:?}",
             error_messages(&trace)
         );
-        assert!(
-            find(&trace, "conversation.item.assistant_truncated").is_none(),
-            "the played_ms snapshot is always 0, so emit_server_truncate early-returns and portal cannot learn how much was spoken"
-        );
+        let truncated = find(&trace, "conversation.item.assistant_truncated")
+            .expect("portal learns how much of the cancelled reply was spoken");
+        assert_eq!(truncated["audio_end_ms"], json!(played));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3364,6 +3272,131 @@ mod client_supplied {
             speakable_flags(&session).await,
             vec![true],
             "a rejected create must leave the item speakable so portal can retry after speech_stopped"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn response_create_while_input_speech_is_active_on_the_generate_path_is_rejected() {
+        let Some((session, mut rx)) = conversation_session().await else {
+            return;
+        };
+        inbound(&session, user_item_create("what about tuesday")).await;
+        {
+            let mut state = session.state.lock().await;
+            state.vad = VadPhase::Speaking {
+                item_id: ItemId::new("item_user_live"),
+                audio_start_ms: Millis(0),
+            };
+        }
+        inbound(&session, json!({"type": "response.create"})).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let trace = drain(&mut rx);
+        assert_clean(&trace);
+        assert!(
+            error_messages(&trace).iter().any(|m| m == SPEECH_ACTIVE),
+            "the generate path refuses an open mic exactly as the speak path does: {:?}\n{}",
+            error_messages(&trace),
+            render(&trace)
+        );
+        assert!(
+            find(&trace, RESPONSE_CREATED).is_none(),
+            "a refused registration must leave no lane behind to announce itself\n{}",
+            render(&trace)
+        );
+        assert!(
+            session.state.lock().await.current_response.is_none(),
+            "nothing was registered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_while_the_open_brackets_are_stalled_still_closes_the_response() {
+        let Some(models) = models() else {
+            return;
+        };
+        let session = Arc::new(Session::with_dependencies(
+            query(),
+            models,
+            Intent::Conversation,
+            None,
+            Arc::new(CounterIdSource::new()),
+            inspector::default_sink(),
+        ));
+        let (tx, mut rx) = mpsc::channel::<String>(2);
+        session.attach_websocket(tx.clone()).await;
+        let announcing = session.clone();
+        session
+            .spawn_response_lane(
+                &mut *session.state.lock().await,
+                ResponseId::new("resp_stalled"),
+                ItemId::new("item_stalled"),
+                |lane| async move {
+                    announcing.announce_response(&lane).await;
+                    std::future::pending::<()>().await
+                },
+            )
+            .expect("an idle session admits the response");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while tx.capacity() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("response.created fills the sink, so output_item.added stalls behind it");
+        let cancelling = session.clone();
+        let cancel = tokio::spawn(async move {
+            inbound(&cancelling, json!({"type": "response.cancel"})).await;
+        });
+        wait_until_no_response_is_active(&session).await;
+        let trace = collect_until_response_done(&mut rx).await;
+        cancel.await.expect("response.cancel handled");
+        assert_clean(&trace);
+        let done = find(&trace, RESPONSE_DONE).unwrap_or_else(|| {
+            panic!(
+                "a response whose response.created reached the client is closed by the cancel\n{}",
+                render(&trace)
+            )
+        });
+        assert_eq!(done["response"]["status"], json!("cancelled"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bargein_between_the_lanes_response_done_and_its_exit_adds_nothing() {
+        let Some((session, mut rx)) = conversation_session().await else {
+            return;
+        };
+        let (closed_tx, closed_rx) = oneshot::channel();
+        let closing = session.clone();
+        session
+            .spawn_response_lane(
+                &mut *session.state.lock().await,
+                ResponseId::new("resp_done"),
+                ItemId::new("item_done"),
+                |lane| async move {
+                    closing.announce_response(&lane).await;
+                    closing
+                        .close_response(
+                            "resp_done",
+                            None,
+                            events::completed_response("resp_done", "item_done", SPEAK_TEXT, 0),
+                        )
+                        .await;
+                    let _ = closed_tx.send(());
+                    std::future::pending::<()>().await
+                },
+            )
+            .expect("an idle session admits the response");
+        closed_rx
+            .await
+            .expect("the lane delivered its own response.done");
+        pipeline::commit_bargein(&session, "item_user_next", 1234).await;
+        let trace = drain(&mut rx);
+        assert_clean(&trace);
+        assert_eq!(
+            trace.iter().filter(|e| ty(e) == RESPONSE_DONE).count(),
+            1,
+            "the lane's own response.done closes the response, so a barge-in after it is a no-op\n{}",
+            render(&trace)
         );
     }
 }

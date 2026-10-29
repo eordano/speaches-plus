@@ -10,7 +10,7 @@ try:
 except ImportError as e:
     raise RuntimeError(
         "pybind11 is required to build whisper_bindings. "
-        "Install it with `pip install pybind11>=2.13`."
+        "Install it with `uv pip install 'pybind11>=2.13'`."
     ) from e
 
 def _split_env(name: str) -> list[str]:

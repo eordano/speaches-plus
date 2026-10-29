@@ -83,7 +83,7 @@ def dump_reference(km, phonemes: str, pack_row, out: Path) -> dict:
             g = dec.generator
             f0u = g.f0_upsamp(d["F0_pred"][:, None]).transpose(1, 2)
             har_source, _, _ = g.m_source(f0u)
-            d["har_source"] = har_source.transpose(1, 2).squeeze(1)  # (1, L)
+            d["har_source"] = har_source.transpose(1, 2).squeeze(1)
             har_spec, har_phase = g.stft.transform(d["har_source"])
             d["har"] = torch.cat([har_spec, har_phase], dim=1)
         finally:
@@ -93,7 +93,7 @@ def dump_reference(km, phonemes: str, pack_row, out: Path) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--kokoro-src", required=True, type=Path, help="directory containing kokoro/ (pip download kokoro)")
+    ap.add_argument("--kokoro-src", required=True, type=Path, help="directory containing kokoro/ (uv pip install --no-deps --target DIR kokoro)")
     ap.add_argument("--config", required=True, type=Path); ap.add_argument("--pth", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--ref", type=Path); ap.add_argument("--phonemes"); ap.add_argument("--pack", type=Path, help=".npy style pack; the row for the token count is used")

@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 pub(crate) use crate::wgpu_backend::dequant::bytes_to_words;
 use crate::wgpu_backend::device::WgpuContext;
 pub(crate) use crate::wgpu_backend::pack::unpack_u8_by_element as words_to_bytes;
@@ -8,7 +6,7 @@ pub(crate) use crate::wgpu_backend::pack::{
 };
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
-pub const WGSL: &str = include_str!("../../../wgsl/tree_verify_attn.wgsl");
+pub const WGSL: &str = crate::wgsl!("../../../wgsl/tree_verify_attn.wgsl");
 
 pub const WORKGROUP_SIZE: u32 = 256;
 pub const MAX_HEAD_DIM: usize = 512;
@@ -247,174 +245,25 @@ pub fn kv_append_bf16(
     Ok(())
 }
 
-pub fn kv_compact_bf16(
-    ctx: &WgpuContext,
-    kc: &mut [u16],
-    vc: &mut [u16],
-    path: &[i32],
-    base: usize,
-    n_accept: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-) -> Result<()> {
-    if n_accept == 0 || n_kv_heads == 0 || head_dim == 0 {
-        return Ok(());
-    }
-    let row = n_kv_heads * head_dim;
-    if !row.is_multiple_of(2) {
-        return Err(WgpuError::Unsupported(format!(
-            "kv_compact_bf16 needs an even n_kv_heads*head_dim so bf16 pairs land on whole u32 words; got {row}"
-        )));
-    }
-    dispatch::check_len("kv_compact_bf16 path", path.len(), n_accept)?;
-    let slots = slot_count(kc.len(), row, "kv_compact_bf16 kc")?;
-    dispatch::check_len("kv_compact_bf16 vc", vc.len(), kc.len())?;
-    if base + n_accept > slots {
-        return Err(WgpuError::Shape(format!(
-            "kv_compact_bf16: base {base} + n_accept {n_accept} exceeds {slots} cache slots"
-        )));
-    }
-    for (i, &p) in path.iter().enumerate() {
-        if p < 0 || base + p as usize >= slots {
-            return Err(WgpuError::Shape(format!(
-                "kv_compact_bf16: path[{i}] = {p} with base {base} is outside {slots} cache slots"
-            )));
-        }
-    }
-    check_device(ctx, "kv_compact_bf16", 0)?;
-
-    let row_words = row / 2;
-    let total = n_accept * row_words;
-    let params = TvParams {
-        n_kv_heads: n_kv_heads as u32,
-        head_dim: head_dim as u32,
-        base: base as u32,
-        n_accept: n_accept as u32,
-        stride_words: row_words as u32,
-        total: total as u32,
-        ..Default::default()
-    };
-
-    let kcb = dispatch::storage_from_slice(ctx, "tv.compact.kc", &pack_bf16(kc));
-    let vcb = dispatch::storage_from_slice(ctx, "tv.compact.vc", &pack_bf16(vc));
-    let skb = dispatch::storage_zeroed(ctx, "tv.compact.sk", (total * 4) as u64);
-    let svb = dispatch::storage_zeroed(ctx, "tv.compact.sv", (total * 4) as u64);
-    let pb = dispatch::storage_from_slice(ctx, "tv.compact.path", path);
-    let ub = dispatch::uniform_from(ctx, "tv.compact.params", &params);
-
-    let gather: [(u32, &wgpu::Buffer); 6] = [
-        (12, &kcb),
-        (13, &vcb),
-        (14, &skb),
-        (15, &svb),
-        (16, &pb),
-        (17, &ub),
-    ];
-    let scatter: [(u32, &wgpu::Buffer); 5] =
-        [(12, &kcb), (13, &vcb), (14, &skb), (15, &svb), (17, &ub)];
-    let groups = dispatch::workgroup_count_1d(ctx, total as u64, WORKGROUP_SIZE);
-    let src = compose(WGSL);
-    dispatch::run(
-        ctx,
-        "nv_kernels_kv_gather_bf16",
-        &src,
-        "kv_gather_bf16",
-        &gather,
-        groups,
-    )?;
-    dispatch::run(
-        ctx,
-        "nv_kernels_kv_scatter_bf16",
-        &src,
-        "kv_scatter_bf16",
-        &scatter,
-        groups,
-    )?;
-
-    let got_k: Vec<u32> = dispatch::read_back(ctx, &kcb, kc.len() / 2)?;
-    unpack_bf16(&got_k, kc);
-    let got_v: Vec<u32> = dispatch::read_back(ctx, &vcb, vc.len() / 2)?;
-    unpack_bf16(&got_v, vc);
-    Ok(())
-}
-
-pub fn cpu_kv_append_bf16(
-    k_src: &[u16],
-    v_src: &[u16],
-    kc: &mut [u16],
-    vc: &mut [u16],
-    n_committed: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    k: usize,
-    ring: usize,
-) {
-    let row = n_kv_heads * head_dim;
-    for token in 0..k {
-        let mut slot = n_committed + token;
-        if ring > 0 {
-            slot %= ring;
-        }
-        let src = token * row;
-        let dst = slot * row;
-        kc[dst..dst + row].copy_from_slice(&k_src[src..src + row]);
-        vc[dst..dst + row].copy_from_slice(&v_src[src..src + row]);
-    }
-}
-
-pub fn cpu_kv_compact_bf16(
-    kc: &mut [u16],
-    vc: &mut [u16],
-    path: &[i32],
-    base: usize,
-    n_accept: usize,
-    stride: usize,
-) {
-    let mut sk = vec![0u16; n_accept * stride];
-    let mut sv = vec![0u16; n_accept * stride];
-    for i in 0..n_accept {
-        let src = (base + path[i] as usize) * stride;
-        sk[i * stride..(i + 1) * stride].copy_from_slice(&kc[src..src + stride]);
-        sv[i * stride..(i + 1) * stride].copy_from_slice(&vc[src..src + stride]);
-    }
-    for i in 0..n_accept {
-        let dst = (base + i) * stride;
-        kc[dst..dst + stride].copy_from_slice(&sk[i * stride..(i + 1) * stride]);
-        vc[dst..dst + stride].copy_from_slice(&sv[i * stride..(i + 1) * stride]);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert_eq!(std::mem::size_of::<TvParams>() % 16, 0);
-    }
-
-    #[test]
-    fn byte_word_packing_round_trips() {
-        let bytes: Vec<u8> = (0u8..13).collect();
-        let words = bytes_to_words(&bytes);
-        let mut back = vec![0u8; bytes.len()];
-        words_to_bytes(&words, &mut back);
-        assert_eq!(back, bytes);
-    }
-
-    #[test]
-    fn cpu_compact_matches_gather_scatter() {
-        let stride = 2;
-        let mut kc: Vec<u16> = (0u16..12).collect();
-        let mut vc: Vec<u16> = (100u16..112).collect();
-        cpu_kv_compact_bf16(&mut kc, &mut vc, &[2, 0], 1, 2, stride);
-        assert_eq!(&kc[2..6], &[6, 7, 2, 3]);
-        assert_eq!(&vc[2..6], &[106, 107, 102, 103]);
-    }
-
-    #[test]
-    fn slot_bounds_are_checked() {
-        assert!(slot_count(10, 4, "x").is_err());
-        assert_eq!(slot_count(12, 4, "x").unwrap(), 3);
+    fn params_packing_and_slot_bounds_follow_the_shader_contract() {
+        {
+            assert_eq!(std::mem::size_of::<TvParams>() % 16, 0);
+        }
+        {
+            let bytes: Vec<u8> = (0u8..13).collect();
+            let words = bytes_to_words(&bytes);
+            let mut back = vec![0u8; bytes.len()];
+            words_to_bytes(&words, &mut back);
+            assert_eq!(back, bytes);
+        }
+        {
+            assert!(slot_count(10, 4, "x").is_err());
+            assert_eq!(slot_count(12, 4, "x").unwrap(), 3);
+        }
     }
 }

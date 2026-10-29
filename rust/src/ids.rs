@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -81,7 +80,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn random_ids_are_unique_and_prefixed() {
+    fn random_ids_are_unique_and_counter_ids_are_deterministic_per_kind() {
         let src = RandomIdSource;
         let a = src.item();
         let b = src.item();
@@ -91,24 +90,21 @@ mod tests {
         assert!(src.session().as_str().starts_with("sess_"));
         assert!(src.response().as_str().starts_with("resp_"));
         assert!(src.event().as_str().starts_with("evt_"));
-    }
-
-    #[test]
-    fn counter_ids_are_deterministic() {
-        let src = CounterIdSource::new();
-        assert_eq!(src.item().as_str(), format!("item_{:024}", 0));
-        assert_eq!(src.item().as_str(), format!("item_{:024}", 1));
-        assert_eq!(src.response().as_str(), format!("resp_{:024}", 0));
-        assert_eq!(src.session().as_str(), format!("sess_{:024}", 0));
-        assert_eq!(src.event().as_str(), format!("evt_{:024}", 0));
-    }
-
-    #[test]
-    fn counters_are_per_kind_independent() {
-        let src = CounterIdSource::new();
-        for _ in 0..3 {
-            src.item();
+        {
+            let src = CounterIdSource::new();
+            assert_eq!(src.item().as_str(), format!("item_{:024}", 0));
+            assert_eq!(src.item().as_str(), format!("item_{:024}", 1));
+            assert_eq!(src.response().as_str(), format!("resp_{:024}", 0));
+            assert_eq!(src.session().as_str(), format!("sess_{:024}", 0));
+            assert_eq!(src.event().as_str(), format!("evt_{:024}", 0));
         }
-        assert_eq!(src.response().as_str(), format!("resp_{:024}", 0));
+        {
+            let src = CounterIdSource::new();
+            for _ in 0..3 {
+                src.item();
+            }
+            assert_eq!(src.response().as_str(), format!("resp_{:024}", 0));
+        }
     }
+
 }

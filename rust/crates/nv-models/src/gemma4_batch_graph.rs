@@ -93,12 +93,50 @@ pub fn build_slot_table(seq_table: &[u32], scratch_block: u32, rows: usize) -> R
 }
 
 #[cfg(feature = "cuda")]
-#[path = "graph_teardown.rs"]
-pub mod graph_teardown;
+pub use nv_quant::graph_teardown;
 
 #[cfg(feature = "cuda")]
-#[path = "capture_stream.rs"]
-pub mod capture_stream;
+pub use nv_quant::capture_stream;
+
+#[cfg(all(test, feature = "cuda"))]
+mod capture_stream_policy {
+    use super::capture_stream::CaptureStream;
+    use candle_core::Device;
+    use std::sync::Arc;
+
+    #[test]
+    fn for_device_disables_event_tracking_before_it_allocates_the_nvfp4_workspace() {
+        let Ok(device) = Device::new_cuda_with_stream(0) else {
+            panic!(
+                "no CUDA device 0: this suite is the only gate on the capture-stream policy and \
+                 must not report success having executed nothing"
+            );
+        };
+        let Device::Cuda(d) = &device else {
+            unreachable!()
+        };
+        let ctx = d.cuda_stream().context().clone();
+        let cs = CaptureStream::for_device(&device).expect("CaptureStream on the stream device");
+        assert!(
+            !ctx.is_event_tracking(),
+            "CaptureStream::for_device must disable cudarc event tracking BEFORE it allocates the \
+             64 MiB nvfp4 workspace and before the engine allocates any buffer the capture will \
+             touch; a slice allocated with tracking on carries read/write CudaEvents that record \
+             into the capture and then record an error on teardown. Constructing a CaptureStream \
+             is therefore not free -- it disables tracking for the whole CONTEXT -- so an engine \
+             whose eager candle path is still live must not build one in its constructor: {}",
+            crate::graph_engine::THE_EAGER_ALL_NAN_WAS_THE_GROUPED_MULTI_TOKEN_DEFECT_NOW_FIXED_NOT_THIS_DISABLE
+        );
+        assert!(
+            std::ptr::eq(
+                Arc::as_ptr(cs.stream().context()),
+                Arc::as_ptr(d.cuda_stream().context())
+            ),
+            "the capture stream must belong to the context whose tracking was just disabled, or \
+             this test disarmed a different context than the engine will capture on"
+        );
+    }
+}
 
 #[cfg(feature = "cuda")]
 pub use graphed::Gemma4BatchGraphFamily;
@@ -111,7 +149,6 @@ mod graphed {
     use crate::host_serving_util::CachedPinnedHostStagingViaCuMemHostAllocFlags0BecauseCudarcAllocPinnedIsWriteCombinedAndHostReadsOfWcAreUncachedAndPageableDtohReallocatesEveryStep as CachedPinnedHostStaging;
     use crate::host_serving_util::{DeviceArgmaxTokenExit, InGraphPhaseEventLadder};
     use crate::paged_fp8::PagedKvFp8Pool;
-    use anyhow::anyhow;
     use candle_core::{DType, Device, Tensor};
     use cudarc::driver::{CudaSlice, CudaStream};
     use half::bf16;
@@ -159,7 +196,7 @@ mod graphed {
         crate::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_G4_QKNORM_ROPE_FUSED")
     }
 
-    extern "C" {
+    unsafe extern "C" {
         fn nv_kernels_g4_qknorm_rope_vnorm_bf16(
             stream: *mut std::ffi::c_void,
             q_raw: *const u16,
@@ -242,7 +279,7 @@ mod graphed {
             scratch_base: u32,
             max_ctx: usize,
         ) -> Result<Self> {
-            if !matches!(device, Device::Cuda(_)) {
+            if !device.is_cuda() {
                 bail!("Gemma4BatchGraphFamily requires a CUDA device");
             }
             if model.dtype() != DType::BF16 {
@@ -254,9 +291,9 @@ mod graphed {
             let cfg = model.config().clone();
             let b_max = plan.max_bucket();
             let (block_size, pool_blocks, lanes) = {
-                let p = pool
-                    .lock()
-                    .map_err(|_| anyhow!("Gemma4BatchGraphFamily: kv pool mutex poisoned"))?;
+                let p = pool.lock().map_err(|_| {
+                    anyhow::anyhow!("Gemma4BatchGraphFamily: kv pool mutex poisoned")
+                })?;
                 let c = p.config();
                 (c.block_size, c.num_blocks, c.lanes)
             };
@@ -292,45 +329,31 @@ mod graphed {
             let alloc = |n: usize| -> Result<CudaSlice<bf16>> {
                 capture_stream
                     .alloc_zeros::<bf16>(n)
-                    .map_err(|e| anyhow!(e))
+                    .map_err(|e| anyhow::anyhow!(e))
             };
             let mut slots = Vec::with_capacity(b_max);
             for _ in 0..b_max {
                 slots.push(GraphSlot {
-                    table_dev: capture_stream
-                        .alloc_zeros::<i32>(max_rows)
-                        .map_err(|e| anyhow!(e))?,
-                    start_dev: capture_stream
-                        .alloc_zeros::<i32>(1)
-                        .map_err(|e| anyhow!(e))?,
-                    n_total_dev: capture_stream
-                        .alloc_zeros::<i32>(1)
-                        .map_err(|e| anyhow!(e))?,
+                    table_dev: capture_stream.alloc_zeros::<i32>(max_rows)?,
+                    start_dev: capture_stream.alloc_zeros::<i32>(1)?,
+                    n_total_dev: capture_stream.alloc_zeros::<i32>(1)?,
                     host_table: vec![0i32; max_rows].into_boxed_slice(),
                     host_start: Box::new([0i32; 1]),
                     host_n_total: Box::new([1i32; 1]),
                 });
             }
-            let token_buf = capture_stream
-                .alloc_zeros::<u32>(b_max)
-                .map_err(|e| anyhow!(e))?;
-            let pos_buf = capture_stream
-                .alloc_zeros::<i32>(b_max)
-                .map_err(|e| anyhow!(e))?;
+            let token_buf = capture_stream.alloc_zeros::<u32>(b_max)?;
+            let pos_buf = capture_stream.alloc_zeros::<i32>(b_max)?;
             let logits_buf = alloc(b_max * vocab)?;
             let scratch_elems = crate::paged_fp8::flash_scratch_elems_for(n_q, hd_max);
-            let scratch = capture_stream
-                .alloc_zeros::<f32>(scratch_elems)
-                .map_err(|e| anyhow!(e))?;
-            let fan_in = capture_stream
-                .alloc_zeros::<u32>(n_q)
-                .map_err(|e| anyhow!(e))?;
+            let scratch = capture_stream.alloc_zeros::<f32>(scratch_elems)?;
+            let fan_in = capture_stream.alloc_zeros::<u32>(n_q)?;
             let rows_host =
                 CachedPinnedHostStaging::alloc_cu_mem_host_alloc_flags0_cached_page_locked(
                     capture_stream.context(),
                     b_max * vocab,
                 )?;
-            capture_stream.synchronize().map_err(|e| anyhow!(e))?;
+            capture_stream.synchronize()?;
 
             Ok(Self {
                 model,
@@ -398,16 +421,6 @@ mod graphed {
             Ok(())
         }
 
-        pub fn disarm_lora(&mut self) {
-            if let Some(arm) = self.lora.take() {
-                arm.dispatch.disarm();
-            }
-        }
-
-        pub fn lora_armed(&self) -> bool {
-            self.lora.is_some()
-        }
-
         pub fn plan(&self) -> &BucketPlan {
             &self.plan
         }
@@ -437,10 +450,10 @@ mod graphed {
                 let src = self.logits_buf.slice(0..n_active);
                 stream
                     .memcpy_dtoh(&src, &mut self.rows_host.as_mut_slice()[..n_active])
-                    .map_err(|e| anyhow!("dtoh logits rows: {e:?}"))?;
+                    .map_err(|e| anyhow::anyhow!("dtoh logits rows: {e:?}"))?;
                 stream
                     .synchronize()
-                    .map_err(|e| anyhow!("dtoh logits rows landed sync: {e:?}"))?;
+                    .map_err(|e| anyhow::anyhow!("dtoh logits rows landed sync: {e:?}"))?;
             }
             self.accumulate_phase_ladder_after_the_step_results_landed_on_host(was_cached);
             let host = &self.rows_host.as_slice()[..n_active];
@@ -504,10 +517,9 @@ mod graphed {
             if active.is_empty() {
                 bail!("Gemma4BatchGraphFamily.step: empty batch");
             }
-            let b_bucket = self
-                .plan
-                .bucket_for(active.len())
-                .ok_or_else(|| anyhow!("batch {} exceeds max graph bucket", active.len()))?;
+            let b_bucket = self.plan.bucket_for(active.len()).ok_or_else(|| {
+                anyhow::anyhow!("batch {} exceeds max graph bucket", active.len())
+            })?;
             let max_total = active
                 .iter()
                 .map(|u| u.n_total.max(1) as usize)
@@ -534,7 +546,7 @@ mod graphed {
                 };
                 arm.dispatch
                     .set_mapping(&mapping)
-                    .map_err(|e| anyhow!("arm lora mapping: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("arm lora mapping: {e}"))?;
             }
 
             let pad = inactive_slot();
@@ -550,9 +562,8 @@ mod graphed {
                 slot.host_table.copy_from_slice(&table);
             }
 
-            let dev = match &self.device {
-                Device::Cuda(d) => d.clone(),
-                _ => unreachable!(),
+            let Device::Cuda(dev) = self.device.clone() else {
+                unreachable!()
             };
             let ctx = dev.cuda_stream().context().clone();
             if ctx.is_event_tracking() {
@@ -560,7 +571,7 @@ mod graphed {
             }
             dev.cuda_stream()
                 .synchronize()
-                .map_err(|e| anyhow!("null-stream sync before graph step: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("null-stream sync before graph step: {e:?}"))?;
 
             let capture_stream = self.capture.stream().clone();
             let need_warm = !self.warmed.contains(&token);
@@ -603,7 +614,7 @@ mod graphed {
                 nv_layers::cuda_stream::with_stream(capture_stream.clone(), || {
                     run_body(&capture_stream, &mut args)
                 })?;
-                capture_stream.synchronize().map_err(|e| anyhow!(e))?;
+                capture_stream.synchronize()?;
                 self.warmed.insert(token);
             }
 
@@ -637,37 +648,34 @@ mod graphed {
 
     fn run_body(s: &Arc<CudaStream>, a: &mut BodyArgs) -> Result<()> {
         let b = a.b;
-        let dev = match a.device {
-            Device::Cuda(d) => d.clone(),
-            _ => bail!("cuda device required"),
+        let Device::Cuda(dev) = a.device.clone() else {
+            bail!("cuda device required")
         };
         pm(a, s, "t0")?;
 
         {
             let mut dst = a.token_buf.slice_mut(0..b);
             s.memcpy_htod(&a.host_tokens[..b], &mut dst)
-                .map_err(|e| anyhow!("htod tokens: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("htod tokens: {e:?}"))?;
         }
         {
             let mut dst = a.pos_buf.slice_mut(0..b);
             s.memcpy_htod(&a.host_pos[..b], &mut dst)
-                .map_err(|e| anyhow!("htod pos: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("htod pos: {e:?}"))?;
         }
         for slot in a.slots[..b].iter_mut() {
             s.memcpy_htod(&slot.host_table[..], &mut slot.table_dev)
-                .map_err(|e| anyhow!("htod table: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("htod table: {e:?}"))?;
             s.memcpy_htod(&slot.host_start[..], &mut slot.start_dev)
-                .map_err(|e| anyhow!("htod start: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("htod start: {e:?}"))?;
             s.memcpy_htod(&slot.host_n_total[..], &mut slot.n_total_dev)
-                .map_err(|e| anyhow!("htod n_total: {e:?}"))?;
+                .map_err(|e| anyhow::anyhow!("htod n_total: {e:?}"))?;
         }
 
-        let mut tok_b = unsafe { s.alloc::<u32>(b).map_err(|e| anyhow!(e))? };
-        s.memcpy_dtod(&a.token_buf.slice(0..b), &mut tok_b)
-            .map_err(|e| anyhow!(e))?;
-        let mut pos_b = unsafe { s.alloc::<i32>(b).map_err(|e| anyhow!(e))? };
-        s.memcpy_dtod(&a.pos_buf.slice(0..b), &mut pos_b)
-            .map_err(|e| anyhow!(e))?;
+        let mut tok_b = unsafe { s.alloc::<u32>(b)? };
+        s.memcpy_dtod(&a.token_buf.slice(0..b), &mut tok_b)?;
+        let mut pos_b = unsafe { s.alloc::<i32>(b)? };
+        s.memcpy_dtod(&a.pos_buf.slice(0..b), &mut pos_b)?;
         let tokens_t = {
             let st = candle_core::CudaStorage::wrap_cuda_slice(tok_b, dev.clone());
             Tensor::from_storage(
@@ -737,12 +745,11 @@ mod graphed {
         let off = ll.start_offset();
         let src = lsl.slice(off..off + n);
         let mut dst = a.logits_buf.slice_mut(0..n);
-        s.memcpy_dtod(&src, &mut dst).map_err(|e| anyhow!(e))?;
+        s.memcpy_dtod(&src, &mut dst)?;
         pm(a, s, "logits_dtod")?;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn qknorm_rope_vnorm_fused_op(
         s: &Arc<CudaStream>,
         dev: &candle_core::CudaDevice,
@@ -794,9 +801,9 @@ mod graphed {
         if cos_c.dtype() != DType::F32 || sin_c.dtype() != DType::F32 {
             return Ok(None);
         }
-        let mut q_out = unsafe { s.alloc::<bf16>(b * n_q * hd).map_err(|e| anyhow!(e))? };
-        let mut k_out = unsafe { s.alloc::<bf16>(b * n_kv * hd).map_err(|e| anyhow!(e))? };
-        let mut v_out = unsafe { s.alloc::<bf16>(b * n_kv * hd).map_err(|e| anyhow!(e))? };
+        let mut q_out = unsafe { s.alloc::<bf16>(b * n_q * hd)? };
+        let mut k_out = unsafe { s.alloc::<bf16>(b * n_kv * hd)? };
+        let mut v_out = unsafe { s.alloc::<bf16>(b * n_kv * hd)? };
         let rc = {
             let cuda_slice_bf16 = |t: &Tensor| -> Result<(u64, usize)> {
                 let (st, l) = t.storage_and_layout();
@@ -945,7 +952,7 @@ mod graphed {
         pm(a, s, "qknorm_rope")?;
 
         let row_elems = n_q * head_dim;
-        let mut out_slice = unsafe { s.alloc::<bf16>(b * row_elems).map_err(|e| anyhow!(e))? };
+        let mut out_slice = unsafe { s.alloc::<bf16>(b * row_elems)? };
 
         let (q_storage, q_layout) = q_rot.storage_and_layout();
         let q_cuda = match &*q_storage {
@@ -962,7 +969,7 @@ mod graphed {
             let mut p = a
                 .pool
                 .lock()
-                .map_err(|_| anyhow!("Gemma4BatchGraphFamily: kv pool mutex poisoned"))?;
+                .map_err(|_| anyhow::anyhow!("Gemma4BatchGraphFamily: kv pool mutex poisoned"))?;
             let block_size = p.config().block_size;
             p.append_layer(li, &k_i, &v_i, 1, &slot.start_dev, &slot.table_dev)?;
             if let Some(l) = a.phase.as_mut() {
@@ -1046,7 +1053,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bucket_pads_to_smallest_ge() {
+    fn bucket_plan_parses_the_env_and_pads_to_the_smallest_bucket_ge() {
         let plan = BucketPlan::new(vec![1, 2, 4, 8]);
         assert_eq!(plan.bucket_for(1), Some(1));
         assert_eq!(plan.bucket_for(2), Some(2));
@@ -1055,10 +1062,7 @@ mod tests {
         assert_eq!(plan.bucket_for(8), Some(8));
         assert_eq!(plan.bucket_for(9), None);
         assert_eq!(plan.bucket_for(0), None);
-    }
 
-    #[test]
-    fn graph_sizes_env_parsing() {
         assert_eq!(BucketPlan::parse(None).sizes(), DEFAULT_GRAPH_SIZES);
         assert_eq!(BucketPlan::parse(Some("2,6,2")).sizes(), &[2, 6]);
         assert_eq!(BucketPlan::parse(Some("0,-1,x,3")).sizes(), &[3]);
@@ -1068,25 +1072,20 @@ mod tests {
     }
 
     #[test]
-    fn slot_table_padding() {
+    fn slot_tables_pad_inactive_slots_are_never_zero_len_and_shape_tokens_and_the_uniform_decode_predicate_separate_batches(
+    ) {
         assert_eq!(
             build_slot_table(&[5, 9], 42, 4).unwrap(),
             vec![5, 9, 42, 42]
         );
         assert_eq!(build_slot_table(&[], 7, 3).unwrap(), vec![7, 7, 7]);
         assert!(build_slot_table(&[1, 2, 3], 42, 2).is_err());
-    }
 
-    #[test]
-    fn inactive_slot_never_zero_len() {
         let s = inactive_slot();
         assert_eq!(s.n_total, 1);
         assert_eq!(s.pos, 0);
         assert!(s.block_table.is_empty());
-    }
 
-    #[test]
-    fn shape_token_is_one_graph_per_batch_size() {
         let mut seen = std::collections::HashSet::new();
         for &b in &[1usize, 2, 4, 8] {
             assert!(
@@ -1095,10 +1094,7 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), 4);
-    }
 
-    #[test]
-    fn uniform_decode_predicate() {
         assert!(is_uniform_decode(0, 1));
         assert!(is_uniform_decode(0, 8));
         assert!(!is_uniform_decode(1, 4));

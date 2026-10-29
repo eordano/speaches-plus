@@ -6,6 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "whisper_bindings"
 version = "0.1.0"
 description = "pybind11 bindings around whisper.cpp's whisper_full API (port of speaches-plus/go/internal/stt/whisper_cgo.c)."
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 license = { text = "MPL-2.0" }
 readme = "README.md"

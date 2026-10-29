@@ -140,13 +140,6 @@ impl Drop for LagunaSpecReservation {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) fn laguna_serve_spec_enabled() -> bool {
-    std::env::var("NV_LAGUNA_SERVE_SPEC")
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true)
-}
-
-#[cfg(feature = "cuda")]
 pub(crate) fn laguna_serve_draft_enabled() -> bool {
     std::env::var("NV_LAGUNA_SERVE_DRAFT")
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
@@ -235,7 +228,6 @@ impl LagunaSpecServe {
         req: &ChatGenerateRequest,
         prompt_tokens: usize,
         max_new: usize,
-        host_sample: bool,
     ) -> bool {
         let params = sampling_params_from(req);
         params.is_greedy()
@@ -243,7 +235,6 @@ impl LagunaSpecServe {
             && req.guided.is_none()
             && req.logit_bias.is_empty()
             && !req.logprobs
-            && !host_sample
             && self
                 .tail
                 .fits(prompt_tokens, max_new, self.num_spec, self.max_seq)
@@ -251,7 +242,46 @@ impl LagunaSpecServe {
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct LagunaText {
+    decoder: nv_tokenizer::IncrementalDecoder,
+    decoded: String,
+    emitter: StreamEmitter,
+}
+
+#[cfg(feature = "cuda")]
+impl LagunaText {
+    pub(crate) fn new(stop: &[String]) -> Self {
+        Self {
+            decoder: nv_tokenizer::IncrementalDecoder::new(),
+            decoded: String::new(),
+            emitter: StreamEmitter::new(stop),
+        }
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        tokenizer: &tokenizers::Tokenizer,
+        id: u32,
+    ) -> anyhow::Result<(String, bool)> {
+        let Some(piece) = self.decoder.push(tokenizer, id)? else {
+            return Ok((String::new(), false));
+        };
+        self.decoded.push_str(&piece);
+        Ok(self.emitter.step(&self.decoded))
+    }
+
+    pub(crate) fn finish(&mut self, tokenizer: &tokenizers::Tokenizer) -> anyhow::Result<String> {
+        if let Some(tail) = self.decoder.flush(tokenizer)? {
+            self.decoded.push_str(&tail);
+        }
+        Ok(self.emitter.finish(&self.decoded))
+    }
+}
+
+#[cfg(feature = "cuda")]
+const EAGER: &str = "laguna-eager";
+
+#[cfg(feature = "cuda")]
 pub(crate) async fn run_sampling_laguna(
     model: LagunaShared,
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -293,13 +323,8 @@ pub(crate) async fn run_sampling_laguna(
         model.config().max_position_embeddings,
     )?;
 
-    if let Some(spec) = spec.as_ref().filter(|_| laguna_serve_spec_enabled()) {
-        let eligible = spec.request_is_eligible(
-            &req,
-            prompt_ids.len(),
-            max_new,
-            std::env::var_os("NV_LAGUNA_HOST_SAMPLE").is_some(),
-        );
+    if let Some(spec) = spec.as_ref() {
+        let eligible = spec.request_is_eligible(&req, prompt_ids.len(), max_new);
         if eligible {
             let deadline = model.1.deadline();
             let Some(permit) = model.1.acquire_spec(tx, deadline).await? else {
@@ -327,7 +352,7 @@ pub(crate) async fn run_sampling_laguna(
         return Ok(());
     };
     let mut cache: Box<dyn nv_models::gemma4::Gemma4Cache + Send> =
-        if std::env::var_os("NV_LAGUNA_FP8_KV").is_some() {
+        if nv_config::env_arm_present_at_all_reread_every_call("NV_LAGUNA_FP8_KV") {
             match model.new_kv_cache_fp8(cache_len) {
                 Ok(c) => Box::new(c),
                 Err(e) => {
@@ -375,24 +400,20 @@ pub(crate) async fn run_sampling_laguna(
         anyhow::bail!("no legal token at prefill: the sampling mask left every candidate at -inf");
     }
 
-    let host_sample = std::env::var_os("NV_LAGUNA_HOST_SAMPLE").is_some();
     let cuda_dev = match &device {
         candle_core::Device::Cuda(d) => Some(d.clone()),
         _ => None,
     };
     let mut argmax_scratch = match &cuda_dev {
-        Some(d) if sampler.fast_greedy() && !host_sample => Some(LagunaArgmaxScratch::new(d)?),
+        Some(d) if sampler.fast_greedy() => Some(LagunaArgmaxScratch::new(d)?),
         _ => None,
     };
-    let mut inc_decoder = (!host_sample).then(nv_tokenizer::IncrementalDecoder::new);
-
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new);
-    let mut emitted_text = String::new();
+    let mut text = LagunaText::new(&req.stop);
     let mut completion_tokens: u32 = 0;
     let mut finish_reason = "length".to_string();
-    let stop_strings = req.stop.clone();
+    let send_timeout = sse_send_timeout();
 
-    if tx.send(ChatEvent::Started { prompt_tokens }).await.is_err() {
+    if !push_or_abort(tx, ChatEvent::Started { prompt_tokens }, send_timeout, EAGER).await {
         return Ok(());
     }
 
@@ -404,48 +425,29 @@ pub(crate) async fn run_sampling_laguna(
             finish_reason = "stop".into();
             break;
         }
-        generated_ids.push(last);
-        completion_tokens = generated_ids.len() as u32;
+        completion_tokens += 1;
 
-        let piece = match inc_decoder.as_mut() {
-            Some(dec) => {
-                let p = dec.push(&tokenizer, last)?.unwrap_or_default();
-                emitted_text.push_str(&p);
-                p
-            }
-            None => {
-                let new_text = tokenizer
-                    .decode(&generated_ids, true)
-                    .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
-                let p = if new_text.len() > emitted_text.len() {
-                    new_text[emitted_text.len()..].to_string()
-                } else {
-                    String::new()
-                };
-                emitted_text = new_text;
-                p
-            }
-        };
+        let (piece, stop_hit) = text.push(&tokenizer, last)?;
 
-        if !piece.is_empty() && tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
+        if !piece.is_empty()
+            && !push_or_abort(tx, ChatEvent::TextDelta(piece), send_timeout, EAGER).await
+        {
             return Ok(());
         }
         if req.logprobs
-            && tx
-                .send(ChatEvent::Logprob(build_logprob_entry(
-                    &tokenizer, &last_out,
-                )))
-                .await
-                .is_err()
+            && !push_or_abort(
+                tx,
+                ChatEvent::Logprob(build_logprob_entry(&tokenizer, &last_out)),
+                send_timeout,
+                EAGER,
+            )
+            .await
         {
             return Ok(());
         }
         yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot().await;
 
-        if stop_strings
-            .iter()
-            .any(|s| !s.is_empty() && emitted_text.ends_with(s))
-        {
+        if stop_hit {
             finish_reason = "stop".into();
             break;
         }
@@ -497,28 +499,24 @@ pub(crate) async fn run_sampling_laguna(
         }
     }
 
-    if let Some(dec) = inc_decoder.as_mut() {
-        if let Some(p) = dec.flush(&tokenizer)? {
-            if !p.is_empty() {
-                emitted_text.push_str(&p);
-                if tx.send(ChatEvent::TextDelta(p)).await.is_err() {
-                    return Ok(());
-                }
-            }
-        }
+    let tail = text.finish(&tokenizer)?;
+    if !tail.is_empty() && !push_or_abort(tx, ChatEvent::TextDelta(tail), send_timeout, EAGER).await
+    {
+        return Ok(());
     }
 
-    let _ = tx
-        .send(ChatEvent::Done {
-            finish_reason,
-            completion_tokens,
-        })
-        .await;
+    let _ = send_stopped_by_then_done(
+        tx,
+        &mut text.emitter,
+        finish_reason,
+        completion_tokens,
+        Some(send_timeout),
+    )
+    .await;
     Ok(())
 }
 
 #[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_laguna_spec_stream(
     spec: &LagunaSpecServe,
     tokenizer: &Arc<tokenizers::Tokenizer>,
@@ -545,7 +543,6 @@ pub(crate) async fn run_laguna_spec_stream(
     };
     let job = SpecServeJob {
         prompt_ids: prompt_ids.to_vec(),
-        prompt_text: req.prompt.clone(),
         max_new,
         eos_ids: eos_ids.to_vec(),
         emit: Box::new(move |ev| {
@@ -579,14 +576,12 @@ pub(crate) async fn run_laguna_spec_stream(
         }
     }
 
-    let mut inc_decoder = nv_tokenizer::IncrementalDecoder::new();
-    let mut emitted_text = String::new();
+    let mut text = LagunaText::new(&req.stop);
     let mut completion_tokens: u32 = 0;
     let mut finish_reason: Option<String> = None;
     let mut started = false;
     let mut done = false;
     let mut local_stop = false;
-    let stop_strings = &req.stop;
 
     'outer: loop {
         let event = tokio::select! {
@@ -620,17 +615,11 @@ pub(crate) async fn run_laguna_spec_stream(
                         break;
                     }
                     completion_tokens += 1;
-                    let piece = inc_decoder.push(tokenizer, t)?.unwrap_or_default();
-                    if !piece.is_empty() {
-                        emitted_text.push_str(&piece);
-                        if tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
-                            return Ok(());
-                        }
+                    let (piece, stop_hit) = text.push(tokenizer, t)?;
+                    if !piece.is_empty() && tx.send(ChatEvent::TextDelta(piece)).await.is_err() {
+                        return Ok(());
                     }
-                    if stop_strings
-                        .iter()
-                        .any(|s| !s.is_empty() && emitted_text.ends_with(s))
-                    {
+                    if stop_hit {
                         finish_reason = Some("stop".into());
                         local_stop = true;
                         break 'outer;
@@ -679,20 +668,18 @@ pub(crate) async fn run_laguna_spec_stream(
         return Ok(());
     }
 
-    if let Some(p) = inc_decoder.flush(tokenizer)? {
-        if !p.is_empty() {
-            emitted_text.push_str(&p);
-            if tx.send(ChatEvent::TextDelta(p)).await.is_err() {
-                return Ok(());
-            }
-        }
+    let tail = text.finish(tokenizer)?;
+    if !tail.is_empty() && tx.send(ChatEvent::TextDelta(tail)).await.is_err() {
+        return Ok(());
     }
-    let _ = tx
-        .send(ChatEvent::Done {
-            finish_reason: finish_reason.unwrap_or_else(|| "length".into()),
-            completion_tokens,
-        })
-        .await;
+    let _ = send_stopped_by_then_done(
+        tx,
+        &mut text.emitter,
+        finish_reason.unwrap_or_else(|| "length".into()),
+        completion_tokens,
+        None,
+    )
+    .await;
     Ok(())
 }
 
@@ -923,16 +910,16 @@ mod overload_tests {
                 (262144, 1, false),
             ] {
                 assert_eq!(
-                    spec.request_is_eligible(&req, prompt, output, false),
+                    spec.request_is_eligible(&req, prompt, output),
                     expected,
                     "worker capacity route {tail:?}, prompt={prompt}, output={output}"
                 );
             }
             assert!(request_window(261888, 256, 262144, 262144).is_ok());
             assert!(request_window(261889, 256, 262144, 262144).is_err());
-            assert!(spec.request_is_eligible(&req, 262142, 1, false));
+            assert!(spec.request_is_eligible(&req, 262142, 1));
             assert_eq!(
-                spec.request_is_eligible(&req, 262143, 1, false),
+                spec.request_is_eligible(&req, 262143, 1),
                 tail == LagunaWorkerTail::PreparedSpec,
                 "prepared plain admission requires at least two remaining cache slots"
             );
@@ -949,12 +936,12 @@ mod overload_tests {
             (4, 261882, 261883),
         ] {
             legacy.num_spec = k;
-            assert!(legacy.request_is_eligible(&req, accepted_prompt, 256, false));
-            assert!(!legacy.request_is_eligible(&req, refused_prompt, 256, false));
-            assert!(!legacy.request_is_eligible(&req, 261888, 256, false));
+            assert!(legacy.request_is_eligible(&req, accepted_prompt, 256));
+            assert!(!legacy.request_is_eligible(&req, refused_prompt, 256));
+            assert!(!legacy.request_is_eligible(&req, 261888, 256));
         }
         legacy.num_spec = usize::MAX;
-        assert!(!legacy.request_is_eligible(&req, 1, 1, false));
+        assert!(!legacy.request_is_eligible(&req, 1, 1));
         for tail in [
             LagunaWorkerTail::Reserved,
             LagunaWorkerTail::PreparedPlain,
@@ -962,24 +949,23 @@ mod overload_tests {
         ] {
             let spec = capacity_fixture(tail);
             let mut req = capacity_greedy_request();
-            assert!(spec.request_is_eligible(&req, 168000, 256, false));
-            assert!(!spec.request_is_eligible(&req, 168000, 256, true));
+            assert!(spec.request_is_eligible(&req, 168000, 256));
             req.temperature = Some(0.7);
-            assert!(!spec.request_is_eligible(&req, 168000, 256, false));
+            assert!(!spec.request_is_eligible(&req, 168000, 256));
             req.temperature = Some(0.0);
             req.presence_penalty = Some(0.5);
-            assert!(!spec.request_is_eligible(&req, 168000, 256, false));
+            assert!(!spec.request_is_eligible(&req, 168000, 256));
             req.presence_penalty = None;
             req.guided = Some(nv_grammar::GrammarSpec::Regex("answer".into()));
-            assert!(!spec.request_is_eligible(&req, 168000, 256, false));
+            assert!(!spec.request_is_eligible(&req, 168000, 256));
             req.guided = None;
             req.logit_bias = vec![(1, 0.5)];
-            assert!(!spec.request_is_eligible(&req, 168000, 256, false));
+            assert!(!spec.request_is_eligible(&req, 168000, 256));
             req.logit_bias.clear();
             req.logprobs = true;
-            assert!(!spec.request_is_eligible(&req, 168000, 256, false));
+            assert!(!spec.request_is_eligible(&req, 168000, 256));
             req.logprobs = false;
-            assert!(spec.request_is_eligible(&req, 168000, 256, false));
+            assert!(spec.request_is_eligible(&req, 168000, 256));
         }
     }
 
@@ -1897,4 +1883,75 @@ mod overload_tests {
         drop(gate.acquire(&next_tx).await.unwrap().unwrap());
         assert!(gate.acquire(&tx).await.unwrap().is_none());
     }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod text_tests {
+    use super::LagunaText;
+
+    fn bytelevel_tokenizer() -> tokenizers::Tokenizer {
+        let json = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [],
+            "model": {
+                "type": "WordLevel",
+                "vocab": {
+                    "<unk>": 0, "h": 1, "ðŁ": 2, "ĺĢ": 3, "âĤ": 4, "¬": 5,
+                    "EN": 6, "OUGHĠdone": 7, "D": 8, "sayĠE": 9, "N": 10, "DĠnow": 11,
+                    "Hello": 12, "oneĠ": 13, "twoĠ": 14, "three": 15, "x": 16, "aby": 17
+                },
+                "unk_token": "<unk>"
+            },
+            "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true}
+        });
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap()
+    }
+
+    fn stream(text: &mut LagunaText, tok: &tokenizers::Tokenizer, ids: &[u32]) -> (String, bool) {
+        let mut out = String::new();
+        for &id in ids {
+            let (piece, hit) = text.push(tok, id).expect("push");
+            out.push_str(&piece);
+            if hit {
+                return (out, true);
+            }
+        }
+        out.push_str(&text.finish(tok).expect("finish"));
+        (out, false)
+    }
+
+    #[test]
+    fn laguna_streams_split_characters_whole_and_excludes_stops_found_mid_piece() {
+        let tok = bytelevel_tokenizer();
+        assert_eq!(tok.decode(&[1, 2], true).unwrap(), "h\u{FFFD}");
+        for (ids, whole) in [([1u32, 2, 3], "h\u{1F600}"), ([1, 4, 5], "h\u{20AC}")] {
+            let mut text = LagunaText::new(&[]);
+            assert_eq!(
+                stream(&mut text, &tok, &ids),
+                (whole.to_string(), false),
+                "a character split across tokens must reach the client whole"
+            );
+        }
+        {
+            let tok = bytelevel_tokenizer();
+            let cases: [(&str, &[u32], &str, bool); 6] = [
+                ("END", &[6, 7], "ENOUGH done", false),
+                ("END", &[6, 8], "", true),
+                ("END", &[9, 10, 11], "say ", true),
+                ("Hell", &[12], "", true),
+                ("ab", &[16, 17], "x", true),
+                ("three", &[13, 14, 15], "one two ", true),
+            ];
+            for (stop, ids, want, hit) in cases {
+                let mut text = LagunaText::new(&[stop.to_string()]);
+                assert_eq!(
+                    stream(&mut text, &tok, ids),
+                    (want.to_string(), hit),
+                    "stop {stop:?} over ids {ids:?}: Laguna must stream exactly what every other CUDA \
+                     family streams, the text before the earliest stop, never the stop itself"
+                );
+            }
+        }
+    }
+
 }

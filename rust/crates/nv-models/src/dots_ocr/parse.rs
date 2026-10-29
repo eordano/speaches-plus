@@ -163,7 +163,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_a_complete_array() {
+    fn parses_a_complete_array_in_array_order_skips_pictures_and_wraps_plain_text() {
         let raw = r##"[
           {"bbox": [10, 20, 30, 40], "category": "Title", "text": "# Hello"},
           {"bbox": [10, 50, 300, 90], "category": "Text", "text": "body"}
@@ -175,30 +175,14 @@ mod tests {
         assert_eq!(page.elements[0].category.as_deref(), Some("Title"));
         assert_eq!(page.to_plain_text(), "# Hello\n\nbody");
         assert!(page.elements.iter().all(|e| e.category_is_known()));
-    }
 
-    #[test]
-    fn recovers_complete_objects_from_a_truncated_array() {
-        let raw = r#"[
-          {"bbox": [1, 2, 3, 4], "category": "Text", "text": "one"},
-          {"bbox": [5, 6, 7, 8], "category": "Text", "text": "tw"#;
-        let page = parse_layout_json(raw);
-        assert!(page.truncated);
-        assert_eq!(page.elements.len(), 1);
-        assert_eq!(page.to_plain_text(), "one");
-    }
+        let raw = r#"[{"bbox":[400,10,500,20],"category":"Text","text":"right column"},
+                      {"bbox":[10,10,100,20],"category":"Text","text":"left column"}]"#;
+        assert_eq!(
+            parse_layout_json(raw).to_plain_text(),
+            "right column\n\nleft column"
+        );
 
-    #[test]
-    fn braces_inside_strings_do_not_split_objects() {
-        let raw = r#"[{"bbox":[0,0,1,1],"category":"Formula","text":"\\frac{a}{b} \" }"}]"#;
-        let page = parse_layout_json(raw);
-        assert!(!page.truncated);
-        assert_eq!(page.elements.len(), 1);
-        assert_eq!(page.elements[0].text.as_deref(), Some(r#"\frac{a}{b} " }"#));
-    }
-
-    #[test]
-    fn picture_elements_have_no_text_and_are_skipped() {
         let raw = r#"[{"bbox":[0,0,10,10],"category":"Picture"},
                       {"bbox":[0,20,10,30],"category":"Text","text":"after"}]"#;
         let page = parse_layout_json(raw);
@@ -206,22 +190,23 @@ mod tests {
         assert!(page.elements[0].is_picture());
         assert_eq!(page.elements[0].text, None);
         assert_eq!(page.to_plain_text(), "after");
+
+        let page = plain_text_fallback("hello world");
+        assert_eq!(page.to_plain_text(), "hello world");
+        assert!(!page.truncated);
     }
 
     #[test]
-    fn strips_markdown_code_fences() {
+    fn strips_markdown_code_fences_and_braces_inside_strings_do_not_split_objects() {
         let raw = "```json\n[{\"bbox\":[0,0,1,1],\"category\":\"Text\",\"text\":\"x\"}]\n```";
         let page = parse_layout_json(raw);
         assert!(!page.truncated);
         assert_eq!(page.to_plain_text(), "x");
-    }
-
-    #[test]
-    fn reading_order_is_array_order_not_geometry() {
-        let raw = r#"[{"bbox":[400,10,500,20],"category":"Text","text":"right column"},
-                      {"bbox":[10,10,100,20],"category":"Text","text":"left column"}]"#;
+        let raw = r#"[{"bbox":[0,0,1,1],"category":"Formula","text":"\\frac{a}{b} \" }"}]"#;
         let page = parse_layout_json(raw);
-        assert_eq!(page.to_plain_text(), "right column\n\nleft column");
+        assert!(!page.truncated);
+        assert_eq!(page.elements.len(), 1);
+        assert_eq!(page.elements[0].text.as_deref(), Some(r#"\frac{a}{b} " }"#));
     }
 
     #[test]
@@ -233,16 +218,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_or_garbage_output_is_marked_truncated() {
+    fn truncated_arrays_keep_complete_objects_and_garbage_is_marked_truncated() {
+        let raw = r#"[
+          {"bbox": [1, 2, 3, 4], "category": "Text", "text": "one"},
+          {"bbox": [5, 6, 7, 8], "category": "Text", "text": "tw"#;
+        let page = parse_layout_json(raw);
+        assert!(page.truncated);
+        assert_eq!(page.elements.len(), 1);
+        assert_eq!(page.to_plain_text(), "one");
         assert!(parse_layout_json("not json at all").truncated);
         assert!(!parse_layout_json("").truncated);
         assert!(parse_layout_json("").elements.is_empty());
-    }
-
-    #[test]
-    fn plain_text_fallback_wraps_raw_output() {
-        let page = plain_text_fallback("hello world");
-        assert_eq!(page.to_plain_text(), "hello world");
-        assert!(!page.truncated);
     }
 }

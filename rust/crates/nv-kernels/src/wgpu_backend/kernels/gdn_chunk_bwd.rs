@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
@@ -88,7 +86,6 @@ struct ChunkIo {
     k: Vec<f32>,
     v: Vec<f32>,
     gb: Vec<f32>,
-    t0: usize,
     clen: usize,
 }
 
@@ -116,7 +113,6 @@ fn chunk_io(
         k: slice_rows(k, b, t, h, HEAD_DIM, t0, clen),
         v: slice_rows(v, b, t, h, HEAD_DIM, t0, clen),
         gb,
-        t0,
         clen,
     }
 }
@@ -326,32 +322,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_module_stays_inside_the_measured_browser_caps() {
-        assert!(
-            !WGSL.contains("subgroup"),
-            "no subgroup ops, no directive split needed"
-        );
-        assert!(!WGSL.contains("enable "), "no enable directives");
-        assert!(!WGSL.contains("f16"), "f32 only");
-        assert_eq!(WGSL.matches("@workgroup_size(128)").count(), 2);
-        let storage_bindings = WGSL.matches("var<storage").count();
-        assert_eq!(
-            storage_bindings, 10,
-            "10 storage declarations total; each entry references at most 9, under the \
-             measured maxStorageBuffersPerShaderStage=10"
-        );
-        let wg_bytes = 3 * 128 * 4 + 2 * 128 * 16 + 128 * 8;
-        assert_eq!(WGSL.matches("var<workgroup>").count(), 6);
-        assert!(
-            wg_bytes <= 32768,
-            "workgroup memory {wg_bytes} must fit the measured 32768-byte browser limit"
-        );
-    }
-
-    #[test]
-    fn both_entries_are_declared() {
-        let s = compose(WGSL);
-        assert!(s.contains("fn gdn_chunk_fwd_states_f32("));
-        assert!(s.contains("fn gdn_chunk_bwd_f32("));
+    fn the_module_stays_inside_the_measured_browser_caps_and_declares_both_entries() {
+        {
+            assert!(
+                !WGSL.contains("subgroup"),
+                "no subgroup ops, no directive split needed"
+            );
+            assert!(!WGSL.contains("enable "), "no enable directives");
+            assert!(!WGSL.contains("f16"), "f32 only");
+            assert_eq!(WGSL.matches("@workgroup_size(128)").count(), 2);
+            let storage_bindings = WGSL.matches("var<storage").count();
+            assert_eq!(
+                storage_bindings, 10,
+                "10 storage declarations total; each entry references at most 9, under the \
+                 measured maxStorageBuffersPerShaderStage=10"
+            );
+            let wg_bytes = 3 * 128 * 4 + 2 * 128 * 16 + 128 * 8;
+            assert_eq!(WGSL.matches("var<workgroup>").count(), 6);
+            assert!(
+                wg_bytes <= 32768,
+                "workgroup memory {wg_bytes} must fit the measured 32768-byte browser limit"
+            );
+        }
+        {
+            let s = compose(WGSL);
+            assert!(s.contains("fn gdn_chunk_fwd_states_f32("));
+            assert!(s.contains("fn gdn_chunk_bwd_f32("));
+        }
     }
 }

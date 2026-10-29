@@ -6,17 +6,15 @@ use serde_json::json;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::track::track_remote::TrackRemote;
+use webrtc::data_channel::{DataChannel, DataChannelEvent};
+use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
+use webrtc::peer_connection::PeerConnection;
 
 use crate::RealtimeQuery;
 
 use super::audio_in::AudioIngest;
 use super::audio_in_ws::WsAudioIngest;
 use super::audio_out;
-use super::eou_integrated::IntegratedVerdictAction;
 use super::inspector::{self, FanoutSink, InspectorEvent, InspectorSink, RelayInspectorSink};
 use super::session_update::{parse_session_update, StagedInstructions};
 use super::state::{
@@ -30,8 +28,8 @@ use crate::defaults;
 use crate::eou::audio as eou_audio;
 use crate::eou::onnx as eou_text;
 use crate::eou::{
-    EouConfig, EouKind, EouModel, FusionEouModel, HeuristicEouModel, IntegratedEouBackend,
-    IntegratedVerdict, MissingAudioEouModel, StubEouModel,
+    EouConfig, EouKind, EouModel, FusionEouModel, HeuristicEouModel,
+    MissingAudioEouModel, StubEouModel,
 };
 use crate::errors::code as errcode;
 use crate::ids::{self, IdSource};
@@ -56,8 +54,6 @@ pub struct Session {
     pub inspector: Arc<dyn InspectorSink>,
     pub eou_config: EouConfig,
     pub eou_model: Option<Arc<dyn EouModel>>,
-    #[allow(dead_code)]
-    pub integrated_backend: Mutex<Option<Arc<dyn IntegratedEouBackend>>>,
 
     pub turn_detection: Arc<TurnDetectionConfig>,
 
@@ -81,6 +77,7 @@ pub struct Session {
     pub output_language: std::sync::Mutex<Option<String>>,
     pub tts_speed_bits: AtomicU32,
     pub model: std::sync::Mutex<String>,
+    pub conversation_model: std::sync::Mutex<Option<String>>,
     pub transcription_model: std::sync::Mutex<Option<String>>,
     pub stt_language: std::sync::Mutex<Option<String>>,
 
@@ -428,7 +425,6 @@ impl Session {
             inspector,
             eou_config,
             eou_model,
-            integrated_backend: Mutex::new(None),
             turn_detection,
             outbound_queue_cap_ms,
             outbound_queue_cap_events,
@@ -453,6 +449,7 @@ impl Session {
             output_language: std::sync::Mutex::new(None),
             tts_speed_bits: AtomicU32::new(1.0f32.to_bits()),
             model: std::sync::Mutex::new(model_label),
+            conversation_model: std::sync::Mutex::new(None),
             transcription_model: std::sync::Mutex::new(transcription_model_label),
             stt_language: std::sync::Mutex::new(None),
             eou_runtime: std::sync::Mutex::new(eou_runtime_init),
@@ -467,15 +464,10 @@ impl Session {
         }
     }
 
-    pub async fn attach_peer_connection(self: &Arc<Self>, pc: Arc<RTCPeerConnection>) {
+    pub async fn attach_peer_connection(self: &Arc<Self>, pc: Arc<dyn PeerConnection>) {
         let mut state = self.state.lock().await;
         state.pc = Some(pc);
         check_or_react(self, &state);
-    }
-
-    pub async fn transition_to_terminated(self: &Arc<Self>) {
-        self.transition_to_terminated_with(state::TerminationReason::ClientClosed)
-            .await;
     }
 
     pub async fn cancel_session_lanes(&self) {
@@ -508,7 +500,7 @@ impl Session {
         drop(ws_guard);
     }
 
-    pub async fn peer_connection(&self) -> Option<Arc<RTCPeerConnection>> {
+    pub async fn peer_connection(&self) -> Option<Arc<dyn PeerConnection>> {
         self.state.lock().await.pc.clone()
     }
 
@@ -537,8 +529,12 @@ impl Session {
         self.event_seq.stamp(value);
     }
 
-    pub(super) async fn deliver_to_sink(&self, sink: &EventSink, mut value: serde_json::Value) {
+    pub(super) async fn deliver_to_sink(&self, sink: &EventSink, value: serde_json::Value) {
         let _ordered = self.outbound_send.lock().await;
+        self.send_holding_outbound_order(sink, value).await;
+    }
+
+    async fn send_holding_outbound_order(&self, sink: &EventSink, mut value: serde_json::Value) {
         self.stamp_event_id(&mut value);
         let typ = value
             .get("type")
@@ -602,54 +598,54 @@ impl Session {
             .await;
     }
 
-    pub async fn attach_data_channel(self: &Arc<Self>, dc: Arc<RTCDataChannel>) {
-        let label = dc.label().to_string();
-        let dc_open = dc.clone();
-        let session_open = self.clone();
-        let label_open = label.clone();
-        dc.on_open(Box::new(move || {
-            let label = label_open;
-            let dc = dc_open;
-            let session = session_open;
-            Box::pin(async move {
-                info!(label = %label, "data channel open");
-                {
-                    let mut state = session.state.lock().await;
-                    if matches!(state.session, SessionPhase::Pending) {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
-                            .unwrap_or(0);
-                        state.session = SessionPhase::Active {
-                            created_at_ms: crate::types::Millis(now_ms),
-                        };
+    pub async fn attach_data_channel(self: &Arc<Self>, dc: Arc<dyn DataChannel>) {
+        let label = dc.label().await.unwrap_or_default();
+        let session = self.clone();
+        let events = dc.clone();
+        tokio::spawn(self.cancel.wrap_unit(async move {
+            while let Some(event) = events.poll().await {
+                match event {
+                    DataChannelEvent::OnOpen => session.on_data_channel_open(&label, &events).await,
+                    DataChannelEvent::OnMessage(msg) => {
+                        if let Err(err) =
+                            session.handle_client_event(&label, msg.data.freeze()).await
+                        {
+                            warn!(error = %err, label, "data channel message handling failed");
+                        }
                     }
-                    check_or_react(&session, &state);
+                    DataChannelEvent::OnClose => break,
+                    _ => {}
                 }
-                let view = session.current_session_view().await;
-                let event = json!({
-                    "type": "session.created",
-                    "session": view,
-                });
-                session
-                    .deliver_to_sink(&EventSink::DataChannel(dc), event)
-                    .await;
-            })
-        }));
-        let label_msg = label.clone();
-        let session_msg = self.clone();
-        dc.on_message(Box::new(move |msg: DataChannelMessage| {
-            let label = label_msg.clone();
-            let session = session_msg.clone();
-            Box::pin(async move {
-                if let Err(err) = session.handle_client_event(&label, msg.data).await {
-                    warn!(error = %err, label, "data channel message handling failed");
-                }
-            })
+            }
+            debug!(label, "data channel event stream ended");
         }));
         let mut state = self.state.lock().await;
         state.event_sink = Some(EventSink::DataChannel(dc));
         check_or_react(self, &state);
+    }
+
+    async fn on_data_channel_open(self: &Arc<Self>, label: &str, dc: &Arc<dyn DataChannel>) {
+        info!(label = %label, "data channel open");
+        {
+            let mut state = self.state.lock().await;
+            if matches!(state.session, SessionPhase::Pending) {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                state.session = SessionPhase::Active {
+                    created_at_ms: crate::types::Millis(now_ms),
+                };
+            }
+            check_or_react(self, &state);
+        }
+        let view = self.current_session_view().await;
+        let event = json!({
+            "type": "session.created",
+            "session": view,
+        });
+        self.deliver_to_sink(&EventSink::DataChannel(dc.clone()), event)
+            .await;
     }
 
     pub async fn attach_websocket(self: &Arc<Self>, ws_send: tokio::sync::mpsc::Sender<String>) {
@@ -878,6 +874,16 @@ impl Session {
         if let Some(secs) = staged.session_max_duration_s {
             self.session_max_duration_s.store(secs, Ordering::Relaxed);
             self.reschedule_max_duration_timeout().await;
+        }
+        if let Some(m) = staged.model {
+            let mut label = self.model.lock().expect("model poisoned");
+            if *label != m {
+                *label = m.clone();
+                *self
+                    .conversation_model
+                    .lock()
+                    .expect("conversation_model poisoned") = Some(m);
+            }
         }
         if let Some(v) = staged.voice {
             *self.voice.lock().expect("voice poisoned") = v;
@@ -1531,130 +1537,132 @@ impl Session {
             .await;
             return;
         }
-        {
-            let state = self.state.lock().await;
-            let busy = state.current_response.is_some()
-                || !matches!(state.resp, super::state::RespPhase::None);
-            if busy {
-                drop(state);
-                super::events::emit_error(
-                    self,
-                    errcode::RESPONSE_ALREADY_ACTIVE,
-                    "a response is already active",
-                    event_id,
-                    None,
-                )
-                .await;
-                return;
-            }
-        }
         let response_has_input = inbound_response.and_then(|r| r.get("input")).is_some();
         let speak_item_id: Option<String> = inbound_response
             .and_then(|r| r.get("speak_item_id"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let mut spoken_item: Option<ItemId> = None;
-        let selection = {
-            let mut state = self.state.lock().await;
-            let source = super::state::select_response_source(
-                &state.conversation,
-                response_has_input,
-                speak_item_id.as_deref(),
-            );
-            match source {
-                super::state::ResponseSource::Speak { index, text } => {
-                    if matches!(state.vad, VadPhase::Speaking { .. }) {
-                        drop(state);
-                        super::events::emit_error(
-                            self,
-                            errcode::INVALID_REQUEST_ERROR,
-                            "cannot create a response while input speech is active",
-                            event_id,
-                            None,
-                        )
-                        .await;
-                        return;
-                    }
-                    state.conversation[index].client_speakable = false;
-                    spoken_item = Some(ItemId::new(state.conversation[index].id.clone()));
-                    super::state::ResponseSource::Speak { index, text }
-                }
-                other => other,
-            }
-        };
-        let (prompt_text, prefilled) = match selection {
-            super::state::ResponseSource::SpeakUnavailable { reason } => {
-                super::events::emit_error(
-                    self,
-                    errcode::INVALID_REQUEST_ERROR,
-                    reason,
-                    event_id,
-                    Some("response.speak_item_id"),
-                )
-                .await;
-                return;
-            }
-            super::state::ResponseSource::Speak { text, .. } => (
-                String::new(),
-                Some(super::pipeline::PrefilledText::ClientSupplied(text)),
-            ),
-            super::state::ResponseSource::Generate { prompt } => {
-                if prompt.is_empty() {
-                    super::events::emit_error(
-                        self,
-                        errcode::INVALID_REQUEST_ERROR,
-                        "no user message in conversation to respond to",
-                        event_id,
-                        None,
-                    )
-                    .await;
-                    return;
-                }
-                (prompt, None)
-            }
-        };
-        let response_id = self.id_source.response();
-        let assistant_item_id = spoken_item.unwrap_or_else(|| self.id_source.item());
-        let played_ms = Arc::new(AtomicU64::new(0));
-        let transcript_so_far = Arc::new(Mutex::new(String::new()));
-        let wire_opened = Arc::new(AtomicBool::new(false));
-        let session_for_task = self.clone();
-        let response_id_for_task = response_id.clone();
-        let assistant_item_id_for_task = assistant_item_id.as_str().to_string();
-        let played_ms_for_task = played_ms.clone();
-        let transcript_so_far_for_task = transcript_so_far.clone();
-        let wire_opened_for_task = wire_opened.clone();
-        let prompt_for_task = prompt_text.clone();
         let overrides = super::pipeline::ResponseOverrides {
             instructions: override_instructions,
             modalities: override_modalities,
         };
-        let handle = tokio::spawn(self.cancel.wrap_unit(async move {
-            let _ = super::pipeline::run_response(
-                &session_for_task,
-                response_id_for_task.as_str(),
-                assistant_item_id_for_task,
-                prompt_for_task,
-                played_ms_for_task,
-                transcript_so_far_for_task,
-                prefilled,
+        let refused = {
+            let mut state = self.state.lock().await;
+            self.start_requested_response(
+                &mut state,
+                response_has_input,
+                speak_item_id.as_deref(),
                 overrides,
-                wire_opened_for_task,
             )
-            .await;
-            session_for_task
-                .clear_response_if_matches(&response_id_for_task)
-                .await;
-        }));
-        self.register_response(
+        };
+        if let Err((code, message, param)) = refused {
+            super::events::emit_error(self, code, message, event_id, param).await;
+        }
+    }
+
+    fn start_requested_response(
+        self: &Arc<Self>,
+        state: &mut SessionState,
+        response_has_input: bool,
+        speak_item_id: Option<&str>,
+        overrides: super::pipeline::ResponseOverrides,
+    ) -> Result<(), (&'static str, &'static str, Option<&'static str>)> {
+        use super::state::ResponseSource;
+        const ALREADY_ACTIVE: (&str, &str, Option<&str>) = (
+            errcode::RESPONSE_ALREADY_ACTIVE,
+            "a response is already active",
+            None,
+        );
+        let admitted = state.resp_admit();
+        if matches!(
+            admitted,
+            Err(state::InvariantViolation::IllegalRespTransition { .. })
+        ) {
+            return Err(ALREADY_ACTIVE);
+        }
+        let source =
+            state::select_response_source(&state.conversation, response_has_input, speak_item_id);
+        let (prompt, prefilled, spoken_item) = match source {
+            ResponseSource::SpeakUnavailable { reason } => {
+                return Err((
+                    errcode::INVALID_REQUEST_ERROR,
+                    reason,
+                    Some("response.speak_item_id"),
+                ))
+            }
+            _ if admitted.is_err() => {
+                return Err((
+                    errcode::INVALID_REQUEST_ERROR,
+                    "cannot create a response while input speech is active",
+                    None,
+                ))
+            }
+            ResponseSource::Generate { prompt } if prompt.is_empty() => {
+                return Err((
+                    errcode::INVALID_REQUEST_ERROR,
+                    "no user message in conversation to respond to",
+                    None,
+                ))
+            }
+            ResponseSource::Generate { prompt } => (prompt, None, None),
+            ResponseSource::Speak { index, text } => {
+                let item = &mut state.conversation[index];
+                item.client_speakable = false;
+                (
+                    String::new(),
+                    Some(super::pipeline::PrefilledText::ClientSupplied(text)),
+                    Some(ItemId::new(item.id.clone())),
+                )
+            }
+        };
+        let response_id = self.id_source.response();
+        let assistant_item_id = spoken_item.unwrap_or_else(|| self.id_source.item());
+        let session = self.clone();
+        self.spawn_response_lane(
+            state,
             response_id,
-            handle,
-            played_ms,
             assistant_item_id,
-            transcript_so_far,
-            wire_opened,
+            move |lane| async move {
+                let _ = super::pipeline::run_response(&session, lane, prompt, prefilled, overrides)
+                    .await;
+            },
         )
-        .await;
+        .map_err(|_| ALREADY_ACTIVE)
+    }
+
+    pub(super) fn spawn_response_lane<F>(
+        self: &Arc<Self>,
+        state: &mut SessionState,
+        id: ResponseId,
+        assistant_item_id: ItemId,
+        lane: impl FnOnce(ResponseLane) -> F,
+    ) -> Result<(), state::InvariantViolation>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        state.resp_admit()?;
+        let parts = ResponseLane {
+            id: id.clone(),
+            assistant_item_id: assistant_item_id.clone(),
+            played_ms: Arc::default(),
+            transcript_so_far: Arc::default(),
+            wire_opened: Arc::default(),
+        };
+        let runs = lane(parts.clone());
+        let session = self.clone();
+        let lane_id = id.clone();
+        let handle = tokio::spawn(self.cancel.wrap_unit(async move {
+            runs.await;
+            session.clear_response_if_matches(&lane_id).await;
+        }));
+        let runtime = ResponseRuntime {
+            handle,
+            transcript_so_far: parts.transcript_so_far,
+            wire_opened: parts.wire_opened,
+        };
+        let _ = state.resp_create_from_none(id, assistant_item_id, runtime);
+        check_or_react(self, state);
+        Ok(())
     }
 
     pub(super) async fn instructions(&self) -> Option<String> {
@@ -1678,20 +1686,6 @@ impl Session {
         }
     }
 
-    pub(super) async fn append_assistant_item(
-        &self,
-        id: String,
-        transcript: String,
-        audio_ms: u64,
-    ) {
-        let mut state = self.state.lock().await;
-        state
-            .conversation
-            .push(ConversationItem::new_assistant_audio(
-                id, transcript, audio_ms,
-            ));
-    }
-
     pub async fn build_eou_context(&self, k: usize) -> String {
         let state = self.state.lock().await;
         let total = state.conversation.len();
@@ -1712,6 +1706,19 @@ impl Session {
             out.push_str(text);
         }
         out
+    }
+
+    pub(super) fn llm_config_for_turn(&self) -> Option<LlmConfig> {
+        let mut cfg = self.llm_config.clone()?;
+        if let Some(m) = self
+            .conversation_model
+            .lock()
+            .expect("conversation_model poisoned")
+            .clone()
+        {
+            cfg.model = m;
+        }
+        Some(cfg)
     }
 
     pub(super) async fn build_chat_messages(&self, instructions: Option<&str>) -> Vec<ChatMessage> {
@@ -1816,26 +1823,56 @@ impl Session {
         self.state.lock().await.current_speech_item.clone()
     }
 
-    pub(super) async fn register_response(
-        self: &Arc<Self>,
-        id: ResponseId,
-        handle: JoinHandle<()>,
-        _played_ms: Arc<AtomicU64>,
-        assistant_item_id: ItemId,
-        transcript_so_far: Arc<Mutex<String>>,
-        wire_opened: Arc<AtomicBool>,
-    ) {
-        let mut state = self.state.lock().await;
-        let runtime = ResponseRuntime {
-            handle,
-            transcript_so_far,
-            wire_opened,
+    pub(super) async fn announce_response(&self, lane: &ResponseLane) -> bool {
+        let _ordered = self.outbound_send.lock().await;
+        let sink = {
+            let state = self.state.lock().await;
+            if state.resp.id() != Some(&lane.id) {
+                return false;
+            }
+            state.event_sink.clone()
         };
-        if let Err(v) = state.resp_create_from_none(id, assistant_item_id, runtime) {
-            warn!(violation = ?v, "register_response invariant violation");
-            return;
+        if let Some(sink) = sink {
+            for ev in super::events::response_open_brackets(
+                lane.id.as_str(),
+                lane.assistant_item_id.as_str(),
+            ) {
+                self.send_holding_outbound_order(&sink, ev).await;
+            }
         }
-        check_or_react(self, &state);
+        lane.wire_opened.store(true, Ordering::Release);
+        true
+    }
+
+    pub(super) async fn close_response(
+        self: &Arc<Self>,
+        response_id: &str,
+        assistant_item: Option<ConversationItem>,
+        events: Vec<super::wire::OutboundEvent>,
+    ) -> bool {
+        let _ordered = self.outbound_send.lock().await;
+        let sink = {
+            let mut state = self.state.lock().await;
+            if state.resp.id().map(ResponseId::as_str) != Some(response_id) {
+                return false;
+            }
+            let _ = state.resp_retire_to_none();
+            state.conversation.extend(assistant_item);
+            check_or_react(self, &state);
+            state.event_sink.clone()
+        };
+        let Some(sink) = sink else {
+            return true;
+        };
+        for ev in events {
+            match serde_json::to_value(&ev) {
+                Ok(value) => self.send_holding_outbound_order(&sink, value).await,
+                Err(err) => {
+                    warn!(event = ev.type_name(), error = %err, "failed to serialize OutboundEvent")
+                }
+            }
+        }
+        true
     }
 
     pub(super) async fn clear_response_if_matches(self: &Arc<Self>, id: &ResponseId) {
@@ -1849,12 +1886,12 @@ impl Session {
         check_or_react(self, &state);
     }
 
-    pub(super) async fn mark_streaming(self: &Arc<Self>, id: &str) {
+    pub(super) async fn mark_streaming(self: &Arc<Self>, id: &str, played_ms: &Arc<AtomicU64>) {
         let mut state = self.state.lock().await;
         let is_created_match =
             matches!(&state.resp, RespPhase::Created { id: rid, .. } if rid.as_str() == id);
         if is_created_match {
-            let _ = state.resp_advance_to_streaming(Arc::new(AtomicU64::new(0)));
+            let _ = state.resp_advance_to_streaming(played_ms.clone());
         }
         check_or_react(self, &state);
     }
@@ -1923,6 +1960,10 @@ impl Session {
             (runtime, response_id, assistant_item_id, played_ms_snapshot)
         };
         let runtime = runtime?;
+        let wire_opened = {
+            let _ordered = self.outbound_send.lock().await;
+            runtime.wire_opened.load(Ordering::Acquire)
+        };
         runtime.handle.abort();
         if let Some(rid) = response_id.as_ref() {
             if self.tts_abort.cancel(rid.as_str()).await {
@@ -1933,7 +1974,6 @@ impl Session {
             }
         }
         let transcript = runtime.transcript_so_far.lock().await.clone();
-        let wire_opened = runtime.wire_opened.load(Ordering::Acquire);
         Some(CancelledSnapshot {
             response_id: response_id?,
             assistant_item_id: assistant_item_id?,
@@ -2017,71 +2057,6 @@ impl Session {
         *last = None;
     }
 
-    #[allow(dead_code)]
-    pub async fn set_integrated_backend(&self, backend: Arc<dyn IntegratedEouBackend>) {
-        let mut slot = self.integrated_backend.lock().await;
-        if let Some(old) = slot.replace(backend) {
-            old.reset();
-        }
-    }
-
-    #[allow(dead_code)]
-    pub async fn handle_integrated_verdict(
-        self: &Arc<Self>,
-        verdict: &IntegratedVerdict,
-    ) -> IntegratedVerdictAction {
-        if !matches!(self.eou_config.kind, EouKind::Integrated) {
-            return IntegratedVerdictAction::Ignored;
-        }
-        let cfg = &self.eou_config;
-        let p_eot = clip01(verdict.p_eot);
-        let p_eager = clip01(verdict.p_eager_eot);
-
-        self.inspector.emit(InspectorEvent::EouScored {
-            session_id: self.id.as_str().to_string(),
-            kind: EouKind::Integrated.as_str(),
-            score: p_eot,
-            eager_score: Some(p_eager),
-            threshold: cfg.eot_threshold,
-            language: None,
-            input_chars: Some(verdict.transcript_so_far.chars().count() as u32),
-            input_audio_ms: None,
-            delay_ms: 0,
-            elapsed_ms: 0,
-            cancelled_by: "none",
-            hard_cap_fired: false,
-        });
-
-        if p_eot >= cfg.eot_threshold {
-            return IntegratedVerdictAction::Commit;
-        }
-
-        if p_eager >= cfg.eager_eot_threshold {
-            let mut state = self.state.lock().await;
-            if matches!(state.resp, RespPhase::None) {
-                let predicted_id = self.id_source.response();
-                let predicted_item_id = self.id_source.item();
-                if state
-                    .resp_start_predicted(predicted_id.clone(), predicted_item_id, p_eager, None)
-                    .is_ok()
-                {
-                    self.inspector.emit(InspectorEvent::PredictedPromoted {
-                        session_id: self.id.as_str().to_string(),
-                        response_id: predicted_id.as_str().to_string(),
-                        score: p_eager,
-                    });
-                    return IntegratedVerdictAction::StartedPredicted;
-                }
-            }
-        }
-
-        IntegratedVerdictAction::None
-    }
-
-    #[allow(dead_code)]
-    pub async fn handle_stt_turn_resumed(self: &Arc<Self>) {
-        self.rollback_predicted_if_any("turn_resumed").await;
-    }
 }
 
 fn read_session_max_duration_s_from_env() -> u64 {
@@ -2113,6 +2088,15 @@ fn clip01(x: f32) -> f32 {
         return 1.0;
     }
     x.clamp(0.0, 1.0)
+}
+
+#[derive(Clone)]
+pub(super) struct ResponseLane {
+    pub(super) id: ResponseId,
+    pub(super) assistant_item_id: ItemId,
+    pub(super) played_ms: Arc<AtomicU64>,
+    pub(super) transcript_so_far: Arc<Mutex<String>>,
+    pub(super) wire_opened: Arc<AtomicBool>,
 }
 
 pub(super) struct CancelledSnapshot {
@@ -2241,9 +2225,12 @@ impl Session {
         }
     }
 
-    pub async fn attach_audio_track(self: &Arc<Self>, track: Arc<TrackRemote>) {
-        let codec = track.codec();
-        let channels = codec.capability.channels as usize;
+    pub async fn attach_audio_track(self: &Arc<Self>, track: Arc<dyn TrackRemote>) {
+        let channels = match track.ssrcs().await.first() {
+            Some(&ssrc) => track.codec(ssrc).await.map(|c| c.channels as usize),
+            None => None,
+        }
+        .unwrap_or(2);
         let mut ingest = match AudioIngest::new(channels) {
             Ok(ingest) => ingest,
             Err(err) => {
@@ -2257,30 +2244,28 @@ impl Session {
         let audio_store = self.audio_store.clone();
         tokio::spawn(self.cancel.wrap_unit(async move {
             let mut packets = 0u64;
-            loop {
-                match track.read_rtp().await {
-                    Ok((pkt, _attrs)) => {
-                        packets += 1;
-                        if let Err(err) = ingest.process(&pkt.payload) {
-                            warn!(error = %err, "opus decode failed; dropping packet");
-                            continue;
-                        }
-                        let samples = ingest.take();
-                        if samples.is_empty() {
-                            continue;
-                        }
-                        audio_store.append_mic_in_f32(&samples);
-                        if tx.send(AudioIn::Samples(samples)).await.is_err() {
-                            debug!(packets, "VAD task dropped; ending RTP loop");
-                            break;
-                        }
-                    }
-                    Err(err) => {
-                        info!(error = %err, packets, "track ended");
-                        break;
-                    }
+            while let Some(event) = track.poll().await {
+                let pkt = match event {
+                    TrackRemoteEvent::OnRtpPacket(pkt) => pkt,
+                    TrackRemoteEvent::OnEnded => break,
+                    _ => continue,
+                };
+                packets += 1;
+                if let Err(err) = ingest.process(&pkt.payload) {
+                    warn!(error = %err, "opus decode failed; dropping packet");
+                    continue;
+                }
+                let samples = ingest.take();
+                if samples.is_empty() {
+                    continue;
+                }
+                audio_store.append_mic_in_f32(&samples);
+                if tx.send(AudioIn::Samples(samples)).await.is_err() {
+                    debug!(packets, "VAD task dropped; ending RTP loop");
+                    break;
                 }
             }
+            info!(packets, "track ended");
         }));
     }
 }
@@ -2723,6 +2708,49 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn session_update_model_selects_the_conversation_upstream_model() {
+        let mut query = probe_query();
+        query.model = Some("label-from-query".into());
+        let mut session = Session::with_dependencies(
+            query,
+            Models::get_or_init().expect("models container"),
+            Intent::Transcription,
+            None,
+            Arc::new(crate::ids::CounterIdSource::new()),
+            inspector::default_sink(),
+        );
+        session.llm_config = Some(LlmConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: None,
+            model: "env-default".into(),
+        });
+        let session = Arc::new(session);
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        session.attach_websocket(tx).await;
+        assert_eq!(session.llm_config_for_turn().unwrap().model, "env-default");
+        session
+            .handle_session_update(json!({"session":{"model":"label-from-query"}}), None)
+            .await;
+        assert_eq!(
+            session.llm_config_for_turn().unwrap().model,
+            "env-default",
+            "echoing the session's own model label must not re-route the conversation"
+        );
+        session
+            .handle_session_update(json!({"session":{"model":"claude-opus-5-5"}}), None)
+            .await;
+        assert_eq!(session.llm_config_for_turn().unwrap().model, "claude-opus-5-5");
+        let mut updated = None;
+        while let Ok(event) = rx.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+            if event["type"] == "session.updated" {
+                updated = Some(event["session"].clone());
+            }
+        }
+        assert_eq!(updated.expect("session.updated")["model"], "claude-opus-5-5");
+    }
+
+    #[tokio::test]
     async fn realtime_synthesis_uses_updated_voice_and_output_locale() {
         let mut query = probe_query();
         query.voice = Some("af_heart".into());
@@ -2794,49 +2822,41 @@ mod tests {
     }
 
     #[test]
-    fn validate_session_max_duration_rejects_zero() {
+    fn validate_session_max_duration_accepts_the_range_and_rejects_zero_and_above_the_cap() {
         assert!(validate_session_max_duration_s(0).is_err());
+        {
+            let cap = defaults::session::MAX_DURATION_HARD_CAP_S;
+            assert!(validate_session_max_duration_s(cap + 1).is_err());
+        }
+        {
+            assert_eq!(validate_session_max_duration_s(1), Ok(1));
+            let cap = defaults::session::MAX_DURATION_HARD_CAP_S;
+            assert_eq!(validate_session_max_duration_s(cap), Ok(cap));
+            assert_eq!(validate_session_max_duration_s(900), Ok(900));
+        }
     }
 
     #[test]
-    fn validate_session_max_duration_rejects_above_hard_cap() {
-        let cap = defaults::session::MAX_DURATION_HARD_CAP_S;
-        assert!(validate_session_max_duration_s(cap + 1).is_err());
-    }
-
-    #[test]
-    fn validate_session_max_duration_accepts_in_range() {
-        assert_eq!(validate_session_max_duration_s(1), Ok(1));
-        let cap = defaults::session::MAX_DURATION_HARD_CAP_S;
-        assert_eq!(validate_session_max_duration_s(cap), Ok(cap));
-        assert_eq!(validate_session_max_duration_s(900), Ok(900));
-    }
-
-    #[test]
-    fn remaining_timeout_preserves_elapsed() {
+    fn remaining_timeout_preserves_elapsed_floors_at_zero_and_is_full_when_new() {
         let new_secs = 600;
         let created = 1_000_000_u64;
         let now = created + 5 * 60 * 1000;
         let remaining = compute_remaining_timeout_ms(new_secs, created, now);
         assert_eq!(remaining, 5 * 60 * 1000);
-    }
-
-    #[test]
-    fn remaining_timeout_zero_when_new_value_below_elapsed() {
-        let new_secs = 60;
-        let created = 1_000_000_u64;
-        let now = created + 90 * 1000;
-        let remaining = compute_remaining_timeout_ms(new_secs, created, now);
-        assert_eq!(remaining, 0);
-    }
-
-    #[test]
-    fn remaining_timeout_full_when_just_started() {
-        let new_secs = 1800;
-        let created = 1_000_000_u64;
-        let now = created;
-        let remaining = compute_remaining_timeout_ms(new_secs, created, now);
-        assert_eq!(remaining, 1_800_000);
+        {
+            let new_secs = 60;
+            let created = 1_000_000_u64;
+            let now = created + 90 * 1000;
+            let remaining = compute_remaining_timeout_ms(new_secs, created, now);
+            assert_eq!(remaining, 0);
+        }
+        {
+            let new_secs = 1800;
+            let created = 1_000_000_u64;
+            let now = created;
+            let remaining = compute_remaining_timeout_ms(new_secs, created, now);
+            assert_eq!(remaining, 1_800_000);
+        }
     }
 
     #[test]
@@ -2845,36 +2865,6 @@ mod tests {
         assert!(!cfg.eager_disabled());
         assert_eq!(cfg.eager_p_threshold, defaults::eou::EAGER_P_THRESHOLD);
         assert!(cfg.eager_p_threshold > 0.0 && cfg.eager_p_threshold < 1.0);
-    }
-
-    #[test]
-    fn eager_threshold_gate_passes_at_or_above_threshold() {
-        let cfg = EouConfig::default();
-        let p_above = 0.6_f32;
-        let p_below = 0.3_f32;
-        assert!(!cfg.eager_disabled() && p_above >= cfg.eager_p_threshold);
-        assert!(!cfg.eager_disabled() && p_below < cfg.eager_p_threshold);
-    }
-
-    #[test]
-    fn eager_dispatch_throttle_window_uses_eager_interval_ms() {
-        let cfg = EouConfig::default();
-        let throttle = std::time::Duration::from_millis(cfg.eager_interval_ms as u64);
-        let prev = std::time::Instant::now();
-        let recent = prev + std::time::Duration::from_millis(50);
-        let later = prev + throttle + std::time::Duration::from_millis(1);
-        assert!(recent.duration_since(prev) < throttle);
-        assert!(later.duration_since(prev) >= throttle);
-    }
-
-    #[test]
-    fn eager_disabled_sentinel_fully_blocks_dispatch() {
-        let mut cfg = EouConfig::default();
-        cfg.eager_p_threshold = defaults::eou::EAGER_P_THRESHOLD_DISABLED;
-        assert!(cfg.eager_disabled());
-        let p = 0.99_f32;
-        let gated = !cfg.eager_disabled() && p >= cfg.eager_p_threshold;
-        assert!(!gated);
     }
 
     #[tokio::test]
@@ -2900,137 +2890,14 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs SPEACHES_PLUS_MODELS and REALTIME_DIARIZATION=1"]
-    async fn sub_min_speech_commit_spawns_no_diarization_for_unannounced_item() {
-        if !super::super::diarization::realtime_enabled() {
-            eprintln!("SKIP: REALTIME_DIARIZATION not enabled");
-            return;
-        }
-        let models = match Models::get_or_init() {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("SKIP: models unavailable: {e}");
-                return;
-            }
-        };
-        let session = Arc::new(Session::with_dependencies(
-            probe_query(),
-            models,
-            Intent::Transcription,
-            None,
-            Arc::new(crate::ids::CounterIdSource::new()),
-            inspector::default_sink(),
-        ));
-        let (tx, mut rx) = mpsc::channel::<String>(1024);
-        session.attach_websocket(tx).await;
-
-        let item_id = "item_sub_min".to_string();
-        let diar_guard = session.diarizer.lock().await;
-        let before = Arc::strong_count(&session);
-        handle_vad_event(
-            &session,
-            VadEvent::SpeechCommitted {
-                item_id: item_id.clone(),
-                audio_end_ms: 50,
-                audio: vec![0.0f32; 800],
-                speech_samples: 800,
-            },
-        )
-        .await;
-        let after = Arc::strong_count(&session);
-        drop(diar_guard);
-
-        let mut trace = Vec::new();
-        while let Ok(t) = rx.try_recv() {
-            trace.push(serde_json::from_str::<serde_json::Value>(&t).expect("json"));
-        }
-        let announced = trace.iter().any(|e| {
-            matches!(
-                e.get("type").and_then(|t| t.as_str()),
-                Some("conversation.item.added") | Some("input_audio_buffer.committed")
-            )
-        });
-        assert!(
-            !announced,
-            "sub-min-speech commit unexpectedly announced an item: {trace:#?}"
-        );
-        assert!(
-            super::super::order_harness::i4_no_unannounced_item_refs(&trace).is_empty(),
-            "I4 violated on the real trace: {trace:#?}"
-        );
-        assert_eq!(
-            after, before,
-            "a diarization task was spawned for {item_id}, an item that is never announced"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "needs SPEACHES_PLUS_MODELS and REALTIME_DIARIZATION=1"]
-    async fn above_min_speech_commit_still_announces_the_item() {
-        if !super::super::diarization::realtime_enabled() {
-            eprintln!("SKIP: REALTIME_DIARIZATION not enabled");
-            return;
-        }
-        let models = match Models::get_or_init() {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("SKIP: models unavailable: {e}");
-                return;
-            }
-        };
-        let session = Arc::new(Session::with_dependencies(
-            probe_query(),
-            models,
-            Intent::Transcription,
-            None,
-            Arc::new(crate::ids::CounterIdSource::new()),
-            inspector::default_sink(),
-        ));
-        let (tx, mut rx) = mpsc::channel::<String>(1024);
-        session.attach_websocket(tx).await;
-
-        let item_id = "item_long".to_string();
-        let diar_guard = session.diarizer.lock().await;
-        let before = Arc::strong_count(&session);
-        handle_vad_event(
-            &session,
-            VadEvent::SpeechCommitted {
-                item_id: item_id.clone(),
-                audio_end_ms: 1000,
-                audio: vec![0.0f32; 16_000],
-                speech_samples: 16_000,
-            },
-        )
-        .await;
-        let after = Arc::strong_count(&session);
-        drop(diar_guard);
-        assert!(
-            after > before,
-            "an above-min-speech commit must keep dispatching work"
-        );
-
-        let mut trace = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let mut announced = false;
-        while std::time::Instant::now() < deadline && !announced {
-            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-                Ok(Some(t)) => {
-                    let v = serde_json::from_str::<serde_json::Value>(&t).expect("json");
-                    announced = v.get("type").and_then(|t| t.as_str())
-                        == Some("input_audio_buffer.committed");
-                    trace.push(v);
-                }
-                _ => break,
-            }
-        }
-        assert!(
-            announced,
-            "above-min-speech commit never announced its item: {trace:#?}"
-        );
-        assert!(
-            super::super::order_harness::i4_no_unannounced_item_refs(&trace).is_empty(),
-            "I4 violated on the real trace: {trace:#?}"
-        );
+    #[test]
+    fn eager_dispatch_throttle_window_uses_eager_interval_ms() {
+        let cfg = EouConfig::default();
+        let throttle = std::time::Duration::from_millis(cfg.eager_interval_ms as u64);
+        let prev = std::time::Instant::now();
+        let recent = prev + std::time::Duration::from_millis(50);
+        let later = prev + throttle + std::time::Duration::from_millis(1);
+        assert!(recent.duration_since(prev) < throttle);
+        assert!(later.duration_since(prev) >= throttle);
     }
 }

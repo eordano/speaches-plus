@@ -16,12 +16,14 @@ use whisper_rs::{
 
 pub mod mel;
 pub mod parakeet;
+pub mod voxtral;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Ct2,
     WhisperCpp,
     Parakeet,
+    Voxtral,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -40,8 +42,6 @@ impl WhisperTask {
     }
 }
 
-pub const ALLOW_UNSUPPORTED_TRANSLATE_ENV: &str = "STT_ALLOW_UNSUPPORTED_TRANSLATE";
-
 #[derive(Debug, Clone)]
 pub struct TranslateUnsupported {
     pub model_id: String,
@@ -52,8 +52,8 @@ impl std::fmt::Display for TranslateUnsupported {
         write!(
             f,
             "speech model {:?} is a transcribe-only checkpoint and cannot perform \
-             translation; load a translation-capable model or set {}=1 to override",
-            self.model_id, ALLOW_UNSUPPORTED_TRANSLATE_ENV
+             translation; load a translation-capable model",
+            self.model_id
         )
     }
 }
@@ -70,11 +70,7 @@ pub struct SttRequestOptions {
     pub initial_prompt: Option<String>,
 }
 
-impl SttRequestOptions {
-    pub fn is_default(&self) -> bool {
-        self.language.is_none() && self.initial_prompt.is_none()
-    }
-}
+impl SttRequestOptions {}
 
 #[derive(Debug, Clone)]
 pub struct SttParamUnsupported {
@@ -148,16 +144,6 @@ fn checkpoint_tail(path: &Path) -> String {
     comps.join("/")
 }
 
-fn env_flag_enabled(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-        }
-        Err(_) => false,
-    }
-}
-
 fn ort_dylib_carries_the_cuda_ep() -> bool {
     std::env::var_os("ORT_DYLIB_PATH")
         .map(PathBuf::from)
@@ -188,6 +174,7 @@ impl Backend {
         match value {
             "ct2" | "ctranslate2" | "faster-whisper" => Backend::Ct2,
             "parakeet" | "parakeet-tdt" | "tdt" => Backend::Parakeet,
+            "voxtral" | "voxtral-realtime" | "voxtral-cpp" | "voxtral.cpp" => Backend::Voxtral,
             "" if gpu_parakeet_ready => {
                 tracing::info!(
                     var = super::defaults::env::STT_BACKEND,
@@ -288,6 +275,19 @@ impl WhisperEngine {
                     id,
                 }
             }
+            Backend::Voxtral => {
+                let dir = voxtral::model_dir(
+                    model_dir,
+                    env_checkpoint_override(voxtral::VOXTRAL_MODEL_DIR_ENV),
+                )?;
+                let id = voxtral::VOXTRAL_MODEL_ID.to_string();
+                let model = voxtral::VoxtralStt::load(&dir)?;
+                tracing::info!(dir = %dir.display(), id, device = model.device_name(), "voxtral realtime backend loaded");
+                WhisperHandle::Voxtral {
+                    inner: Arc::new(model),
+                    id,
+                }
+            }
             Backend::WhisperCpp => {
                 let path = whisper_cpp_model_path(model_dir)?;
                 let path_str = path
@@ -329,6 +329,10 @@ pub enum WhisperHandle {
         inner: Arc<parakeet::ParakeetTdt>,
         id: String,
     },
+    Voxtral {
+        inner: Arc<voxtral::VoxtralStt>,
+        id: String,
+    },
 }
 
 impl WhisperHandle {
@@ -337,6 +341,7 @@ impl WhisperHandle {
             WhisperHandle::Ct2 { id, .. } => id,
             WhisperHandle::WhisperCpp { id, .. } => id,
             WhisperHandle::Parakeet { id, .. } => id,
+            WhisperHandle::Voxtral { id, .. } => id,
         }
     }
 
@@ -349,6 +354,7 @@ impl WhisperHandle {
             }),
             WhisperHandle::WhisperCpp { .. } => None,
             WhisperHandle::Parakeet { inner, .. } => Some(inner.ep()),
+            WhisperHandle::Voxtral { inner, .. } => Some(inner.device_name()),
         }
     }
 
@@ -358,7 +364,10 @@ impl WhisperHandle {
             return true;
         }
         if GENERIC_WHISPER_ALIASES_MATCH_ANY_WHISPER_BACKEND.contains(&req.as_str()) {
-            return !matches!(self, WhisperHandle::Parakeet { .. });
+            return !matches!(
+                self,
+                WhisperHandle::Parakeet { .. } | WhisperHandle::Voxtral { .. }
+            );
         }
         if req.len() < 4 {
             return false;
@@ -370,13 +379,11 @@ impl WhisperHandle {
     }
 
     pub fn supports_translate(&self) -> bool {
-        if env_flag_enabled(ALLOW_UNSUPPORTED_TRANSLATE_ENV) {
-            return true;
-        }
         match self {
             WhisperHandle::Ct2 { inner, .. } => inner.supports_translate,
             WhisperHandle::WhisperCpp { id, .. } => !checkpoint_is_transcribe_only(id),
             WhisperHandle::Parakeet { .. } => false,
+            WhisperHandle::Voxtral { .. } => false,
         }
     }
 }
@@ -385,12 +392,26 @@ const SILENCE_PEAK_THRESHOLD: f32 = super::defaults::stt::SILENCE_PEAK_THRESHOLD
 
 pub mod noise_gate;
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub logprob: f32,
+}
+
+pub fn mean_logprob(tokens: &[TokenLogprob]) -> Option<f32> {
+    if tokens.is_empty() {
+        return None;
+    }
+    Some((tokens.iter().map(|t| t.logprob as f64).sum::<f64>() / tokens.len() as f64) as f32)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptionResult {
     pub text: String,
     pub avg_logprob: Option<f32>,
     pub no_speech_prob: Option<f32>,
     pub compression_ratio: Option<f32>,
+    pub tokens: Vec<TokenLogprob>,
 
     pub segments: Vec<TimedSegment>,
     pub language: Option<String>,
@@ -449,12 +470,6 @@ impl TranscriptionResult {
     pub fn empty() -> Self {
         Self::default()
     }
-    pub fn from_text<S: Into<String>>(s: S) -> Self {
-        Self {
-            text: s.into(),
-            ..Self::default()
-        }
-    }
 }
 
 impl WhisperHandle {
@@ -464,10 +479,6 @@ impl WhisperHandle {
 
     pub fn transcribe_full(&self, audio_16k_mono: &[f32]) -> Result<TranscriptionResult> {
         self.transcribe_full_with_task(audio_16k_mono, WhisperTask::Transcribe)
-    }
-
-    pub fn translate_full(&self, audio_16k_mono: &[f32]) -> Result<TranscriptionResult> {
-        self.transcribe_full_with_task(audio_16k_mono, WhisperTask::Translate)
     }
 
     pub fn transcribe_full_with_task(
@@ -488,6 +499,25 @@ impl WhisperHandle {
             return Err(anyhow::Error::new(TranslateUnsupported {
                 model_id: self.model_id().to_string(),
             }));
+        }
+        if let WhisperHandle::Voxtral { id, .. } = self {
+            if opts.initial_prompt.is_some() {
+                return Err(anyhow::Error::new(SttParamUnsupported {
+                    param: "prompt",
+                    message: format!(
+                        "prompt is not supported by the loaded STT model {id:?} (voxtral \
+                         realtime conditions on audio alone); omit the field or load a whisper \
+                         model"
+                    ),
+                }));
+            }
+            if let Some(lang) = opts.language.as_deref() {
+                tracing::debug!(
+                    language = lang,
+                    "voxtral realtime detects the language itself; the request's language \
+                     field is accepted and not applied"
+                );
+            }
         }
         if let WhisperHandle::Parakeet { id, .. } = self {
             if let Some(lang) = opts.language.as_deref() {
@@ -532,17 +562,27 @@ impl WhisperHandle {
             WhisperHandle::Parakeet { inner, .. } => {
                 transcribe_parakeet(inner, audio_16k_mono, task)
             }
+            WhisperHandle::Voxtral { inner, .. } => transcribe_voxtral(inner, audio_16k_mono, task),
         }
     }
 }
 
-fn transcribe_parakeet(
-    model: &parakeet::ParakeetTdt,
+fn transcribe_voxtral(
+    model: &voxtral::VoxtralStt,
     audio_16k_mono: &[f32],
     task: WhisperTask,
 ) -> Result<TranscriptionResult> {
-    let text = model.transcribe(audio_16k_mono)?;
+    let t = std::time::Instant::now();
+    let (raw, token_ids) = model.transcribe(audio_16k_mono)?;
+    let text = raw.trim().to_string();
     let duration_ms = (audio_16k_mono.len() as f64 / 16.0).round() as u32;
+    tracing::debug!(
+        elapsed_ms = t.elapsed().as_millis() as u64,
+        audio_ms = duration_ms,
+        steps = token_ids.len(),
+        text_tokens = nv_models::voxtral::text_token_count(&token_ids),
+        "voxtral transcribed"
+    );
     let segments = if text.is_empty() {
         Vec::new()
     } else {
@@ -560,6 +600,40 @@ fn transcribe_parakeet(
         avg_logprob: None,
         no_speech_prob: None,
         compression_ratio: None,
+        tokens: Vec::new(),
+        segments,
+        language: None,
+        duration_s: Some(audio_16k_mono.len() as f32 / 16_000.0),
+        task,
+    })
+}
+
+fn transcribe_parakeet(
+    model: &parakeet::ParakeetTdt,
+    audio_16k_mono: &[f32],
+    task: WhisperTask,
+) -> Result<TranscriptionResult> {
+    let (text, tokens) = model.transcribe_scored(audio_16k_mono)?;
+    let avg_logprob = mean_logprob(&tokens);
+    let duration_ms = (audio_16k_mono.len() as f64 / 16.0).round() as u32;
+    let segments = if text.is_empty() {
+        Vec::new()
+    } else {
+        vec![TimedSegment {
+            t_start_ms: 0,
+            t_end_ms: duration_ms,
+            text: text.clone(),
+            avg_logprob: None,
+            no_speech_prob: None,
+            words: proportional_word_timings(&text, 0, duration_ms),
+        }]
+    };
+    Ok(TranscriptionResult {
+        text,
+        avg_logprob,
+        no_speech_prob: None,
+        compression_ratio: None,
+        tokens,
         segments,
         language: Some("en".to_string()),
         duration_s: Some(audio_16k_mono.len() as f32 / 16_000.0),
@@ -573,14 +647,6 @@ fn peak_amplitude(samples: &[f32]) -> f32 {
 
 const CHUNK_SAMPLES: usize = 30 * 16_000;
 
-fn stt_beam_size() -> usize {
-    std::env::var(super::defaults::stt::BEAM_SIZE_ENV_RESTORES_THE_GREEDY_DECODE)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(super::defaults::stt::BEAM_SIZE)
-}
-
 fn transcribe_ct2_long(
     state: &Ct2State,
     audio: &[f32],
@@ -591,6 +657,7 @@ fn transcribe_ct2_long(
         return transcribe_ct2(state, audio, task, opts);
     }
     let mut all_segments: Vec<TimedSegment> = Vec::new();
+    let mut all_tokens: Vec<TokenLogprob> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
     let mut lp_sum = 0.0_f64;
     let mut lp_weight = 0.0_f64;
@@ -635,6 +702,7 @@ fn transcribe_ct2_long(
                 nsp_weight += chunk_dur_ms;
             }
         }
+        all_tokens.extend(res.tokens);
         for mut seg in res.segments {
             seg.t_start_ms += offset_ms;
             seg.t_end_ms += offset_ms;
@@ -660,6 +728,7 @@ fn transcribe_ct2_long(
             None
         },
         compression_ratio: None,
+        tokens: all_tokens,
         segments: all_segments,
         language,
         duration_s: Some(audio.len() as f32 / 16_000.0),
@@ -809,7 +878,7 @@ fn transcribe_ct2(
     prompt_tokens.extend(["<|startoftranscript|>", language_token.as_str(), task_token]);
     let prompts: Vec<Vec<&str>> = vec![prompt_tokens];
     let mut options = Ct2WhisperOptions {
-        beam_size: stt_beam_size(),
+        beam_size: crate::defaults::stt::BEAM_SIZE,
         ..Default::default()
     };
     options.return_scores = true;
@@ -886,6 +955,7 @@ fn transcribe_ct2(
         avg_logprob,
         no_speech_prob,
         compression_ratio: None,
+        tokens: Vec::new(),
         segments: timed,
         language: language_code(&language_token),
         duration_s: Some(real_audio_ms as f32 / 1000.0),
@@ -1147,6 +1217,7 @@ fn transcribe_whisper_cpp(
         avg_logprob,
         no_speech_prob,
         compression_ratio: None,
+        tokens: Vec::new(),
         segments: timed,
         language,
         duration_s: Some(real_audio_ms as f32 / 1000.0),
@@ -1435,69 +1506,27 @@ mod tests {
         assert_eq!(segs[1].t_start_ms, 1200);
         assert_eq!(segs[1].t_end_ms, 2500);
         assert_eq!(segs[1].text_tokens, vec![" wor", "ld"]);
-    }
 
-    #[test]
-    fn splits_ct2_segments_skips_leading_text() {
-        let toks: Vec<String> = vec!["<|sot|>", "<|en|>", "<|0.00|>", "hi", "<|1.00|>"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let segs = split_ct2_segments(&toks, &[], None, u32::MAX);
-        assert_eq!(segs.len(), 1);
+        let toks = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let segs = split_ct2_segments(&toks(&["<|sot|>", "<|en|>", "<|0.00|>", "hi", "<|1.00|>"]), &[], None, u32::MAX);
+        assert_eq!(segs.len(), 1, "leading non-timestamp text is skipped");
         assert_eq!(segs[0].text_tokens, vec!["hi"]);
-    }
 
-    #[test]
-    fn splits_ct2_segments_by_id() {
-        let toks: Vec<String> = vec!["<|0.00|>", "hi", "<|1.20|>"]
-            .into_iter()
-            .map(String::from)
-            .collect();
         let ids: Vec<usize> = vec![50364, 12345, 50424];
-        let segs = split_ct2_segments(&toks, &ids, Some(50364), u32::MAX);
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].t_start_ms, 0);
-        assert_eq!(segs[0].t_end_ms, 1200);
-    }
+        let segs = split_ct2_segments(&toks(&["<|0.00|>", "hi", "<|1.20|>"]), &ids, Some(50364), u32::MAX);
+        assert_eq!((segs.len(), segs[0].t_start_ms, segs[0].t_end_ms), (1, 0, 1200), "split by id");
 
-    #[test]
-    fn splits_ct2_segments_clamps_to_audio_ms() {
-        let toks: Vec<String> = vec!["<|0.00|>", "hi", "<|29.84|>"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let segs = split_ct2_segments(&toks, &[], None, 3_000);
-        assert_eq!(segs.len(), 1);
-        assert_eq!(segs[0].t_start_ms, 0);
-        assert_eq!(segs[0].t_end_ms, 3_000);
-    }
+        let segs = split_ct2_segments(&toks(&["<|0.00|>", "hi", "<|29.84|>"]), &[], None, 3_000);
+        assert_eq!((segs.len(), segs[0].t_start_ms, segs[0].t_end_ms), (1, 0, 3_000), "clamped to audio_ms");
 
-    #[test]
-    fn splits_ct2_segments_drops_inverted_pairs() {
-        let toks: Vec<String> = vec!["<|2.00|>", "hi", "<|1.00|>"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let segs = split_ct2_segments(&toks, &[], None, u32::MAX);
-        assert!(segs.is_empty(), "{segs:?}");
-    }
-
-    #[test]
-    fn splits_ct2_segments_handles_no_timestamps() {
-        let toks: Vec<String> = vec!["hi", "there"].into_iter().map(String::from).collect();
-        let segs = split_ct2_segments(&toks, &[], None, u32::MAX);
-        assert!(segs.is_empty(), "{segs:?}");
-    }
-
-    #[test]
-    fn splits_ct2_segments_handles_trailing_only_timestamp() {
-        let toks: Vec<String> = vec!["<|0.00|>", "hi"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let segs = split_ct2_segments(&toks, &[], None, u32::MAX);
-        assert!(segs.is_empty(), "{segs:?}");
+        for (label, v) in [
+            ("inverted pair", &["<|2.00|>", "hi", "<|1.00|>"][..]),
+            ("no timestamps", &["hi", "there"][..]),
+            ("trailing-only timestamp", &["<|0.00|>", "hi"][..]),
+        ] {
+            let segs = split_ct2_segments(&toks(v), &[], None, u32::MAX);
+            assert!(segs.is_empty(), "{label}: {segs:?}");
+        }
     }
 
     #[test]
@@ -1511,10 +1540,6 @@ mod tests {
         assert_eq!(words[1].end_ms, 600);
         assert_eq!(words[2].start_ms, 600);
         assert_eq!(words[2].end_ms, 900);
-    }
-
-    #[test]
-    fn proportional_word_timings_handles_unicode_char_counts() {
         let words = proportional_word_timings("café latte", 0, 2000);
         assert_eq!(words.len(), 2);
         assert_eq!(words[0].word, "café");
@@ -1537,10 +1562,7 @@ mod tests {
         assert_eq!(words[1].word, "world");
         assert_eq!(words[1].start_ms, 500);
         assert_eq!(words[1].end_ms, 750);
-    }
-
-    #[test]
-    fn group_whisper_tokens_falls_back_when_empty() {
+        assert!(!words.iter().any(|w| is_whisper_pseudo_token(&w.word)));
         let words = group_whisper_tokens_into_words(&[], 0, 1000, "fall back text");
         assert_eq!(words.len(), 3);
         assert_eq!(words[0].word, "fall");
@@ -1554,43 +1576,32 @@ mod tests {
     }
 
     #[test]
-    fn whisper_model_override_accepts_a_file_path() {
-        let d = scratch("wm-file");
-        let bin = d.join("ggml-large-v3-turbo-q8_0.bin");
-        std::fs::write(&bin, b"x").unwrap();
-        let empty = scratch("wm-file-empty");
-        let got = whisper_cpp_model_path_with(&empty, Some(bin.clone())).unwrap();
-        assert_eq!(got, bin);
-    }
-
-    #[test]
-    fn whisper_model_override_accepts_a_directory() {
-        let d = scratch("wm-dir");
-        let bin = d.join("ggml-large-v3-turbo.bin");
-        std::fs::write(&bin, b"x").unwrap();
-        let empty = scratch("wm-dir-empty");
-        let got = whisper_cpp_model_path_with(&empty, Some(d.clone())).unwrap();
-        assert_eq!(got, bin);
-    }
-
-    #[test]
-    fn whisper_quantised_checkpoint_found_without_exact_name() {
-        let d = scratch("wm-quant");
-        let bin = d.join("ggml-large-v3-turbo-q8_0.bin");
-        std::fs::write(&bin, b"x").unwrap();
-        let got = whisper_cpp_model_path_with(&d, None).unwrap();
-        assert_eq!(got, bin);
-    }
-
-    #[test]
-    fn whisper_unusable_override_falls_back_to_models_dir() {
-        let d = scratch("wm-fallback");
-        let bin = d.join("ggml-large-v3.bin");
-        std::fs::write(&bin, b"x").unwrap();
-        let got =
-            whisper_cpp_model_path_with(&d, Some(std::path::PathBuf::from("/nope/missing.bin")))
-                .unwrap();
-        assert_eq!(got, bin);
+    fn whisper_model_override_accepts_a_file_or_dir_and_falls_back_to_models_dir() {
+        let empty = scratch("wm-empty");
+        for (tag, name, override_is_dir) in [
+            ("wm-file", "ggml-large-v3-turbo-q8_0.bin", false),
+            ("wm-dir", "ggml-large-v3-turbo.bin", true),
+        ] {
+            let d = scratch(tag);
+            let bin = d.join(name);
+            std::fs::write(&bin, b"x").unwrap();
+            let over = if override_is_dir { d.clone() } else { bin.clone() };
+            assert_eq!(whisper_cpp_model_path_with(&empty, Some(over)).unwrap(), bin);
+            assert_eq!(
+                whisper_cpp_model_path_with(&d, None).unwrap(),
+                bin,
+                "a quantised or exact checkpoint is found in the models dir without an override"
+            );
+            assert_eq!(
+                whisper_cpp_model_path_with(
+                    &d,
+                    Some(std::path::PathBuf::from("/nope/missing.bin"))
+                )
+                .unwrap(),
+                bin,
+                "an unusable override falls back to the models dir"
+            );
+        }
     }
 
     #[test]
@@ -1603,10 +1614,6 @@ mod tests {
             ct2_model_dir_with(&empty, Some(d.join("model.bin"))).unwrap(),
             d
         );
-    }
-
-    #[test]
-    fn ct2_unusable_override_falls_back_to_models_dir() {
         let root = scratch("ct2-fallback");
         let conv = root.join("whisper-ct2");
         std::fs::create_dir_all(&conv).unwrap();
@@ -1633,15 +1640,6 @@ mod tests {
         assert!(!is_whisper_pseudo_token(" hello"));
         assert!(!is_whisper_pseudo_token("["));
         assert!(!is_whisper_pseudo_token("]bracket"));
-    }
-
-    #[test]
-    fn pseudo_tokens_never_reach_word_grouping() {
-        let toks: Vec<(String, i64, i64)> = vec![(" hel".into(), 10, 20), ("lo".into(), 20, 35)];
-        let words = group_whisper_tokens_into_words(&toks, 0, 800, "hello");
-        assert_eq!(words.len(), 1);
-        assert_eq!(words[0].word, "hello");
-        assert!(!words.iter().any(|w| is_whisper_pseudo_token(&w.word)));
     }
 
     #[test]
@@ -1674,10 +1672,6 @@ mod tests {
         assert_eq!(repaired[0].avg_logprob, Some(-0.3));
         assert_eq!(repaired[0].words.len(), 2);
         assert!(repaired[0].words.iter().all(|w| w.end_ms <= 8_420));
-    }
-
-    #[test]
-    fn whole_clip_segment_stays_empty_for_empty_text() {
         assert!(whole_clip_segment("", 8_420, None, None).is_empty());
         assert!(whole_clip_segment("   ", 8_420, None, None).is_empty());
         assert!(whole_clip_segment("hi", 0, None, None).is_empty());
@@ -1692,36 +1686,30 @@ mod tests {
     }
 
     #[test]
-    fn turbo_checkpoints_are_transcribe_only() {
-        assert!(checkpoint_is_transcribe_only("ggml-large-v3-turbo"));
-        assert!(checkpoint_is_transcribe_only(
-            "faster-whisper-large-v3-turbo-ct2"
-        ));
-        assert!(!checkpoint_is_transcribe_only("ggml-large-v3"));
-    }
-
-    #[test]
-    fn english_only_checkpoints_are_transcribe_only() {
-        assert!(checkpoint_is_transcribe_only("ggml-tiny.en"));
-        assert!(checkpoint_is_transcribe_only("ggml-base.en.bin"));
-        assert!(checkpoint_is_transcribe_only("faster-whisper-medium.en"));
-        assert!(checkpoint_is_transcribe_only(&checkpoint_tail(Path::new(
-            "/hub/models--Systran--faster-whisper-tiny.en/snapshots/abc"
-        ))));
-        assert!(!checkpoint_is_transcribe_only("ggml-large-v3"));
-        assert!(!checkpoint_is_transcribe_only("whisper-large-v3"));
-        assert!(!checkpoint_is_transcribe_only("checkpoints.enc"));
-        assert!(!checkpoint_is_transcribe_only("model.env"));
-    }
-
-    #[test]
-    fn checkpoint_tail_sees_hf_repo_name_but_not_ancestors() {
-        let hf = Path::new(
-            "/turbo-cache/models--deepdml--faster-whisper-large-v3-turbo-ct2/snapshots/abc",
-        );
-        assert!(checkpoint_is_transcribe_only(&checkpoint_tail(hf)));
-        let plain = Path::new("/turbo-cache/models/whisper-large-v3/snapshots/abc");
-        assert!(!checkpoint_is_transcribe_only(&checkpoint_tail(plain)));
+    fn turbo_and_english_only_checkpoints_are_transcribe_only() {
+        for name in [
+            "ggml-large-v3-turbo",
+            "faster-whisper-large-v3-turbo-ct2",
+            "ggml-tiny.en",
+            "ggml-base.en.bin",
+            "faster-whisper-medium.en",
+        ] {
+            assert!(checkpoint_is_transcribe_only(name), "{name}");
+        }
+        for name in ["ggml-large-v3", "whisper-large-v3", "checkpoints.enc", "model.env"] {
+            assert!(!checkpoint_is_transcribe_only(name), "{name}");
+        }
+        for (path, want) in [
+            ("/hub/models--Systran--faster-whisper-tiny.en/snapshots/abc", true),
+            ("/turbo-cache/models--deepdml--faster-whisper-large-v3-turbo-ct2/snapshots/abc", true),
+            ("/turbo-cache/models/whisper-large-v3/snapshots/abc", false),
+        ] {
+            assert_eq!(
+                checkpoint_is_transcribe_only(&checkpoint_tail(Path::new(path))),
+                want,
+                "{path}: checkpoint_tail sees the hf repo name but not ancestors"
+            );
+        }
     }
 
     #[test]
@@ -1751,6 +1739,10 @@ mod tests {
                 Backend::Parakeet
             );
             assert_eq!(
+                Backend::from_value("voxtral", gpu_parakeet_ready),
+                Backend::Voxtral
+            );
+            assert_eq!(
                 Backend::from_value("whisper-cpp", gpu_parakeet_ready),
                 Backend::WhisperCpp
             );
@@ -1763,10 +1755,6 @@ mod tests {
                 Backend::WhisperCpp
             );
         }
-    }
-
-    #[test]
-    fn backend_unset_selects_parakeet_only_when_gpu_stt_is_ready() {
         assert_eq!(Backend::from_value("", false), Backend::WhisperCpp);
         assert_eq!(Backend::from_value("", true), Backend::Parakeet);
     }
@@ -1794,21 +1782,15 @@ mod tests {
         strip_echoed_prompt_context(&mut tokens, &mut ids, &prefix);
         assert_eq!(tokens, s(&["<|0.00|>", "ĠThe", "Ġfox", "<|1.00|>"]));
         assert_eq!(ids, vec![6, 7, 8, 9]);
-    }
 
-    #[test]
-    fn unechoed_sequences_are_left_intact() {
         let mut tokens = s(&["ĠThe", "Ġfox"]);
         let mut ids = vec![1usize, 2];
-        let prefix = s(&["<|startofprev|>", "ĠYesterday"]);
         strip_echoed_prompt_context(&mut tokens, &mut ids, &prefix);
-        assert_eq!(tokens, s(&["ĠThe", "Ġfox"]));
+        assert_eq!(tokens, s(&["ĠThe", "Ġfox"]), "unechoed sequences are left intact");
         assert_eq!(ids, vec![1, 2]);
-        let mut tokens2 = s(&["ĠThe", "Ġfox"]);
-        let mut ids2 = vec![1usize, 2];
-        strip_echoed_prompt_context(&mut tokens2, &mut ids2, &[]);
-        assert_eq!(tokens2.len(), 2);
-        assert_eq!(ids2.len(), 2);
+        strip_echoed_prompt_context(&mut tokens, &mut ids, &[]);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(ids.len(), 2);
     }
 
     fn transcribe_ct2_legacy(state: &Ct2State, audio: &[f32]) -> Result<String> {
@@ -1828,7 +1810,7 @@ mod tests {
             "<|notimestamps|>",
         ]];
         let options = Ct2WhisperOptions {
-            beam_size: stt_beam_size(),
+            beam_size: crate::defaults::stt::BEAM_SIZE,
             ..Default::default()
         };
         let mut results = state
@@ -1847,98 +1829,6 @@ mod tests {
             .decode(tokens)
             .context("ct2 tokenizer decode")?;
         Ok(strip_special_tokens(&decoded).trim().to_string())
-    }
-
-    #[test]
-    fn ct2_timestamps_perf_cost() {
-        if std::env::var("CT2_BENCH").ok().as_deref() != Some("1") {
-            eprintln!("ct2 bench: skipping -- set CT2_BENCH=1 to run");
-            return;
-        }
-        use std::path::PathBuf;
-        let audio_path =
-            std::env::var("CT2_DIFF_AUDIO").unwrap_or_else(|_| "/tmp/audio16k_ref.bin".to_string());
-        let model_dir_root = std::env::var("CT2_DIFF_MODEL_DIR").unwrap_or_else(|_| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("models")
-                .to_string_lossy()
-                .into_owned()
-        });
-        if !std::path::Path::new(&audio_path).exists() {
-            eprintln!("ct2 bench: skipping -- no {audio_path}");
-            return;
-        }
-        let dir = match ct2_model_dir(std::path::Path::new(&model_dir_root)) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("ct2 bench: skipping -- no ct2 model: {e:#}");
-                return;
-            }
-        };
-
-        let bytes = std::fs::read(&audio_path).expect("read audio bin");
-        let audio: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-
-        let model = Ct2Whisper::new(&dir, ct2_config()).expect("load ct2 model");
-        let tokenizer = Ct2Tokenizer::new(&dir).expect("load tokenizer");
-        let n_mels = model.n_mels();
-        let timestamp_begin_id = tokenizer.token_to_id("<|0.00|>");
-        let state = Ct2State {
-            model,
-            tokenizer,
-            mel: mel::WhisperMel::new(n_mels),
-            timestamp_begin_id,
-            supports_translate: false,
-        };
-
-        let runs: usize = std::env::var("CT2_BENCH_RUNS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(6);
-
-        let bench = |label: &str, f: &dyn Fn()| -> u128 {
-            f();
-            let mut times: Vec<u128> = Vec::with_capacity(runs);
-            for _ in 0..runs {
-                let t = std::time::Instant::now();
-                f();
-                times.push(t.elapsed().as_micros());
-            }
-            times.sort();
-            let median = times[times.len() / 2];
-            let min = times[0];
-            let max = times[times.len() - 1];
-            eprintln!(
-                "{label:>16}: median {:>6.1} ms  (min {:>6.1}, max {:>6.1}, n={runs})",
-                median as f64 / 1000.0,
-                min as f64 / 1000.0,
-                max as f64 / 1000.0,
-            );
-            median
-        };
-
-        let m_legacy = bench("legacy (no-ts)", &|| {
-            let _ = transcribe_ct2_legacy(&state, &audio).expect("legacy");
-        });
-        let m_new = bench("new (ts+split)", &|| {
-            let _ = transcribe_ct2(
-                &state,
-                &audio,
-                WhisperTask::Transcribe,
-                &SttRequestOptions::default(),
-            )
-            .expect("new");
-        });
-
-        let delta_pct = (m_new as f64 - m_legacy as f64) / m_legacy as f64 * 100.0;
-        eprintln!(
-            "delta: {:+.2}% ({:+.1} ms median)",
-            delta_pct,
-            (m_new as f64 - m_legacy as f64) / 1000.0
-        );
     }
 
     #[test]
@@ -2026,6 +1916,98 @@ mod tests {
         assert_eq!(
             all_seg_words, nw,
             "joined text doesn't equal concatenation of segment texts"
+        );
+    }
+
+    #[test]
+    fn ct2_timestamps_perf_cost() {
+        if !nv_config::env_arm_opt_in_eq_some_1_reread_every_call("CT2_BENCH") {
+            eprintln!("ct2 bench: skipping -- set CT2_BENCH=1 to run");
+            return;
+        }
+        use std::path::PathBuf;
+        let audio_path =
+            std::env::var("CT2_DIFF_AUDIO").unwrap_or_else(|_| "/tmp/audio16k_ref.bin".to_string());
+        let model_dir_root = std::env::var("CT2_DIFF_MODEL_DIR").unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("models")
+                .to_string_lossy()
+                .into_owned()
+        });
+        if !std::path::Path::new(&audio_path).exists() {
+            eprintln!("ct2 bench: skipping -- no {audio_path}");
+            return;
+        }
+        let dir = match ct2_model_dir(std::path::Path::new(&model_dir_root)) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("ct2 bench: skipping -- no ct2 model: {e:#}");
+                return;
+            }
+        };
+
+        let bytes = std::fs::read(&audio_path).expect("read audio bin");
+        let audio: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        let model = Ct2Whisper::new(&dir, ct2_config()).expect("load ct2 model");
+        let tokenizer = Ct2Tokenizer::new(&dir).expect("load tokenizer");
+        let n_mels = model.n_mels();
+        let timestamp_begin_id = tokenizer.token_to_id("<|0.00|>");
+        let state = Ct2State {
+            model,
+            tokenizer,
+            mel: mel::WhisperMel::new(n_mels),
+            timestamp_begin_id,
+            supports_translate: false,
+        };
+
+        let runs: usize = std::env::var("CT2_BENCH_RUNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+
+        let bench = |label: &str, f: &dyn Fn()| -> u128 {
+            f();
+            let mut times: Vec<u128> = Vec::with_capacity(runs);
+            for _ in 0..runs {
+                let t = std::time::Instant::now();
+                f();
+                times.push(t.elapsed().as_micros());
+            }
+            times.sort();
+            let median = times[times.len() / 2];
+            let min = times[0];
+            let max = times[times.len() - 1];
+            eprintln!(
+                "{label:>16}: median {:>6.1} ms  (min {:>6.1}, max {:>6.1}, n={runs})",
+                median as f64 / 1000.0,
+                min as f64 / 1000.0,
+                max as f64 / 1000.0,
+            );
+            median
+        };
+
+        let m_legacy = bench("legacy (no-ts)", &|| {
+            let _ = transcribe_ct2_legacy(&state, &audio).expect("legacy");
+        });
+        let m_new = bench("new (ts+split)", &|| {
+            let _ = transcribe_ct2(
+                &state,
+                &audio,
+                WhisperTask::Transcribe,
+                &SttRequestOptions::default(),
+            )
+            .expect("new");
+        });
+
+        let delta_pct = (m_new as f64 - m_legacy as f64) / m_legacy as f64 * 100.0;
+        eprintln!(
+            "delta: {:+.2}% ({:+.1} ms median)",
+            delta_pct,
+            (m_new as f64 - m_legacy as f64) / 1000.0
         );
     }
 }

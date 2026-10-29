@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
@@ -123,18 +121,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shape_mismatch_is_reported() {
-        let e = check_shapes(8, 16, 16, 8, 2, 1, 4, 8).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn matching_shapes_are_accepted() {
-        check_shapes(8, 32, 32, 8, 2, 1, 4, 8).unwrap();
-    }
-
-    #[test]
-    fn params_are_uniform_buffer_sized() {
-        assert_eq!(std::mem::size_of::<AttnDecodeParams>() % 16, 0);
+    fn shape_checks_and_params_follow_the_shader_contract() {
+        {
+            let e = check_shapes(8, 16, 16, 8, 2, 1, 4, 8).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            check_shapes(8, 32, 32, 8, 2, 1, 4, 8).unwrap();
+        }
+        {
+            assert_eq!(std::mem::size_of::<AttnDecodeParams>() % 16, 0);
+        }
     }
 }

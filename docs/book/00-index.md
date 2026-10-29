@@ -19,10 +19,10 @@ implement what it describes, so it doubles as a map of the tree.
 > nothing else -- no `INDEX.md`, no `§`-numbered sections, no `F-NN` flag ids --
 > so a citation naming any of those is citing something that does not exist and
 > reads as evidence while being none. A number earns its place one of two ways:
-> it names a **suite in the tree that reproduces it**, or it carries its **basis
+> it names a suite in the tree that reproduces it, or it carries its **basis
 > tuple** (checkpoint, harness, backend, batch, token count, sha, log path)
 > inline, in the paragraph making the claim, where it cannot be pruned away from
-> it. A number with neither is labelled **UNVERIFIED at HEAD** at its site,
+> it. A number with neither is labelled UNVERIFIED at HEAD at its site,
 > together with what would establish it; that label is a standing invitation to
 > re-measure, not a licence to quote.
 
@@ -39,27 +39,27 @@ implement what it describes, so it doubles as a map of the tree.
 
 ## Subchapters
 
-**1 -- Architecture**
+1 -- Architecture
 
 - [1.1 Charter](01.1-native-rust-port-prd.md) -- the normative goals, the acceptance bar, and the T0-T5 numerics contract
 
-**2 -- Model loading**
+2 -- Model loading
 
 - [2.1 Model compatibility matrix](02.1-model-compat-matrix.md) -- what this server can actually serve, audited against the tree
 - [2.2 GGUF format notes](02.2-gguf-format.md) -- the GGUF loader, format notes and upstream citations
 
-**3 -- Speculative decoding**
+3 -- Speculative decoding
 
 - [3.1 MTP drafter contract](03.1-mtp-drafter-notes.md) -- the shapes, constants and dataflow the gemma-4-E4B assistant drafter must match
 
-**4 -- Kernels and quantization**
+4 -- Kernels and quantization
 
 - [4.1 FP8 contract](04.1-fp8.md) -- cross-backend contract, defaults and known issues; `include_str!`'d by `fp8_contract_e4m3.rs`
 - [4.2 FP8 epilogue mechanism](04.2-fp8-epilogue-mechanism.md) -- what the 2026-08 wgpu fix actually changed
 - [4.3 Quantization balance](04.3-quantization-balance.md) -- per-component performance/quality recipe
 - [4.5 WGSL -> naga -> MSL kernel rules](04.5-wgsl-naga-msl-kernel-rules.md) -- design rules so the next Apple-GPU kernel is fast the first time (§R6 carries the measured 4/8-bit format ranking on Metal)
 
-**5 -- Backends**
+5 -- Backends
 
 - [5.1 wgpu status](05.1-wgpu-status.md) -- canonical wgpu document: what works, how correct, what remains
 - [5.2 Kernel parity](05.2-kernel-parity-matrix.md) -- what would catch a wrong number: the three cross-backend suites, the host oracles that carry the rest, and the kernels with no value gate at all
@@ -71,8 +71,9 @@ implement what it describes, so it doubles as a map of the tree.
 - [5.10 KV disk persistence](05.10-kv-disk-persistence.md) -- warm tokens across restarts (all wgpu decoders, `NV_KV_CACHE_DIR`)
 - [5.11 KV prime checkpointing](05.11-kv-prime-checkpointing.md) -- deep-context primes saved and kill-resumable (`NV_KV_CKPT_DIR`), fingerprint-keyed, refuse-on-mismatch
 - [5.12 Kernel rationale](05.12-kernel-rationale.md) -- the measured facts behind kernel design choices: grid-axis guard law, flash-decode bandwidth structure, smem opt-in, WGSL occupancy rules, harness invariants
+- [5.13 Rust idioms](05.13-rust-idioms.md) -- one way per concept across the crates: errors, env knobs, device dispatch, assertions, cudarc copies, test names, backend twins, constructors, kernel binding, lint suppressions
 
-**6 -- Serving surface**
+6 -- Serving surface
 
 - [6.1 CUDA serving architecture](06.1-serving-architecture.md) -- paged KV, continuous batching, the graphed Eagle3 verify loop
 - [6.2 Concurrency and ordering](06.2-concurrency-and-ordering.md) -- the realtime-lane contract; read before parallelizing anything there
@@ -80,6 +81,7 @@ implement what it describes, so it doubles as a map of the tree.
 - [6.4 Notebook digitizer](06.4-notebooks.md) -- scanned notebook pages to per-page markdown
 - [6.5 LoRA design](06.5-lora-design.md) -- normative multi-adapter serving design, vLLM-cited; §12 is the wgpu/Metal path
 - [6.6 LoRA training](06.6-lora-training.md) -- train an adapter and serve it here, end to end
+- [6.12 Contrastive tool decisions](06.12-clm-tooluse.md) -- train and serve CLM heads with the System One API
 - [6.7 Continual LoRA](06.7-continual-lora.md) -- trajectory capture, runtime adapter load/unload, the consolidation loop
 - [6.8 Cross-language wire types](06.8-cross-language-wire-types.md) -- one Rust source, typeshare-generated TS/Kotlin/Go, drift gates
 - [6.9 Roll-over beats](06.9-roll-over-beats.md) -- what "beats base" has to mean: a
@@ -92,25 +94,25 @@ implement what it describes, so it doubles as a map of the tree.
   serving arm: OPFS model delivery, the wasm surface and its parity gates, and the
   readback-pump / wasm-memory limits that still gate in-tab execution
 
-**7 -- Speech stack**
+7 -- Speech stack
 
 - [7.1 Realtime session RFC v3](07.1-barge-turn-spec-rfc-v3.md) -- the `/v1/realtime` session state machine, normative constants
 - [7.2 Voices](07.2-voices.md) -- recordings to named speakers to a fitted Kokoro voice: workspace manifest, local/remote sync, fit tiers with early stopping, measured cost, runtime voice store
 - [7.3 Kokoro in candle](07.3-kokoro-candle.md) -- porting Kokoro-82M to candle so adapted voices train and serve without torch: architecture table, staged parity gates, autograd plan
 
-**8 -- Build and testing**
+8 -- Build and testing
 
 - [8.1 Quality harness](08.1-quality-harness.md) -- the only sanctioned way to measure output quality, and what each model's prompt framing costs
 - [8.2 Quality verdicts](08.2-quality-verdicts.md) -- how an arm is decided SHIP / REJECT / UNRESOLVED, and why a band is meaningless without its measured noise floor
 
 ## Reading paths
 
-- **Serving a model** -- 2, then 6.
-- **Making decode faster** -- 3, then 4.
-- **Porting to non-CUDA hardware** -- 5, then 4.
-- **Changing a kernel** -- 4, then 8 for how to build and verify it.
-- **Touching audio** -- 7, then 6.
-- **"What state is X in?"** -- the subchapters of X's chapter.
+- Serving a model -- 2, then 6.
+- Making decode faster -- 3, then 4.
+- Porting to non-CUDA hardware -- 5, then 4.
+- Changing a kernel -- 4, then 8 for how to build and verify it.
+- Touching audio -- 7, then 6.
+- "What state is X in?" -- the subchapters of X's chapter.
 
 ## Two conventions worth knowing before you edit
 

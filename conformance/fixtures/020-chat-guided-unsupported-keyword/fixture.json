@@ -1,0 +1,18 @@
+{
+  "name": "020-chat-guided-unsupported-keyword",
+  "family": "020-chat-completions",
+  "description": "A json_schema with a keyword guided decoding cannot enforce (multipleOf) is refused with a 400 naming the keyword, before admission, instead of being ignored and returning a value the schema forbids. Needs no model: the handler compiles the grammar before any engine runs.",
+  "endpoint": {"method": "POST", "path": "/v1/chat/completions"},
+  "request_body": {
+    "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    "messages": [{"role": "user", "content": "Pick a multiple of three."}],
+    "max_tokens": 16,
+    "response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "integer", "multipleOf": 3}}}
+  },
+  "expected_response": {
+    "status": 400,
+    "error": {"type": "invalid_request_error", "param": "response_format", "message_contains": "multipleOf"}
+  },
+  "comparison_strategy": "status+error_envelope",
+  "skip_when_no_model": false
+}

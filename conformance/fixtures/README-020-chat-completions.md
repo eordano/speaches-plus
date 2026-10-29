@@ -6,7 +6,7 @@ for the chat endpoint regardless of which engine (EchoEngine fallback,
 NvEngineChat with real Qwen3 weights, future grammar-constrained decoder)
 is serving.
 
-## Fixtures (4)
+## Fixtures (7)
 
 | ID                            | Coverage                                                                  |
 | ----------------------------- | ------------------------------------------------------------------------- |
@@ -14,6 +14,9 @@ is serving.
 | `020-chat-sampled-temp07`     | temp=0.7 + seed=1337; deterministic double-run + golden first_token_id    |
 | `020-chat-structured-json`    | `response_format=json_object` + embedded JSON schema; field-pin assertion |
 | `020-chat-tool-call-stub`     | `tools=[get_weather]` + streaming SSE; structural placeholder today       |
+| `020-chat-guided-schema-keywords` | `json_schema` with oneOf, bounds, lengths, pattern, item counts; schema-valid content |
+| `020-chat-guided-unsupported-keyword` | `multipleOf` refused with a 400 naming the keyword (no model needed) |
+| `020-chat-forced-tool-required` | `tool_choice=required` over two tools; schema-valid arguments, `finish_reason=tool_calls` |
 
 ## "Passing" in placeholder mode
 

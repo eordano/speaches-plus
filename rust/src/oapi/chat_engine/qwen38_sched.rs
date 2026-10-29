@@ -21,29 +21,6 @@ pub(crate) const Q38_SCHED_POLICY_LATE_JOINERS_WAIT_FOR_FULL_GROUP_DRAIN: &str =
 pub(crate) const GROUP_LANES_ARE_ALWAYS_PREFILLED_AT_FORMATION_SO_A_PAD_CLOBBERED_LANE_NEVER_REACHES_A_LIVE_REQUEST:
     () = ();
 
-pub(crate) const GROUP_FORMATION_PREFILL_WALL_IS_THE_GDN_PREFILL_SCAN_NOT_THE_LANE_COUNT_SO_STREAM_CONCURRENCY_IS_THE_WRONG_LEVER:
-    &str = "at c=8 formation costs one prefill_lane per lane and the wall attributes 85% (20 \
-            token prompt) to 98% (320 token prompt) of each call to mixer_linear_attn, whose \
-            hot inner loop is run_gdn_scan_candle_stateful -- a token-sequential chain of candle \
-            broadcast_mul/sum ops over the [n_v, d_k, d_v] recurrent state. Those are candle ops \
-            and candle 0.10 launches every op on CudaDevice::cuda_stream(), never on the \
-            nv_layers::cuda_stream override, so forking the prefills onto lane streams moves no \
-            work off the device stream and leaves the nv kernels that DO honour the override \
-            racing the candle ops that do not. The lever that moves this wall is \
-            NV_Q38_GDN_CHUNK_PREFILL=1, which replaces the token-sequential scan with the fused \
-            chunk kernel: a 20-token prefill drops 134.3 ms -> 29.9 ms and a 320-token prefill \
-            1631.3 ms -> 73.0 ms on unsloth/Qwen3.8-27B-NVFP4";
-
-pub(crate) fn group_formation_prefill_scan_arm() -> &'static str {
-    let _ = GROUP_FORMATION_PREFILL_WALL_IS_THE_GDN_PREFILL_SCAN_NOT_THE_LANE_COUNT_SO_STREAM_CONCURRENCY_IS_THE_WRONG_LEVER;
-    if nv_layers::linear_attn::chunk_prefill_env_read_per_call_so_one_process_can_ab_both_scan_paths(
-    ) {
-        "gdn_chunk"
-    } else {
-        "gdn_candle_token_sequential"
-    }
-}
-
 pub(crate) fn q38_batch_window_ms_env_nv_q38_batch_window_ms() -> u64 {
     std::env::var("NV_Q38_BATCH_WINDOW_MS")
         .ok()
@@ -77,6 +54,7 @@ impl GroupRoster {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn seat(&self, lane: usize) -> LaneSeat {
         self.seats[lane]
     }
@@ -158,7 +136,7 @@ mod gpu {
 
     pub(crate) fn step_overlap_env_opt_in_nv_q38_step_overlap_1_the_next_step_launches_before_detok_and_sse_so_host_consume_rides_the_gpu_step(
     ) -> bool {
-        std::env::var("NV_Q38_STEP_OVERLAP").ok().as_deref() == Some("1")
+        nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_STEP_OVERLAP")
     }
 
     pub(crate) const THE_EAGER_SOLO_BODY_STEPS_UNCAPTURED_AND_SAMPLES_BY_A_FULL_VOCAB_LOGITS_DTOH_WHILE_A_ONE_LANE_GROUP_REPLAYS_THE_BUCKET_1_GRAPH_AND_EXITS_ON_THE_DEVICE_ARGMAX:
@@ -172,7 +150,7 @@ mod gpu {
 
     pub(crate) fn solo_via_lanes_env_opt_in_nv_q38_solo_via_lanes_1_a_lone_request_runs_as_a_one_lane_group(
     ) -> bool {
-        std::env::var("NV_Q38_SOLO_VIA_LANES").ok().as_deref() == Some("1")
+        nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_Q38_SOLO_VIA_LANES")
     }
 
     pub(crate) const Q38_SCHED_PACKED_FORMATION_PREFILLS_EVERY_ADMITTED_LANE_IN_ONE_WIDE_CALL:
@@ -301,16 +279,6 @@ mod gpu {
         out
     }
 
-    pub(crate) fn group_device_argmax_default_on_kill_nv_q38_batch_device_argmax_0_byte_exact_per_the_widening_and_tie_break_constants_in_qwen38_batch(
-    ) -> bool {
-        std::env::var("NV_Q38_BATCH_DEVICE_ARGMAX").ok().as_deref() != Some("0")
-    }
-
-    pub(crate) fn q36_group_device_argmax_default_on_kill_nv_q36_batch_device_argmax_0_byte_exact_per_the_same_widening_and_tie_break_constants(
-    ) -> bool {
-        std::env::var("NV_Q36_BATCH_DEVICE_ARGMAX").ok().as_deref() != Some("0")
-    }
-
     pub(crate) const LANE_PREFILL_MATCHES_EACH_FAMILYS_SOLO_SERVING_PREFILL_ROUTE_DENSE_HAS_NO_MOE_TO_ROUTE_AND_MOE_GOES_THROUGH_THE_INSTALLED_HOOK_LIKE_THE_EAGER_SOLO_BODY_SO_A_GROUP_LANE_AND_ITS_SOLO_REFERENCE_SHARE_PREFILL_BYTES:
         () = ();
 
@@ -380,17 +348,6 @@ mod gpu {
             match self {
                 Self::Dense38(_) => q38_batch_window_ms_env_nv_q38_batch_window_ms(),
                 Self::Moe36(_) => q36_batch_window_ms_env_nv_q36_batch_window_ms(),
-            }
-        }
-
-        fn device_argmax_default_on(&self) -> bool {
-            match self {
-                Self::Dense38(_) => {
-                    group_device_argmax_default_on_kill_nv_q38_batch_device_argmax_0_byte_exact_per_the_widening_and_tie_break_constants_in_qwen38_batch()
-                }
-                Self::Moe36(_) => {
-                    q36_group_device_argmax_default_on_kill_nv_q36_batch_device_argmax_0_byte_exact_per_the_same_widening_and_tie_break_constants()
-                }
             }
         }
 
@@ -507,7 +464,6 @@ mod gpu {
     }
 
     impl QwenBatchScheduler {
-        #[allow(clippy::too_many_arguments)]
         pub(crate) fn spawn(
             lanes: QwenLanePool,
             mtp: Option<QwenMtpHead>,
@@ -558,10 +514,6 @@ mod gpu {
                 lanes_n,
                 outstanding: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }))
-        }
-
-        pub(crate) fn lanes(&self) -> usize {
-            self.lanes_n
         }
 
         pub(crate) fn submit(
@@ -632,7 +584,6 @@ mod gpu {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn dispatch_loop(
         mut rx: mpsc::Receiver<SchedJob>,
         mut lanes: QwenLanePool,
@@ -734,7 +685,6 @@ mod gpu {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn run_solo(
         lanes: &mut QwenLanePool,
         mtp: Option<&QwenMtpHead>,
@@ -928,12 +878,14 @@ mod gpu {
                     }
                 }
             }
-            let _ = self
-                .push_evicting_this_member_on_timeout_or_close(ChatEvent::Done {
-                    finish_reason: self.finish_reason.clone(),
-                    completion_tokens: self.completion_tokens,
-                })
-                .await;
+            let terminal = self
+                .emitter
+                .stopped_by_then_done(self.finish_reason.clone(), self.completion_tokens);
+            for ev in terminal {
+                if !self.push_evicting_this_member_on_timeout_or_close(ev).await {
+                    return;
+                }
+            }
         }
 
         async fn consume_sampled_token_and_stream_it_so_ttft_is_paid_at_the_lanes_own_prefill(
@@ -1200,7 +1152,6 @@ mod gpu {
         members.push(m);
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn prefill_admitted_lane_and_stream_the_first_token(
         lanes: &mut QwenLanePool,
         tokenizer: &Arc<tokenizers::Tokenizer>,
@@ -1216,8 +1167,7 @@ mod gpu {
             return;
         }
         let send_timeout = sched_send_timeout();
-        let prefill_by_device_argmax =
-            adm.sampler.fast_greedy() && lanes.device_argmax_default_on();
+        let prefill_by_device_argmax = adm.sampler.fast_greedy();
         let t_prefill = Instant::now();
         let last = if prefill_by_device_argmax {
             match lanes.prefill_lane_greedy_token_on_device(lane, &adm.prompt_ids) {
@@ -1279,7 +1229,6 @@ mod gpu {
         .await;
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn join_prefill_and_stream_the_first_token(
         lanes: &mut QwenLanePool,
         tokenizer: &Arc<tokenizers::Tokenizer>,
@@ -1308,7 +1257,6 @@ mod gpu {
         .await;
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn run_group(
         lanes: &mut QwenLanePool,
         rx: &mut mpsc::Receiver<SchedJob>,
@@ -1327,9 +1275,8 @@ mod gpu {
         let mut members: Vec<GroupMember> = Vec::with_capacity(lanes.lanes());
         let mut admitted = 0usize;
         let mut prefill_ms: Vec<f64> = Vec::with_capacity(lanes.lanes());
-        let packed_formation_armed = matches!(lanes, QwenLanePool::Dense38(_))
-            && form_pack_env()
-            && lanes.device_argmax_default_on();
+        let packed_formation_armed =
+            matches!(lanes, QwenLanePool::Dense38(_)) && form_pack_env();
         let mut deferred: Vec<AdmittedLane> = Vec::new();
         let mut packed_used = false;
         while admitted < lanes.lanes() {
@@ -1486,7 +1433,7 @@ mod gpu {
         );
 
         let every_member_greedy_so_the_group_samples_by_device_argmax_and_streams_tokens_without_a_logits_dtoh =
-            members.iter().all(|m| m.sampler.fast_greedy()) && lanes.device_argmax_default_on();
+            members.iter().all(|m| m.sampler.fast_greedy());
         let mut step_ms: Vec<f64> = Vec::new();
         let mut host_ms = 0f64;
         let step_overlap_engaged =
@@ -1721,7 +1668,6 @@ mod gpu {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn emit_group_drain_attrib(
         lanes: &QwenLanePool,
         members: &[GroupMember],
@@ -1761,12 +1707,11 @@ mod gpu {
             s.get(s.len() / 2).copied().unwrap_or(0.0)
         };
         eprintln!(
-            "{} group={group_n} prefill_scan={} form={} step_overlap={} form_ms={form_ms:.0} \
+            "{} group={group_n} form={} step_overlap={} form_ms={form_ms:.0} \
              prefill_sum_ms={:.0} prefill_each_ms={:?} first_step_ms={first_step_ms:.0} \
              steps={} p50_step_ms={p50_step_ms:.1} steady_step_sum_ms={:.0} \
              host_sample_detok_sse_ms={host_ms:.0} wall_ms={:.0} tokens={total_tokens}",
             lanes.attrib_prefix(),
-            group_formation_prefill_scan_arm(),
             if packed_used { "packed" } else { "serial" },
             step_overlap as u8,
             prefill_ms.iter().sum::<f64>(),
@@ -2264,26 +2209,31 @@ mod roster_state_machine {
     use super::*;
 
     #[test]
-    fn join_assigns_lowest_vacant_lane_and_caps_at_lane_count() {
+    fn join_leave_and_mark_prefilled_follow_the_lane_lifecycle() {
         let mut r = GroupRoster::new(4);
         assert_eq!(r.join(), Some(0));
         assert_eq!(r.join(), Some(1));
         assert_eq!(r.join(), Some(2));
         assert_eq!(r.join(), Some(3));
         assert_eq!(r.join(), None, "a fifth join must wait for a free lane");
+        {
+            let mut r = GroupRoster::new(2);
+            assert_eq!(r.join(), Some(0));
+            assert_eq!(r.join(), Some(1));
+            r.leave(0);
+            assert_eq!(r.join(), Some(0));
+        }
+        {
+            let mut r = GroupRoster::new(2);
+            assert!(r.mark_prefilled(0).is_err());
+            let lane = r.join().unwrap();
+            r.mark_prefilled(lane).unwrap();
+            assert!(r.mark_prefilled(lane).is_err());
+        }
     }
 
     #[test]
-    fn leave_frees_the_lane_for_the_next_join() {
-        let mut r = GroupRoster::new(2);
-        assert_eq!(r.join(), Some(0));
-        assert_eq!(r.join(), Some(1));
-        r.leave(0);
-        assert_eq!(r.join(), Some(0));
-    }
-
-    #[test]
-    fn step_plan_trims_to_last_active_and_pads_holes() {
+    fn step_plan_trims_pads_clobbers_and_refuses_a_mismatched_feed() {
         let mut r = GroupRoster::new(4);
         for _ in 0..4 {
             let lane = r.join().unwrap();
@@ -2311,61 +2261,49 @@ mod roster_state_machine {
             r.step_plan(&[None, None, None, None]).unwrap().is_none(),
             "an all-vacant roster has no step"
         );
-    }
-
-    #[test]
-    fn a_padded_lane_is_clobbered_and_rejoin_requires_prefill_before_decode() {
-        let mut r = GroupRoster::new(3);
-        for _ in 0..3 {
+        {
+            let mut r = GroupRoster::new(3);
+            for _ in 0..3 {
+                let lane = r.join().unwrap();
+                r.mark_prefilled(lane).unwrap();
+            }
+            r.leave(0);
+            let _ = r.step_plan(&[None, Some(21), Some(22)]).unwrap().unwrap();
+            assert_eq!(
+                r.seat(0),
+                LaneSeat::VacantPadClobbered,
+                "a vacancy covered by the step's bucket is clobbered by the pad row"
+            );
+            let lane = r.join().unwrap();
+            assert_eq!(lane, 0);
+            let err = r
+                .step_plan(&[Some(30), Some(21), Some(22)])
+                .expect_err("decoding a rejoined lane without a prefill must be refused");
+            assert!(err.to_string().contains("pad-clobber"), "{err}");
+            r.mark_prefilled(0).unwrap();
+            let plan = r
+                .step_plan(&[Some(30), Some(21), Some(22)])
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.len(), 3);
+        }
+        {
+            let mut r = GroupRoster::new(2);
             let lane = r.join().unwrap();
             r.mark_prefilled(lane).unwrap();
+            assert!(
+                r.step_plan(&[Some(1)]).is_err(),
+                "short feed must be refused"
+            );
+            assert!(
+                r.step_plan(&[Some(1), Some(2)]).is_err(),
+                "a token on a vacant lane must be refused"
+            );
+            assert!(
+                r.step_plan(&[None, None]).is_err(),
+                "an active lane with no token must be refused"
+            );
         }
-        r.leave(0);
-        let _ = r.step_plan(&[None, Some(21), Some(22)]).unwrap().unwrap();
-        assert_eq!(
-            r.seat(0),
-            LaneSeat::VacantPadClobbered,
-            "a vacancy covered by the step's bucket is clobbered by the pad row"
-        );
-        let lane = r.join().unwrap();
-        assert_eq!(lane, 0);
-        let err = r
-            .step_plan(&[Some(30), Some(21), Some(22)])
-            .expect_err("decoding a rejoined lane without a prefill must be refused");
-        assert!(err.to_string().contains("pad-clobber"), "{err}");
-        r.mark_prefilled(0).unwrap();
-        let plan = r
-            .step_plan(&[Some(30), Some(21), Some(22)])
-            .unwrap()
-            .unwrap();
-        assert_eq!(plan.len(), 3);
     }
 
-    #[test]
-    fn step_feed_must_match_the_roster_exactly() {
-        let mut r = GroupRoster::new(2);
-        let lane = r.join().unwrap();
-        r.mark_prefilled(lane).unwrap();
-        assert!(
-            r.step_plan(&[Some(1)]).is_err(),
-            "short feed must be refused"
-        );
-        assert!(
-            r.step_plan(&[Some(1), Some(2)]).is_err(),
-            "a token on a vacant lane must be refused"
-        );
-        assert!(
-            r.step_plan(&[None, None]).is_err(),
-            "an active lane with no token must be refused"
-        );
-    }
-
-    #[test]
-    fn mark_prefilled_is_only_legal_on_a_freshly_joined_lane() {
-        let mut r = GroupRoster::new(2);
-        assert!(r.mark_prefilled(0).is_err());
-        let lane = r.join().unwrap();
-        r.mark_prefilled(lane).unwrap();
-        assert!(r.mark_prefilled(lane).is_err());
-    }
 }

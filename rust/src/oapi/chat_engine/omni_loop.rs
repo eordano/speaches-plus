@@ -16,7 +16,8 @@ use crate::oapi::chat_engine::sampling::ChatSampler;
 use crate::oapi::chat_engine::spec_env::acquire_chat_permit;
 use crate::oapi::chat_engine::spec_window::kv_window;
 use crate::oapi::chat_engine::stream::{
-    effective_max_new, push_event_async, push_event_blocking, sse_send_timeout,
+    decode_keeping_wire, effective_max_new, push_event_async, push_event_blocking,
+    send_stopped_by_then_done, sse_send_timeout,
     yield_so_the_woken_reader_escapes_this_workers_unstealable_lifo_slot, IncrementalDetok,
     StreamEmitter,
 };
@@ -192,7 +193,37 @@ fn expand_media(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(crate) struct OmniText {
+    detok: IncrementalDetok,
+    emitter: StreamEmitter,
+    generated_ids: Vec<u32>,
+}
+
+impl OmniText {
+    pub(crate) fn new(tokenizer: Arc<tokenizers::Tokenizer>, stop: &[String]) -> Self {
+        Self {
+            detok: IncrementalDetok::new(tokenizer),
+            emitter: StreamEmitter::new(stop),
+            generated_ids: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, id: u32) -> Result<(String, bool)> {
+        self.generated_ids.push(id);
+        let new_text = self.detok.push(id)?;
+        Ok(self.emitter.step(new_text))
+    }
+
+    pub(crate) fn finish(&mut self) -> String {
+        if self.generated_ids.is_empty() {
+            return String::new();
+        }
+        decode_keeping_wire(&self.detok.tokenizer, &self.generated_ids)
+            .map(|full| self.emitter.finish(&full))
+            .unwrap_or_default()
+    }
+}
+
 pub(crate) async fn run_sampling_omni(
     model: Arc<OmniShared>,
     tokenizer: Arc<tokenizers::Tokenizer>,
@@ -248,8 +279,7 @@ pub(crate) async fn run_sampling_omni(
     let send_timeout = sse_send_timeout();
 
     let mut cache = OmniKvCache::new(model.thinker.num_layers());
-    let mut emitter = StreamEmitter::new(&req.stop);
-    let mut detok = IncrementalDetok::new(tokenizer.clone());
+    let mut text = OmniText::new(tokenizer.clone(), &req.stop);
     let mut completion_tokens: u32 = 0;
     let mut finish_reason = "length".to_string();
     let mut aborted = false;
@@ -280,8 +310,7 @@ pub(crate) async fn run_sampling_omni(
                 break;
             }
             completion_tokens += 1;
-            let new_text = detok.push(last)?;
-            let (piece, stop_hit) = emitter.step(new_text);
+            let (piece, stop_hit) = text.push(last)?;
             if !piece.is_empty() {
                 let outcome = push_event_blocking(tx, ChatEvent::TextDelta(piece), send_timeout);
                 if outcome != crate::oapi::chat_engine::stream::SsePush::Sent {
@@ -315,15 +344,50 @@ pub(crate) async fn run_sampling_omni(
     })?;
 
     if !aborted {
-        let _ = push_event_async(
+        let tail = text.finish();
+        if !tail.is_empty() {
+            let _ = push_event_async(tx, ChatEvent::TextDelta(tail), send_timeout).await;
+        }
+        let _ = send_stopped_by_then_done(
             tx,
-            ChatEvent::Done {
-                finish_reason,
-                completion_tokens,
-            },
-            send_timeout,
+            &mut text.emitter,
+            finish_reason,
+            completion_tokens,
+            Some(send_timeout),
         )
         .await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::OmniText;
+    use std::sync::Arc;
+
+    #[test]
+    fn omni_flushes_held_stop_prefix() {
+        let tok: tokenizers::Tokenizer = r#"{
+            "version": "1.0", "truncation": null, "padding": null, "added_tokens": [],
+            "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+            "decoder": {"type": "Fuse"},
+            "model": {"type": "WordLevel", "vocab": {"<unk>": 0, "the ": 1, "E": 2},
+                      "unk_token": "<unk>"}
+        }"#
+        .parse()
+        .expect("test tokenizer");
+        let mut text = OmniText::new(Arc::new(tok), &["END".to_string()]);
+        let mut out = String::new();
+        for id in [1, 2] {
+            let (piece, hit) = text.push(id).expect("push");
+            assert!(!hit, "\"the E\" holds no stop");
+            out.push_str(&piece);
+        }
+        assert_eq!(out, "the ", "the stop prefix \"E\" is held back while it may still become END");
+        out.push_str(&text.finish());
+        assert_eq!(
+            out, "the E",
+            "the stream ended without END, so the held-back prefix is text the client is owed"
+        );
+    }
 }

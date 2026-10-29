@@ -63,13 +63,12 @@ impl Mlp {
 
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        if gate.dtype() != DType::BF16 || !matches!(gate.device(), Device::Cuda(_)) {
+        if gate.dtype() != DType::BF16 || !gate.device().is_cuda() {
             let activated = candle_nn::ops::silu(&gate)?.mul(&up)?;
             return self.down_proj.forward(&activated);
         }
-        let dev = match gate.device() {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = gate.device().clone() else {
+            unreachable!()
         };
         let stream = crate::cuda_stream::current_stream(&dev);
         if let Some(output) = self.down_proj.try_forward_silu_nvfp4(&gate, &up)? {

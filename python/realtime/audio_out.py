@@ -165,9 +165,6 @@ class OutboundPacer:
             except Exception as err:
                 log.debug("track.drop_queued raised: %s", err)
 
-    def last_pcm_bytes(self) -> bytes | None:
-        return self._last_pcm_bytes
-
     async def _write_pcm_frame(self, frame) -> None:
         if self._cancelled:
             return

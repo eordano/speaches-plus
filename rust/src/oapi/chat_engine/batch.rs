@@ -1,5 +1,6 @@
 #[cfg(feature = "cuda")]
 use super::*;
+#[cfg(any(feature = "cuda", test))]
 pub(crate) fn graph_decode_eligible(
     items: &[nv_engine::SeqInput],
     accepts: impl FnOnce(usize, usize) -> bool,
@@ -104,121 +105,47 @@ pub(crate) fn build_gemma4_batch_engine(
     model: Arc<nv_models::gemma4::Gemma4>,
     device: candle_core::Device,
     kv_max_seq_len: usize,
+    pool: crate::oapi::vram_plan::Gemma4BatchPool,
 ) -> anyhow::Result<nv_engine::BatchEngineHandle> {
     use crate::oapi::batch_chat::Gemma4PagedBatchStepper;
 
-    let max_batch_size = std::env::var("NV_BATCH_MAX_SEQS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(8)
-        .max(1);
-    let block_size = 16usize;
-    let blocks_per_seq = kv_max_seq_len.div_ceil(block_size);
-    let want_blocks = (max_batch_size * blocks_per_seq).max(block_size);
-
-    let hybrid = nv_models::gemma4::kv_ring_enabled();
-    let num_blocks = if let Some(n) = std::env::var("NV_BATCH_KV_BLOCKS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        n.max(block_size)
-    } else {
-        let (per_block, const_bytes) = if hybrid {
-            let g1 = nv_models::paged_fp8::PagedPoolConfig::from_gemma4_hybrid(
-                model.config(),
-                1,
-                block_size,
-                max_batch_size,
-            );
-            let g2 = nv_models::paged_fp8::PagedPoolConfig::from_gemma4_hybrid(
-                model.config(),
-                2,
-                block_size,
-                max_batch_size,
-            );
-            let marginal = g2.pool_bytes().saturating_sub(g1.pool_bytes()).max(1);
-            let constant = g1.pool_bytes().saturating_sub(marginal);
-            (marginal, constant)
-        } else {
-            let geom =
-                nv_models::paged_fp8::PagedPoolConfig::from_gemma4(model.config(), 1, block_size);
-            (geom.bytes_per_block().max(1), 0usize)
-        };
-
-        let frac: f64 = std::env::var("NV_BATCH_KV_FRACTION")
-            .ok()
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|f| *f > 0.0 && *f < 1.0)
-            .unwrap_or(0.25);
-        let free_bytes = match &device {
-            candle_core::Device::Cuda(d) => {
-                let _ = nv_layers::cuda_stream::current_stream(d);
-                nv_layers::cudarc::driver::result::mem_get_info()
-                    .ok()
-                    .map(|(free, _total)| free)
-            }
-            _ => None,
-        };
-        match free_bytes {
-            Some(free) => {
-                let budget = ((free as f64 * frac) as usize).saturating_sub(const_bytes);
-                let affordable = (budget / per_block).max(block_size);
-                let chosen = affordable.min(want_blocks);
-                tracing::info!(
-                    free_gb = free as f64 / 1e9,
-                    hybrid,
-                    per_block_kb = per_block as f64 / 1e3,
-                    const_mb = const_bytes as f64 / 1e6,
-                    want_blocks,
-                    affordable,
-                    chosen,
-                    "NV_BATCH_ENGINE: sizing paged KV pool from free VRAM"
-                );
-                chosen
-            }
-            None => {
-                tracing::warn!(
-                    "NV_BATCH_ENGINE: mem_get_info unavailable; capping KV pool at 2048 blocks"
-                );
-                want_blocks.min(2048)
-            }
-        }
-    };
-
+    let block_size = crate::oapi::vram_plan::GEMMA4_BATCH_BLOCK_SIZE_IS_THE_SCHEDULER_BLOCK;
+    let num_blocks = pool.num_blocks;
     let cfg = nv_engine::SchedulerConfig {
-        max_batch_size,
+        max_batch_size: pool.max_batch_size,
         max_batched_tokens: kv_max_seq_len.max(4096),
         block_size,
         num_blocks,
     };
-
-    let graph_on = std::env::var("NV_BATCH_GRAPH").is_ok_and(|v| v != "0");
-    let plan = nv_models::gemma4_batch_graph::BucketPlan::from_env();
-    let graph_usable = graph_on && !hybrid;
-    if graph_on && hybrid {
+    tracing::info!(
+        num_blocks,
+        pool_blocks = pool.pool_blocks,
+        lanes = pool.lanes,
+        pool_mib = pool.bytes >> 20,
+        "NV_BATCH_ENGINE: paged KV pool sized by the vram plan"
+    );
+    if !pool.graph && nv_config::env_arm_opt_in_set_to_anything_but_0_reread_every_call("NV_BATCH_GRAPH") {
         tracing::warn!(
             "NV_BATCH_GRAPH=1 ignored: hybrid KV-ring lanes are active (NV_KV_RING); \
              batched decode stays eager"
         );
     }
-    let scratch_blocks = if graph_usable { plan.max_bucket() } else { 0 };
-    let pool_blocks = num_blocks + scratch_blocks;
+    let plan = nv_models::gemma4_batch_graph::BucketPlan::from_env();
     let max_ctx = std::env::var("NV_BATCH_GRAPH_MAX_CTX")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(kv_max_seq_len);
 
-    let lanes = if hybrid { max_batch_size } else { 0 };
     let build = move || -> Box<dyn nv_engine::BatchStepper> {
         let inner = Gemma4PagedBatchStepper::new(
             model.clone(),
             device.clone(),
-            pool_blocks,
+            pool.pool_blocks,
             block_size,
-            lanes,
+            pool.lanes,
         )
         .expect("construct Gemma4PagedBatchStepper");
-        if !graph_usable {
+        if !pool.graph {
             return Box::new(inner);
         }
         match nv_models::gemma4_batch_graph::Gemma4BatchGraphFamily::new(

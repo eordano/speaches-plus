@@ -1,7 +1,6 @@
 
 import re
 
-import numpy as np
 
 from transformers.audio_utils import AudioInput
 from transformers.feature_extraction_utils import BatchFeature

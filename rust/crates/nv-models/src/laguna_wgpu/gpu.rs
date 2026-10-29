@@ -1,4 +1,8 @@
-use anyhow::Result;
+use anyhow::{anyhow, bail, ensure, Result};
+use bytemuck::{bytes_of, cast_slice};
+use std::env;
+use std::sync::Arc;
+use wgpu::{BindGroup, Buffer, ComputePipeline};
 
 use nv_kernels::wgpu_backend::dispatch;
 use nv_kernels::wgpu_backend::kernels as wk;
@@ -11,6 +15,7 @@ use super::weights::{
     bytes_to_words, pack_pairs, HostBf16ExpertStack, HostBf16Lin, HostExperts, HostLin,
     HostNvfp4ExpertStack, HostNvfp4Lin,
 };
+use crate::pod;
 
 pub const GEMV_BF16_WGSL: &str = include_str!("../../../nv-kernels/wgsl/laguna_gemv_bf16.wgsl");
 
@@ -18,143 +23,125 @@ pub const GEMV_NVFP4_WGSL: &str = include_str!("../../../nv-kernels/wgsl/laguna_
 
 pub const QUANT_ROWS_WGSL: &str = include_str!("../../../nv-kernels/wgsl/laguna_quant_rows.wgsl");
 
-pub const GEMV_I8_WGSL: &str = include_str!("../../../nv-kernels/wgsl/laguna_gemv_i8.wgsl");
+pub const GEMV_I8_WGSL: &str = nv_kernels::wgsl!("../../../nv-kernels/wgsl/laguna_gemv_i8.wgsl");
 
 pub const COMMON_WGSL: &str = include_str!("../../../nv-kernels/wgsl/laguna_common.wgsl");
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct GemvBf16Params {
-    pub n_rows: u32,
-    pub k_words: u32,
-    pub groups_x: u32,
-    pub out_f32: u32,
-    pub w_row_words: u32,
-    pub x_off_words: u32,
-    pub y_off_words: u32,
-    pub pad0: u32,
-    pub alpha: f32,
-    pub pad1: u32,
-    pub pad2: u32,
-    pub pad3: u32,
-}
+pod! {
+    pub struct GemvBf16Params {
+        pub n_rows: u32,
+        pub k_words: u32,
+        pub groups_x: u32,
+        pub out_f32: u32,
+        pub w_row_words: u32,
+        pub x_off_words: u32,
+        pub y_off_words: u32,
+        pub pad0: u32,
+        pub alpha: f32,
+        pub pad1: u32,
+        pub pad2: u32,
+        pub pad3: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct GemvBf16ExpertParams {
-    pub n_rows: u32,
-    pub k_words: u32,
-    pub groups_x: u32,
-    pub out_f32: u32,
-    pub w_row_words: u32,
-    pub w_e_stride_words: u32,
-    pub x_slot_stride_words: u32,
-    pub y_slot_stride_words: u32,
-    pub alpha: f32,
-    pub x_slot_div: u32,
-    pub pad1: u32,
-    pub pad2: u32,
-}
+    pub struct GemvBf16ExpertParams {
+        pub n_rows: u32,
+        pub k_words: u32,
+        pub groups_x: u32,
+        pub out_f32: u32,
+        pub w_row_words: u32,
+        pub w_e_stride_words: u32,
+        pub x_slot_stride_words: u32,
+        pub y_slot_stride_words: u32,
+        pub alpha: f32,
+        pub x_slot_div: u32,
+        pub pad1: u32,
+        pub pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct GemvI8Params {
-    pub n_rows: u32,
-    pub k_elems: u32,
-    pub groups_x: u32,
-    pub x_slot_stride_elems: u32,
-    pub w_e_stride_words: u32,
-    pub y_slot_stride_words: u32,
-    pub use_sel: u32,
-    pub groups_per_row: u32,
-    pub group_shift: u32,
-    pub x_slot_div: u32,
-    pub pad1: u32,
-    pub pad2: u32,
-}
+    pub struct GemvI8Params {
+        pub n_rows: u32,
+        pub k_elems: u32,
+        pub groups_x: u32,
+        pub x_slot_stride_elems: u32,
+        pub w_e_stride_words: u32,
+        pub y_slot_stride_words: u32,
+        pub use_sel: u32,
+        pub groups_per_row: u32,
+        pub group_shift: u32,
+        pub x_slot_div: u32,
+        pub pad1: u32,
+        pub pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct GemvNvfp4Params {
-    pub alpha: f32,
-    pub n_rows: u32,
-    pub k_blocks: u32,
-    pub k_tiles: u32,
-    pub groups_x: u32,
-    pub w_e_stride_vec2: u32,
-    pub sf_e_stride_bytes: u32,
-    pub x_slot_stride_vec2: u32,
-    pub xsf_slot_stride_bytes: u32,
-    pub y_slot_stride_words: u32,
-    pub per_expert_alpha: u32,
-    pub x_slot_div: u32,
-}
+    pub struct GemvNvfp4Params {
+        pub alpha: f32,
+        pub n_rows: u32,
+        pub k_blocks: u32,
+        pub k_tiles: u32,
+        pub groups_x: u32,
+        pub w_e_stride_vec2: u32,
+        pub sf_e_stride_bytes: u32,
+        pub x_slot_stride_vec2: u32,
+        pub xsf_slot_stride_bytes: u32,
+        pub y_slot_stride_words: u32,
+        pub per_expert_alpha: u32,
+        pub x_slot_div: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct QuantRowsParams {
-    pub k_blocks: u32,
-    pub n_slots: u32,
-    pub use_sel: u32,
-    pub x_slot_stride_elems: u32,
-    pub x_slot_div: u32,
-    pub pad0: u32,
-    pub pad1: u32,
-    pub pad2: u32,
-}
+    pub struct QuantRowsParams {
+        pub k_blocks: u32,
+        pub n_slots: u32,
+        pub use_sel: u32,
+        pub x_slot_stride_elems: u32,
+        pub x_slot_div: u32,
+        pub pad0: u32,
+        pub pad1: u32,
+        pub pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct RmsParams {
-    pub hidden: u32,
-    pub batch: u32,
-    pub eps: f32,
-    pub words_per_row: u32,
-}
+    pub struct RmsParams {
+        pub hidden: u32,
+        pub batch: u32,
+        pub eps: f32,
+        pub words_per_row: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct ResScaleParams {
-    pub n: u32,
-    pub n_words: u32,
-    pub scale: f32,
-    pub cap: f32,
-    pub inv_cap: f32,
-    pub pad0: u32,
-    pub pad1: u32,
-    pub pad2: u32,
-}
+    pub struct ResScaleParams {
+        pub n: u32,
+        pub n_words: u32,
+        pub scale: f32,
+        pub cap: f32,
+        pub inv_cap: f32,
+        pub pad0: u32,
+        pub pad1: u32,
+        pub pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct GatherParams {
-    pub row_off: u32,
-    pub n_rows: u32,
-    pub hidden_words: u32,
-    pub vocab: u32,
-}
+    pub struct GatherParams {
+        pub row_off: u32,
+        pub n_rows: u32,
+        pub hidden_words: u32,
+        pub vocab: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct SiluMulParams {
-    pub n_words: u32,
-    pub pad0: u32,
-    pub pad1: u32,
-    pub pad2: u32,
-}
+    pub struct SiluMulParams {
+        pub n_words: u32,
+        pub pad0: u32,
+        pub pad1: u32,
+        pub pad2: u32,
+    }
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct ArgmaxParams {
-    pub n: u32,
-    pub groups: u32,
-    pub pad0: u32,
-    pub pad1: u32,
+    pub struct ArgmaxParams {
+        pub n: u32,
+        pub groups: u32,
+        pub pad0: u32,
+        pub pad1: u32,
+    }
 }
 
 pub struct Pass {
-    pub pipeline: std::sync::Arc<wgpu::ComputePipeline>,
-    pub bind: wgpu::BindGroup,
+    pub pipeline: Arc<ComputePipeline>,
+    pub bind: BindGroup,
     pub grid: (u32, u32, u32),
     pub entry: String,
 }
@@ -165,33 +152,12 @@ pub fn vram_report_enabled() -> bool {
     crate::wgpu_ledger::vram_report_var_enabled("NV_LAGUNA_WGPU_VRAM")
 }
 
-pub fn staging_flush_enabled() -> bool {
-    !matches!(
-        std::env::var("NV_LAGUNA_WGPU_STAGING_FLUSH")
-            .ok()
-            .as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
-pub fn qshare_enabled() -> bool {
-    std::env::var("NV_LAGUNA_WGPU_QSHARE").ok().as_deref() != Some("0")
-}
-
-pub fn mprefill_enabled() -> bool {
-    std::env::var("NV_LAGUNA_WGPU_MPREFILL").ok().as_deref() != Some("0")
-}
-
-pub fn mprefill_forced() -> bool {
-    std::env::var("NV_LAGUNA_WGPU_MPREFILL").ok().as_deref() == Some("1")
-}
-
 pub struct Builder {
     pub core: crate::wgpu_ledger::VramLedger,
     pub passes: Vec<Pass>,
     pub mpf_passes: Vec<Pass>,
     pub emit_mpf: bool,
-    pub state_buffers: Vec<(wgpu::Buffer, u64)>,
+    pub state_buffers: Vec<(Buffer, u64)>,
 }
 
 impl std::ops::Deref for Builder {
@@ -213,7 +179,6 @@ impl Builder {
             core: crate::wgpu_ledger::VramLedger::new(
                 ctx,
                 "lgw-",
-                staging_flush_enabled,
                 STAGING_FLUSH_BYTES,
             ),
             passes: Vec::new(),
@@ -223,7 +188,7 @@ impl Builder {
         }
     }
 
-    pub fn state_zeros(&mut self, label: &str, bytes: u64) -> wgpu::Buffer {
+    pub fn state_zeros(&mut self, label: &str, bytes: u64) -> Buffer {
         let b = self.zeros(label, bytes);
         self.state_buffers.push((b.clone(), bytes));
         b
@@ -234,11 +199,11 @@ impl Builder {
         label: &str,
         source: &str,
         entry: &str,
-        binds: &[(u32, &wgpu::Buffer)],
+        binds: &[(u32, &Buffer)],
         grid: (u32, u32, u32),
     ) -> Result<()> {
         let pipeline = dispatch::cached_compute_pipeline(self.ctx, label, source, entry)
-            .map_err(|e| anyhow::anyhow!("pipeline {label}::{entry}: {e}"))?;
+            .map_err(|e| anyhow!("pipeline {label}::{entry}: {e}"))?;
         let bind = dispatch::bind_group(self.ctx, &pipeline, binds);
         let p = Pass {
             pipeline,
@@ -271,20 +236,20 @@ pub const STEP_TOTAL: usize = 2;
 pub const STEP_SLIDING_START: usize = 3;
 pub const STEP_SLOTS: usize = 4;
 
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-pub struct StepUniform {
-    pub tok: u32,
-    pub pos: u32,
-    pub total: u32,
-    pub sliding_start: u32,
+pod! {
+    pub struct StepUniform {
+        pub tok: u32,
+        pub pos: u32,
+        pub total: u32,
+        pub sliding_start: u32,
+    }
 }
 
 pub struct StepBuffers {
-    pub tok: wgpu::Buffer,
-    pub pos: wgpu::Buffer,
-    pub step: wgpu::Buffer,
-    pub uni: wgpu::Buffer,
+    pub tok: Buffer,
+    pub pos: Buffer,
+    pub step: Buffer,
+    pub uni: Buffer,
 }
 
 impl StepBuffers {
@@ -305,17 +270,14 @@ impl StepBuffers {
         total_tokens: u32,
         sliding_start: u32,
     ) {
-        ctx.queue
-            .write_buffer(&self.tok, 0, bytemuck::bytes_of(&token));
-        ctx.queue
-            .write_buffer(&self.pos, 0, bytemuck::bytes_of(&pos));
+        ctx.queue.write_buffer(&self.tok, 0, bytes_of(&token));
+        ctx.queue.write_buffer(&self.pos, 0, bytes_of(&pos));
         let slots: [u32; STEP_SLOTS] = [token, pos, total_tokens, sliding_start];
-        ctx.queue
-            .write_buffer(&self.step, 0, bytemuck::cast_slice(&slots));
+        ctx.queue.write_buffer(&self.step, 0, cast_slice(&slots));
         ctx.queue.write_buffer(
             &self.uni,
             0,
-            bytemuck::bytes_of(&StepUniform {
+            bytes_of(&StepUniform {
                 tok: token,
                 pos,
                 total: total_tokens,
@@ -382,7 +344,7 @@ impl Default for Sources {
 }
 
 pub struct Bf16Gpu {
-    pub w: wgpu::Buffer,
+    pub w: Buffer,
     pub n: usize,
     pub k: usize,
 }
@@ -390,17 +352,17 @@ pub struct Bf16Gpu {
 pub use crate::nvfp4_host::Nvfp4Gpu;
 
 pub struct Bf16ExpertGpu {
-    pub w: wgpu::Buffer,
+    pub w: Buffer,
     pub e: usize,
     pub n: usize,
     pub k: usize,
 }
 
 pub struct Nvfp4ExpertGpu {
-    pub w: wgpu::Buffer,
-    pub scales: wgpu::Buffer,
-    pub alphas: wgpu::Buffer,
-    pub globals: wgpu::Buffer,
+    pub w: Buffer,
+    pub scales: Buffer,
+    pub alphas: Buffer,
+    pub globals: Buffer,
     pub globals_uniform: bool,
     pub e: usize,
     pub n: usize,
@@ -408,8 +370,8 @@ pub struct Nvfp4ExpertGpu {
 }
 
 pub struct I8Gpu {
-    pub w: wgpu::Buffer,
-    pub s: wgpu::Buffer,
+    pub w: Buffer,
+    pub s: Buffer,
     pub e: usize,
     pub n: usize,
     pub k: usize,
@@ -479,7 +441,7 @@ pub enum W8Scope {
 }
 
 pub fn w8_mode() -> (bool, bool) {
-    let v = std::env::var("NV_LAGUNA_WGPU_W8").unwrap_or_default();
+    let v = env::var("NV_LAGUNA_WGPU_W8").unwrap_or_default();
     match v.trim() {
         "ffn" => (false, true),
         "attn" => (true, false),
@@ -530,21 +492,20 @@ pub fn upload_nvfp4_i8(b: &mut Builder, label: &str, l: &HostNvfp4Lin) -> I8Gpu 
     upload_nvfp4_experts_i8(b, label, &st)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_gemv_i8_experts(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     ex: &I8Gpu,
-    x_packed: &wgpu::Buffer,
-    y: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
+    x_packed: &Buffer,
+    y: &Buffer,
+    sel: &Buffer,
     slots: usize,
     use_sel: bool,
     x_per_slot: bool,
     x_slot_div: usize,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         ex.k.is_multiple_of(4),
         "{label}: i8 gemv needs k % 4 == 0, got {}",
         ex.k
@@ -652,14 +613,13 @@ pub fn upload_experts(b: &mut Builder, label: &str, e: &HostExperts) -> ExpertsG
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_gemv_bf16(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Bf16Gpu,
-    x_packed: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x_packed: &Buffer,
+    y: &Buffer,
     out_f32: bool,
     y_off_words: usize,
 ) -> Result<()> {
@@ -688,15 +648,14 @@ pub fn push_gemv_bf16(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_gemv_bf16_experts(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Bf16ExpertGpu,
-    x_packed: &wgpu::Buffer,
-    y: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
+    x_packed: &Buffer,
+    y: &Buffer,
+    sel: &Buffer,
     slots: usize,
     x_per_slot: bool,
     x_slot_div: usize,
@@ -728,16 +687,15 @@ pub fn push_gemv_bf16_experts(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_quant_rows(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x_packed: &wgpu::Buffer,
-    packed_out: &wgpu::Buffer,
-    scales_out: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
-    globals: &wgpu::Buffer,
+    x_packed: &Buffer,
+    packed_out: &Buffer,
+    scales_out: &Buffer,
+    sel: &Buffer,
+    globals: &Buffer,
     k_elems: usize,
     slots: usize,
     use_sel: bool,
@@ -745,7 +703,7 @@ pub fn push_quant_rows(
     x_slot_div: usize,
 ) -> Result<()> {
     let k_blocks = k_elems / NVFP4_BLOCK;
-    anyhow::ensure!(
+    ensure!(
         k_blocks.is_multiple_of(4),
         "quant rows needs k/{NVFP4_BLOCK} divisible by 4, got {k_blocks}"
     );
@@ -777,18 +735,17 @@ pub fn push_quant_rows(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_gemv_nvfp4(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    w: &wgpu::Buffer,
-    ws: &wgpu::Buffer,
-    xq: &wgpu::Buffer,
-    xs: &wgpu::Buffer,
-    y: &wgpu::Buffer,
-    sel: &wgpu::Buffer,
-    alphas: &wgpu::Buffer,
+    w: &Buffer,
+    ws: &Buffer,
+    xq: &Buffer,
+    xs: &Buffer,
+    y: &Buffer,
+    sel: &Buffer,
+    alphas: &Buffer,
     n_rows: usize,
     k_elems: usize,
     slots: usize,
@@ -849,11 +806,11 @@ pub fn push_gemv_nvfp4(
 }
 
 pub struct LinScratch {
-    pub xq: wgpu::Buffer,
-    pub xs: wgpu::Buffer,
-    pub globals: wgpu::Buffer,
-    pub sel0: wgpu::Buffer,
-    pub alpha_dummy: wgpu::Buffer,
+    pub xq: Buffer,
+    pub xs: Buffer,
+    pub globals: Buffer,
+    pub sel0: Buffer,
+    pub alpha_dummy: Buffer,
 }
 
 pub fn alloc_lin_scratch(b: &mut Builder, label: &str, lin: &LinGpu) -> LinScratch {
@@ -883,8 +840,8 @@ pub fn push_lin_gemv(
     label: &str,
     lin: &LinGpu,
     scratch: &LinScratch,
-    x_packed: &wgpu::Buffer,
-    y_packed: &wgpu::Buffer,
+    x_packed: &Buffer,
+    y_packed: &Buffer,
 ) -> Result<()> {
     match lin {
         LinGpu::Bf16(w) => push_gemv_bf16(b, s, label, w, x_packed, y_packed, false, 0),
@@ -962,7 +919,7 @@ pub fn alloc_pair_scratch(
     label_b: &str,
     lin_b: &LinGpu,
 ) -> PairScratch {
-    if qshare_enabled() && lin_pair_shares_quant(lin_a, lin_b) {
+    if lin_pair_shares_quant(lin_a, lin_b) {
         PairScratch::SharedQuant(alloc_lin_scratch(b, label_a, lin_a))
     } else {
         PairScratch::PerLin(
@@ -972,7 +929,6 @@ pub fn alloc_pair_scratch(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_lin_gemv_pair(
     b: &mut Builder,
     s: &Sources,
@@ -981,9 +937,9 @@ pub fn push_lin_gemv_pair(
     label_b: &str,
     lin_b: &LinGpu,
     scratch: &PairScratch,
-    x_packed: &wgpu::Buffer,
-    y_a: &wgpu::Buffer,
-    y_b: &wgpu::Buffer,
+    x_packed: &Buffer,
+    y_a: &Buffer,
+    y_b: &Buffer,
 ) -> Result<()> {
     match scratch {
         PairScratch::PerLin(sa, sb) => {
@@ -993,12 +949,12 @@ pub fn push_lin_gemv_pair(
         PairScratch::SharedQuant(sh) => {
             let (wa, wb) = match (lin_a, lin_b) {
                 (LinGpu::Nvfp4(wa), LinGpu::Nvfp4(wb)) => (wa, wb),
-                _ => anyhow::bail!(
+                _ => bail!(
                     "{label_a}/{label_b}: SharedQuant scratch reached a non-nvfp4 pair; \
                      alloc_pair_scratch shares only when lin_pair_shares_quant holds"
                 ),
             };
-            anyhow::ensure!(
+            ensure!(
                 wa.k == wb.k && wa.input_global.to_bits() == wb.input_global.to_bits(),
                 "{label_a}/{label_b}: one shared input quant yields both consumers' bytes \
                  bitwise only when k and input_global are bit-equal; differing globals must \
@@ -1063,11 +1019,11 @@ pub fn push_lin_gemv_pair(
 
 pub struct MRows {
     pub m: usize,
-    pub list: wgpu::Buffer,
-    pub sel0: wgpu::Buffer,
+    pub list: Buffer,
+    pub sel0: Buffer,
 }
 
-pub fn alloc_mrows(b: &mut Builder, m: usize, list: wgpu::Buffer) -> MRows {
+pub fn alloc_mrows(b: &mut Builder, m: usize, list: Buffer) -> MRows {
     MRows {
         m,
         list,
@@ -1096,18 +1052,17 @@ pub fn alloc_lin_scratch_rows(b: &mut Builder, label: &str, lin: &LinGpu, m: usi
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_gemv_bf16_rows(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     w: &Bf16Gpu,
-    x_packed: &wgpu::Buffer,
-    y: &wgpu::Buffer,
+    x_packed: &Buffer,
+    y: &Buffer,
     mp: &MRows,
     out_f32: bool,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         out_f32 || w.n.is_multiple_of(2),
         "{label}: rows gemv packs bf16 output pairs per token, n {} must be even",
         w.n
@@ -1143,18 +1098,17 @@ pub fn push_gemv_bf16_rows(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_lin_gemv_rows(
     b: &mut Builder,
     s: &Sources,
     label: &str,
     lin: &LinGpu,
     scratch: &LinScratch,
-    x_packed: &wgpu::Buffer,
-    y_packed: &wgpu::Buffer,
+    x_packed: &Buffer,
+    y_packed: &Buffer,
     mp: &MRows,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         lin.n().is_multiple_of(2),
         "{label}: rows gemv packs output pairs per token, n {} must be even",
         lin.n()
@@ -1211,7 +1165,7 @@ pub fn alloc_pair_scratch_rows(
     lin_b: &LinGpu,
     m: usize,
 ) -> PairScratch {
-    if qshare_enabled() && lin_pair_shares_quant(lin_a, lin_b) {
+    if lin_pair_shares_quant(lin_a, lin_b) {
         PairScratch::SharedQuant(alloc_lin_scratch_rows(b, label_a, lin_a, m))
     } else {
         PairScratch::PerLin(
@@ -1221,7 +1175,6 @@ pub fn alloc_pair_scratch_rows(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_lin_gemv_pair_rows(
     b: &mut Builder,
     s: &Sources,
@@ -1230,9 +1183,9 @@ pub fn push_lin_gemv_pair_rows(
     label_b: &str,
     lin_b: &LinGpu,
     scratch: &PairScratch,
-    x_packed: &wgpu::Buffer,
-    y_a: &wgpu::Buffer,
-    y_b: &wgpu::Buffer,
+    x_packed: &Buffer,
+    y_a: &Buffer,
+    y_b: &Buffer,
     mp: &MRows,
 ) -> Result<()> {
     match scratch {
@@ -1243,12 +1196,12 @@ pub fn push_lin_gemv_pair_rows(
         PairScratch::SharedQuant(sh) => {
             let (wa, wb) = match (lin_a, lin_b) {
                 (LinGpu::Nvfp4(wa), LinGpu::Nvfp4(wb)) => (wa, wb),
-                _ => anyhow::bail!(
+                _ => bail!(
                     "{label_a}/{label_b}: SharedQuant rows scratch reached a non-nvfp4 pair; \
                      alloc_pair_scratch_rows shares only when lin_pair_shares_quant holds"
                 ),
             };
-            anyhow::ensure!(
+            ensure!(
                 wa.k == wb.k && wa.input_global.to_bits() == wb.input_global.to_bits(),
                 "{label_a}/{label_b}: one shared input quant per token yields both consumers' \
                  bytes bitwise only when k and input_global are bit-equal"
@@ -1294,14 +1247,13 @@ pub fn push_lin_gemv_pair_rows(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_rmsnorm_rows(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x_packed: &wgpu::Buffer,
-    w_packed: &wgpu::Buffer,
-    y_packed: &wgpu::Buffer,
+    x_packed: &Buffer,
+    w_packed: &Buffer,
+    y_packed: &Buffer,
     hidden: usize,
     eps: f32,
     m: usize,
@@ -1324,15 +1276,14 @@ pub fn push_rmsnorm_rows(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_rmsnorm_residual_rows(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    delta_packed: &wgpu::Buffer,
-    res_packed: &wgpu::Buffer,
-    w_packed: &wgpu::Buffer,
-    y_packed: &wgpu::Buffer,
+    delta_packed: &Buffer,
+    res_packed: &Buffer,
+    w_packed: &Buffer,
+    y_packed: &Buffer,
     hidden: usize,
     eps: f32,
     m: usize,
@@ -1365,9 +1316,9 @@ pub fn push_silu_mul(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    gate_packed: &wgpu::Buffer,
-    up_packed: &wgpu::Buffer,
-    out_packed: &wgpu::Buffer,
+    gate_packed: &Buffer,
+    up_packed: &Buffer,
+    out_packed: &Buffer,
     n_elems_total: usize,
 ) -> Result<()> {
     let n_words = n_elems_total / 2;
@@ -1397,9 +1348,9 @@ pub fn push_rmsnorm(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    x_packed: &wgpu::Buffer,
-    w_packed: &wgpu::Buffer,
-    y_packed: &wgpu::Buffer,
+    x_packed: &Buffer,
+    w_packed: &Buffer,
+    y_packed: &Buffer,
     hidden: usize,
     eps: f32,
 ) -> Result<()> {
@@ -1421,15 +1372,14 @@ pub fn push_rmsnorm(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn push_rmsnorm_residual(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    delta_packed: &wgpu::Buffer,
-    res_packed: &wgpu::Buffer,
-    w_packed: &wgpu::Buffer,
-    y_packed: &wgpu::Buffer,
+    delta_packed: &Buffer,
+    res_packed: &Buffer,
+    w_packed: &Buffer,
+    y_packed: &Buffer,
     hidden: usize,
     eps: f32,
 ) -> Result<()> {
@@ -1461,9 +1411,9 @@ pub fn push_residual_add(
     b: &mut Builder,
     s: &Sources,
     label: &str,
-    delta_packed: &wgpu::Buffer,
-    res_packed: &wgpu::Buffer,
-    out_packed: &wgpu::Buffer,
+    delta_packed: &Buffer,
+    res_packed: &Buffer,
+    out_packed: &Buffer,
     hidden: usize,
 ) -> Result<()> {
     let p = b.uni(

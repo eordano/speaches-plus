@@ -1,14 +1,19 @@
 use anyhow::{Context, Result};
 use opus::{Application, Channels, Encoder};
-use rubato::{FastFixedIn, PolynomialDegree, Resampler};
+use rtc::media::Sample;
+use rtc::peer_connection::configuration::media_engine::MIME_TYPE_OPUS;
+use rtc::rtp_transceiver::rtp_sender::{
+    RTCRtpCodec, RTCRtpCodingParameters, RTCRtpEncodingParameters, RtpCodecKind,
+};
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+use rubato::{Async, FixedAsync, PolynomialDegree, Resampler};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::debug;
-use webrtc::api::media_engine::MIME_TYPE_OPUS;
-use webrtc::media::Sample;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
+use webrtc::media_stream::MediaStreamTrack;
+use webrtc::rtp_transceiver::RtpSender;
 
 #[allow(dead_code)]
 pub const OUT_SAMPLE_RATE: usize = crate::defaults::audio::OUT_SAMPLE_RATE;
@@ -59,25 +64,72 @@ impl From<anyhow::Error> for OutboundPushError {
     }
 }
 
-impl OutboundPushError {
-    #[allow(dead_code)]
-    pub fn is_queue_full(&self) -> bool {
-        matches!(self, OutboundPushError::QueueFull { .. })
+impl OutboundPushError {}
+
+pub struct OutboundTrack {
+    pub track: Arc<TrackLocalStaticSample>,
+    ssrc: u32,
+    payload_type: OnceLock<u8>,
+}
+
+impl OutboundTrack {
+    pub async fn bind_negotiated_payload_type(&self, sender: &Arc<dyn RtpSender>) -> Result<u8> {
+        let pt = sender
+            .get_parameters()
+            .await
+            .context("outbound sender parameters")?
+            .rtp_parameters
+            .codecs
+            .first()
+            .map(|c| c.payload_type)
+            .context("outbound sender has no negotiated codec")?;
+        let _ = self.payload_type.set(pt);
+        Ok(pt)
+    }
+
+    async fn write_sample(&self, sample: &Sample) -> Result<()> {
+        let pt = *self
+            .payload_type
+            .get()
+            .context("outbound track written before negotiation")?;
+        self.track
+            .write_sample(self.ssrc, pt, sample, &[])
+            .await
+            .context("write opus sample")
     }
 }
 
-pub fn build_outbound_track() -> Arc<TrackLocalStaticSample> {
-    Arc::new(TrackLocalStaticSample::new(
-        RTCRtpCodecCapability {
-            mime_type: MIME_TYPE_OPUS.to_string(),
-            clock_rate: 48_000,
-            channels: 1,
-            sdp_fmtp_line: "minptime=10;useinbandfec=1".to_string(),
-            ..Default::default()
-        },
-        "audio".to_string(),
-        "speaches-tts".to_string(),
-    ))
+pub fn build_outbound_track() -> Result<Arc<OutboundTrack>> {
+    let ssrc = uuid::Uuid::new_v4().as_u128() as u32;
+    let track = TrackLocalStaticSample::new(
+        Instant::now(),
+        MediaStreamTrack::new(
+            "audio".to_string(),
+            "speaches-tts".to_string(),
+            "speaches-tts".to_string(),
+            RtpCodecKind::Audio,
+            vec![RTCRtpEncodingParameters {
+                rtp_coding_parameters: RTCRtpCodingParameters {
+                    ssrc: Some(ssrc),
+                    ..Default::default()
+                },
+                codec: RTCRtpCodec {
+                    mime_type: MIME_TYPE_OPUS.to_string(),
+                    clock_rate: 48_000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1".to_string(),
+                    rtcp_feedback: vec![],
+                },
+                ..Default::default()
+            }],
+        ),
+    )
+    .context("build outbound opus track")?;
+    Ok(Arc::new(OutboundTrack {
+        track: Arc::new(track),
+        ssrc,
+        payload_type: OnceLock::new(),
+    }))
 }
 
 pub fn read_queue_cap_ms_from_env() -> u64 {
@@ -156,8 +208,8 @@ impl QueueGate {
 }
 
 pub struct OutboundPacer {
-    track: Arc<TrackLocalStaticSample>,
-    resampler: FastFixedIn<f32>,
+    track: Arc<OutboundTrack>,
+    resampler: Async<f32>,
     encoder: Encoder,
     in_buf: Vec<Vec<f32>>,
     out_buf: Vec<Vec<f32>>,
@@ -171,17 +223,14 @@ pub struct OutboundPacer {
 }
 
 impl OutboundPacer {
-    pub fn start(
-        track: Arc<TrackLocalStaticSample>,
-        played_ms: Arc<AtomicU64>,
-        queue_cap_ms: u64,
-    ) -> Self {
-        let resampler = FastFixedIn::<f32>::new(
+    pub fn start(track: Arc<OutboundTrack>, played_ms: Arc<AtomicU64>, queue_cap_ms: u64) -> Self {
+        let resampler = Async::<f32>::new_poly(
             TTS_RESAMPLER_RATIO,
             1.0,
             PolynomialDegree::Septic,
             IN_CHUNK_SAMPLES,
             1,
+            FixedAsync::Input,
         )
         .expect("rubato 24->48k");
         let chunk_out = resampler.output_frames_max();
@@ -229,9 +278,14 @@ impl OutboundPacer {
             if take < IN_CHUNK_SAMPLES {
                 self.in_buf[0].resize(IN_CHUNK_SAMPLES, 0.0);
             }
+            let out_frames = self.out_buf[0].len();
+            let input = SequentialSliceOfVecs::new(&self.in_buf, 1, IN_CHUNK_SAMPLES)
+                .context("rubato input buffer")?;
+            let mut output = SequentialSliceOfVecs::new_mut(&mut self.out_buf, 1, out_frames)
+                .context("rubato output buffer")?;
             let (_in_used, out_produced) = self
                 .resampler
-                .process_into_buffer(&self.in_buf, &mut self.out_buf, None)
+                .process_into_buffer(&input, &mut output, None)
                 .context("rubato process")?;
             self.carry
                 .extend_from_slice(&self.out_buf[0][..out_produced]);
@@ -278,12 +332,9 @@ impl OutboundPacer {
         let sample = Sample {
             data: bytes::Bytes::copy_from_slice(&self.opus_buf[..n]),
             duration: Duration::from_millis(FRAME_MS as u64),
-            ..Default::default()
+            ..Sample::new(Instant::now())
         };
-        self.track
-            .write_sample(&sample)
-            .await
-            .context("write opus sample")?;
+        self.track.write_sample(&sample).await?;
         let start = *self.start.get_or_insert_with(Instant::now);
         self.frames_written += 1;
         self.played_ms
@@ -347,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn under_cap_pushes_succeed() {
+    fn pushes_succeed_under_the_cap_and_fail_over_it() {
         let pacer = StalledFakePacer::new(200);
 
         for _ in 0..4 {
@@ -356,33 +407,31 @@ mod tests {
                 .expect("under-cap push must succeed");
         }
         assert_eq!(pacer.gate.queued_ms(), 160);
-    }
+        {
+            let pacer = StalledFakePacer::new(200);
 
-    #[test]
-    fn over_cap_push_returns_queue_full() {
-        let pacer = StalledFakePacer::new(200);
-
-        for _ in 0..4 {
-            pacer.push_chunk_ms(50).expect("up-to-cap pushes succeed");
-        }
-        assert_eq!(pacer.gate.queued_ms(), 200);
-
-        let err = pacer
-            .push_chunk_ms(1)
-            .expect_err("over-cap push must error");
-        match err {
-            OutboundPushError::QueueFull { queued_ms, cap_ms } => {
-                assert_eq!(queued_ms, 201);
-                assert_eq!(cap_ms, 200);
+            for _ in 0..4 {
+                pacer.push_chunk_ms(50).expect("up-to-cap pushes succeed");
             }
-            other => panic!("expected QueueFull, got {other:?}"),
-        }
+            assert_eq!(pacer.gate.queued_ms(), 200);
 
-        assert_eq!(pacer.gate.queued_ms(), 200);
+            let err = pacer
+                .push_chunk_ms(1)
+                .expect_err("over-cap push must error");
+            match err {
+                OutboundPushError::QueueFull { queued_ms, cap_ms } => {
+                    assert_eq!(queued_ms, 201);
+                    assert_eq!(cap_ms, 200);
+                }
+                other => panic!("expected QueueFull, got {other:?}"),
+            }
+
+            assert_eq!(pacer.gate.queued_ms(), 200);
+        }
     }
 
     #[test]
-    fn frame_send_decrements_queued_ms() {
+    fn frame_send_decrements_queued_ms_saturating_at_zero() {
         let gate = QueueGate::new(200);
         gate.try_push(100).unwrap();
         assert_eq!(gate.queued_ms(), 100);
@@ -391,16 +440,14 @@ mod tests {
             gate.on_frame_sent();
         }
         assert_eq!(gate.queued_ms(), 0);
-    }
+        {
+            let gate = QueueGate::new(200);
 
-    #[test]
-    fn frame_send_saturates_at_zero() {
-        let gate = QueueGate::new(200);
-
-        for _ in 0..3 {
-            gate.on_frame_sent();
+            for _ in 0..3 {
+                gate.on_frame_sent();
+            }
+            assert_eq!(gate.queued_ms(), 0);
         }
-        assert_eq!(gate.queued_ms(), 0);
     }
 
     #[test]

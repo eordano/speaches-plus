@@ -98,16 +98,6 @@ def _resolve_backend() -> str:
     _RESOLVED_BACKEND = ATTN_BACKEND_NONE
     return _RESOLVED_BACKEND
 
-def reset_backend_cache() -> None:
-    global _RESOLVED_BACKEND
-    _RESOLVED_BACKEND = None
-
-def has_flashinfer() -> bool:
-    return _HAS_FLASHINFER
-
-def has_flash_attn() -> bool:
-    return _HAS_FLASH_ATTN
-
 def fp8_dtype_for(kv_cache_dtype: str | None) -> torch.dtype | None:
     if kv_cache_dtype is None:
         return None
@@ -117,29 +107,6 @@ def fp8_dtype_for(kv_cache_dtype: str | None) -> torch.dtype | None:
     if key in FP8_E5M2_KEYS:
         return torch.float8_e5m2
     return None
-
-def make_kv_scale_remap(
-    proj_suffixes: tuple[str, ...] = ("k_proj", "v_proj"),
-    attn_attr: str = "attn",
-):
-
-    proj_to_target = {
-        "k_proj": "k_scale",
-        "v_proj": "v_scale",
-    }
-
-    def rule(weight_name: str) -> str | None:
-        for proj in proj_suffixes:
-            suffix = f".{proj}.output_scale"
-            if weight_name.endswith(suffix):
-                target = proj_to_target.get(proj)
-                if target is None:
-                    return None
-                prefix = weight_name[: -len(suffix)]
-                return f"{prefix}.{attn_attr}.{target}"
-        return None
-
-    return rule
 
 if _HAS_FLASH_ATTN:
     @triton.jit

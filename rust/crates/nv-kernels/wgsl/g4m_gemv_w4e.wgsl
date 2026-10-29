@@ -25,6 +25,7 @@ var<workgroup> g4w_red: array<f32, 256>;
 
 @compute @workgroup_size(256)
 fn g4m_gemv_w4(
+    #def b3
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -36,6 +37,7 @@ fn g4m_gemv_w4(
     let pair = wid.x + wid.y * g4w_p.groups_x;
     let row = pair * 2u + half;
     let live = row < g4w_p.n_rows;
+    #end
     let row_words = g4w_p.groups * 4u;
     let wbase = select(0u, e * g4w_p.w_e_stride_words + row * row_words, live);
     let sbase = e * g4w_p.s_e_stride_elems + row * g4w_p.groups;
@@ -44,6 +46,7 @@ fn g4m_gemv_w4(
 
     var acc = 0.0;
     for (var g = lane; g < groups; g = g + 128u) {
+        #def b4
         let si = sbase + g;
         let scale = bf16_decode(u16_at(g4w_ws[si >> 1u], si));
         var gdot = 0.0;
@@ -63,6 +66,7 @@ fn g4m_gemv_w4(
     }
     g4w_red[tid] = acc;
     workgroupBarrier();
+        #end
     for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
         if (lane < stride) {
             g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
@@ -101,25 +105,7 @@ fn g4m_gemv_w4_r8(
 
     var acc = 0.0;
     for (var g = lane; g < groups; g = g + 32u) {
-        let si = sbase + g;
-        let scale = bf16_decode(u16_at(g4w_ws[si >> 1u], si));
-        var gdot = 0.0;
-        let wg = wbase + g * 4u;
-        let xg = xbase + g * 16u;
-        for (var j = 0u; j < 4u; j = j + 1u) {
-            let pv = g4w_w[wg + j];
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                let xw = g4w_x[xg + j * 4u + i];
-                let q0 = f32((pv >> (8u * i)) & 15u) - 8.0;
-                let q1 = f32((pv >> (8u * i + 4u)) & 15u) - 8.0;
-                gdot = fma(q0, bf16_lo(xw), gdot);
-                gdot = fma(q1, bf16_hi(xw), gdot);
-            }
-        }
-        acc = fma(scale, gdot, acc);
-    }
-    g4w_red[tid] = acc;
-    workgroupBarrier();
+        #use b4
     for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
         if (lane < stride) {
             g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
@@ -177,6 +163,7 @@ fn g4w_group_dot(wbase_g: u32, sbase_g: u32, xg: u32, from_w2: bool) -> f32 {
 }
 
 fn g4w_row_acc(
+    #def b9
     e: u32,
     row: u32,
     live: bool,
@@ -188,6 +175,7 @@ fn g4w_row_acc(
     let row_words = g4w_p.groups * 4u;
     let wbase = select(0u, e * g4w_p.w_e_stride_words + row * row_words, live);
     let sbase = e * g4w_p.s_e_stride_elems + row * g4w_p.groups;
+    #end
     let groups = select(0u, g4w_p.groups, live);
     var acc = 0.0;
     for (var g = lane; g < groups; g = g + lane_stride) {
@@ -198,20 +186,11 @@ fn g4w_row_acc(
 
 @compute @workgroup_size(256)
 fn g4m_gemv_w4_gu_gelu(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let half = tid >> 7u;
-    let lane = tid & 127u;
-    let slot = wid.z;
-    let e = g4w_sel[slot];
-    let pair = wid.x + wid.y * g4w_p.groups_x;
-    let row = pair * 2u + half;
-    let live = row < g4w_p.n_rows;
+    #use b3
     let xbase = slot * g4w_p.x_slot_stride_words;
 
     g4w_red[tid] = g4w_row_acc(e, row, live, lane, 128u, xbase, false);
+    #def b6
     workgroupBarrier();
     for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
         if (lane < stride) {
@@ -224,8 +203,10 @@ fn g4m_gemv_w4_gu_gelu(
         g4w_gu[1] = g4w_red[128];
     }
     workgroupBarrier();
+    #end
 
     g4w_red[tid] = g4w_row_acc(e, row, live, lane, 128u, xbase, true);
+    #def b1
     workgroupBarrier();
     for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
         if (lane < stride) {
@@ -247,6 +228,7 @@ fn g4m_gemv_w4_gu_gelu(
         g4w_y[slot * g4w_p.y_slot_stride_words + (row >> 1u)] = bf16_pack(a0, a1);
     }
 }
+    #end
 
 @compute @workgroup_size(256)
 fn g4m_gemv_w4_r8_gu_gelu(
@@ -258,6 +240,7 @@ fn g4m_gemv_w4_r8_gu_gelu(
     let lane = tid & 31u;
     let slot = wid.z;
     let e = g4w_sel[slot];
+    #def b2
     let block = wid.x + wid.y * g4w_p.groups_x;
     let row = block * 8u + sub;
     let live = row < g4w_p.n_rows;
@@ -298,6 +281,7 @@ fn g4m_gemv_w4_r8_gu_gelu(
         g4w_y[slot * g4w_p.y_slot_stride_words + (row >> 1u)] = bf16_pack(a0, a1);
     }
 }
+    #end
 
 @compute @workgroup_size(256)
 fn g4m_gemv_w4_r8_down_combine(
@@ -316,6 +300,8 @@ fn g4m_gemv_w4_r8_down_combine(
         let e = g4w_sel[j];
         let xbase = j * g4w_p.x_slot_stride_words;
         g4w_red[tid] = g4w_row_acc(e, row, live, lane, 32u, xbase, false);
+        #def b5
+        #def b8
         workgroupBarrier();
         for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
             if (lane < stride) {
@@ -324,7 +310,9 @@ fn g4m_gemv_w4_r8_down_combine(
             workgroupBarrier();
         }
         let dot_b = bf16_decode(bf16_encode(g4w_red[tid & 0xe0u]));
+        #end
         comb = fma(dot_b, g4w_cw[j], comb);
+        #def b7
         workgroupBarrier();
     }
     if (lane == 0u) {
@@ -339,21 +327,13 @@ fn g4m_gemv_w4_r8_down_combine(
         g4w_y[row >> 1u] = bf16_pack(g4w_gu[sub], hi);
     }
 }
+        #end
+        #end
 
 var<workgroup> g4w_xbuf: array<u32, 3072>;
 
 fn g4w_row_acc_coal_consecutive_lanes_read_consecutive_packed_words(
-    e: u32,
-    row: u32,
-    live: bool,
-    lane: u32,
-    lane_stride: u32,
-    xbase: u32,
-    from_w2: bool
-) -> f32 {
-    let row_words = g4w_p.groups * 4u;
-    let wbase = select(0u, e * g4w_p.w_e_stride_words + row * row_words, live);
-    let sbase = e * g4w_p.s_e_stride_elems + row * g4w_p.groups;
+    #use b9
     let words = select(0u, row_words, live);
     var acc = 0.0;
     for (var idx = lane; idx < words; idx = idx + lane_stride) {
@@ -395,60 +375,19 @@ fn g4w_preload_x_words(tid: u32, n_words: u32) {
 
 @compute @workgroup_size(256)
 fn g4m_gemv_w4_gu_gelu_coal(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let half = tid >> 7u;
-    let lane = tid & 127u;
-    let slot = wid.z;
-    let e = g4w_sel[slot];
-    let pair = wid.x + wid.y * g4w_p.groups_x;
-    let row = pair * 2u + half;
-    let live = row < g4w_p.n_rows;
+    #use b3
     let xbase = slot * g4w_p.x_slot_stride_words;
     g4w_preload_x_words(tid, xbase + g4w_p.groups * 16u);
 
     g4w_red[tid] = g4w_row_acc_coal_consecutive_lanes_read_consecutive_packed_words(
         e, row, live, lane, 128u, xbase, false
     );
-    workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-    if (tid == 0u) {
-        g4w_gu[0] = g4w_red[0];
-        g4w_gu[1] = g4w_red[128];
-    }
-    workgroupBarrier();
+    #use b6
 
     g4w_red[tid] = g4w_row_acc_coal_consecutive_lanes_read_consecutive_packed_words(
         e, row, live, lane, 128u, xbase, true
     );
-    workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-    if (tid == 0u) {
-        var g_hi = 0.0;
-        var u_hi = 0.0;
-        if (row + 1u < g4w_p.n_rows) {
-            g_hi = g4w_gu[1];
-            u_hi = g4w_red[128];
-        }
-        let gw = bf16_pack(g4w_gu[0], g_hi);
-        let uw = bf16_pack(g4w_red[0], u_hi);
-        let a0 = bf16_decode(bf16_encode(g4w_gelu(bf16_lo(gw)))) * bf16_lo(uw);
-        let a1 = bf16_decode(bf16_encode(g4w_gelu(bf16_hi(gw)))) * bf16_hi(uw);
-        g4w_y[slot * g4w_p.y_slot_stride_words + (row >> 1u)] = bf16_pack(a0, a1);
-    }
-}
+    #use b1
 
 @compute @workgroup_size(256)
 fn g4m_gemv_w4_r8_down_combine_coal(
@@ -470,29 +409,7 @@ fn g4m_gemv_w4_r8_down_combine_coal(
         g4w_red[tid] = g4w_row_acc_coal_consecutive_lanes_read_consecutive_packed_words(
             e, row, live, lane, 32u, xbase, false
         );
-        workgroupBarrier();
-        for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
-            if (lane < stride) {
-                g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
-            }
-            workgroupBarrier();
-        }
-        let dot_b = bf16_decode(bf16_encode(g4w_red[tid & 0xe0u]));
-        comb = fma(dot_b, g4w_cw[j], comb);
-        workgroupBarrier();
-    }
-    if (lane == 0u) {
-        g4w_gu[sub] = comb;
-    }
-    workgroupBarrier();
-    if (lane == 0u && (sub & 1u) == 0u && live) {
-        var hi = 0.0;
-        if (row + 1u < g4w_p.n_rows) {
-            hi = g4w_gu[sub + 1u];
-        }
-        g4w_y[row >> 1u] = bf16_pack(g4w_gu[sub], hi);
-    }
-}
+        #use b5
 
 @group(0) @binding(20) var<storage, read> g4w_logits: array<f32>;
 @group(0) @binding(21) var<storage, read> g4w_pes: array<f32>;
@@ -554,41 +471,10 @@ fn g4m_gemv_w4_gu_gelu_rank(
     let xbase = slot * g4w_p.x_slot_stride_words;
 
     g4w_red[tid] = g4w_row_acc(e, row, live, lane, 128u, xbase, false);
-    workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-    if (tid == 0u) {
-        g4w_gu[0] = g4w_red[0];
-        g4w_gu[1] = g4w_red[128];
-    }
-    workgroupBarrier();
+    #use b6
 
     g4w_red[tid] = g4w_row_acc(e, row, live, lane, 128u, xbase, true);
-    workgroupBarrier();
-    for (var stride = 64u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-    if (tid == 0u) {
-        var g_hi = 0.0;
-        var u_hi = 0.0;
-        if (row + 1u < g4w_p.n_rows) {
-            g_hi = g4w_gu[1];
-            u_hi = g4w_red[128];
-        }
-        let gw = bf16_pack(g4w_gu[0], g_hi);
-        let uw = bf16_pack(g4w_red[0], u_hi);
-        let a0 = bf16_decode(bf16_encode(g4w_gelu(bf16_lo(gw)))) * bf16_lo(uw);
-        let a1 = bf16_decode(bf16_encode(g4w_gelu(bf16_hi(gw)))) * bf16_hi(uw);
-        g4w_y[slot * g4w_p.y_slot_stride_words + (row >> 1u)] = bf16_pack(a0, a1);
-    }
-}
+    #use b1
 
 @compute @workgroup_size(256)
 fn g4m_gemv_w4_r8_gu_gelu_rank(
@@ -601,46 +487,7 @@ fn g4m_gemv_w4_r8_gu_gelu_rank(
     let lane = tid & 31u;
     let slot = wid.z;
     let e = g4w_rank_id[slot];
-    let block = wid.x + wid.y * g4w_p.groups_x;
-    let row = block * 8u + sub;
-    let live = row < g4w_p.n_rows;
-    let xbase = slot * g4w_p.x_slot_stride_words;
-
-    g4w_red[tid] = g4w_row_acc(e, row, live, lane, 32u, xbase, false);
-    workgroupBarrier();
-    for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-    if (lane == 0u) {
-        g4w_gu[sub] = g4w_red[tid];
-    }
-    workgroupBarrier();
-
-    g4w_red[tid] = g4w_row_acc(e, row, live, lane, 32u, xbase, true);
-    workgroupBarrier();
-    for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
-        if (lane < stride) {
-            g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
-        }
-        workgroupBarrier();
-    }
-    if (lane == 0u && (sub & 1u) == 0u && live) {
-        var g_hi = 0.0;
-        var u_hi = 0.0;
-        if (row + 1u < g4w_p.n_rows) {
-            g_hi = g4w_gu[sub + 1u];
-            u_hi = g4w_red[tid + 32u];
-        }
-        let gw = bf16_pack(g4w_gu[sub], g_hi);
-        let uw = bf16_pack(g4w_red[tid], u_hi);
-        let a0 = bf16_decode(bf16_encode(g4w_gelu(bf16_lo(gw)))) * bf16_lo(uw);
-        let a1 = bf16_decode(bf16_encode(g4w_gelu(bf16_hi(gw)))) * bf16_hi(uw);
-        g4w_y[slot * g4w_p.y_slot_stride_words + (row >> 1u)] = bf16_pack(a0, a1);
-    }
-}
+    #use b2
 
 @compute @workgroup_size(256)
 fn g4m_gemv_w4_r8_down_combine_rank(
@@ -661,29 +508,9 @@ fn g4m_gemv_w4_r8_down_combine_rank(
         let e = g4w_rank_id[j];
         let xbase = j * g4w_p.x_slot_stride_words;
         g4w_red[tid] = g4w_row_acc(e, row, live, lane, 32u, xbase, false);
-        workgroupBarrier();
-        for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
-            if (lane < stride) {
-                g4w_red[tid] = g4w_red[tid] + g4w_red[tid + stride];
-            }
-            workgroupBarrier();
-        }
-        let dot_b = bf16_decode(bf16_encode(g4w_red[tid & 0xe0u]));
+        #use b8
         comb = fma(dot_b, g4w_rank_w[j], comb);
-        workgroupBarrier();
-    }
-    if (lane == 0u) {
-        g4w_gu[sub] = comb;
-    }
-    workgroupBarrier();
-    if (lane == 0u && (sub & 1u) == 0u && live) {
-        var hi = 0.0;
-        if (row + 1u < g4w_p.n_rows) {
-            hi = g4w_gu[sub + 1u];
-        }
-        g4w_y[row >> 1u] = bf16_pack(g4w_gu[sub], hi);
-    }
-}
+        #use b7
 
 var<workgroup> g4w_red2: array<f32, 256>;
 
@@ -714,17 +541,7 @@ fn g4w_group_dot2_single_x_pass_bitwise_per_mat(
 
 @compute @workgroup_size(256)
 fn g4m_gemv_w4_gu_gelu_fusedx(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let half = tid >> 7u;
-    let lane = tid & 127u;
-    let slot = wid.z;
-    let e = g4w_sel[slot];
-    let pair = wid.x + wid.y * g4w_p.groups_x;
-    let row = pair * 2u + half;
-    let live = row < g4w_p.n_rows;
+    #use b3
     let xbase = slot * g4w_p.x_slot_stride_words;
 
     let row_words = g4w_p.groups * 4u;

@@ -453,30 +453,6 @@ async def handle_client_too_slow(
         )
     )
 
-async def stream_llm_sentences(
-    cfg: LlmConfig,
-    instructions: str | None,
-    user_text: str,
-    cancel: asyncio.Event | None = None,
-) -> AsyncIterator[str]:
-    """Yield sentence-sized chunks; retained for test compatibility.
-
-    The live `run_response` path uses `complete_stream_messages` directly so
-    transcript deltas can be emitted per SSE chunk (W12) instead of per
-    sentence. This helper is still imported by older tests.
-    """
-    chunker = SentenceChunker()
-    messages: list[ChatMessage] = []
-    if instructions:
-        messages.append(ChatMessage(role="system", content=instructions))
-    messages.append(ChatMessage(role="user", content=user_text))
-    async for delta in complete_stream_messages(cfg, messages, cancel=cancel):
-        for sentence in chunker.feed(delta):
-            yield sentence
-    tail = chunker.flush()
-    if tail:
-        yield tail
-
 def _resolve_voice(session: "Session") -> str:
     from tts.kokoro import DEFAULT_VOICE as _KOKORO_DEFAULT_VOICE
 

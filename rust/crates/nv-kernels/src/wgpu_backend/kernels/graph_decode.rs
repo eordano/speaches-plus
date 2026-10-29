@@ -1,10 +1,8 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::kernels::attn_decode;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
-pub const WGSL: &str = include_str!("../../../wgsl/graph_decode.wgsl");
+pub const WGSL: &str = crate::wgsl!("../../../wgsl/graph_decode.wgsl");
 
 pub const WORKGROUP_SIZE: u32 = 128;
 pub const ARGMAX_BLOCKS: usize = 256;

@@ -210,79 +210,35 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_single_token_propose_nothing() {
+    fn proposals_follow_the_hand_worked_table() {
         let mut sam = SuffixAutomaton::new();
-        assert!(sam.propose(8, 1).is_none());
+        assert!(sam.propose(8, 1).is_none(), "empty");
         sam.extend(5);
-        assert!(sam.propose(8, 1).is_none());
-    }
-
-    #[test]
-    fn no_repeat_proposes_nothing() {
-        let mut sam = SuffixAutomaton::new();
-        sam.extend_slice(&[1, 2, 3, 4, 5]);
-        assert!(sam.propose(8, 1).is_none());
-    }
-
-    #[test]
-    fn simple_repeat_continues_from_earlier_occurrence() {
-        let mut sam = SuffixAutomaton::new();
-        sam.extend_slice(&[10, 20, 30, 40, 10, 20]);
-        let p = sam.propose(8, 1).unwrap();
-        assert_eq!(p.match_len, 2);
-        assert_eq!(p.tokens, vec![30, 40, 10, 20]);
-    }
-
-    #[test]
-    fn max_len_caps_the_continuation() {
-        let mut sam = SuffixAutomaton::new();
-        sam.extend_slice(&[10, 20, 30, 40, 10, 20]);
-        let p = sam.propose(2, 1).unwrap();
-        assert_eq!(p.tokens, vec![30, 40]);
-    }
-
-    #[test]
-    fn min_match_gates_short_matches() {
-        let mut sam = SuffixAutomaton::new();
-        sam.extend_slice(&[10, 20, 30, 40, 10, 20]);
-        assert!(sam.propose(8, 3).is_none());
-        assert!(sam.propose(8, 2).is_some());
-    }
-
-    #[test]
-    fn period_one_run_proposes_more_of_the_run() {
-        let mut sam = SuffixAutomaton::new();
-        sam.extend_slice(&[7, 7, 7, 7]);
-        let p = sam.propose(8, 1).unwrap();
-        assert_eq!(p.match_len, 3);
-        assert_eq!(p.tokens, vec![7]);
-    }
-
-    #[test]
-    fn matches_longest_repeated_suffix_not_shorter_one() {
-        let mut sam = SuffixAutomaton::new();
-        sam.extend_slice(&[1, 2, 3, 9, 1, 2, 3, 5, 2, 3]);
-        let p = sam.propose(8, 1).unwrap();
-        assert_eq!(p.match_len, 2);
-        assert_eq!(p.tokens, vec![9, 1, 2, 3, 5, 2, 3]);
-    }
-
-    #[test]
-    fn agentic_tool_echo_pattern_yields_long_continuation() {
-        let mut sam = SuffixAutomaton::new();
+        assert!(sam.propose(8, 1).is_none(), "single token");
         let call: Vec<u32> = vec![100, 101, 102, 103, 104, 105, 106, 107];
-        let mut stream: Vec<u32> = Vec::new();
-        stream.extend_from_slice(&call);
-        stream.extend_from_slice(&[1, 2, 3]);
-        stream.extend_from_slice(&call[..4]);
-        sam.extend_slice(&stream);
-        let p = sam.propose(4, 2).unwrap();
-        assert_eq!(p.match_len, 4);
-        assert_eq!(p.tokens, &call[4..8]);
+        let mut echo: Vec<u32> = call.clone();
+        echo.extend_from_slice(&[1, 2, 3]);
+        echo.extend_from_slice(&call[..4]);
+        let cases: [(&str, Vec<u32>, usize, usize, Option<(usize, Vec<u32>)>); 8] = [
+            ("no repeat", vec![1, 2, 3, 4, 5], 8, 1, None),
+            ("simple repeat", vec![10, 20, 30, 40, 10, 20], 8, 1, Some((2, vec![30, 40, 10, 20]))),
+            ("max_len caps", vec![10, 20, 30, 40, 10, 20], 2, 1, Some((2, vec![30, 40]))),
+            ("min_match gates", vec![10, 20, 30, 40, 10, 20], 8, 3, None),
+            ("min_match met", vec![10, 20, 30, 40, 10, 20], 8, 2, Some((2, vec![30, 40, 10, 20]))),
+            ("period one run", vec![7, 7, 7, 7], 8, 1, Some((3, vec![7]))),
+            ("longest suffix", vec![1, 2, 3, 9, 1, 2, 3, 5, 2, 3], 8, 1, Some((2, vec![9, 1, 2, 3, 5, 2, 3]))),
+            ("agentic tool echo", echo, 4, 2, Some((4, call[4..8].to_vec()))),
+        ];
+        for (label, tokens, max_len, min_match, want) in cases {
+            let mut sam = SuffixAutomaton::new();
+            sam.extend_slice(&tokens);
+            let got = sam.propose(max_len, min_match).map(|p| (p.match_len, p.tokens));
+            assert_eq!(got, want, "{label}");
+        }
     }
 
     #[test]
-    fn matches_naive_reference_on_random_streams() {
+    fn matches_the_naive_reference_on_random_streams_and_every_source_is_a_true_earlier_occurrence() {
         let mut rng: u64 = 0x243f6a8885a308d3;
         let mut next = move || {
             rng ^= rng << 13;
@@ -319,10 +275,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn proposal_source_is_a_true_earlier_occurrence() {
         let mut rng: u64 = 0x13198a2e03707344;
         let mut next = move || {
             rng ^= rng << 13;
@@ -403,20 +355,17 @@ mod tests {
     }
 
     #[test]
-    fn ema_moves_toward_observations() {
+    fn the_accept_ema_moves_toward_observations_and_the_suffix_arm_decision_thresholds_hold() {
         let mut e = AcceptEma::new(0.5, 2.0);
         assert!((e.value() - 2.0).abs() < 1e-12);
         e.observe(4);
         assert!((e.value() - 3.0).abs() < 1e-12);
         e.observe(0);
         assert!((e.value() - 1.5).abs() < 1e-12);
-    }
-
-    #[test]
-    fn suffix_arm_decision_thresholds() {
         assert!(suffix_arm_wins(3, 2, 5, 2.5));
         assert!(!suffix_arm_wins(2, 2, 5, 2.5));
         assert!(!suffix_arm_wins(8, 4, 3, 1.0));
         assert!(suffix_arm_wins(1, 1, 1, 1.0));
     }
+
 }

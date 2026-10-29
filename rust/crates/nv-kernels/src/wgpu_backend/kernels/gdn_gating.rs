@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 #[cfg(test)]
 use crate::wgpu_backend::WgpuError;
@@ -177,21 +175,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shape_mismatch_is_reported() {
-        assert_eq!(check_shapes(16, 16, 4, 4, 16, 16, 4, 4).unwrap(), 16);
-        let e = check_shapes(15, 16, 4, 4, 16, 16, 4, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-        let e = check_shapes(16, 16, 3, 4, 16, 16, 4, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-        let e = check_shapes(16, 16, 4, 4, 16, 12, 4, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn widen_zero_extends() {
-        assert_eq!(
-            widen(&[0xbf80u16, 0x0000, 0xffff]),
-            vec![0xbf80u32, 0, 0xffff]
-        );
+    fn shape_mismatch_is_reported_and_widen_zero_extends() {
+        {
+            assert_eq!(check_shapes(16, 16, 4, 4, 16, 16, 4, 4).unwrap(), 16);
+            let e = check_shapes(15, 16, 4, 4, 16, 16, 4, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+            let e = check_shapes(16, 16, 3, 4, 16, 16, 4, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+            let e = check_shapes(16, 16, 4, 4, 16, 12, 4, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            assert_eq!(
+                widen(&[0xbf80u16, 0x0000, 0xffff]),
+                vec![0xbf80u32, 0, 0xffff]
+            );
+        }
     }
 }

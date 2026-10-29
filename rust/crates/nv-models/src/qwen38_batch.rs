@@ -1,8 +1,14 @@
 use super::*;
 use crate::gemma4_batch_graph::BucketPlan;
+use anyhow::{bail, ensure};
+use candle_core::op::BackpropOp;
+use candle_core::{CudaStorage, Storage};
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use half::bf16;
 use nv_kernels::graph::CudaGraphRunner;
+use std::collections::HashSet;
+use std::env;
+use std::sync::Once;
 
 pub fn nv_q38_batch_env_opt_in_nv_q38_batch_1_the_serving_loop_routes_batch_xor_spec_per_request_group(
 ) -> bool {
@@ -28,7 +34,7 @@ pub const A_PADDED_LANE_IS_CLOBBERED_AND_MUST_REPREFILL_BEFORE_REUSE_BECAUSE_THE
 pub fn rowwise_group_env_nv_q38_batch_rowwise_per_row_m1_twins_set_ffn_for_bit_exactness_because_the_nvfp4_mlp_m_row_route_is_the_sole_non_twin(
     g: &str,
 ) -> bool {
-    std::env::var("NV_Q38_BATCH_ROWWISE")
+    env::var("NV_Q38_BATCH_ROWWISE")
         .map(|v| v.split(',').any(|t| t.trim() == g || t.trim() == "all"))
         .unwrap_or(false)
 }
@@ -70,7 +76,7 @@ pub fn null_stage_probe_env_nv_q38_null_stage_replaces_every_launch_a_named_stag
 ) -> bool {
     static NULLED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     let set = NULLED.get_or_init(|| {
-        let raw = std::env::var("NV_Q38_NULL_STAGE").unwrap_or_default();
+        let raw = env::var("NV_Q38_NULL_STAGE").unwrap_or_default();
         let v: Vec<String> = raw
             .split(',')
             .map(|t| t.trim().to_string())
@@ -92,11 +98,10 @@ fn one_zeroing_node_where_a_stages_launches_were(
     dims: (usize, usize, usize),
 ) -> Result<Tensor> {
     let _ = THE_NULL_NODE_IS_A_ZEROING_ALLOCATION_ISSUED_AT_THE_STAGES_OWN_POINT_IN_THE_CAPTURED_STREAM_SO_STREAM_ORDER_AND_EVERY_DOWNSTREAM_SHAPE_SURVIVE_WHILE_THE_STAGES_KERNELS_AND_ITS_GRAPH_NODES_BOTH_LEAVE;
-    let dev = match like.device() {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("NV_Q38_NULL_STAGE requires CUDA"),
+    let Device::Cuda(dev) = like.device().clone() else {
+        bail!("NV_Q38_NULL_STAGE requires CUDA")
     };
-    anyhow::ensure!(
+    ensure!(
         like.dtype() == DType::BF16,
         "NV_Q38_NULL_STAGE emits bf16 zeros and this stage's neighbour is {:?}; a null whose dtype \
          differs would add or remove a cast the real stage never ran and price it as the stage",
@@ -107,11 +112,11 @@ fn one_zeroing_node_where_a_stages_launches_were(
     let sl = s
         .alloc_zeros::<bf16>(n)
         .map_err(|e| anyhow::anyhow!("NV_Q38_NULL_STAGE alloc_zeros {n}: {e:?}"))?;
-    let st = candle_core::CudaStorage::wrap_cuda_slice(sl, dev);
+    let st = CudaStorage::wrap_cuda_slice(sl, dev);
     Ok(Tensor::from_storage(
-        candle_core::Storage::Cuda(st),
+        Storage::Cuda(st),
         dims,
-        candle_core::op::BackpropOp::none(),
+        BackpropOp::none(),
         false,
     ))
 }
@@ -143,7 +148,7 @@ pub const THE_FP8_LT_CROSSOVER_IS_A_PROPERTY_OF_WHICHEVER_BF16_ACTIVATION_GEMV_I
      never a cap";
 
 pub fn fp8_lt_mrow_min_lanes_env_override_nv_q38_fp8lt_min_lanes() -> usize {
-    std::env::var("NV_Q38_FP8LT_MIN_LANES")
+    env::var("NV_Q38_FP8LT_MIN_LANES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|m| *m >= 2)
@@ -159,13 +164,6 @@ pub const Q38_BATCH_LANES_ROW_TWIN_CEILING_8_THE_SOLE_M9_TO_16_PROJECTION_ROUTE_
 
 pub const Q38_BATCH_BOOT_HEADROOM_MIN_FREE_BYTES_512MB_BECAUSE_16_LANES_OF_8K_KV_PLUS_GDN_STATE_TAKE_3_4GB_AND_GRAPH_CAPTURE_STILL_NEEDS_POOL_PAGES:
     usize = 512 << 20;
-
-pub fn batch_gemm_fp8lt_subarm_default_on_kill_nv_q38_batch_gemm_fp8lt_0_it_rowquants_activations_to_e4m3_unlike_the_bf16_exact_mk_gemv(
-) -> bool {
-    nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-        "NV_Q38_BATCH_GEMM_FP8LT",
-    )
-}
 
 pub const LANE_CONCURRENT_ATTN_AND_GDN_ARE_BIT_IDENTICAL_TO_THE_SERIAL_LOOP_ONLY_THE_MROW_AB_GEMM_AND_FP8_LT_ROUTES_CHANGE_NUMERIC_ROUTE:
     () = ();
@@ -204,8 +202,7 @@ fn b1_solo_arm_stack_engages_for_this_model(model: &Qwen3Moe) -> bool {
         return false;
     }
     let _ = THE_B1_SOLO_TRUNK_REFUSES_UNDER_ANY_NV_Q38_BATCH_ROWWISE_PIN_FOR_A_REASON_AND_A_DEFECT;
-    if std::env::var("NV_Q38_BATCH_ROWWISE").is_ok()
-        || !nv_q38_fused_qkv_prep_env_kill_switch_nv_q38_fused_qkv_0()
+    if nv_config::env_arm_present_at_all_reread_every_call("NV_Q38_BATCH_ROWWISE")
         || model.dtype() != DType::BF16
         || model.rope.cos().dtype() != DType::F32
     {
@@ -239,7 +236,7 @@ fn lap(prof: &mut BatchProf, label: &'static str) {
 
 pub fn q38_batch_bucket_plan_env_nv_q38_batch_sizes() -> BucketPlan {
     BucketPlan::parse(Some(
-        std::env::var("NV_Q38_BATCH_SIZES")
+        env::var("NV_Q38_BATCH_SIZES")
             .ok()
             .as_deref()
             .unwrap_or(Q38_BATCH_DEFAULT_BUCKETS),
@@ -268,12 +265,12 @@ pub struct Qwen38BatchLanes {
     captures: u64,
     replays: u64,
     buckets_whose_lazy_inits_are_materialized_so_recapture_skips_the_eager_warm_and_lin_state_snapshot:
-        std::collections::HashSet<usize>,
+        HashSet<usize>,
 
     _err_drain: CtxErrDrain,
 }
 
-struct CtxErrDrain(Arc<CudaContext>);
+pub(super) struct CtxErrDrain(pub(super) Arc<CudaContext>);
 
 impl Drop for CtxErrDrain {
     fn drop(&mut self) {
@@ -288,38 +285,32 @@ impl Qwen38BatchLanes {
         max_seq_len: usize,
         plan: BucketPlan,
     ) -> Result<Self> {
-        let dev = match device {
-            Device::Cuda(d) => d.clone(),
-            _ => anyhow::bail!("Qwen38BatchLanes requires a CUDA device"),
+        let Device::Cuda(dev) = device.clone() else {
+            bail!("Qwen38BatchLanes requires a CUDA device")
         };
-        anyhow::ensure!(
+        ensure!(
             model.is_dense(),
             "Qwen38BatchLanes: only the dense trunk batches; MoE routing stays on the solo engine"
         );
-        anyhow::ensure!(
+        ensure!(
             model.dtype() == DType::BF16,
             "Qwen38BatchLanes: trunk dtype must be BF16, got {:?}",
             model.dtype()
         );
-        anyhow::ensure!(
-            nv_q38_fused_qkv_prep_env_kill_switch_nv_q38_fused_qkv_0(),
-            "Qwen38BatchLanes: NV_Q38_FUSED_QKV=0 disables the fused qkv+rope+store decode arm \
-             the per-lane batch attention is built from"
-        );
         let cfg = model.config();
         let hd = cfg.head_dim;
-        anyhow::ensure!(
+        ensure!(
             hd.is_multiple_of(32) && hd <= 1024 && model.rope.cos().dtype() == DType::F32,
             "Qwen38BatchLanes: fused qkv decode geometry contract broken (head_dim {hd})"
         );
         for (li, layer) in model.layers.iter().enumerate() {
-            anyhow::ensure!(
+            ensure!(
                 layer.ffn.as_dense().is_some(),
                 "Qwen38BatchLanes: layer {li} ffn is {}, dense required",
                 layer.ffn.label()
             );
             if let LayerMixer::Linear(la) = &layer.mixer {
-                anyhow::ensure!(
+                ensure!(
                     la.fused_decode_supported(),
                     "Qwen38BatchLanes: layer {li} linear-attn fused decode unsupported; the \
                      non-fused recurrent path is neither capture-safe nor lane-splittable"
@@ -327,12 +318,12 @@ impl Qwen38BatchLanes {
             }
         }
         let b_max = plan.max_bucket();
-        anyhow::ensure!(
+        ensure!(
             b_max <= Q38_BATCH_LANES_MAX_16_MIRRORING_THE_MK_KERNEL_FAMILY_TEMPLATE_ARM_CAP,
             "Qwen38BatchLanes: bucket {b_max} exceeds the m<=16 mk kernel-family template-arm \
              ceiling (gemv_e4m3_mk / gemm_bf16_mk / flash_decode all stop at 16 rows)"
         );
-        anyhow::ensure!(
+        ensure!(
             b_max <= Q38_BATCH_LANES_ROW_TWIN_CEILING_8_THE_SOLE_M9_TO_16_PROJECTION_ROUTE_IS_THE_FP8_LT_ROWQUANT_GEMM_THE_BATCH_GEMM_ARM_OWNS
                 || batch_gemm_env_opt_in_nv_q38_batch_gemm_1_lane_concurrent_attn_gdn_mrow_ab_and_fp8_lt_arms(),
             "Qwen38BatchLanes: bucket {b_max} > 8 requires NV_Q38_BATCH_GEMM=1"
@@ -383,7 +374,7 @@ impl Qwen38BatchLanes {
             .synchronize()
             .map_err(|e| anyhow::anyhow!("sync after alloc: {e:?}"))?;
         if let Ok((free, total)) = cudarc::driver::result::mem_get_info() {
-            anyhow::ensure!(
+            ensure!(
                 free >= Q38_BATCH_BOOT_HEADROOM_MIN_FREE_BYTES_512MB_BECAUSE_16_LANES_OF_8K_KV_PLUS_GDN_STATE_TAKE_3_4GB_AND_GRAPH_CAPTURE_STILL_NEEDS_POOL_PAGES,
                 "Qwen38BatchLanes: {b_max} lanes leave {:.2} GiB of {:.2} GiB free, under the \
                  boot headroom floor",
@@ -416,7 +407,7 @@ impl Qwen38BatchLanes {
             captures: 0,
             replays: 0,
             buckets_whose_lazy_inits_are_materialized_so_recapture_skips_the_eager_warm_and_lin_state_snapshot:
-                std::collections::HashSet::new(),
+                HashSet::new(),
             _err_drain: CtxErrDrain(dev.cuda_stream().context().clone()),
         };
         built.boot_warm_every_bucket_on_garbage_states_then_reset_so_serving_groups_capture_without_the_eager_warm_pass()?;
@@ -428,9 +419,6 @@ impl Qwen38BatchLanes {
     ) -> Result<()> {
         if !self.capture_supported
             || nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_OFF")
-            || !nv_config::env_arm_opt_out_default_on_unless_eq_some_0_reread_every_call(
-                "NV_Q38_BATCH_BOOT_WARM",
-            )
         {
             return Ok(());
         }
@@ -490,7 +478,7 @@ impl Qwen38BatchLanes {
     }
 
     pub fn reset_lane(&mut self, lane: usize) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             lane < self.caches.len(),
             "reset_lane: lane {lane} out of range"
         );
@@ -541,8 +529,8 @@ impl Qwen38BatchLanes {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
             let (ls, ll) = last.storage_and_layout();
             let lcuda = match &*ls {
-                candle_core::Storage::Cuda(c) => c,
-                _ => anyhow::bail!("prefill logits must be on CUDA"),
+                Storage::Cuda(c) => c,
+                _ => bail!("prefill logits must be on CUDA"),
             };
             let lsl = lcuda.as_cuda_slice::<f32>()?;
             let view = lsl.slice(ll.start_offset()..);
@@ -562,7 +550,7 @@ impl Qwen38BatchLanes {
                     op as *mut u32,
                 )
             };
-            anyhow::ensure!(rc == 0, "prefill argmax_f32_rows rc={rc}");
+            ensure!(rc == 0, "prefill argmax_f32_rows rc={rc}");
         }
         let host: Vec<u32> = self
             .stream
@@ -576,20 +564,20 @@ impl Qwen38BatchLanes {
         lane: usize,
         prompt: &[u32],
     ) -> Result<Tensor> {
-        anyhow::ensure!(!prompt.is_empty(), "prefill_lane: empty prompt");
-        anyhow::ensure!(
+        ensure!(!prompt.is_empty(), "prefill_lane: empty prompt");
+        ensure!(
             lane < self.caches.len(),
             "prefill_lane: lane {lane} out of range"
         );
         self.invalidate_graphs_synced_because_eager_work_after_capture_faults_like_the_solo_engines_prefill()?;
         self.reset_lane(lane)?;
         let seq = prompt.len();
-        anyhow::ensure!(
+        ensure!(
             seq < self.caches[lane].max_seq_len(),
             "prefill_lane: {seq} tokens leave no decode slot in max_seq_len {}",
             self.caches[lane].max_seq_len()
         );
-        let chunk_raw = std::env::var(NV_Q38_PREFILL_CHUNK_ENV_DEFAULT_4096_SET_0_FOR_THE_ONE_SHOT_FORWARD_WHOSE_TRANSIENTS_MEASURED_0_21_MIB_PER_TOKEN).ok();
+        let chunk_raw = env::var(NV_Q38_PREFILL_CHUNK_ENV_DEFAULT_4096_SET_0_FOR_THE_ONE_SHOT_FORWARD_WHOSE_TRANSIENTS_MEASURED_0_21_MIB_PER_TOKEN).ok();
         nv_layers::linear::nvfp4_cfx_set_prefill_total_tokens_hint(seq);
         let logits = match batch_prefill_chunk_tokens_explicit_setting_preserves_unset_one_shot(
             chunk_raw.as_deref(),
@@ -630,13 +618,13 @@ impl Qwen38BatchLanes {
         k_chunk: &Tensor,
         v_chunk: &Tensor,
     ) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             lane < self.caches.len(),
             "prime_lane: lane {lane} out of range"
         );
         let t = k_chunk.dims().get(1).copied().unwrap_or(0);
         let pos = self.lane_pos[lane];
-        anyhow::ensure!(
+        ensure!(
             pos + t <= self.caches[lane].max_seq_len(),
             "prime_lane: {pos} + {t} exceeds max_seq_len {}",
             self.caches[lane].max_seq_len()
@@ -656,33 +644,33 @@ impl Qwen38BatchLanes {
         let () = PACKED_FORMATION_PREFILL_IS_ONE_WIDE_CALL_BECAUSE_CHAT_PREFILL_IS_PER_CALL_WEIGHT_TRAFFIC_BOUND_29_9MS_AT_20_TOKENS_73MS_AT_320_SO_N_SERIAL_CALLS_PAY_THE_WEIGHTS_N_TIMES;
         let () = PACKED_PREFILL_FFN_NORMS_AND_HEAD_RIDE_THE_PACKED_ROWS_SO_THEIR_BYTES_ARE_M_ROW_CLASS_WHILE_EACH_MIXER_SEGMENT_RUNS_THE_SOLO_PREFILL_ROUTE_ON_ITS_OWN_LANE_CACHE;
         let () = DEVICE_ARGMAX_IS_BYTE_EXACT_VS_HOST_SAMPLING_BECAUSE_BF16_TO_F32_WIDENS_EXACTLY_AND_ARGMAX_F32_ROWS_SKIPS_NONFINITE_AND_BREAKS_TIES_LOWEST_INDEX_LIKE_ARGMAX_CHECKED;
-        anyhow::ensure!(
+        ensure!(
             form_pack_env_opt_in_nv_q38_form_pack_1_packed_formation_prefill_rides_the_m_row_gemm_routes_so_it_requires_nv_q38_batch_gemm_1(),
             "packed prefill: NV_Q38_FORM_PACK=1 plus NV_Q38_BATCH_GEMM=1 are required; without \
              the GEMM arm the batch route is byte-gated and packed rows are m-row class"
         );
-        anyhow::ensure!(!joins.is_empty(), "packed prefill: no lanes");
+        ensure!(!joins.is_empty(), "packed prefill: no lanes");
         let b = joins.len();
-        anyhow::ensure!(
+        ensure!(
             b <= self.caches.len(),
             "packed prefill: {b} joins but only {} lanes",
             self.caches.len()
         );
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for &(lane, prompt) in joins {
-            anyhow::ensure!(
+            ensure!(
                 lane < self.caches.len(),
                 "packed prefill: lane {lane} out of range"
             );
-            anyhow::ensure!(
+            ensure!(
                 seen.insert(lane),
                 "packed prefill: lane {lane} joined twice"
             );
-            anyhow::ensure!(
+            ensure!(
                 !prompt.is_empty(),
                 "packed prefill: empty prompt on lane {lane}"
             );
-            anyhow::ensure!(
+            ensure!(
                 prompt.len() < self.caches[lane].max_seq_len(),
                 "packed prefill: {} tokens leave no decode slot in max_seq_len {}",
                 prompt.len(),
@@ -794,8 +782,8 @@ impl Qwen38BatchLanes {
             use cudarc::driver::{DevicePtr, DevicePtrMut};
             let (ls, ll) = lc.storage_and_layout();
             let lcuda = match &*ls {
-                candle_core::Storage::Cuda(c) => c,
-                _ => anyhow::bail!("packed prefill logits must be on CUDA"),
+                Storage::Cuda(c) => c,
+                _ => bail!("packed prefill logits must be on CUDA"),
             };
             let lsl = lcuda.as_cuda_slice::<f32>()?;
             let view = lsl.slice(ll.start_offset()..);
@@ -814,7 +802,7 @@ impl Qwen38BatchLanes {
                     op as *mut u32,
                 )
             };
-            anyhow::ensure!(rc == 0, "packed prefill argmax_f32_rows rc={rc}");
+            ensure!(rc == 0, "packed prefill argmax_f32_rows rc={rc}");
         }
         for (j, &(lane, _)) in joins.iter().enumerate() {
             let (_, len) = segs[j];
@@ -904,14 +892,14 @@ impl Qwen38BatchLanes {
     }
 
     fn step_batch_enqueue_common(&mut self, tokens: &[Option<u32>]) -> Result<usize> {
-        anyhow::ensure!(!tokens.is_empty(), "step_batch: empty step");
-        anyhow::ensure!(
+        ensure!(!tokens.is_empty(), "step_batch: empty step");
+        ensure!(
             tokens.len() <= self.caches.len(),
             "step_batch: {} rows but only {} lanes",
             tokens.len(),
             self.caches.len()
         );
-        anyhow::ensure!(
+        ensure!(
             tokens.iter().any(|t| t.is_some()),
             "step_batch: all rows padded; nothing to decode"
         );
@@ -928,7 +916,7 @@ impl Qwen38BatchLanes {
         })?;
         for (i, t) in tokens.iter().enumerate() {
             if t.is_some() {
-                anyhow::ensure!(
+                ensure!(
                     self.lane_pos[i] < self.caches[i].max_seq_len(),
                     "step_batch: lane {i} cache full at {}",
                     self.lane_pos[i]
@@ -1100,9 +1088,8 @@ impl Qwen38BatchLanes {
     }
 
     fn step_batch_captured(&mut self, b_bucket: usize) -> Result<bool> {
-        let dev = match &self.device {
-            Device::Cuda(d) => d.clone(),
-            _ => unreachable!(),
+        let Device::Cuda(dev) = self.device.clone() else {
+            unreachable!()
         };
         let key =
             Q38_BATCH_GRAPH_SHAPE_TOKEN_BASE_KEEPS_SOLO_KEY_1_AND_VERIFY_BASE_0X51000_UNTOUCHED
@@ -1192,10 +1179,7 @@ impl Drop for Qwen38BatchLanes {
     }
 }
 
-fn disable_event_tracking_at_first_capture(dev: &candle_core::CudaDevice) {
-    if nv_config::env_arm_opt_in_eq_some_1_reread_every_call("NV_GRAPH_KEEP_EVENT_TRACKING") {
-        return;
-    }
+pub(super) fn disable_event_tracking_at_first_capture(dev: &candle_core::CudaDevice) {
     let stream = dev.cuda_stream();
     if !stream.context().is_event_tracking() {
         return;
@@ -1206,13 +1190,12 @@ fn disable_event_tracking_at_first_capture(dev: &candle_core::CudaDevice) {
     );
 }
 
-struct ArgmaxScratch<'a> {
-    val: &'a mut CudaSlice<f32>,
-    idx: &'a mut CudaSlice<i32>,
-    out: &'a mut CudaSlice<u32>,
+pub(super) struct ArgmaxScratch<'a> {
+    pub(super) val: &'a mut CudaSlice<f32>,
+    pub(super) idx: &'a mut CudaSlice<i32>,
+    pub(super) out: &'a mut CudaSlice<u32>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_batch_step_body(
     s: &Arc<CudaStream>,
     model: &Qwen3Moe,
@@ -1254,8 +1237,8 @@ fn copy_logits_then_device_argmax_rows(
     let lc = logits.to_dtype(DType::F32)?.contiguous()?;
     let (ls, ll) = lc.storage_and_layout();
     let lcuda = match &*ls {
-        candle_core::Storage::Cuda(c) => c,
-        _ => anyhow::bail!("batch logits must be on CUDA"),
+        Storage::Cuda(c) => c,
+        _ => bail!("batch logits must be on CUDA"),
     };
     let lsl = lcuda.as_cuda_slice::<f32>()?;
     let n = b * vocab;
@@ -1280,11 +1263,10 @@ fn copy_logits_then_device_argmax_rows(
             op as *mut u32,
         )
     };
-    anyhow::ensure!(rc == 0, "argmax_f32_rows rc={rc}");
+    ensure!(rc == 0, "argmax_f32_rows rc={rc}");
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn batch_step_body_inner(
     s: &Arc<CudaStream>,
     model: &Qwen3Moe,
@@ -1299,9 +1281,8 @@ fn batch_step_body_inner(
     lane_streams: &[Arc<CudaStream>],
 ) -> Result<()> {
     let _batch_e4m3_group_scope = nv_layers::linear::Qwen38BatchE4m3GroupScopeGuard::enter(b);
-    let dev = match &model.device {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("cuda device required"),
+    let Device::Cuda(dev) = model.device.clone() else {
+        bail!("cuda device required")
     };
     {
         let mut dst = token_buf.slice_mut(0..b);
@@ -1313,17 +1294,11 @@ fn batch_step_body_inner(
         cache.prepare_for_step(wp as usize, nt as usize)?;
     }
 
-    let mut tok_b = unsafe { s.alloc::<u32>(b).map_err(|e| anyhow::anyhow!(e))? };
-    s.memcpy_dtod(&token_buf.slice(0..b), &mut tok_b)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let mut tok_b = unsafe { s.alloc::<u32>(b)? };
+    s.memcpy_dtod(&token_buf.slice(0..b), &mut tok_b)?;
     let tokens_t = {
-        let st = candle_core::CudaStorage::wrap_cuda_slice(tok_b, dev.clone());
-        Tensor::from_storage(
-            candle_core::Storage::Cuda(st),
-            (b,),
-            candle_core::op::BackpropOp::none(),
-            false,
-        )
+        let st = CudaStorage::wrap_cuda_slice(tok_b, dev.clone());
+        Tensor::from_storage(Storage::Cuda(st), (b,), BackpropOp::none(), false)
     };
 
     let mut prof: BatchProf = nv_layers::linear_attn::gdn_step_prof::SyncLaps::begin_if_armed(&dev);
@@ -1337,9 +1312,7 @@ fn batch_step_body_inner(
         None
     };
     let _fp8_lt_mrow_scope = nv_layers::linear::VerifyTcFp8LtGemmScopeGuard::enter_if(
-        gemm_arm
-            && batch_gemm_fp8lt_subarm_default_on_kill_nv_q38_batch_gemm_fp8lt_0_it_rowquants_activations_to_e4m3_unlike_the_bf16_exact_mk_gemv()
-            && b >= fp8_lt_mrow_min_lanes_env_override_nv_q38_fp8lt_min_lanes(),
+        gemm_arm && b >= fp8_lt_mrow_min_lanes_env_override_nv_q38_fp8lt_min_lanes(),
     );
 
     let hidden_size = model.config().hidden_size;
@@ -1358,7 +1331,7 @@ fn batch_step_body_inner(
     if b == 1 && b1_solo_arm_stack_engages_for_this_model(model) {
         let () = B1_SOLO_TRUNK_TAKES_A_STABLE_ZERO_POSITIONS_TENSOR_AND_A_CAPTURE_TIME_WRITE_START_BECAUSE_THE_M1_FUSED_QKV_ROPE_STORE_ARM_READS_ITS_ROPE_POSITION_FROM_THE_DEVICE_WRITE_POS_BUFFER_THAT_PREPARE_FOR_STEP_REFRESHES_BEFORE_EVERY_REPLAY;
         let () = THE_M1_FUSED_DECODE_STACK_IS_SHAPE_GATED_TO_ONE_BY_ONE_BY_HIDDEN_SO_A_B_ROW_GROUP_REACHES_IT_ONLY_BY_LOOPING_B_TIMES_AND_ROUND_22_PRICED_THAT_LOOP_AT_223US_AT_M1_378_AT_M2_AND_2974_AT_M16_AGAINST_A_FLAT_256_286US_TILE;
-        static ONCE: std::sync::Once = std::sync::Once::new();
+        static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             eprintln!(
                 "[qwen38_batch] NV_Q38_BATCH_SOLO_ARMS b=1 step routed through the m1 fused \
@@ -1487,7 +1460,7 @@ fn batch_step_body_inner(
     copy_logits_then_device_argmax_rows(s, &logits, logits_buf, amax, vocab, b)
 }
 
-fn proj_rows(lin: &Linear, x: &Tensor, b: usize) -> Result<Tensor> {
+pub(super) fn proj_rows(lin: &Linear, x: &Tensor, b: usize) -> Result<Tensor> {
     let mut rows = Vec::with_capacity(b);
     for i in 0..b {
         rows.push(lin.forward(&x.narrow(1, i, 1)?.contiguous()?)?);
@@ -1518,7 +1491,6 @@ fn join_lanes(main: &Arc<CudaStream>, lanes: &[Arc<CudaStream>]) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn batch_full_attention(
     model: &Qwen3Moe,
     attn: &AttentionLayer,
@@ -1555,7 +1527,7 @@ fn batch_full_attention(
         )
     };
     lap(prof, "b.attn.qkv_proj");
-    anyhow::ensure!(
+    ensure!(
         q_raw.dtype() == DType::BF16
             && k_raw.dtype() == DType::BF16
             && v_raw.dtype() == DType::BF16,
@@ -1565,9 +1537,8 @@ fn batch_full_attention(
     let n_heads = attn.n_heads;
     let hd = attn.head_dim;
     let scaling = 1.0 / (hd as f32).sqrt();
-    let dev = match &model.device {
-        Device::Cuda(d) => d.clone(),
-        _ => anyhow::bail!("batch_full_attention requires CUDA"),
+    let Device::Cuda(dev) = model.device.clone() else {
+        bail!("batch_full_attention requires CUDA")
     };
     let main = nv_layers::cuda_stream::current_stream(&dev);
     let conc = lanes_conc.filter(|ls| b > 1 && ls.len() >= b);
@@ -1624,7 +1595,6 @@ fn batch_full_attention(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn batch_full_attention_lanes_concurrent(
     model: &Qwen3Moe,
     attn: &AttentionLayer,
@@ -1643,9 +1613,8 @@ fn batch_full_attention_lanes_concurrent(
     let hd = attn.head_dim;
     let hh = n_heads * hd;
     let scaling = 1.0 / (hd as f32).sqrt();
-    let dev = match &model.device {
-        Device::Cuda(d) => d.clone(),
-        _ => unreachable!(),
+    let Device::Cuda(dev) = model.device.clone() else {
+        unreachable!()
     };
     let mut out_all = unsafe {
         main.alloc::<bf16>(b * hh)
@@ -1660,7 +1629,7 @@ fn batch_full_attention_lanes_concurrent(
         None
     };
     let lanes_for_the_attention_split_pick = if attn_lane_split_env_opt_in_nv_q38_attn_lane_split_1_the_split_pick_divides_the_one_lane_rung_by_the_lane_group_width() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
+        static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             eprintln!(
                 "[qwen38_batch] NV_Q38_ATTN_LANE_SPLIT active: {} lanes in flight take split rung \
@@ -1714,8 +1683,8 @@ fn batch_full_attention_lanes_concurrent(
                 let c = src.contiguous()?;
                 let (st, l) = c.storage_and_layout();
                 let cu = match &*st {
-                    candle_core::Storage::Cuda(x) => x,
-                    _ => anyhow::bail!("lane output must be CUDA"),
+                    Storage::Cuda(x) => x,
+                    _ => bail!("lane output must be CUDA"),
                 };
                 let sl = cu.as_cuda_slice::<bf16>()?;
                 let view = sl.slice(l.start_offset()..);
@@ -1734,7 +1703,7 @@ fn batch_full_attention_lanes_concurrent(
                         (i * hh) as i64,
                     )
                 };
-                anyhow::ensure!(rc == 0, "copy_cols_bf16 rc={rc}");
+                ensure!(rc == 0, "copy_cols_bf16 rc={rc}");
                 Ok(())
             };
             copy_into(
@@ -1744,7 +1713,7 @@ fn batch_full_attention_lanes_concurrent(
             match (q_sig.as_ref(), sig_all.as_mut()) {
                 (Some(sig), Some(sa)) => copy_into(sig, sa)?,
                 (None, None) => {}
-                _ => anyhow::bail!(
+                _ => bail!(
                     "batch_full_attention_lanes_concurrent: q_sig presence disagrees with \
                      attn_output_gate"
                 ),
@@ -1754,22 +1723,22 @@ fn batch_full_attention_lanes_concurrent(
     }
     join_lanes(main, ls)?;
     let out_t = {
-        let storage = candle_core::CudaStorage::wrap_cuda_slice(out_all, dev.clone());
+        let storage = CudaStorage::wrap_cuda_slice(out_all, dev.clone());
         Tensor::from_storage(
-            candle_core::Storage::Cuda(storage),
+            Storage::Cuda(storage),
             (1usize, b, hh),
-            candle_core::op::BackpropOp::none(),
+            BackpropOp::none(),
             false,
         )
     };
     match sig_all {
         Some(sa) => {
             let sig_t = {
-                let storage = candle_core::CudaStorage::wrap_cuda_slice(sa, dev);
+                let storage = CudaStorage::wrap_cuda_slice(sa, dev);
                 Tensor::from_storage(
-                    candle_core::Storage::Cuda(storage),
+                    Storage::Cuda(storage),
                     (1usize, b, hh),
-                    candle_core::op::BackpropOp::none(),
+                    BackpropOp::none(),
                     false,
                 )
             };
@@ -1779,7 +1748,6 @@ fn batch_full_attention_lanes_concurrent(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn batch_gdn(
     la: &LinearAttention,
     li: usize,
@@ -1806,7 +1774,7 @@ fn batch_gdn(
             let slot = slot_of(cache)?;
             match cache.lin_attn_states[slot].as_ref() {
                 Some(st) if st.is_fused() => states.push(st),
-                _ => anyhow::bail!(
+                _ => bail!(
                     "batch_gdn: lane state for layer {li} is not fused; \
                      ensure_all_lane_lin_states_fused must run before any batch step"
                 ),
@@ -1856,9 +1824,9 @@ mod batch_prefill_chunk_policy_tests {
         ] {
             assert_eq!(chunk(raw, 168000), None, "raw={raw:?}");
         }
+        explicit_positive_chunk_only_changes_prompts_crossing_its_boundary();
     }
 
-    #[test]
     fn explicit_positive_chunk_only_changes_prompts_crossing_its_boundary() {
         for tokens in [0, 1, 4095, 4096] {
             assert_eq!(chunk(Some("4096"), tokens), None);

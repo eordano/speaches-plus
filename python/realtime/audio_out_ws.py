@@ -163,14 +163,6 @@ class AudioPacer:
     webrtc: object | None = None
     websocket: WsAudioPacer | None = None
 
-    @classmethod
-    def from_webrtc(cls, p) -> "AudioPacer":
-        return cls(webrtc=p)
-
-    @classmethod
-    def from_websocket(cls, p: WsAudioPacer) -> "AudioPacer":
-        return cls(websocket=p)
-
     async def play(self, audio_24k_samples) -> None:
         if self.webrtc is not None:
             await self.webrtc.play(audio_24k_samples)

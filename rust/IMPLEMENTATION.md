@@ -1,7 +1,7 @@
 # Implementation notes
 
 Source files are comment-free repo-wide (`scripts/strip-comments.py`
-is the canonical formatter); for the realtime lane, the *why* behind
+is the canonical formatter); for the realtime lane, the why behind
 subtle decisions, the spec references, and the constraints invisible
 from the code alone live here. Spec references are to
 `docs/book/07.1-barge-turn-spec-rfc-v3.md` (RFC v3) unless noted; the
@@ -114,7 +114,7 @@ smart-turn constants live in `defaults.rs`, `eou/mod.rs`, `eou/audio.rs`.
   | `vad` / `audio` / `stt` / `kokoro` | implementation internals (sample rates, frame sizes, model hyperparameters) |
   | `env` | environment-variable names; consumers reference these symbols, so a rename touches one line |
 
-- **No source-level comments**; explanations live here. (The old
+- No source-level comments; explanations live here. (The old
   in-process conformance bridge `tests/conformance.rs` was culled in
   `431c0d5fb` -- see §15.6 below.)
 
@@ -171,8 +171,8 @@ Live and tested:
   `input_features`; output `logits` is one scalar of RAW logits -- apply
   sigmoid. Preprocessing in `eou/audio.rs`: take the last
   `eou.audio_window_ms` of buffered 16 kHz mono f32; clamp to `[-1, 1]`;
-  if shorter than 8 s, **zero-pad on the left** so the audio sits at the
-  *end* of the window (`eou.audio_pad_alignment = leading`, smart-turn's
+  if shorter than 8 s, zero-pad on the left so the audio sits at the
+  end of the window (`eou.audio_pad_alignment = leading`, smart-turn's
   required alignment); reflect-padded STFT (`n_fft = 400`, `hop = 160`,
   Hann) -> 80-bin mel -> `log10(max(mel, 1e-10))` clipped to `max - 8`
   -> `(x + 4) / 4` (standard whisper normalisation). Session behind
@@ -210,7 +210,7 @@ Live and tested:
   re-entry restarts naturally.
 - §7.1 commit -- buffer rotates to a `SealedBuffer` and
   `conversation.item.created` is emitted; rejected commits below
-  `min_speech_ms` emit `input_audio_buffer.speech_stopped` *before* the
+  `min_speech_ms` emit `input_audio_buffer.speech_stopped` before the
   error (matches the §004-backchannel fixture) and restore
   `Stopped -> Silent`.
 - §7.2 `conversation.item.input_audio_transcription.failed` on STT
@@ -401,16 +401,16 @@ ConversationItem { id, role: User|Assistant|System, status: InProgress|Completed
 
 Append points:
 
-- **Commit (`commit_after_eou`)**: append `UserAudio { InProgress }`
+- Commit (`commit_after_eou`): append `UserAudio { InProgress }`
   alongside `conversation.item.created`. The append happens here, not
   on `vad.speech_stopped`, so a cancelled commit timer leaves no
   phantom `in_progress` entries (§I6).
-- **STT completion (`process_utterance`)**: mutate user item to
+- STT completion (`process_utterance`): mutate user item to
   `Completed`, fill `transcript`, alongside
   `conversation.item.input_audio_transcription.completed`.
-- **Response success (`run_response`)**: append `AssistantAudio` with
+- Response success (`run_response`): append `AssistantAudio` with
   full transcript and `played_ms` snapshot.
-- **Inbound `conversation.item.create`**: append `Text` (defaults to
+- Inbound `conversation.item.create`: append `Text` (defaults to
   `Completed`); delete / truncate as in the table above.
 
 ## Barge-in
@@ -561,7 +561,6 @@ the transition (I9), so the wire sees the same `response_id` on
 |---|---|---|
 | `vad.speech_started` re-enters during Predicted | `speech_resumed` | `handle_vad_event` |
 | `response.cancel` during Predicted | `cancel_event` | `handle_response_cancel` |
-| `EouKind::Integrated` turn resumes | `turn_resumed` | `handle_stt_turn_resumed` |
 | Token buffer exceeds cap | `predicted_overflow` (preceded by `EouPredictedOverflow`) | `commit_after_eou` |
 
 Rollback aborts both runners (`PredictedRunner::task.abort()`,
@@ -582,7 +581,7 @@ compare at the promotion seam.
 ## Hard-cap race (§6.3)
 
 `eou::race_hard_cap(deadline, future)` is the §6.3 mandatory-pattern
-helper: a deadline derived **once** at `vad.speech_stopped` is observed
+helper: a deadline derived once at `vad.speech_stopped` is observed
 twice -- while EOU is computing, then again while the verdict-derived
 `delay_ms` sleeps (`tokio::select!` of `sleep_until(hard_cap_deadline)`
 against each). Both observations bias toward the deadline arm so a
@@ -654,7 +653,7 @@ fixed-delay, so a slow encode doesn't compound slip into later frames.
 
 `OutboundPacer::played_ms` is an `Arc<AtomicU64>`.
 
-- **Bump after `write_sample` returns, not before** -- an abort landing
+- Bump after `write_sample` returns, not before -- an abort landing
   mid-frame must not count that frame as drained.
 - **`Ordering::Release` on the writer; `Acquire` at the cancel snapshot
   site.** `cancel_current_response` reads `played_ms` inside the same
@@ -695,12 +694,12 @@ status_details.reason="client_too_slow")`.
 
 ### Failure -> terminate (§4.4, §9.6)
 
-- **§9.6 invariant violation** -- `state::check_state` returning `Err`
+- §9.6 invariant violation -- `state::check_state` returning `Err`
   emits `InvariantViolation` and spawns `terminate_with_error` with
   `INTERNAL_STATE_ERROR`. Detection runs synchronously under the mutex;
   termination is spawned so `pc.close().await` never runs with the lock
   held.
-- **§4.4 VAD failure** -- `vad_supervisor_step` counts consecutive ONNX
+- §4.4 VAD failure -- `vad_supervisor_step` counts consecutive ONNX
   errors; at `defaults::vad::FAILURE_THRESHOLD = 3` it emits
   `VadEvent::Failed { reason }`; the handler emits `VadFailed` then
   `terminate_with_error` with `VAD_FAILED`. `vad_supervisor_step` is a
@@ -879,7 +878,7 @@ SDK client without translation:
 - `POST /v1/audio/speech` -- `src/tts/http.rs`. JSON body,
   Kokoro synthesis chunked through ffmpeg per format. Matches Python
   speaches except one deliberate divergence: out-of-range `speed`
-  returns **400** with an OpenAI error envelope, where speaches
+  returns 400 with an OpenAI error envelope, where speaches
   validates inside the streaming generator and returns 200 + zero
   bytes -- we fail loudly so SDK callers see the mistake. The chunker,
   emoji/markdown stripper, and f32->s16 helpers live in
@@ -973,7 +972,7 @@ disconnect.
 ### `WsAudioIngest` resampler carry state
 
 In `realtime/audio_in_ws.rs`, `src_position` and `last_sample` carry
-**across** `append` events so chunk boundaries don't click
+across `append` events so chunk boundaries don't click
 mid-utterance. Fuzz-asserted invariants:
 
 - Constructor and `ingest_b64` never panic -- `Err` on malformed input

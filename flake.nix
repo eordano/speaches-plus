@@ -29,13 +29,20 @@
           crateDirs = nixpkgs.lib.attrNames (
             nixpkgs.lib.filterAttrs (_: type: type == "directory") (builtins.readDir ./rust/crates)
           );
+          declaresExampleTargets =
+            crate:
+            nixpkgs.lib.hasInfix "[[example]]" (builtins.readFile (./rust/crates + "/${crate}/Cargo.toml"));
           crateNonBuildTrees = fs.unions (
             nixpkgs.lib.concatMap (
               crate:
-              map (dir: fs.maybeMissing (./rust/crates + "/${crate}/${dir}")) [
-                "tests"
-                "benches"
-              ]
+              map (dir: fs.maybeMissing (./rust/crates + "/${crate}/${dir}")) (
+                [
+                  "tests"
+                  "benches"
+                  "hip"
+                ]
+                ++ nixpkgs.lib.optional (!declaresExampleTargets crate) "examples"
+              )
             ) crateDirs
           );
           crateNotes = fs.fileFilter (
@@ -45,16 +52,24 @@
         in
         fs.toSource {
           root = ./rust;
-          fileset = fs.difference (fs.unions [
-            ./rust/Cargo.toml
-            ./rust/Cargo.lock
-            ./rust/build.rs
-            ./rust/.cargo
-            ./rust/src
-            ./rust/crates
-            (fs.fileFilter (file: !file.hasExt "npy") ./rust/voices)
-            ./rust/static
-          ]) (fs.difference (fs.unions [ crateNonBuildTrees crateNotes ]) buildTimeFixtures);
+          fileset =
+            fs.difference
+              (fs.unions [
+                ./rust/Cargo.toml
+                ./rust/Cargo.lock
+                ./rust/build.rs
+                ./rust/.cargo
+                ./rust/src
+                ./rust/crates
+                (fs.fileFilter (file: !file.hasExt "npy") ./rust/voices)
+                ./rust/static
+              ])
+              (
+                fs.difference (fs.unions [
+                  crateNonBuildTrees
+                  crateNotes
+                ]) buildTimeFixtures
+              );
         };
 
       cudaCapabilities = [
@@ -62,36 +77,33 @@
         "12.0"
       ];
 
+      skipPy =
+        pkg:
+        pkg.overridePythonAttrs (_: {
+          doCheck = false;
+          doInstallCheck = false;
+        });
+      disablePy =
+        tests: pkg:
+        pkg.overridePythonAttrs (old: {
+          disabledTests = (old.disabledTests or [ ]) ++ tests;
+        });
+
       unbreakDlinfoOverlay = _final: prev: {
-        python3Packages = prev.python3Packages.override {
+        python314Packages = prev.python314Packages.override {
           overrides =
             _pyFinal: pyPrev:
             {
-              dlinfo = pyPrev.dlinfo.overridePythonAttrs (_: {
+              dlinfo = (skipPy pyPrev.dlinfo).overridePythonAttrs (_: {
                 meta.broken = false;
-                doCheck = false;
-                doInstallCheck = false;
               });
             }
             // nixpkgs.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
-              requests-futures = pyPrev.requests-futures.overridePythonAttrs (_: {
-                doCheck = false;
-                doInstallCheck = false;
-              });
-              aiohttp = pyPrev.aiohttp.overridePythonAttrs (_: {
-                doCheck = false;
-                doInstallCheck = false;
-              });
-              geoip2 = pyPrev.geoip2.overridePythonAttrs (_: {
-                doCheck = false;
-                doInstallCheck = false;
-              });
-              pyarrow = pyPrev.pyarrow.overridePythonAttrs (old: {
-                disabledTests = (old.disabledTests or [ ]) ++ [ "test_timezone_absent" ];
-              });
-              httplib2 = pyPrev.httplib2.overridePythonAttrs (old: {
-                disabledTests = (old.disabledTests or [ ]) ++ [ "test_socks5_auth" ];
-              });
+              requests-futures = skipPy pyPrev.requests-futures;
+              aiohttp = skipPy pyPrev.aiohttp;
+              geoip2 = skipPy pyPrev.geoip2;
+              pyarrow = disablePy [ "test_timezone_absent" ] pyPrev.pyarrow;
+              httplib2 = disablePy [ "test_socks5_auth" ] pyPrev.httplib2;
             };
         };
 
@@ -99,30 +111,18 @@
           (prev.pythonPackagesExtensions or [ ])
           ++ nixpkgs.lib.optionals prev.stdenv.hostPlatform.isDarwin [
             (_pyFinal: pyPrev: {
-
-              httpcore2 = pyPrev.httpcore2.overridePythonAttrs (_: {
-                doCheck = false;
-                doInstallCheck = false;
-              });
-
-              httpx2 = pyPrev.httpx2.overridePythonAttrs (_: {
-                doCheck = false;
-                doInstallCheck = false;
-              });
-
-              django = pyPrev.django.overridePythonAttrs (_: {
-                doCheck = false;
-                doInstallCheck = false;
-              });
-
-              google-api-core = pyPrev.google-api-core.overridePythonAttrs (old: {
-                disabledTests = (old.disabledTests or [ ]) ++ [ "test_apply_passthrough" ];
-              });
-
-              nltk = pyPrev.nltk.overridePythonAttrs (_: {
-                doCheck = false;
-                doInstallCheck = false;
-              });
+              httpcore2 = skipPy pyPrev.httpcore2;
+              httpx2 = skipPy pyPrev.httpx2;
+              django = skipPy pyPrev.django;
+              nltk = skipPy pyPrev.nltk;
+              google-api-core = disablePy [ "test_apply_passthrough" ] pyPrev.google-api-core;
+              moto = disablePy [ "test_state_machine_with_parallel_states" ] pyPrev.moto;
+              openai = disablePy [
+                "test_mtls_example_presents_full_client_chain"
+                "test_default_chain_uses_container_credentials"
+                "test_default_chain_uses_ec2_instance_metadata"
+                "test_existing_aiohttp_adapter_is_unchanged_when_installed"
+              ] pyPrev.openai;
             })
           ];
       };
@@ -144,6 +144,22 @@
                 done
               done
             '';
+          });
+        };
+
+      llamaCppNoCheckDarwinOverlay =
+        _final: prev:
+        nixpkgs.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
+          llama-cpp = prev.llama-cpp.overrideAttrs { doCheck = false; };
+        };
+
+      nodejsSlimDarwinOverlay =
+        _final: prev:
+        nixpkgs.lib.optionalAttrs prev.stdenv.hostPlatform.isDarwin {
+          nodejs-slim_26 = (prev.nodejs-slim_26.overrideAttrs { doCheck = false; }).overrideAttrs (old: {
+            outputChecks = builtins.mapAttrs (_: v: v // { disallowedReferences = [ ]; }) (
+              old.outputChecks or { }
+            );
           });
         };
 
@@ -228,8 +244,8 @@
         onnxruntime = prev.onnxruntime.override { ncclSupport = false; };
       };
 
-      mkPkgs =
-        system:
+      mkPkgsWith =
+        cuda: system:
         import nixpkgs {
           inherit system;
           config = {
@@ -237,34 +253,70 @@
             nvidia.acceptLicense = true;
             inherit cudaCapabilities;
             cudaForwardCompat = true;
-          };
+          }
+          // nixpkgs.lib.optionalAttrs cuda { cudaSupport = true; };
           overlays = [
             unbreakDlinfoOverlay
             ffmpegResignOverlay
+            llamaCppNoCheckDarwinOverlay
+            nodejsSlimDarwinOverlay
             arrowCppDarwinOverlay
             cudaSetupHookNvccFixOverlay
-          ];
+          ]
+          ++ nixpkgs.lib.optionals cuda [ onnxruntimeNoNcclOverlay ];
+        };
+      mkPkgs = mkPkgsWith false;
+      mkCudaPkgs = mkPkgsWith true;
+
+      ctranslate2For =
+        pkgs: withCUDA: cudaPackages:
+        if withCUDA then
+          pkgs.ctranslate2.override {
+            inherit cudaPackages;
+            withCUDA = true;
+            withCuDNN = true;
+          }
+        else
+          pkgs.ctranslate2;
+
+      whisperCppFor =
+        pkgs: withCUDA: cudaPackages:
+        if withCUDA then
+          pkgs.whisper-cpp.override {
+            inherit cudaPackages;
+            cudaSupport = true;
+          }
+        else
+          pkgs.whisper-cpp;
+
+      ortLibFor =
+        pkgs:
+        "${pkgs.onnxruntime}/lib/libonnxruntime${
+          if pkgs.stdenv.hostPlatform.isLinux then ".so" else ".dylib"
+        }";
+
+      cutlass44For =
+        pkgs:
+        pkgs.fetchFromGitHub {
+          owner = "NVIDIA";
+          repo = "cutlass";
+          tag = "v4.4.2";
+          hash = "sha256-0q9Ad0Z6E/rO2PdM4uQc8H0E0qs9uKc3reHepiHhjEc=";
         };
 
-      mkCudaPkgs =
-        system:
-        import nixpkgs {
-          inherit system;
-          config = {
-            allowUnfree = true;
-            nvidia.acceptLicense = true;
-            cudaSupport = true;
-            inherit cudaCapabilities;
-            cudaForwardCompat = true;
-          };
-          overlays = [
-            unbreakDlinfoOverlay
-            ffmpegResignOverlay
-            arrowCppDarwinOverlay
-            cudaSetupHookNvccFixOverlay
-            onnxruntimeNoNcclOverlay
-          ];
+      flashinfer064For =
+        pkgs:
+        pkgs.fetchFromGitHub {
+          owner = "flashinfer-ai";
+          repo = "flashinfer";
+          tag = "v0.6.4";
+          fetchSubmodules = true;
+          hash = "sha256-Hq3oTeEJHRvXwThI8vc06E3Ot/FnPP0sZUfze3ISa2o=";
         };
+
+      enumBaseFlags = "-Wno-elaborated-enum-base -Wno-error=elaborated-enum-base";
+
+      profileModels = p: profiles.${p} or (throw "unknown profile: ${p}");
 
       mkModels =
         system:
@@ -305,8 +357,8 @@
         builtins.mapAttrs (name: def: mkModel (def // { gitRepoHash = gitRepoHashes.${name}; })) {
           qwen36-text = {
             url = "RedHatAI/Qwen3.6-35B-A3B-NVFP4";
-            rev = "e850c696e6d75f965367e816c16bc7dacd955ffa";
-            fileTreeHash = "sha256-3boLVG/JJWfX/f7jyd+3AHf718vNElLqRgl+XRa5KQk=";
+            rev = "e94a930c8e9b8a7d3763e449289c261c9c7d3e5e";
+            fileTreeHash = "sha256-cscbYPYWKYpv20WP6hybJ38V/CdicDAOGhgMWLuuRD8=";
             filters.exclude = [
               "model_visual\\.safetensors"
               "model_mtp\\.safetensors"
@@ -316,8 +368,8 @@
 
           qwen36-mm = {
             url = "RedHatAI/Qwen3.6-35B-A3B-NVFP4";
-            rev = "e850c696e6d75f965367e816c16bc7dacd955ffa";
-            fileTreeHash = "sha256-3boLVG/JJWfX/f7jyd+3AHf718vNElLqRgl+XRa5KQk=";
+            rev = "e94a930c8e9b8a7d3763e449289c261c9c7d3e5e";
+            fileTreeHash = "sha256-cscbYPYWKYpv20WP6hybJ38V/CdicDAOGhgMWLuuRD8=";
             filters.include = [
               ".*\\.safetensors"
               ".*\\.json"
@@ -350,8 +402,8 @@
 
           qwen38-dense-nvfp4 = {
             url = "unsloth/Qwen3.8-27B-NVFP4";
-            rev = "16b6615af3548b88e2d8e382457bc705b00479cf";
-            fileTreeHash = "sha256-YJUUMm5pKLqdRgU8crDO+/Y5OYG0cauil4hiDl6UfuY=";
+            rev = "f0b7c9e722f5565102fff8481c99e4d86ae099c7";
+            fileTreeHash = "sha256-SNqYuhKrwjFtAcpiVx9VyvOtL/Mpf/6CvOB3uSTTs0s=";
             envVars = [
               "NV_QWEN38_DIR"
               "NV_CHAT_MODEL_DIR"
@@ -375,8 +427,8 @@
 
           gemma4-verifier = {
             url = "nvidia/Gemma-4-31B-IT-NVFP4";
-            rev = "e5ef03afa233c35cb000323ff098d4291e1dd07c";
-            fileTreeHash = "sha256-oPR/XnakSFTZENuL2yxiWrKukAhxUvMsS8O5rx+zo4U=";
+            rev = "4135a98a9b728a548947683219633b25682223ac";
+            fileTreeHash = "sha256-K/1k0U5OWRyT0j/4KKzZ8oSw30N+sFsJRJGps0X7tM0=";
             envVars = [
               "NV_GEMMA4_VERIFIER_DIR"
               "NV_CHAT_MODEL_DIR"
@@ -516,7 +568,7 @@
         let
           nix-hug-lib = nix-hug.lib.${system};
           models = mkModels system;
-          names = profiles.${profileName} or (throw "unknown profile: ${profileName}");
+          names = profileModels profileName;
         in
         nix-hug-lib.buildCache {
           models = map (n: models.${n}.drv) names;
@@ -526,7 +578,7 @@
         system: profileName: hub:
         let
           models = mkModels system;
-          names = profiles.${profileName} or (throw "unknown profile: ${profileName}");
+          names = profileModels profileName;
           oneModel =
             n:
             let
@@ -541,7 +593,7 @@
         system: profileName:
         let
           models = mkModels system;
-          names = profiles.${profileName} or (throw "unknown profile: ${profileName}");
+          names = profileModels profileName;
           lines = nixpkgs.lib.concatMapStringsSep "\n" (
             n:
             let
@@ -589,39 +641,9 @@
             hash = "sha256-RwvF6O91YFg2DDMnykMOWQZCdmXAwfucHzkzwNHi3YY=";
           };
 
-          cutlass-44 = pkgs.fetchFromGitHub {
-            owner = "NVIDIA";
-            repo = "cutlass";
-            tag = "v4.4.2";
-            hash = "sha256-0q9Ad0Z6E/rO2PdM4uQc8H0E0qs9uKc3reHepiHhjEc=";
-          };
-
-          flashinfer-064 = pkgs.fetchFromGitHub {
-            owner = "flashinfer-ai";
-            repo = "flashinfer";
-            tag = "v0.6.4";
-            fetchSubmodules = true;
-            hash = "sha256-Hq3oTeEJHRvXwThI8vc06E3Ot/FnPP0sZUfze3ISa2o=";
-          };
-
-          ctranslate2 =
-            if withCUDA then
-              pkgs.ctranslate2.override {
-                inherit cudaPackages;
-                withCUDA = true;
-                withCuDNN = true;
-              }
-            else
-              pkgs.ctranslate2;
-
-          whisper-cpp =
-            if withCUDA then
-              pkgs.whisper-cpp.override {
-                inherit cudaPackages;
-                cudaSupport = true;
-              }
-            else
-              pkgs.whisper-cpp;
+          ctranslate2 = ctranslate2For pkgs withCUDA cudaPackages;
+          whisper-cpp = whisperCppFor pkgs withCUDA cudaPackages;
+          ortLib = ortLibFor pkgs;
 
           runtimeLibs = [
             ctranslate2
@@ -653,7 +675,7 @@
           packages =
             with pkgs;
             [
-              go
+              go_latest
               cargo
               rustc
               rustfmt
@@ -666,8 +688,8 @@
               uv
               git
               libclang
-              ccache
             ]
+            ++ pkgs.lib.optional isLinux pkgs.ccache
             ++ runtimeLibs
             ++ pkgs.lib.optionals isLinux [
               pkgs.stdenv.cc.cc.lib
@@ -683,8 +705,8 @@
 
           env = {
             LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
-            ORT_DYLIB_PATH = "${pkgs.onnxruntime}/lib/libonnxruntime${if isLinux then ".so" else ".dylib"}";
-            ONNXRUNTIME_LIB = "${pkgs.onnxruntime}/lib/libonnxruntime${if isLinux then ".so" else ".dylib"}";
+            ORT_DYLIB_PATH = ortLib;
+            ONNXRUNTIME_LIB = ortLib;
             ESPEAK_DATA_PATH = "${pkgs.espeak-ng}/share/espeak-ng-data";
             CT2_DEVICE = if withCUDA then "cuda" else "cpu";
             CUDA_PATH = pkgs.lib.optionalString withCUDA "${cudaPackages.cudatoolkit}";
@@ -692,23 +714,19 @@
             CUDA_COMPUTE_CAP = pkgs.lib.optionalString withCUDA (
               builtins.replaceStrings [ "." ] [ "" ] (pkgs.lib.last cudaCapabilities)
             );
-            CUTLASS_DIR = pkgs.lib.optionalString withCUDA "${cutlass-44}";
+            CUTLASS_DIR = pkgs.lib.optionalString withCUDA "${cutlass44For pkgs}";
             NCCL_ROOT = pkgs.lib.optionalString withCUDA "${cudaPackages.nccl}";
             CUDNN_ROOT = pkgs.lib.optionalString withCUDA "${cudaPackages.cudnn}";
             CUDNN_FRONTEND_DIR = pkgs.lib.optionalString withCUDA "${cudaPackages.cudnn-frontend}";
 
-            FLASHINFER_DIR = pkgs.lib.optionalString withCUDA "${flashinfer-064}";
+            FLASHINFER_DIR = pkgs.lib.optionalString withCUDA "${flashinfer064For pkgs}";
 
             CMAKE_CUDA_ARCHITECTURES = pkgs.lib.optionalString withCUDA (
               pkgs.lib.concatStringsSep ";" (map (c: builtins.replaceStrings [ "." ] [ "" ] c) cudaCapabilities)
             );
             CMAKE_POLICY_VERSION_MINIMUM = "3.5";
-            CFLAGS = pkgs.lib.optionalString (
-              !isLinux
-            ) "-Wno-elaborated-enum-base -Wno-error=elaborated-enum-base";
-            CXXFLAGS = pkgs.lib.optionalString (
-              !isLinux
-            ) "-Wno-elaborated-enum-base -Wno-error=elaborated-enum-base";
+            CFLAGS = pkgs.lib.optionalString (!isLinux) enumBaseFlags;
+            CXXFLAGS = pkgs.lib.optionalString (!isLinux) enumBaseFlags;
             BINDGEN_EXTRA_CLANG_ARGS = pkgs.lib.optionalString (!isLinux) "-Wno-elaborated-enum-base";
             SPEACHES_PROFILE =
               if withCUDA then
@@ -791,30 +809,11 @@
           cudaPackages ? pkgs.cudaPackages_12,
         }:
         let
-          isLinux = pkgs.stdenv.hostPlatform.isLinux;
-
-          ctranslate2 =
-            if withCUDA then
-              pkgs.ctranslate2.override {
-                inherit cudaPackages;
-                withCUDA = true;
-                withCuDNN = true;
-              }
-            else
-              pkgs.ctranslate2;
-
-          whisper-cpp =
-            if withCUDA then
-              pkgs.whisper-cpp.override {
-                inherit cudaPackages;
-                cudaSupport = true;
-              }
-            else
-              pkgs.whisper-cpp;
-
-          ortLib = "${pkgs.onnxruntime}/lib/libonnxruntime${if isLinux then ".so" else ".dylib"}";
+          ctranslate2 = ctranslate2For pkgs withCUDA cudaPackages;
+          whisper-cpp = whisperCppFor pkgs withCUDA cudaPackages;
+          ortLib = ortLibFor pkgs;
         in
-        pkgs.buildGoModule {
+        pkgs.buildGoLatestModule {
           pname = "speaches-plus-go";
           version = "0.0.1";
           src = pkgs.lib.fileset.toSource {
@@ -826,7 +825,7 @@
               ./go/internal
             ];
           };
-          vendorHash = "sha256-bqooFaAFeabBSL0Hgt+fPlAQPWdugA1Zy4iKVj+WX28=";
+          vendorHash = "sha256-XZyrKttJSdvszkWcGeOxN+wDwgGE7FRyW4W7Rk2C1Fk=";
           subPackages = [ "cmd/server" ];
 
           nativeBuildInputs = [ pkgs.pkg-config ];
@@ -869,6 +868,7 @@
           cudaPackages ? pkgs.cudaPackages_12,
           profile ? "full",
           crate ? null,
+          cudaComputeCap ? null,
         }:
         let
           inherit (pkgs) lib;
@@ -878,21 +878,6 @@
 
           cudaforgeThreadsBoundSoParallelNvccFitsInRam = "16";
 
-          cutlass-44 = pkgs.fetchFromGitHub {
-            owner = "NVIDIA";
-            repo = "cutlass";
-            tag = "v4.4.2";
-            hash = "sha256-0q9Ad0Z6E/rO2PdM4uQc8H0E0qs9uKc3reHepiHhjEc=";
-          };
-
-          flashinfer-064 = pkgs.fetchFromGitHub {
-            owner = "flashinfer-ai";
-            repo = "flashinfer";
-            tag = "v0.6.4";
-            fetchSubmodules = true;
-            hash = "sha256-Hq3oTeEJHRvXwThI8vc06E3Ot/FnPP0sZUfze3ISa2o=";
-          };
-
           cutlassForCudaforge = pkgs.fetchgit {
             url = "https://github.com/NVIDIA/cutlass.git";
             rev = "7d49e6c7e2f8896c47f586706e67e1fb215529dc";
@@ -901,24 +886,8 @@
             deepClone = false;
           };
 
-          ctranslate2 =
-            if withCUDA then
-              pkgs.ctranslate2.override {
-                inherit cudaPackages;
-                withCUDA = true;
-                withCuDNN = true;
-              }
-            else
-              pkgs.ctranslate2;
-
-          whisper-cpp =
-            if withCUDA then
-              pkgs.whisper-cpp.override {
-                inherit cudaPackages;
-                cudaSupport = true;
-              }
-            else
-              pkgs.whisper-cpp;
+          ctranslate2 = ctranslate2For pkgs withCUDA cudaPackages;
+          whisper-cpp = whisperCppFor pkgs withCUDA cudaPackages;
 
           features =
             if withCUDA then
@@ -933,7 +902,7 @@
             else
               [ ];
 
-          ortLib = "${pkgs.onnxruntime}/lib/libonnxruntime${if isLinux then ".so" else ".dylib"}";
+          ortLib = ortLibFor pkgs;
 
           craneLib =
             let
@@ -1004,6 +973,7 @@
                 whisper-cpp
                 onnxruntime
               ]
+              ++ lib.optionals (!isLinux) [ pkgs.libiconv ]
               ++ lib.optionals withVulkan [ pkgs.vulkan-loader ]
               ++ lib.optionals withCUDA (
                 with cudaPackages;
@@ -1027,8 +997,8 @@
               CMAKE_POLICY_VERSION_MINIMUM = "3.5";
             }
             // lib.optionalAttrs (!isLinux) {
-              CFLAGS = "-Wno-elaborated-enum-base -Wno-error=elaborated-enum-base";
-              CXXFLAGS = "-Wno-elaborated-enum-base -Wno-error=elaborated-enum-base";
+              CFLAGS = enumBaseFlags;
+              CXXFLAGS = enumBaseFlags;
               BINDGEN_EXTRA_CLANG_ARGS = "-Wno-elaborated-enum-base";
             }
             // lib.optionalAttrs withCUDA {
@@ -1036,9 +1006,13 @@
               CUDAFORGE_THREADS = cudaforgeThreadsBoundSoParallelNvccFitsInRam;
               CUDA_PATH = "${cudaPackages.cudatoolkit}";
               CUDA_ARCH_LIST = lib.concatStringsSep ";" cudaCapabilities;
-              CUDA_COMPUTE_CAP = builtins.replaceStrings [ "." ] [ "" ] (lib.last cudaCapabilities);
-              CUTLASS_DIR = "${cutlass-44}";
-              FLASHINFER_DIR = "${flashinfer-064}";
+              CUDA_COMPUTE_CAP =
+                if cudaComputeCap != null then
+                  cudaComputeCap
+                else
+                  builtins.replaceStrings [ "." ] [ "" ] (lib.last cudaCapabilities);
+              CUTLASS_DIR = "${cutlass44For pkgs}";
+              FLASHINFER_DIR = "${flashinfer064For pkgs}";
               NCCL_ROOT = "${cudaPackages.nccl}";
               CUDNN_ROOT = "${cudaPackages.cudnn}";
               CUDNN_FRONTEND_DIR = "${cudaPackages.cudnn-frontend}";
@@ -1141,6 +1115,9 @@
           applicationArgs
           // {
             inherit passthru cargoArtifacts;
+            preBuild = applicationArgs.preBuild + ''
+              find "''${CARGO_TARGET_DIR:-target}" -path '*/out/build/CMakeCache.txt' -delete
+            '';
           }
         );
 
@@ -1188,7 +1165,7 @@
           ];
         };
 
-        speaches-plus-python-pkg = pkgs.python3Packages.buildPythonPackage {
+        speaches-plus-python-pkg = pkgs.python314Packages.buildPythonPackage {
           pname = "speaches-plus-python";
           version = "0.2.0";
           format = "pyproject";
@@ -1219,11 +1196,11 @@
               ./python/NOTICE.md
             ];
           };
-          nativeBuildInputs = with pkgs.python3Packages; [
+          nativeBuildInputs = with pkgs.python314Packages; [
             setuptools
             wheel
           ];
-          propagatedBuildInputs = with pkgs.python3Packages; [
+          propagatedBuildInputs = with pkgs.python314Packages; [
             fastapi
             uvicorn
             python-multipart
@@ -1250,7 +1227,7 @@
           doCheck = false;
         };
 
-        serverEnv = pkgs.python3.withPackages (_: [ speaches-plus-python-pkg ]);
+        serverEnv = pkgs.python314.withPackages (_: [ speaches-plus-python-pkg ]);
 
         speaches-plus-python = pkgs.writeShellScriptBin "speaches-plus-python" ''
           export PHONEMIZER_ESPEAK_LIBRARY="''${PHONEMIZER_ESPEAK_LIBRARY:-${pkgs.espeak-ng}/lib/libespeak-ng${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}}"
@@ -1380,6 +1357,11 @@
                 version = "0.11.0";
                 hash = "sha256-XsskUJOw95G4nTQgw9+cbUnGCrY7pU24lr+KO69IZwY=";
               }}
+              ${crate {
+                name = "candle-metal-kernels";
+                version = "0.11.0";
+                hash = "sha256-JC6Dxqz2ObsnPJKdc8Z6iCu03QihQPEhCW4Zui8hPT4=";
+              }}
               for f in ATTRIBUTION LICENSE FILES; do
                 cp ${mlxDir}/$f $out/mlx-steel-attn/$f
               done
@@ -1434,17 +1416,17 @@
               pyPkgs.espeak-ng
               pyPkgs.ruff
               pyPkgs.ty
-              pyPkgs.python3Packages.pyinstrument
-              pyPkgs.python3Packages.pybind11
-              pyPkgs.python3Packages.setuptools
-              pyPkgs.python3Packages.wheel
+              pyPkgs.python314Packages.pyinstrument
+              pyPkgs.python314Packages.pybind11
+              pyPkgs.python314Packages.setuptools
+              pyPkgs.python314Packages.wheel
               pyPkgs.pkg-config
               pyPkgs.cmake
             ];
             buildInputs = [
               pyPkgs.ctranslate2
               pyPkgs.whisper-cpp
-              pyPkgs.python3Packages.pybind11
+              pyPkgs.python314Packages.pybind11
               pyPkgs.stdenv.cc.cc
             ];
             PHONEMIZER_ESPEAK_LIBRARY = "${pyPkgs.espeak-ng}/lib/libespeak-ng${pyPkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
@@ -1460,13 +1442,9 @@
             WHISPER_LIBRARY_DIR = "${pyPkgs.whisper-cpp}/lib";
 
             shellHook = ''
-              # Symlinks below may already exist with read-only nix-store
-              # targets; ln -sfn errors with EPERM rather than overwriting.
-              # Suppress noise -- if the symlink target is already pointing at
-              # the right /nix/store path, the test runners will find the file.
               _ln() { ln -sfn "$@" 2>/dev/null || true; }
               for tree in rust/models go/models; do
-                [ -e "$tree" ] || continue  # skip if speaches-plus checkout missing
+                [ -e "$tree" ] || continue
                 mkdir -p "$tree" "$tree/whisper-ct2" 2>/dev/null || true
                 _ln ${pyModels.sileroVad}                                "$tree/silero_vad.onnx"
                 _ln ${pyModels.whisperGgml}/ggml-large-v3-turbo.bin       "$tree/ggml-large-v3-turbo.bin"
@@ -1480,12 +1458,6 @@
                 _ln ${pyModels.wespeaker}/voxceleb_resnet293_LM.onnx      "$tree/wespeaker-resnet293-LM.onnx"
                 ${nixpkgs.lib.optionalString pyPkgs.stdenv.hostPlatform.isLinux ''_ln ${(mkDiarizenExporter system).onnx} "$tree/diarizen-segmentation.onnx"''}
               done
-              # Linux-only: ct2_bindings/_ct2.so + whisper_bindings/_whisper.so
-              # don't have rpath baked in (setuptools doesn't auto-emit -Wl,-rpath
-              # for nix store paths). Without LD_LIBRARY_PATH the loader fails
-              # at import time with "libctranslate2.so.4: cannot open shared
-              # object file". On macOS this isn't needed -- dylibs encode their
-              # absolute install_name and the loader finds them by id.
               ${
                 if pyPkgs.stdenv.hostPlatform.isLinux then
                   ''

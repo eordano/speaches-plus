@@ -87,7 +87,7 @@ def analyze_cluster(recs, marks, label, out):
 
     ms = lambda ns: ns / 1e6 / nsteps
     out.write(f"\n## {label}  ({nsteps} steady steps)\n\n")
-    out.write(f"```\n")
+    out.write("```\n")
     out.write(f"step wall (logits-copy end -> next)  : {ms(tot_wall):8.3f} ms   100.0%\n")
     out.write(f"GPU busy (union of all GPU activity) : {ms(tot_busy):8.3f} ms   "
               f"{tot_busy/tot_wall*100:5.1f}%\n")
@@ -98,10 +98,10 @@ def analyze_cluster(recs, marks, label, out):
     out.write(f"GPU IDLE inside the step             : {ms(tot_wall-tot_busy):8.3f} ms   "
               f"{(tot_wall-tot_busy)/tot_wall*100:5.1f}%\n")
     out.write(f"   - dead gap before first kernel    : {ms(tot_gap_before):8.3f} ms\n")
-    out.write(f"```\n")
+    out.write("```\n")
 
     rows = sorted(per_name.items(), key=lambda kv: -kv[1][0])
-    out.write(f"\n| # | kernel | calls/step | ms/step | % busy | % wall |\n")
+    out.write("\n| # | kernel | calls/step | ms/step | % busy | % wall |\n")
     out.write("|---|---|---|---|---|---|\n")
     for i, (k, (d, n)) in enumerate(rows[:28], 1):
         out.write(f"| {i} | `{k}` | {n/nsteps:.1f} | {ms(d):.4f} | "

@@ -6,6 +6,7 @@ use nv_layers::attn::{attention, AttnConfig};
 use nv_layers::linear::Linear;
 
 use crate::qwen3_vision::Qwen3VisionConfig;
+use crate::weights::{load_1d, load_2d, load_lin_bias};
 
 const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
@@ -591,38 +592,6 @@ fn lin_bias_zeros(out_f: usize, in_f: usize, dtype: DType, device: &Device) -> R
     )
 }
 
-fn load_1d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    dim: usize,
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 1 || d[0] != dim {
-        anyhow::bail!("{name}: expected [{}], got {:?}", dim, d);
-    }
-    Ok(w)
-}
-
-fn load_2d(
-    weights: &nv_weights::WeightLoader,
-    name: &str,
-    shape: (usize, usize),
-    dtype: DType,
-) -> Result<Tensor> {
-    let w = weights
-        .get(name, dtype)
-        .with_context(|| format!("load {name}"))?;
-    let d = w.dims();
-    if d.len() != 2 || d[0] != shape.0 || d[1] != shape.1 {
-        anyhow::bail!("{name}: expected [{}, {}], got {:?}", shape.0, shape.1, d);
-    }
-    Ok(w)
-}
-
 fn load_ln(
     weights: &nv_weights::WeightLoader,
     prefix: &str,
@@ -633,18 +602,6 @@ fn load_ln(
     let w = load_1d(weights, &format!("{prefix}.weight"), dim, dtype)?;
     let b = load_1d(weights, &format!("{prefix}.bias"), dim, dtype)?;
     Ok(LayerNorm::new(w, b, eps))
-}
-
-fn load_lin_bias(
-    weights: &nv_weights::WeightLoader,
-    prefix: &str,
-    out_f: usize,
-    in_f: usize,
-    dtype: DType,
-) -> Result<Linear> {
-    let w = load_2d(weights, &format!("{prefix}.weight"), (out_f, in_f), dtype)?;
-    let b = load_1d(weights, &format!("{prefix}.bias"), out_f, dtype)?;
-    Linear::new(w, Some(b))
 }
 
 #[cfg(test)]
@@ -669,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn smart_resize_multiple_of_factor() {
+    fn smart_resize_keeps_the_budget_and_factor_and_patchify_then_forward_give_the_deepstack_shapes() {
         let (h, w) = smart_resize(
             100,
             200,
@@ -680,10 +637,6 @@ mod tests {
         assert_eq!(h % 32, 0);
         assert_eq!(w % 32, 0);
         assert!(h * w >= SMART_RESIZE_MIN_PIXELS);
-    }
-
-    #[test]
-    fn smart_resize_never_exceeds_the_pixel_budget_even_for_degenerate_aspects() {
         for (h, w) in [
             (1usize, 1_000_000usize),
             (1_000_000, 1),
@@ -700,22 +653,13 @@ mod tests {
             assert_eq!(hb % 32, 0);
             assert_eq!(wb % 32, 0);
         }
-    }
 
-    #[test]
-    fn patchify_shape_and_grid() {
-        let enc = OmniVisionEncoder::new(tiny_cfg(), vec![1], &Device::Cpu).unwrap();
-        let (w, h) = (8usize, 8usize);
-        let rgb = vec![128u8; w * h * 3];
-        let (patches, grid) = enc.patchify_rgb(&rgb, w, h, &Device::Cpu).unwrap();
-        assert_eq!(grid, (1, 2, 2));
-        assert_eq!(patches.dims(), &[4, 3 * 2 * 4 * 4]);
-    }
-
-    #[test]
-    fn forward_shapes_and_deepstack() {
         let cfg = tiny_cfg();
         let enc = OmniVisionEncoder::new(cfg.clone(), vec![0, 1], &Device::Cpu).unwrap();
+        let rgb = vec![128u8; 8 * 8 * 3];
+        let (patches, grid) = enc.patchify_rgb(&rgb, 8, 8, &Device::Cpu).unwrap();
+        assert_eq!(grid, (1, 2, 2));
+        assert_eq!(patches.dims(), &[4, 3 * 2 * 4 * 4]);
         let (w, h) = (16usize, 16usize);
         let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i % 255) as u8).collect();
         let (patches, grid) = enc.patchify_rgb(&rgb, w, h, &Device::Cpu).unwrap();
@@ -729,4 +673,5 @@ mod tests {
         let v: Vec<f32> = main.flatten_all().unwrap().to_vec1().unwrap();
         assert!(v.iter().all(|x| x.is_finite()));
     }
+
 }

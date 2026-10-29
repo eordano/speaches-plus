@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import io, json, os, struct, sys, wave, zipfile
+import io, json, os, sys, wave, zipfile
 import numpy as np
 
 STYLE_ROW = 100

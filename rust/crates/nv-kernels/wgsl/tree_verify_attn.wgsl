@@ -137,6 +137,7 @@ fn tree_verify_attn_bf16(
         let live = p < nc;
         var partial = 0.0;
         if (live) {
+            #def b1
             let kbase = (p * nkv + kvh) * hd;
             for (var d = lane; d < hd; d = d + TV_WARP) {
                 partial = fma(tva_qsh[d], tva_kc_at(kbase + d), partial);
@@ -159,6 +160,7 @@ fn tree_verify_attn_bf16(
             m = m_new;
         }
     }
+            #end
 
     let n_tree = (tva_p.k + TV_WARPS - 1u) / TV_WARPS;
     for (var it = 0u; it < n_tree; it = it + 1u) {
@@ -179,28 +181,7 @@ fn tree_verify_attn_bf16(
         var p = 0u;
         if (live) {
             p = nc + j;
-            let kbase = (p * nkv + kvh) * hd;
-            for (var d = lane; d < hd; d = d + TV_WARP) {
-                partial = fma(tva_qsh[d], tva_kc_at(kbase + d), partial);
-            }
-        }
-        let reduced = tva_warp_sum(tid, partial);
-        if (live) {
-            let score = reduced * tva_p.scaling;
-            let m_new = max(m, score);
-            let corr = tv_exp(m - m_new);
-            let w = tv_exp(score - m_new);
-            l = fma(l, corr, w);
-            let vbase = (p * nkv + kvh) * hd;
-            for (var i = 0u; i < TV_MAX_ACC; i = i + 1u) {
-                let d = lane + i * TV_WARP;
-                if (d < hd) {
-                    acc[i] = fma(acc[i], corr, w * tva_vc_at(vbase + d));
-                }
-            }
-            m = m_new;
-        }
-    }
+            #use b1
 
     if (lane == 0u) {
         tva_sm[warp] = m;
@@ -272,51 +253,4 @@ fn kv_append_bf16(
     let dst = slot * row + e;
     tvap_kc[dst] = tvap_ksrc[idx];
     tvap_vc[dst] = tvap_vsrc[idx];
-}
-
-@compute @workgroup_size(256)
-fn kv_gather_bf16(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(num_workgroups) ng: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-) {
-    let idx = (wg.y * ng.x + wg.x) * TV_BLOCK + lid.x;
-    if (idx >= tvac_p.total) {
-        return;
-    }
-    let row = tvac_p.stride_words;
-    let i = idx / row;
-    let e = idx - i * row;
-    var srow = tvac_p.base + u32(max(tvac_path[i], 0));
-    if (tvac_p.ring > 0u) {
-        srow = srow % tvac_p.ring;
-    }
-    let src = srow * row + e;
-    tvac_sk[idx] = tvac_kc[src];
-    tvac_sv[idx] = tvac_vc[src];
-}
-
-@compute @workgroup_size(256)
-fn kv_scatter_bf16(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(num_workgroups) ng: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-) {
-    let idx = (wg.y * ng.x + wg.x) * TV_BLOCK + lid.x;
-    if (idx >= tvac_p.total) {
-        return;
-    }
-    let row = tvac_p.stride_words;
-    let i = idx / row;
-    let e = idx - i * row;
-    var drow = tvac_p.base + i;
-    if (tvac_p.ring > 0u) {
-        if (i + tvac_p.ring < tvac_p.n_accept) {
-            return;
-        }
-        drow = drow % tvac_p.ring;
-    }
-    let dst = drow * row + e;
-    tvac_kc[dst] = tvac_sk[idx];
-    tvac_vc[dst] = tvac_sv[idx];
 }

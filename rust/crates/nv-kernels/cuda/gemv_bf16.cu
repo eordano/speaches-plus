@@ -1159,9 +1159,7 @@ extern "C" int nv_kernels_gemv_e4m3_mk_h(
     size_t smem_h = (size_t)M * (K >> 4) * 9 * sizeof(__nv_bfloat162);
     if (limit == 0 || smem_h > limit) return -1;
     cudaStream_t s = (cudaStream_t)stream;
-    static const bool rows2_off_env_nv_q38_e4m3_r2_off_h =
-        getenv("NV_Q38_E4M3_R2_OFF") != nullptr;
-    if (M == 1 && !rows2_off_env_nv_q38_e4m3_r2_off_h) {
+    if (M == 1) {
         size_t smem1 = (size_t)(K >> 4) * 9 * sizeof(float2);
         if (smem1 <= limit) {
             dim3 grid((unsigned)((N + 2 * kRowsPerBlock - 1) / (2 * kRowsPerBlock)));
@@ -1582,11 +1580,7 @@ static int launch_gemv_e4m3_mk(
         size_t smem_f32 = (size_t)TM * (K >> 4) * 9 * sizeof(float2);
         if (smem_f32 <= (size_t)mk_smem_limit()) {
             if constexpr (TM <= kMkRows2MaxTmBeforeAccPlusDualDeqRegsSpill) {
-                static const bool mk_rows2_off_env_nv_q38_e4m3_mk_r2_off =
-                    getenv("NV_Q38_E4M3_MK_R2_OFF") != nullptr;
-                if (!mk_rows2_off_env_nv_q38_e4m3_mk_r2_off) {
-                    return launch_gemv_e4m3_mk_xf32_rows2<TM>(s, wq, row_scale, x, y, N, K);
-                }
+                return launch_gemv_e4m3_mk_xf32_rows2<TM>(s, wq, row_scale, x, y, N, K);
             }
             return launch_gemv_e4m3_mk_xf32_when_m_ge_2_pays_conversion_once_not_per_row<TM>(
                 s, wq, row_scale, x, y, N, K);
@@ -1621,9 +1615,7 @@ extern "C" int nv_kernels_gemv_e4m3_mk(
     size_t smem = (size_t)M * (K >> 4) * 9 * sizeof(__nv_bfloat162);
     if (limit == 0 || smem > limit) return -1;
     cudaStream_t s = (cudaStream_t)stream;
-    static const bool rows2_off_env_nv_q38_e4m3_r2_off =
-        getenv("NV_Q38_E4M3_R2_OFF") != nullptr;
-    if (M == 1 && !rows2_off_env_nv_q38_e4m3_r2_off) {
+    if (M == 1) {
         size_t smem1 = (size_t)(K >> 4) * 9 * sizeof(float2);
         if (smem1 > (size_t)mk_smem_limit()) {
             size_t smem_bf = (size_t)(K >> 4) * 9 * sizeof(__nv_bfloat162);
@@ -1970,26 +1962,22 @@ static int launch_gemv_e4m3_mk_dual(
     size_t smem = (size_t)TM * (K >> 4) * 9 * sizeof(float2);
     if (smem > (size_t)mk_smem_limit()) return -1;
     if constexpr (TM <= kMkRows2MaxTmBeforeAccPlusDualDeqRegsSpill) {
-        static const bool mk_rows2_off_env_nv_q38_e4m3_mk_r2_off =
-            getenv("NV_Q38_E4M3_MK_R2_OFF") != nullptr;
-        if (!mk_rows2_off_env_nv_q38_e4m3_mk_r2_off) {
-            static DynamicSmemOptin optin_r2;
-            int orc = raise_dynamic_smem_optin_never_lowering_it(
-                optin_r2,
-                (const void*)
-                    gemv_e4m3_mk_dual_xf32_rows2_kernel_row_math_matches_two_separate_mk_rows2_launches_bitwise<
-                        TM>,
-                smem);
-            if (orc != 0) return orc;
-            dim3 grid((unsigned)((n_a + n_b) / (2 * kRowsPerBlock)));
-            gemv_e4m3_mk_dual_xf32_rows2_kernel_row_math_matches_two_separate_mk_rows2_launches_bitwise<
-                TM><<<grid, dim3(kBlockDim), smem, s>>>(
-                wq_a, rs_a, wq_b, rs_b,
-                reinterpret_cast<const __nv_bfloat16*>(x),
-                reinterpret_cast<__nv_bfloat16*>(y_a),
-                reinterpret_cast<__nv_bfloat16*>(y_b), n_a, n_b, K);
-            return (int)cudaGetLastError();
-        }
+        static DynamicSmemOptin optin_r2;
+        int orc = raise_dynamic_smem_optin_never_lowering_it(
+            optin_r2,
+            (const void*)
+                gemv_e4m3_mk_dual_xf32_rows2_kernel_row_math_matches_two_separate_mk_rows2_launches_bitwise<
+                    TM>,
+            smem);
+        if (orc != 0) return orc;
+        dim3 grid((unsigned)((n_a + n_b) / (2 * kRowsPerBlock)));
+        gemv_e4m3_mk_dual_xf32_rows2_kernel_row_math_matches_two_separate_mk_rows2_launches_bitwise<
+            TM><<<grid, dim3(kBlockDim), smem, s>>>(
+            wq_a, rs_a, wq_b, rs_b,
+            reinterpret_cast<const __nv_bfloat16*>(x),
+            reinterpret_cast<__nv_bfloat16*>(y_a),
+            reinterpret_cast<__nv_bfloat16*>(y_b), n_a, n_b, K);
+        return (int)cudaGetLastError();
     }
     static DynamicSmemOptin optin;
     int orc = raise_dynamic_smem_optin_never_lowering_it(
@@ -2033,9 +2021,6 @@ extern "C" int nv_kernels_gemv_e4m3_mk_dual(
     }
     cudaStream_t s = (cudaStream_t)stream;
     if (M == 1) {
-        static const bool rows2_off_env_nv_q38_e4m3_r2_off =
-            getenv("NV_Q38_E4M3_R2_OFF") != nullptr;
-        if (rows2_off_env_nv_q38_e4m3_r2_off) return -1;
         size_t smem1 = (size_t)(K >> 4) * 9 * sizeof(float2);
         if (smem1 > (size_t)mk_smem_limit()) return -1;
         static DynamicSmemOptin optin_dual_m1;

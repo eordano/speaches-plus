@@ -90,6 +90,29 @@ fn chunk_chars() -> usize {
     .min(MAX_CHUNK_CHARS)
 }
 
+fn phoneme_token_count(text: &str, lang: &str) -> Option<usize> {
+    let raw = super::phonemize::phonemize(text, lang).ok()?;
+    Some(super::vocab::tokenize(&super::vocab::clean_phonemes(&raw, lang)).len())
+}
+
+fn fit_phoneme_budget(chunk: String, lang: &str) -> Vec<String> {
+    let words: Vec<&str> = chunk.split_whitespace().collect();
+    let over =
+        phoneme_token_count(&chunk, lang).is_some_and(|n| n > super::vocab::MAX_PHONEME_LENGTH);
+    if !over || words.len() < 2 {
+        return vec![chunk];
+    }
+    let mid = words.len() / 2;
+    let cut = (1..words.len())
+        .filter(|&i| i.abs_diff(mid) <= mid / 2)
+        .filter(|&i| words[i - 1].ends_with([',', ';', ':', ')', '.']))
+        .min_by_key(|&i| i.abs_diff(mid))
+        .unwrap_or(mid);
+    let mut out = fit_phoneme_budget(words[..cut].join(" "), lang);
+    out.extend(fit_phoneme_budget(words[cut..].join(" "), lang));
+    out
+}
+
 fn join_silence_prefixed(samples: Vec<f32>) -> Vec<f32> {
     let n = KOKORO_SAMPLE_RATE as usize * defaults::kokoro::JOIN_SILENCE_MS / 1000;
     let mut out = vec![0.0f32; n];
@@ -386,7 +409,11 @@ pub async fn handle_create_speech(
             "punkt chunk plan"
         );
     }
-    let chunks = plan.chunks;
+    let chunks: Vec<String> = plan
+        .chunks
+        .into_iter()
+        .flat_map(|chunk| fit_phoneme_budget(chunk, &language))
+        .collect();
     let Some((first_chunk, rest)) = chunks.split_first() else {
         return openai_error(
             StatusCode::BAD_REQUEST,
@@ -570,7 +597,6 @@ fn stream_sse(
         })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn stream_audio(
     kokoro: KokoroHandle,
     first: Vec<f32>,
@@ -691,6 +717,7 @@ async fn stream_audio(
         drop(first);
         if let Err(e) = stdin.write_all(&pcm).await {
             warn!(?e, chunk_idx, "ffmpeg stdin write failed");
+            let _ = abort_tx.send(format!("ffmpeg stdin write failed: {e}"));
             let _ = stdin.shutdown().await;
             return;
         }
@@ -732,7 +759,9 @@ async fn stream_audio(
             tracing::debug!(chunk_idx, pcm_bytes = pcm.len(), "writing to ffmpeg stdin");
             if let Err(e) = stdin.write_all(&pcm).await {
                 warn!(?e, chunk_idx, "ffmpeg stdin write failed");
-                break;
+                let _ = abort_tx.send(format!("ffmpeg stdin write failed: {e}"));
+                let _ = stdin.shutdown().await;
+                return;
             }
             total_bytes += pcm.len();
         }
@@ -745,6 +774,7 @@ async fn stream_audio(
         let mut buf = vec![0u8; 4096];
         let mut total_out = 0usize;
         let mut abort_rx = Some(abort_rx);
+        let mut stopped = false;
         loop {
             let abort_wait = async {
                 match abort_rx.as_mut() {
@@ -759,6 +789,7 @@ async fn stream_audio(
                             warn!(%msg, total_out, "aborting ffmpeg stream after synth failure");
                             let _ = tx.send(Err(io_err(msg))).await;
                             let _ = child.start_kill();
+                            stopped = true;
                             break;
                         }
                         Err(_) => {
@@ -782,12 +813,14 @@ async fn stream_audio(
                                 tracing::info!(total_out, "client disconnected; stopping ffmpeg stream");
                                 cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                                 let _ = child.start_kill();
+                                stopped = true;
                                 break;
                             }
                         }
                         Err(e) => {
                             warn!(?e, total_out, "ffmpeg stdout read failed");
                             let _ = tx.send(Err(e)).await;
+                            stopped = true;
                             break;
                         }
                     }
@@ -795,6 +828,10 @@ async fn stream_audio(
             }
         }
         match child.wait().await {
+            Ok(status) if !status.success() && !stopped => {
+                warn!(?status, total_out, "ffmpeg failed; aborting the response");
+                let _ = tx.send(Err(io_err(format!("ffmpeg exited with {status}")))).await;
+            }
             Ok(status) => tracing::debug!(?status, total_out, "ffmpeg exited"),
             Err(e) => warn!(?e, "ffmpeg wait failed"),
         }
@@ -913,43 +950,66 @@ mod tests {
     }
 
     #[test]
-    fn spanish_voices_select_spanish_phonemization_by_default() {
+    fn chunks_over_the_phoneme_limit_split_at_word_boundaries_until_each_fits() {
+        let data = std::env::var("ESPEAK_DATA_PATH").ok();
+        if super::super::phonemize::init(data.as_deref()).is_err() {
+            eprintln!("SKIP: espeak-ng data not available");
+            return;
+        }
+        let max = super::super::vocab::MAX_PHONEME_LENGTH;
+        let chunk = "Port the existing Sites or rebuild them on UI3 (ts 1792601761.126239, \
+                     1792607280.931949). Agents: subscriptions or API tokens. Jarvis already \
+                     rotates 5 accounts (ts 1792753560.912979). Esteban: we can drop it; Mikhail \
+                     will reconcile (ts 1793103721.979819, 1793104960.937549).";
+        assert!(
+            phoneme_token_count(chunk, "en-us").unwrap() > max,
+            "Slack timestamps read out as numbers must push this chunk over the limit"
+        );
+        let parts = fit_phoneme_budget(chunk.to_string(), "en-us");
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(phoneme_token_count(part, "en-us").unwrap() <= max, "{part}");
+        }
+        assert_eq!(
+            parts.join(" ").split_whitespace().collect::<Vec<_>>(),
+            chunk.split_whitespace().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn speech_language_follows_the_voice_unless_overridden_and_the_field_is_optional() {
         for voice in ["ef_dora", "em_alex", "em_santa"] {
             assert_eq!(speech_language(voice, None, "en-us"), Ok("es"));
         }
         for voice in ["af_heart", "bm_george", "custom-voice"] {
             assert_eq!(speech_language(voice, None, "en-us"), Ok("en-us"));
         }
+        {
+            assert_eq!(speech_language("em_alex", Some("en-US"), "es"), Ok("en-us"));
+            assert_eq!(
+                speech_language("af_heart", Some("es-AR"), "en-us"),
+                Ok("es-419")
+            );
+            assert_eq!(
+                speech_language("af_heart", Some("en-GB"), "en-us"),
+                Ok("en-gb")
+            );
+            assert!(speech_language("em_alex", Some("unknown"), "en-us").is_err());
+            assert!(speech_language("em_alex", Some(""), "en-us").is_err());
+        }
+        {
+            let mut body =
+                serde_json::json!({"model":"kokoro","input":"Buenas tardes","voice":"em_alex"});
+            let original: CreateSpeechRequestBody = serde_json::from_value(body.clone()).unwrap();
+            assert!(original.language.is_none());
+            body["language"] = serde_json::json!("es");
+            let spanish: CreateSpeechRequestBody = serde_json::from_value(body).unwrap();
+            assert_eq!(spanish.language.as_deref(), Some("es"));
+        }
     }
 
     #[test]
-    fn explicit_speech_language_overrides_voice_and_rejects_unknown_codes() {
-        assert_eq!(speech_language("em_alex", Some("en-US"), "es"), Ok("en-us"));
-        assert_eq!(
-            speech_language("af_heart", Some("es-AR"), "en-us"),
-            Ok("es-419")
-        );
-        assert_eq!(
-            speech_language("af_heart", Some("en-GB"), "en-us"),
-            Ok("en-gb")
-        );
-        assert!(speech_language("em_alex", Some("unknown"), "en-us").is_err());
-        assert!(speech_language("em_alex", Some(""), "en-us").is_err());
-    }
-
-    #[test]
-    fn speech_request_accepts_optional_language_without_breaking_old_clients() {
-        let mut body =
-            serde_json::json!({"model":"kokoro","input":"Buenas tardes","voice":"em_alex"});
-        let original: CreateSpeechRequestBody = serde_json::from_value(body.clone()).unwrap();
-        assert!(original.language.is_none());
-        body["language"] = serde_json::json!("es");
-        let spanish: CreateSpeechRequestBody = serde_json::from_value(body).unwrap();
-        assert_eq!(spanish.language.as_deref(), Some("es"));
-    }
-
-    #[test]
-    fn riff_patch_replaces_ffmpeg_stream_placeholder_lengths() {
+    fn riff_patch_fixes_placeholder_lengths_and_refuses_non_wav_bodies() {
         let pcm = [0u8; 100];
         let mut wav: Vec<u8> = Vec::new();
         wav.extend_from_slice(b"RIFF");
@@ -966,14 +1026,12 @@ mod tests {
         assert_eq!(riff as usize, wav.len() - 8);
         let data = u32::from_le_bytes(wav[40..44].try_into().unwrap());
         assert_eq!(data as usize, pcm.len());
-    }
-
-    #[test]
-    fn riff_patch_refuses_non_wav_bodies_instead_of_corrupting_them() {
-        let mut mp3 = vec![0xFFu8; 64];
-        assert!(patch_riff_lengths(&mut mp3).is_err());
-        let mut truncated = b"RIFF".to_vec();
-        assert!(patch_riff_lengths(&mut truncated).is_err());
+        {
+            let mut mp3 = vec![0xFFu8; 64];
+            assert!(patch_riff_lengths(&mut mp3).is_err());
+            let mut truncated = b"RIFF".to_vec();
+            assert!(patch_riff_lengths(&mut truncated).is_err());
+        }
     }
 
     #[tokio::test]

@@ -36,7 +36,6 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: BlockConfig,
         pre_attn_norm: RmsNorm,

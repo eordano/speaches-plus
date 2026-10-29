@@ -19,7 +19,6 @@ export function syntaxHighlight(json) {
     .replace(/:\s*(null)/g, ': <span class="tok-p">$1</span>');
 }
 
-// Round `ms` up to a "nice" tick interval (1, 2, 5 x 10^k).
 export function niceStep(ms) {
   const safe = Math.max(0.001, ms);
   const exp = Math.pow(10, Math.floor(Math.log10(safe)));

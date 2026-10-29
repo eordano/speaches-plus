@@ -881,10 +881,6 @@ impl SpProbe {
         self.step.write(self.ctx, &step_raw(committed, kb));
     }
 
-    pub fn stage_len(&self, s: SpStage) -> usize {
-        self.b[self.idx.slot(s)].len()
-    }
-
     pub fn write_stage(&self, s: SpStage, data: &[f32]) {
         let t = &self.b[self.idx.slot(s)];
         assert_eq!(
@@ -1414,10 +1410,6 @@ pub struct ModelDrafter<D: StepDecoder> {
 impl<D: StepDecoder> ModelDrafter<D> {
     pub fn new(inner: D) -> Self {
         Self { inner, last: None }
-    }
-
-    pub fn last_proposal(&self) -> Option<u32> {
-        self.last
     }
 }
 

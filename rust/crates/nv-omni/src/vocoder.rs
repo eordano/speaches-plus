@@ -102,15 +102,6 @@ impl VocoderConfig {
         let main: usize = self.upsample_strides.iter().product();
         pre * main
     }
-
-    pub fn channels_after_stage(&self, stage: usize) -> usize {
-        let mut c = self.decoder_dim;
-        for s in 0..stage {
-            let _ = s;
-            c = (c / 2).max(1);
-        }
-        c
-    }
 }
 
 struct CausalConv1d {
@@ -1617,13 +1608,6 @@ mod tests {
     }
 
     #[test]
-    fn upsample_factor_matches_real_model() {
-        let cfg = tiny_cfg();
-        assert_eq!(cfg.upsample_factor(), SAMPLES_PER_FRAME);
-        assert_eq!(cfg.upsample_factor(), 1_920);
-    }
-
-    #[test]
     fn snake_applies_exp_reparameterization() {
         let dev = Device::Cpu;
         let alpha_raw = Tensor::from_vec(vec![0.3f32, -0.7], (2,), &dev).unwrap();
@@ -1652,7 +1636,7 @@ mod tests {
     }
 
     #[test]
-    fn causal_conv_output_ignores_future_inputs() {
+    fn causal_conv_and_transconv_ignore_future_inputs() {
         let dev = Device::Cpu;
         let mut r = Lcg(7);
         let w = r.tensor(&[4, 4, 7], &dev);
@@ -1692,18 +1676,12 @@ mod tests {
             }
         }
         assert_ne!(y1[t - 1], y2[t - 1]);
-    }
 
-    #[test]
-    fn causal_transconv_length_and_causality() {
-        let dev = Device::Cpu;
-        let mut r = Lcg(11);
         let stride = 3usize;
         let k = 6usize;
         let w = r.tensor(&[2, 2, k], &dev);
         let b = r.tensor(&[2], &dev);
         let tc = CausalConvT1d::new(w, Some(b), stride).unwrap();
-
         let t = 5usize;
         let x1 = r.tensor(&[1, 2, t], &dev);
         let mut vals = x1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1711,7 +1689,6 @@ mod tests {
             vals[c * t + (t - 1)] += 3.0;
         }
         let x2 = Tensor::from_vec(vals, (1, 2, t), &dev).unwrap();
-
         let y1 = tc.forward(&x1).unwrap();
         assert_eq!(y1.dims(), &[1, 2, t * stride]);
         let y1 = y1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
@@ -1728,7 +1705,7 @@ mod tests {
                 assert_eq!(
                     y1[c * ot + tt],
                     y2[c * ot + tt],
-                    "future leak at c={c} t={tt}"
+                    "transconv future leak at c={c} t={tt}"
                 );
             }
         }
@@ -1813,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_zero_weights_produces_zero_waveform_of_expected_length() {
+    fn zero_weight_decode_is_silent_at_every_frame_count_and_base_only_wraps() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let voc = Vocoder::new(cfg.clone(), &dev).expect("build vocoder");
@@ -1831,22 +1808,17 @@ mod tests {
             max_abs, 0.0,
             "zero-init vocoder must produce exact-zero waveform"
         );
-    }
-
-    #[test]
-    fn decode_handles_arbitrary_frame_count() {
-        let dev = Device::Cpu;
-        let cfg = tiny_cfg();
-        let voc = Vocoder::new(cfg.clone(), &dev).expect("build vocoder");
         for &t in &[2usize, 3, 5] {
             let frames = vec![[0u32; NUM_CODEBOOKS]; t];
             let pcm = voc.decode(&frames).unwrap();
             assert_eq!(pcm.len(), t * cfg.upsample_factor(), "T={t}");
         }
+        let pcm = voc.decode_base_only(&[1, 2, 3]).unwrap();
+        assert_eq!(pcm.len(), 3 * cfg.upsample_factor(), "base-only wraps to full frames");
     }
 
     #[test]
-    fn decode_rejects_out_of_range_token() {
+    fn decode_and_config_reject_out_of_range_tokens_single_frames_and_wrong_strides() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let voc = Vocoder::new(cfg.clone(), &dev).unwrap();
@@ -1856,25 +1828,14 @@ mod tests {
         let err = voc.decode(&frames).expect_err("must fail");
         let msg = format!("{err}");
         assert!(msg.contains("speech_tokens"), "msg = {msg}");
-    }
-
-    #[test]
-    fn decode_base_only_wraps_to_full_frames() {
-        let dev = Device::Cpu;
-        let cfg = tiny_cfg();
-        let voc = Vocoder::new(cfg.clone(), &dev).unwrap();
-        let pcm = voc.decode_base_only(&[1, 2, 3]).unwrap();
-        assert_eq!(pcm.len(), 3 * cfg.upsample_factor());
-    }
-
-    #[test]
-    fn decode_rejects_single_frame_with_clean_error() {
-        let dev = Device::Cpu;
-        let cfg = tiny_cfg();
-        let voc = Vocoder::new(cfg, &dev).unwrap();
         let err = voc.decode(&[[0u32; NUM_CODEBOOKS]]).expect_err("must fail");
         let msg = format!("{err}");
         assert!(msg.contains("at least 2 frames"), "msg = {msg}");
+        let mut cfg = tiny_cfg();
+        cfg.upsample_strides = [2, 2, 2, 2];
+        let err = Vocoder::new(cfg, &dev).err().expect("must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("upsample_factor"), "msg = {msg}");
     }
 
     fn synth_vocoder(cfg: &VocoderConfig, dev: &Device, tag: &str) -> Vocoder {
@@ -1966,7 +1927,7 @@ mod tests {
     const SEAM_MAX_ABS_DEV: f32 = 1.0e-7;
 
     #[test]
-    fn decode_geometry_chunks_and_its_seam_matches_the_unchunked_decode() {
+    fn the_chunk_seam_matches_the_unchunked_decode_and_a_truncated_context_stays_bounded() {
         let dev = Device::Cpu;
         let cfg = narrow_cfg();
         let voc = synth_vocoder(&cfg, &dev, "chunkseam");
@@ -2008,13 +1969,7 @@ mod tests {
             "bound gates nothing: one frame of left context must break it (measured 1.10e-6, 11x \
              the bound; zero frames measure 1.60e-2) but got max abs dev {starved_seam}"
         );
-    }
 
-    const TRUNCATED_CTX_MAX_RMS_DEV: f32 = 4.0e-6;
-
-    #[test]
-    fn streamer_truncated_context_stays_bounded_vs_batch() {
-        let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let voc = synth_vocoder(&cfg, &dev, "trunc");
         let frames = varied_frames(&cfg, 14);
@@ -2028,7 +1983,6 @@ mod tests {
             "truncated-context decode drifted: rms dev {dev_2} > {TRUNCATED_CTX_MAX_RMS_DEV}, a \
              bound calibrated on a measured 1.33e-6 with 3x headroom"
         );
-
         let dev_1 = rms_dev(&stream_all(&voc, &frames, 3, 1), &batch);
         assert!(
             dev_1 > TRUNCATED_CTX_MAX_RMS_DEV,
@@ -2037,8 +1991,10 @@ mod tests {
         );
     }
 
+    const TRUNCATED_CTX_MAX_RMS_DEV: f32 = 4.0e-6;
+
     #[test]
-    fn streamer_rejects_bad_inputs() {
+    fn streamer_rejects_bad_inputs_and_emits_the_expected_chunk_sample_counts() {
         let dev = Device::Cpu;
         let cfg = tiny_cfg();
         let voc = Vocoder::new(cfg.clone(), &dev).unwrap();
@@ -2062,13 +2018,7 @@ mod tests {
 
         let st = voc.streamer(4, 4).unwrap();
         assert_eq!(st.finish().unwrap(), Vec::<f32>::new());
-    }
 
-    #[test]
-    fn streamer_emits_expected_chunk_sample_counts() {
-        let dev = Device::Cpu;
-        let cfg = tiny_cfg();
-        let voc = Vocoder::new(cfg.clone(), &dev).unwrap();
         let spf = cfg.upsample_factor();
         let mut st = voc.streamer(3, 2).unwrap();
         let mut emitted: Vec<usize> = Vec::new();
@@ -2083,13 +2033,4 @@ mod tests {
         assert_eq!(emitted, vec![3 * spf, 3 * spf, spf]);
     }
 
-    #[test]
-    fn config_rejects_wrong_upsample_product() {
-        let dev = Device::Cpu;
-        let mut cfg = tiny_cfg();
-        cfg.upsample_strides = [2, 2, 2, 2];
-        let err = Vocoder::new(cfg, &dev).err().expect("must fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("upsample_factor"), "msg = {msg}");
-    }
 }

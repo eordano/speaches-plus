@@ -295,10 +295,6 @@ func (p *sessionPipeline) silenceWatchdog() {
 	}
 }
 
-func hasNonSilence(samples audio.MonoF32) bool {
-	return hasNonSilenceWith(samples, defaultNonSilenceThreshold)
-}
-
 func hasNonSilenceWith(samples audio.MonoF32, threshold float32) bool {
 	if len(samples) == 0 {
 		return false

@@ -1,11 +1,9 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::dequant::{bytes_to_words, NVFP4_BLOCK_SIZE};
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::dispatch;
 use crate::wgpu_backend::{compose, compose_enabled, Result, WgpuError};
 
-pub const WGSL: &str = include_str!("../../../wgsl/gemm_nvfp4.wgsl");
+pub const WGSL: &str = crate::wgsl!("../../../wgsl/gemm_nvfp4.wgsl");
 
 pub const SECTION_SPLIT: &str = "const NVFP4_GEMM_SECTION_SPLIT: u32 = 1u;";
 pub const SCALAR_ENTRY: &str = "gemm_nvfp4_scalar";
@@ -207,79 +205,52 @@ pub fn nvfp4_gemm_bf16(
     Ok(path)
 }
 
-#[doc(hidden)]
-pub fn bench_transfer_floor(
-    ctx: &WgpuContext,
-    a_packed: &[u8],
-    a_scales: &[u8],
-    b_packed: &[u8],
-    b_scales: &[u8],
-    m: usize,
-    n: usize,
-) -> Result<usize> {
-    let a_words = bytes_to_words(a_packed);
-    let a_sf_words = bytes_to_words(a_scales);
-    let b_words = bytes_to_words(b_packed);
-    let b_sf_words = bytes_to_words(b_scales);
-    let _a = dispatch::storage_from_slice(ctx, "floor-a", &a_words);
-    let _asf = dispatch::storage_from_slice(ctx, "floor-a-sf", &a_sf_words);
-    let _b = dispatch::storage_from_slice(ctx, "floor-b", &b_words);
-    let _bsf = dispatch::storage_from_slice(ctx, "floor-b-sf", &b_sf_words);
-    let d = dispatch::storage_zeroed(ctx, "floor-d", (m * n * 4) as u64);
-    let words: Vec<u32> = dispatch::read_back(ctx, &d, m * n)?;
-    Ok(words.len())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn sections_split_and_carry_their_entry_points() {
-        let (head, tail) = split_sections();
-        assert!(head.contains(SCALAR_ENTRY));
-        assert!(!head.contains(COOP_ENTRY));
-        assert!(tail.contains(COOP_ENTRY));
-        assert!(!tail.contains(SCALAR_ENTRY));
+    fn the_sections_split_and_only_the_coop_one_asks_for_16x16x16_f16_f32() {
+        {
+            let (head, tail) = split_sections();
+            assert!(head.contains(SCALAR_ENTRY));
+            assert!(!head.contains(COOP_ENTRY));
+            assert!(tail.contains(COOP_ENTRY));
+            assert!(!tail.contains(SCALAR_ENTRY));
+        }
+        {
+            let coop = coop_source();
+            assert!(coop.starts_with("enable f16;\nenable wgpu_cooperative_matrix;\n"));
+            assert!(coop.contains("coopMultiplyAdd("));
+            let scalar = scalar_source();
+            assert!(!scalar.contains("enable "));
+            assert!(!scalar.contains("coopMultiplyAdd("));
+        }
+        {
+            use crate::wgpu_backend::qualify::{coop_requests_in_wgsl, CoopRequest, CoopScalar};
+            assert_eq!(
+                coop_requests_in_wgsl(&coop_source()),
+                vec![CoopRequest::square(16, CoopScalar::F16, CoopScalar::F32)]
+            );
+            assert!(coop_requests_in_wgsl(&scalar_source()).is_empty());
+        }
+        {
+            assert!(scalar_source().contains("fn nvfp4_scale_byte_index("));
+            assert!(coop_source().contains("fn nvfp4_scale_byte_index("));
+        }
     }
 
     #[test]
-    fn only_the_coop_source_carries_the_enable_directives() {
-        let coop = coop_source();
-        assert!(coop.starts_with("enable f16;\nenable wgpu_cooperative_matrix;\n"));
-        assert!(coop.contains("coopMultiplyAdd("));
-        let scalar = scalar_source();
-        assert!(!scalar.contains("enable "));
-        assert!(!scalar.contains("coopMultiplyAdd("));
-    }
-
-    #[test]
-    fn the_shipped_coop_shader_asks_for_16x16x16_f16_f32_and_nothing_else() {
-        use crate::wgpu_backend::qualify::{coop_requests_in_wgsl, CoopRequest, CoopScalar};
-        assert_eq!(
-            coop_requests_in_wgsl(&coop_source()),
-            vec![CoopRequest::square(16, CoopScalar::F16, CoopScalar::F32)]
-        );
-        assert!(coop_requests_in_wgsl(&scalar_source()).is_empty());
-    }
-
-    #[test]
-    fn both_sources_include_the_dequant_prelude() {
-        assert!(scalar_source().contains("fn nvfp4_scale_byte_index("));
-        assert!(coop_source().contains("fn nvfp4_scale_byte_index("));
-    }
-
-    #[test]
-    fn the_coop_k_step_is_exactly_one_nvfp4_block() {
-        assert_eq!(COOP_TILE, NVFP4_BLOCK_SIZE);
-        assert!(coop_source().contains("coopMultiplyAdd(ta, tb, zero)"));
-        assert!(coop_source().contains("acc[s] = acc[s] + coop_c[lidx + s * COOP_WG]"));
-        assert!(scalar_source().contains("acc = acc + block_dot"));
-    }
-
-    #[test]
-    fn swizzled_scale_len_matches_the_nv_quant_layout() {
-        assert_eq!(swizzled_scale_len(128, 8), 128 * 2 * 4);
-        assert_eq!(swizzled_scale_len(129, 4), 256 * 4);
+    fn the_coop_k_step_is_one_nvfp4_block_and_the_scale_len_matches_nv_quant() {
+        {
+            assert_eq!(COOP_TILE, NVFP4_BLOCK_SIZE);
+            assert!(coop_source().contains("coopMultiplyAdd(ta, tb, zero)"));
+            assert!(coop_source().contains("acc[s] = acc[s] + coop_c[lidx + s * COOP_WG]"));
+            assert!(scalar_source().contains("acc = acc + block_dot"));
+        }
+        {
+            assert_eq!(swizzled_scale_len(128, 8), 128 * 2 * 4);
+            assert_eq!(swizzled_scale_len(129, 4), 256 * 4);
+        }
     }
 }

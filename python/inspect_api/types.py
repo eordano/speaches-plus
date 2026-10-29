@@ -24,17 +24,6 @@ class Corr:
             out["phrase_id"] = self.phrase_id
         return out
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> Corr:
-        if not data:
-            return cls()
-        return cls(
-            turn_id=data.get("turn_id"),
-            item_id=data.get("item_id"),
-            response_id=data.get("response_id"),
-            phrase_id=data.get("phrase_id"),
-        )
-
 @dataclass
 class WireEvent:
     session_id: str

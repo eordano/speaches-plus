@@ -168,7 +168,7 @@ def main():
           f"(B={st.median(bsizes):.0f} / step wall)")
 
     rows = sorted(per_name.items(), key=lambda kv: -kv[1][0])
-    print(f"\n| # | kernel | calls/step | ms/step | % busy | % wall |")
+    print("\n| # | kernel | calls/step | ms/step | % busy | % wall |")
     print("|---|---|---|---|---|---|")
     for i, (k, (d, n)) in enumerate(rows[:top], 1):
         print(f"| {i} | `{k}` | {n/nsteps:.1f} | {ms(d):.4f} | "

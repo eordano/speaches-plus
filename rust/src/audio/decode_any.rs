@@ -65,7 +65,13 @@ pub fn decode_any_to_16k_mono(bytes: &[u8], mime: Option<&str>) -> anyhow::Resul
     } else if ogg_opus::is_ogg_opus(bytes) {
         ogg_opus::decode_ogg_opus_to_16k_mono(bytes)?
     } else if webm_opus::is_webm(bytes) {
-        webm_opus::decode_webm_opus_to_16k_mono(bytes)?
+        webm_opus::decode_webm_opus_to_16k_mono(bytes).or_else(|opus_error| {
+            decode_via_symphonia(bytes).map_err(|error| {
+                anyhow::anyhow!(
+                    "WebM/Matroska audio decode failed: {error:#}; Opus decoder: {opus_error:#}"
+                )
+            })
+        })?
     } else {
         decode_via_symphonia(bytes)?
     };
@@ -77,45 +83,68 @@ pub fn decode_any_to_16k_mono(bytes: &[u8], mime: Option<&str>) -> anyhow::Resul
 mod tests {
     use super::*;
 
+    fn assert_tone(samples: &[f32]) {
+        assert!(
+            (7_000..=9_000).contains(&samples.len()),
+            "half-second tone: {} samples",
+            samples.len()
+        );
+        assert!(samples.iter().all(|s| s.is_finite()));
+        let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+        assert!((0.05..0.15).contains(&rms), "decoded sine RMS: {rms}");
+    }
+
     #[test]
-    fn default_cap_is_30_minutes_of_16k() {
+    fn webm_vorbis_and_opus_both_decode() {
+        let bytes = include_bytes!("../../tests/data/tone-vorbis.webm");
+        assert!(webm_opus::is_webm(bytes));
+        assert!(webm_opus::decode_webm_opus_to_16k_mono(bytes).is_err());
+        assert_tone(&decode_any_to_16k_mono(bytes, Some("audio/webm")).unwrap());
+        {
+            let bytes = include_bytes!("../../tests/data/tone-opus.webm");
+            assert_tone(&decode_any_to_16k_mono(bytes, Some("video/webm")).unwrap());
+        }
+    }
+
+    #[test]
+    fn webm_without_audio_reports_general_decoder_failure() {
+        let bytes = include_bytes!("../../tests/data/video-only.webm");
+        let error = decode_any_to_16k_mono(bytes, None).unwrap_err().to_string();
+        assert!(error.contains("no audio track"), "{error}");
+    }
+
+    #[test]
+    fn decode_cap_defaults_parses_seconds_disables_on_zero_and_falls_back_on_garbage() {
         assert_eq!(max_decode_samples_from(None), 1_800 * 16_000);
         assert_eq!(max_decode_samples_from(Some("  ")), 1_800 * 16_000);
+        {
+            assert_eq!(max_decode_samples_from(Some("60")), 60 * 16_000);
+            assert_eq!(max_decode_samples_from(Some("0.5")), 8_000);
+        }
+        {
+            assert_eq!(max_decode_samples_from(Some("0")), usize::MAX);
+            assert_eq!(max_decode_samples_from(Some("off")), usize::MAX);
+            assert_eq!(max_decode_samples_from(Some("unlimited")), usize::MAX);
+        }
+        {
+            assert_eq!(max_decode_samples_from(Some("abc")), 1_800 * 16_000);
+            assert_eq!(max_decode_samples_from(Some("-5")), 1_800 * 16_000);
+            assert_eq!(max_decode_samples_from(Some("inf")), 1_800 * 16_000);
+        }
     }
 
     #[test]
-    fn env_override_parses_seconds() {
-        assert_eq!(max_decode_samples_from(Some("60")), 60 * 16_000);
-        assert_eq!(max_decode_samples_from(Some("0.5")), 8_000);
-    }
-
-    #[test]
-    fn zero_and_off_disable_the_cap() {
-        assert_eq!(max_decode_samples_from(Some("0")), usize::MAX);
-        assert_eq!(max_decode_samples_from(Some("off")), usize::MAX);
-        assert_eq!(max_decode_samples_from(Some("unlimited")), usize::MAX);
-    }
-
-    #[test]
-    fn garbage_and_negative_fall_back_to_default() {
-        assert_eq!(max_decode_samples_from(Some("abc")), 1_800 * 16_000);
-        assert_eq!(max_decode_samples_from(Some("-5")), 1_800 * 16_000);
-        assert_eq!(max_decode_samples_from(Some("inf")), 1_800 * 16_000);
-    }
-
-    #[test]
-    fn enforce_rejects_only_over_cap() {
+    fn enforce_rejects_only_over_cap_including_raw_pcm_before_decode() {
         assert!(enforce_max_decode_samples(16_000, 16_000).is_ok());
         let err = enforce_max_decode_samples(16_001, 16_000).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("over the"), "{msg}");
         assert!(msg.contains(ENV_MAX_DECODE_SECONDS), "{msg}");
+        {
+            let bytes = vec![0u8; 4 * BYTES_PER_S16];
+            assert!(decode_any_to_16k_mono(&bytes, Some(MIME_RAW_PCM)).is_ok());
+            assert!(enforce_max_decode_samples(bytes.len() / BYTES_PER_S16, 2).is_err());
+        }
     }
 
-    #[test]
-    fn raw_pcm_over_cap_is_rejected_before_decode() {
-        let bytes = vec![0u8; 4 * BYTES_PER_S16];
-        assert!(decode_any_to_16k_mono(&bytes, Some(MIME_RAW_PCM)).is_ok());
-        assert!(enforce_max_decode_samples(bytes.len() / BYTES_PER_S16, 2).is_err());
-    }
 }

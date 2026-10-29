@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -208,10 +207,6 @@ impl AudioStore {
         self.tts_out.append_f32(samples, self.session_start_instant);
     }
 
-    pub fn append_tts_out_pcm16(&self, pcm: &[u8]) {
-        self.tts_out.append_pcm16(pcm, self.session_start_instant);
-    }
-
     fn track(&self, channel: Channel) -> &Track {
         match channel {
             Channel::MicIn => &self.mic_in,
@@ -301,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn append_and_slice_mic_in_round_trip() {
+    fn append_slice_and_close_round_trip_through_the_raw_file_and_sidecar() {
         let dir = temp_dir();
         let store = AudioStore::new("sess_audio".into(), Some(dir.clone()));
         let samples = vec![0.0_f32, 0.5, -0.5, 1.0];
@@ -311,51 +306,46 @@ mod tests {
         let bytes = std::fs::read(&raw).unwrap();
         assert_eq!(bytes.len(), samples.len() * 2);
         let _ = std::fs::remove_dir_all(&dir);
+        {
+            let dir = temp_dir();
+            let store = AudioStore::new("sess_slice".into(), Some(dir.clone()));
+            let samples = vec![0.5_f32; 16_000];
+            store.append_mic_in_f32(&samples);
+            let offset = store.track_offset_ms(Channel::MicIn);
+            let chunk = store.slice(Channel::MicIn, offset, offset + 100);
+            assert_eq!(chunk.len(), 16_000 * 100 / 1000 * 2);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        {
+            let dir = temp_dir();
+            let store = AudioStore::new("sess_side".into(), Some(dir.clone()));
+            let samples = vec![0.1_f32; 1600];
+            store.append_mic_in_f32(&samples);
+            store.close();
+            let sidecar = dir.join("sess_side.audio.json");
+            assert!(sidecar.exists());
+            let body = std::fs::read_to_string(&sidecar).unwrap();
+            assert!(body.contains("\"sample_rate\":16000"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
-    fn slice_clamps_and_truncates() {
-        let dir = temp_dir();
-        let store = AudioStore::new("sess_slice".into(), Some(dir.clone()));
-        let samples = vec![0.5_f32; 16_000];
-        store.append_mic_in_f32(&samples);
-        let offset = store.track_offset_ms(Channel::MicIn);
-        let chunk = store.slice(Channel::MicIn, offset, offset + 100);
-        assert_eq!(chunk.len(), 16_000 * 100 / 1000 * 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn channel_round_trip() {
+    fn channels_round_trip_and_the_wav_header_is_well_formed() {
         assert_eq!(Channel::parse("mic_in"), Some(Channel::MicIn));
         assert_eq!(Channel::parse("tts_out"), Some(Channel::TtsOut));
         assert_eq!(Channel::parse("nope"), None);
         assert_eq!(Channel::MicIn.sample_rate(), 16_000);
         assert_eq!(Channel::TtsOut.sample_rate(), 24_000);
+        {
+            let h = wav_header(8000, 16_000);
+            assert_eq!(&h[0..4], b"RIFF");
+            assert_eq!(&h[8..12], b"WAVE");
+            assert_eq!(&h[12..16], b"fmt ");
+            assert_eq!(&h[36..40], b"data");
+            let data_bytes = u32::from_le_bytes(h[40..44].try_into().unwrap());
+            assert_eq!(data_bytes, 8000 * 2);
+        }
     }
 
-    #[test]
-    fn wav_header_format() {
-        let h = wav_header(8000, 16_000);
-        assert_eq!(&h[0..4], b"RIFF");
-        assert_eq!(&h[8..12], b"WAVE");
-        assert_eq!(&h[12..16], b"fmt ");
-        assert_eq!(&h[36..40], b"data");
-        let data_bytes = u32::from_le_bytes(h[40..44].try_into().unwrap());
-        assert_eq!(data_bytes, 8000 * 2);
-    }
-
-    #[test]
-    fn close_writes_sidecar() {
-        let dir = temp_dir();
-        let store = AudioStore::new("sess_side".into(), Some(dir.clone()));
-        let samples = vec![0.1_f32; 1600];
-        store.append_mic_in_f32(&samples);
-        store.close();
-        let sidecar = dir.join("sess_side.audio.json");
-        assert!(sidecar.exists());
-        let body = std::fs::read_to_string(&sidecar).unwrap();
-        assert!(body.contains("\"sample_rate\":16000"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

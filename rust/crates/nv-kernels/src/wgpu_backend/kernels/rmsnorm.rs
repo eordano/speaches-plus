@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::pack::{pack_u16_pairs as pack_u16, unpack_u16_pairs as unpack_u16};
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
@@ -123,19 +121,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn u16_word_packing_round_trips() {
-        let src: Vec<u16> = (0u16..64).map(|i| i.wrapping_mul(1031)).collect();
-        let words = pack_u16(&src);
-        assert_eq!(words.len(), src.len() / 2);
-        assert_eq!(words[0], src[0] as u32 | ((src[1] as u32) << 16));
-        let mut back = vec![0u16; src.len()];
-        unpack_u16(&words, &mut back);
-        assert_eq!(back, src);
-    }
-
-    #[test]
-    fn params_keep_the_sixteen_byte_uniform_layout() {
-        assert_eq!(std::mem::size_of::<RmsParams>(), 16);
+    fn packing_params_and_shape_check_follow_the_shader_contract() {
+        {
+            let src: Vec<u16> = (0u16..64).map(|i| i.wrapping_mul(1031)).collect();
+            let words = pack_u16(&src);
+            assert_eq!(words.len(), src.len() / 2);
+            assert_eq!(words[0], src[0] as u32 | ((src[1] as u32) << 16));
+            let mut back = vec![0u16; src.len()];
+            unpack_u16(&words, &mut back);
+            assert_eq!(back, src);
+        }
+        {
+            assert_eq!(std::mem::size_of::<RmsParams>(), 16);
+        }
+        {
+            let e = check_shapes(10, 4, 8, 2, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
     }
 
     #[test]
@@ -161,11 +163,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn shape_mismatch_is_reported() {
-        let e = check_shapes(10, 4, 8, 2, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
     }
 }

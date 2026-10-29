@@ -52,7 +52,12 @@ pub fn score(sae: &Sae, x: &Tensor, batch: usize) -> Result<Scored> {
     let mut start = 0;
     while start < n {
         let len = batch.min(n - start);
-        let z = sae.normalize(&crate::train::rows_to_device(x, start, len, sae.mu.device())?)?;
+        let z = sae.normalize(&crate::train::rows_to_device(
+            x,
+            start,
+            len,
+            sae.mu.device(),
+        )?)?;
         let h = sae.encode(&z)?.to_vec2::<f32>()?;
         for row in h {
             let mut on: Vec<(u32, f32)> = row

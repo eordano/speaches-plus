@@ -87,11 +87,11 @@ def _value_info(b, span):
     name, shape = None, []
     for f, w, v in _fields(b, *span):
         if f == 1: name = b[v[0]:v[1]].decode()
-        elif f == 2:  # TypeProto
+        elif f == 2:
             for f2, w2, v2 in _fields(b, *v):
-                if f2 == 1:  # tensor_type
+                if f2 == 1:
                     for f3, w3, v3 in _fields(b, *v2):
-                        if f3 == 2:  # shape
+                        if f3 == 2:
                             for f4, w4, v4 in _fields(b, *v3):
                                 if f4 == 1:
                                     d = None

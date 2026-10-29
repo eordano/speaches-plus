@@ -161,15 +161,15 @@ A model runs on the engine if it:
 
 `Eagle3DraftModel.forward` returns `(logits, midlayer_out)` so the proposer can feed the residual back. `propose_token_ids` re-maps draft-vocab argmax through `d2t` to target-vocab IDs.
 
-**Aux row contract** (`EagleProposer.propose`): `runner_state["last_aux_hidden_states"]` has one row per seq in the input batch order -- including finished seqs. Active seqs are filtered by index, not by `zip(active, aux)`. Older code that zipped aux against the active subset crashed when any seq finished mid-step.
+Aux row contract (`EagleProposer.propose`): `runner_state["last_aux_hidden_states"]` has one row per seq in the input batch order -- including finished seqs. Active seqs are filtered by index, not by `zip(active, aux)`. Older code that zipped aux against the active subset crashed when any seq finished mid-step.
 
-**Partial finish**: a seq that just finished still occupies a row in `aux` but has `is_finished=True`. We `clear_drafts()` for finished seqs and only forward active ones into the draft model.
+Partial finish: a seq that just finished still occupies a row in `aux` but has `is_finished=True`. We `clear_drafts()` for finished seqs and only forward active ones into the draft model.
 
-**Partial acceptance row index** (`ModelRunner._slice_last_aux`, `run`): when verify accepts M of K drafts, the next round's "last hidden state" must be sliced from the M-th accepted row, not the last row of the verify batch. `run` builds `per_seq_aux_offsets = [accepted_count for ...]` and threads it through `_slice_last_aux`.
+Partial acceptance row index (`ModelRunner._slice_last_aux`, `run`): when verify accepts M of K drafts, the next round's "last hidden state" must be sliced from the M-th accepted row, not the last row of the verify batch. `run` builds `per_seq_aux_offsets = [accepted_count for ...]` and threads it through `_slice_last_aux`.
 
-**Chain hoist**: the chain loop appends `next_tokens` and only calls `.tolist()` once after the loop. Collapses K device->host syncs per step into one.
+Chain hoist: the chain loop appends `next_tokens` and only calls `.tolist()` once after the loop. Collapses K device->host syncs per step into one.
 
-**Pin-memory guard**: `pin_memory=True` on a non-CUDA build (CPU, MPS) does not error -- it hangs silently. Anywhere we allocate a CPU tensor that will be H2D-copied, gate `pin_memory` on `device.type == "cuda"` (or `torch.cuda.is_available()` for module-globals like the bitmask cache).
+Pin-memory guard: `pin_memory=True` on a non-CUDA build (CPU, MPS) does not error -- it hangs silently. Anywhere we allocate a CPU tensor that will be H2D-copied, gate `pin_memory` on `device.type == "cuda"` (or `torch.cuda.is_available()` for module-globals like the bitmask cache).
 
 ### N-gram drafter (`nano_vllm/spec_decode/ngram.py`)
 
@@ -481,7 +481,7 @@ All env-var names are centralized in `env.py` (mirrors `speaches-plus/rust/src/d
 
 `nix develop` provides the same env wiring plus `ffmpeg` / `sox` / `curl` / `file` for the e2e test.
 
-The `[gpu]` optional pip extra adds `flash-attn` + `triton` -- required by the nano_vllm engine, only useful on a CUDA box.
+The `[gpu]` optional extra (`uv pip install '.[gpu]'`) adds `flash-attn` + `triton` -- required by the nano_vllm engine, only useful on a CUDA box.
 
 ### Tested-with (last verified by e2e)
 
@@ -532,7 +532,7 @@ Two in-tree pybind11 extensions bridge `libctranslate2` (CTranslate2 Whisper) an
 - `STT_BACKEND=ct2` (or `ctranslate2`, `faster-whisper`) -> CTranslate2 path.
 - Anything else (default) -> whisper.cpp path.
 
-The top-level `server.py` adds `STT_BACKEND=qwen3_omni` as the *default* selector for the omni model; the whisper aliases above are only honored in the dedicated whisper code path.
+The top-level `server.py` adds `STT_BACKEND=qwen3_omni` as the default selector for the omni model; the whisper aliases above are only honored in the dedicated whisper code path.
 
 ### Nixpkgs source
 

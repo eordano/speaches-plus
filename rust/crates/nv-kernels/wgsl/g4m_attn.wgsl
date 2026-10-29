@@ -50,6 +50,7 @@ fn g4m_attn_norm_rope(
     var v1 = 0.0;
     if (e0 < hd) {
         let base = r * ga_p.src_stride + e0;
+        #def b4
         v0 = bf16_decode(u16_at(ga_src[base >> 1u], base));
         v1 = bf16_decode(u16_at(ga_src[(base + 1u) >> 1u], base + 1u));
     }
@@ -63,6 +64,7 @@ fn g4m_attn_norm_rope(
     }
     let rms = inverseSqrt(ga_red[0] / f32(hd) + ga_p.eps);
     if (e0 < hd) {
+        #end
         let w0 = bf16_decode(u16_at(ga_w[e0 >> 1u], e0));
         let w1 = bf16_decode(u16_at(ga_w[(e0 + 1u) >> 1u], e0 + 1u));
         ga_buf[e0] = bf16_decode(bf16_encode(v0 * rms * w0));
@@ -143,6 +145,7 @@ var<workgroup> gd_z: f32;
 
 @compute @workgroup_size(256)
 fn g4m_attn_decode(
+    #def b3
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -163,6 +166,7 @@ fn g4m_attn_decode(
 
     for (var d = tid; d < hd; d = d + 256u) {
         let idx = h * hd + d;
+    #end
         gd_qs[d] = bf16_decode(u16_at(gd_q[idx >> 1u], idx));
     }
     workgroupBarrier();
@@ -180,6 +184,7 @@ fn g4m_attn_decode(
             dot = fma(bf16_decode(u16_at(gd_kc[idx >> 1u], idx)), gd_qs[d], dot);
         }
         let s = dot * gd_p.scale;
+        #def b2
         gd_scores[srow + t] = s;
         lmax = max(lmax, s);
     }
@@ -225,6 +230,7 @@ fn g4m_attn_decode(
             if (gd_p.ring > 0u) {
                 vslot = t % gd_p.ring;
             }
+        #end
             let idx = (vslot * gd_p.n_kv + kv) * hd + d;
             acc = fma(gd_scores[srow + t], bf16_decode(u16_at(gd_vc[idx >> 1u], idx)), acc);
         }
@@ -236,26 +242,7 @@ const GD_E4M3_SHIFT_CARRY_2POW120_RIDES_Q_AND_V_SCALE: f32 = 1329227995784915872
 
 @compute @workgroup_size(256)
 fn g4m_attn_decode_fp8(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let h = wid.x;
-    let tid = lid.x;
-    let hd = gd_p.head_dim;
-    var p = 0u;
-    if (gd_pos[0] > 0) {
-        p = u32(gd_pos[0]);
-    }
-    let total = p + 1u;
-    var start = 0u;
-    if (gd_p.window > 0u && total > gd_p.window) {
-        start = total - gd_p.window;
-    }
-    let kv = h / gd_p.group;
-    let srow = h * gd_p.max_seq;
-
-    for (var d = tid; d < hd; d = d + 256u) {
-        let idx = h * hd + d;
+    #use b3
         gd_qs[d] = bf16_decode(u16_at(gd_q[idx >> 1u], idx))
             * GD_E4M3_SHIFT_CARRY_2POW120_RIDES_Q_AND_V_SCALE;
     }
@@ -279,51 +266,7 @@ fn g4m_attn_decode_fp8(
             );
         }
         let s = dot * gd_ksc[krow] * gd_p.scale;
-        gd_scores[srow + t] = s;
-        lmax = max(lmax, s);
-    }
-    gd_red[tid] = lmax;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s = s >> 1u) {
-        if (tid < s) {
-            gd_red[tid] = max(gd_red[tid], gd_red[tid + s]);
-        }
-        workgroupBarrier();
-    }
-    if (tid == 0u) {
-        gd_m = gd_red[0];
-    }
-    workgroupBarrier();
-    let m = gd_m;
-
-    var lsum = 0.0;
-    for (var t = start + tid; t < total; t = t + 256u) {
-        let e = exp(gd_scores[srow + t] - m);
-        gd_scores[srow + t] = e;
-        lsum = lsum + e;
-    }
-    workgroupBarrier();
-    gd_red[tid] = lsum;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s = s >> 1u) {
-        if (tid < s) {
-            gd_red[tid] = gd_red[tid] + gd_red[tid + s];
-        }
-        workgroupBarrier();
-    }
-    if (tid == 0u) {
-        gd_z = gd_red[0];
-    }
-    workgroupBarrier();
-    let z = gd_z;
-
-    for (var d = tid; d < hd; d = d + 256u) {
-        var acc = 0.0;
-        for (var t = start; t < total; t = t + 1u) {
-            var vslot = t;
-            if (gd_p.ring > 0u) {
-                vslot = t % gd_p.ring;
-            }
+        #use b2
             let vrow = vslot * gd_p.n_kv + kv;
             let idx = vrow * hd + d;
             acc = fma(
@@ -338,6 +281,7 @@ fn g4m_attn_decode_fp8(
 
 @compute @workgroup_size(256)
 fn g4m_attn_norm_rope_qkv(
+    #def b5
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -350,6 +294,7 @@ fn g4m_attn_norm_rope_qkv(
     var src_row = r;
     var w_off = 0u;
     var rope = true;
+    #end
     var out_row = r;
     if (r >= n_q + n_kv) {
         let vr = r - n_q - n_kv;
@@ -361,6 +306,7 @@ fn g4m_attn_norm_rope_qkv(
         w_off = 2u * hd;
         rope = false;
         out_row = r;
+    #def b1
     } else if (r >= n_q) {
         w_off = hd;
     }
@@ -369,19 +315,7 @@ fn g4m_attn_norm_rope_qkv(
     var v1 = 0.0;
     if (e0 < hd) {
         let base = src_row * ga_p.src_stride + e0;
-        v0 = bf16_decode(u16_at(ga_src[base >> 1u], base));
-        v1 = bf16_decode(u16_at(ga_src[(base + 1u) >> 1u], base + 1u));
-    }
-    ga_red[lane] = v0 * v0 + v1 * v1;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s = s >> 1u) {
-        if (lane < s) {
-            ga_red[lane] = ga_red[lane] + ga_red[lane + s];
-        }
-        workgroupBarrier();
-    }
-    let rms = inverseSqrt(ga_red[0] / f32(hd) + ga_p.eps);
-    if (e0 < hd) {
+        #use b4
         let we0 = w_off + e0;
         let w0 = bf16_decode(u16_at(ga_w[we0 >> 1u], we0));
         let w1 = bf16_decode(u16_at(ga_w[(we0 + 1u) >> 1u], we0 + 1u));
@@ -422,6 +356,7 @@ fn g4m_attn_norm_rope_qkv(
             o1 = ga_buf[i1] * s + ga_buf[e1] * c;
         }
     }
+    #end
     ga_out[(out_row * hd + e0) >> 1u] = bf16_pack(o0, o1);
 }
 
@@ -450,18 +385,7 @@ fn g4m_kv_write_stacked(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256)
 fn g4m_attn_norm_rope_qkv_kvwrite(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let r = wid.x;
-    let lane = lid.x;
-    let hd = ga_p.head_dim;
-    let n_q = ga_p.n_q;
-    let n_kv = ga_p.n_kv;
-    let has_v = ga_p.has_rope;
-    var src_row = r;
-    var w_off = 0u;
-    var rope = true;
+    #use b5
     if (r >= n_q + n_kv) {
         let vr = r - n_q - n_kv;
         if (has_v == 1u) {
@@ -471,67 +395,7 @@ fn g4m_attn_norm_rope_qkv_kvwrite(
         }
         w_off = 2u * hd;
         rope = false;
-    } else if (r >= n_q) {
-        w_off = hd;
-    }
-    let e0 = 2u * lane;
-    var v0 = 0.0;
-    var v1 = 0.0;
-    if (e0 < hd) {
-        let base = src_row * ga_p.src_stride + e0;
-        v0 = bf16_decode(u16_at(ga_src[base >> 1u], base));
-        v1 = bf16_decode(u16_at(ga_src[(base + 1u) >> 1u], base + 1u));
-    }
-    ga_red[lane] = v0 * v0 + v1 * v1;
-    workgroupBarrier();
-    for (var s = 128u; s > 0u; s = s >> 1u) {
-        if (lane < s) {
-            ga_red[lane] = ga_red[lane] + ga_red[lane + s];
-        }
-        workgroupBarrier();
-    }
-    let rms = inverseSqrt(ga_red[0] / f32(hd) + ga_p.eps);
-    if (e0 < hd) {
-        let we0 = w_off + e0;
-        let w0 = bf16_decode(u16_at(ga_w[we0 >> 1u], we0));
-        let w1 = bf16_decode(u16_at(ga_w[(we0 + 1u) >> 1u], we0 + 1u));
-        ga_buf[e0] = bf16_decode(bf16_encode(v0 * rms * w0));
-        ga_buf[e0 + 1u] = bf16_decode(bf16_encode(v1 * rms * w1));
-    }
-    workgroupBarrier();
-    if (e0 >= hd) {
-        return;
-    }
-    var p = 0u;
-    if (ga_pos[0] > 0) {
-        p = u32(ga_pos[0]);
-    }
-    var o0 = ga_buf[e0];
-    var o1 = ga_buf[e0 + 1u];
-    if (rope) {
-        let rh = ga_p.rot_half;
-        if (e0 < rh) {
-            let c = ga_cos[p * rh + e0];
-            let s = ga_sin[p * rh + e0];
-            o0 = ga_buf[e0] * c - ga_buf[e0 + rh] * s;
-        } else {
-            let i0 = e0 - rh;
-            let c = ga_cos[p * rh + i0];
-            let s = ga_sin[p * rh + i0];
-            o0 = ga_buf[i0] * s + ga_buf[e0] * c;
-        }
-        let e1 = e0 + 1u;
-        if (e1 < rh) {
-            let c = ga_cos[p * rh + e1];
-            let s = ga_sin[p * rh + e1];
-            o1 = ga_buf[e1] * c - ga_buf[e1 + rh] * s;
-        } else {
-            let i1 = e1 - rh;
-            let c = ga_cos[p * rh + i1];
-            let s = ga_sin[p * rh + i1];
-            o1 = ga_buf[i1] * s + ga_buf[e1] * c;
-        }
-    }
+    #use b1
     let outw = bf16_pack(o0, o1);
     ga_out[(r * hd + e0) >> 1u] = outw;
     if (r >= n_q) {

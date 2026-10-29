@@ -33,12 +33,8 @@ for manifest in Cargo.toml crates/*/Cargo.toml; do
     [ "$crate" = "$THE_ONLY_PACKAGE_THAT_ALSO_NEEDS_WGPU" ] && features="cuda,wgpu"
   fi
   synthetic_batch_gates=()
-  if [ "$crate" = nv-models ]; then
-    if [ "$BACKEND" = wgpu ]; then
-      synthetic_batch_gates=(NV_G4BD=1 NV_G4D_CHUNKED_PREFILL=1 NV_G4D_HOST_SHAPE=1 NV_G4PFW=1)
-    else
-      synthetic_batch_gates=(NV_Q38_BATCH_TEST=1 NV_LAGBAT_TEST=1)
-    fi
+  if [ "$crate" = nv-models ] && [ "$BACKEND" = wgpu ]; then
+    synthetic_batch_gates=(NV_G4BD=1 NV_G4D_CHUNKED_PREFILL=1 NV_G4PFW=1)
   fi
 
   log="$LOG_DIR/$crate.log"

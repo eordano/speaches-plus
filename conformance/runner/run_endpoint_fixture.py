@@ -184,7 +184,7 @@ def validate_fixture(fdir: Path) -> FixtureResult:
     is_endpoint = family in ENDPOINT_FAMILIES
     if is_endpoint and not (ENDPOINT_OR_STEPS & set(data.keys())):
         viols.append(
-            f"missing both `endpoint` and `steps` -- fixture must declare one"
+            "missing both `endpoint` and `steps` -- fixture must declare one"
         )
 
     file_refs = find_multipart_file_refs(data)

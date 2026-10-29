@@ -140,6 +140,11 @@ impl LoraTokenMap {
     }
 }
 
+#[cfg(feature = "cuda")]
+use cudarc::driver::CudaSlice;
+#[cfg(any(feature = "cuda", feature = "wgpu"))]
+use nv_layers::linear::Linear;
+use std::sync::atomic::AtomicU64;
 #[cfg(feature = "wgpu")]
 pub use wgpu_runtime::{WgpuLoraHook, WgpuLoraRuntime};
 
@@ -493,12 +498,9 @@ pub struct ServingHookEngagement {
     pub fallback_candle_applies: u64,
 }
 
-static SERVING_M1_KERNEL_APPLIES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static SERVING_M1_APPLIES_INSIDE_AN_OPEN_CAPTURE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static SERVING_FALLBACK_CANDLE_APPLIES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static SERVING_M1_KERNEL_APPLIES: AtomicU64 = AtomicU64::new(0);
+static SERVING_M1_APPLIES_INSIDE_AN_OPEN_CAPTURE: AtomicU64 = AtomicU64::new(0);
+static SERVING_FALLBACK_CANDLE_APPLIES: AtomicU64 = AtomicU64::new(0);
 
 pub fn serving_hook_engagement_counted_host_side_so_replays_of_a_captured_graph_leave_it_flat(
 ) -> ServingHookEngagement {
@@ -524,11 +526,11 @@ struct CudaM1TwoPhaseDelta {
     device: candle_core::CudaDevice,
     _a_tensors: Vec<Tensor>,
     _b_tensors: Vec<Tensor>,
-    _a_ptrs_d: cudarc::driver::CudaSlice<u64>,
-    _b_ptrs_d: cudarc::driver::CudaSlice<u64>,
-    _slice_n_d: cudarc::driver::CudaSlice<i32>,
-    _slice_start_d: cudarc::driver::CudaSlice<i32>,
-    _partials: cudarc::driver::CudaSlice<f32>,
+    _a_ptrs_d: CudaSlice<u64>,
+    _b_ptrs_d: CudaSlice<u64>,
+    _slice_n_d: CudaSlice<i32>,
+    _slice_start_d: CudaSlice<i32>,
+    _partials: CudaSlice<f32>,
     a_ptrs_ptr: u64,
     b_ptrs_ptr: u64,
     slice_n_ptr: u64,
@@ -689,31 +691,17 @@ fn build_cuda_m1_kernel_delta(
     }
     let n_slices = a_tensors.len();
     let (n_tiles, k_tile) = nv_kernels::lora::m1_shrink_tiling(in_features);
-    #[allow(deprecated)]
-    let a_ptrs_d = stream
-        .clone_htod(&a_addrs)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    #[allow(deprecated)]
-    let b_ptrs_d = stream
-        .clone_htod(&b_addrs)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    #[allow(deprecated)]
-    let slice_n_d = stream
-        .clone_htod(&slice_n)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    #[allow(deprecated)]
-    let slice_start_d = stream
-        .clone_htod(&slice_start)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let mut partials = stream
-        .alloc_zeros::<f32>(n_slices * n_tiles * max_rank)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let ro = |s: &cudarc::driver::CudaSlice<u64>| -> u64 {
+    let a_ptrs_d = stream.clone_htod(&a_addrs)?;
+    let b_ptrs_d = stream.clone_htod(&b_addrs)?;
+    let slice_n_d = stream.clone_htod(&slice_n)?;
+    let slice_start_d = stream.clone_htod(&slice_start)?;
+    let mut partials = stream.alloc_zeros::<f32>(n_slices * n_tiles * max_rank)?;
+    let ro = |s: &CudaSlice<u64>| -> u64 {
         let (p, g) = s.device_ptr(&stream);
         drop(g);
         p
     };
-    let roi = |s: &cudarc::driver::CudaSlice<i32>| -> u64 {
+    let roi = |s: &CudaSlice<i32>| -> u64 {
         let (p, g) = s.device_ptr(&stream);
         drop(g);
         p
@@ -838,7 +826,7 @@ impl nv_layers::linear::LoraDeltaHook for ServingLoraHook {
                 &self.cuda_m1_kernel_delta_that_survives_the_forked_stream_decode_capture
             {
                 if m == 1
-                    && matches!(x2.device(), candle_core::Device::Cuda(_))
+                    && x2.device().is_cuda()
                     && y2.dtype() == candle_core::DType::BF16
                 {
                     use std::sync::atomic::Ordering::Relaxed;
@@ -850,7 +838,7 @@ impl nv_layers::linear::LoraDeltaHook for ServingLoraHook {
                     return Ok(None);
                 }
             }
-            if matches!(x2.device(), candle_core::Device::Cuda(_))
+            if x2.device().is_cuda()
                 && a_capture_is_open_so_candle_matmuls_would_launch_uncaptured_on_the_legacy_stream(
                     x2,
                 )
@@ -919,10 +907,10 @@ pub struct ServingInstall {
 
 #[cfg(any(feature = "cuda", feature = "wgpu"))]
 fn plan_serving_hook<'m>(
-    linear: &'m nv_layers::linear::Linear,
+    linear: &'m Linear,
     slices: &[(String, usize, usize)],
     adapter: &nv_weights::lora_adapter::LoraAdapter,
-    planned: &mut Vec<(&'m nv_layers::linear::Linear, Arc<ServingLoraHook>)>,
+    planned: &mut Vec<(&'m Linear, Arc<ServingLoraHook>)>,
     matched: &mut usize,
 ) -> Result<()> {
     let mut hook_slices = Vec::new();
@@ -953,21 +941,11 @@ fn plan_serving_hook<'m>(
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu"))]
-pub fn detach_gemma4_serving_adapter(model: &Gemma4) {
-    for layer in model.layers() {
-        layer.self_attn.qkv_proj.detach_lora();
-        layer.self_attn.o_proj.detach_lora();
-        layer.mlp.gate_up_proj.detach_lora();
-        layer.mlp.down_proj.detach_lora();
-    }
-}
-
-#[cfg(any(feature = "cuda", feature = "wgpu"))]
 pub fn install_gemma4_serving_adapter(
     model: &Gemma4,
     adapter: &nv_weights::lora_adapter::LoraAdapter,
 ) -> Result<ServingInstall> {
-    let mut planned: Vec<(&nv_layers::linear::Linear, Arc<ServingLoraHook>)> = Vec::new();
+    let mut planned: Vec<(&Linear, Arc<ServingLoraHook>)> = Vec::new();
     let mut matched = 0usize;
     let mut skipped: Vec<String> = Vec::new();
     for (li, layer) in model.layers().iter().enumerate() {
@@ -1035,7 +1013,7 @@ pub fn install_gemma4_serving_adapter(
             adapter.loras.keys().next()
         );
     }
-    let mut attached: Vec<&nv_layers::linear::Linear> = Vec::new();
+    let mut attached: Vec<&Linear> = Vec::new();
     for (linear, hook) in planned {
         if let Err(err) = linear.attach_lora(hook) {
             for l in attached {
@@ -1086,14 +1064,14 @@ pub fn install_laguna_serving_adapter(
     use nv_models::laguna::LagunaFfn;
     let prefix =
         LAGUNA_SERVING_LORA_PREFIX_IS_THE_GEMMA4_NAMESPACE_BECAUSE_NV_WEIGHTS_NORMALIZE_MODULE_NAME_REWRITES_MODEL_LAYERS;
-    let mut planned: Vec<(&nv_layers::linear::Linear, Arc<ServingLoraHook>)> = Vec::new();
+    let mut planned: Vec<(&Linear, Arc<ServingLoraHook>)> = Vec::new();
     let mut matched = 0usize;
     let mut matched_names: Vec<String> = Vec::new();
     let mut w8_bypassed_attention_matched = false;
     for (li, layer) in model.layers().iter().enumerate() {
         let p = format!("{prefix}.layers.{li}");
         let attn = &layer.self_attn;
-        let mut targets: Vec<(&nv_layers::linear::Linear, String, bool)> = vec![
+        let mut targets: Vec<(&Linear, String, bool)> = vec![
             (&attn.q_proj, format!("{p}.self_attn.q_proj"), true),
             (&attn.k_proj, format!("{p}.self_attn.k_proj"), true),
             (&attn.v_proj, format!("{p}.self_attn.v_proj"), true),
@@ -1172,7 +1150,7 @@ pub fn install_laguna_serving_adapter(
              install cannot stick; boot the adapter engine without the shape policy"
         );
     }
-    let mut attached: Vec<&nv_layers::linear::Linear> = Vec::new();
+    let mut attached: Vec<&Linear> = Vec::new();
     for (linear, hook) in planned {
         if let Err(err) = linear.attach_lora(hook) {
             for l in attached {
@@ -1211,6 +1189,111 @@ pub fn install_laguna_serving_adapter(
         hooked_linears: attached.len(),
         skipped,
     })
+}
+
+#[cfg(feature = "cuda")]
+pub struct Qwen4ExpServingAdapter {
+    hooks: Vec<(String, Arc<ServingLoraHook>)>,
+    experts: Vec<(usize, Arc<nv_models::qwen4_exp::lora::expert::ExpertLoraLayer>)>,
+}
+
+#[cfg(feature = "cuda")]
+impl Qwen4ExpServingAdapter {
+    pub fn prepare(
+        model: &nv_models::qwen4_exp::Qwen4Exp,
+        adapter: &nv_weights::lora_adapter::LoraAdapter,
+    ) -> Result<Self> {
+        Self::prepare_with_experts(model, adapter, Vec::new())
+    }
+
+    fn prepare_linears(
+        model: &nv_models::qwen4_exp::Qwen4Exp,
+        adapter: &nv_weights::lora_adapter::LoraAdapter,
+    ) -> Result<Self> {
+        let targets = model.lora_target_linears();
+        for key in adapter.loras.keys() {
+            if !targets.iter().any(|(name, ..)| name == key) {
+                bail!(
+                    "{key}: not a qwen4_exp runtime-LoRA target; serving the other modules would \
+                     silently change the adapter's trained function. Targets are full-attention \
+                     self_attn.{{q,k,v,o}}_proj and mlp.shared_expert.{{gate,up,down}}_proj: {}",
+                    nv_models::qwen4_exp::lora::LINEAR_TARGETS_ARE_THE_BF16_CHECKPOINT_PROJECTIONS_AND_THE_ROUTED_EXPERTS_ADAPT_THROUGH_THE_MOE_LAYER_EXPERT_HOOK
+                );
+            }
+        }
+        let mut hooks = Vec::new();
+        for (name, _, _, linear) in targets {
+            let mut planned = Vec::new();
+            let mut matched = 0usize;
+            plan_serving_hook(
+                linear,
+                &[(name.clone(), 0, linear.out_features())],
+                adapter,
+                &mut planned,
+                &mut matched,
+            )?;
+            if let Some((_, hook)) = planned.pop() {
+                hooks.push((name, hook));
+            }
+        }
+        Ok(Self { hooks, experts: Vec::new() })
+    }
+
+    pub fn prepare_with_experts(
+        model: &nv_models::qwen4_exp::Qwen4Exp,
+        adapter: &nv_weights::lora_adapter::LoraAdapter,
+        experts: Vec<(usize, Arc<nv_models::qwen4_exp::lora::expert::ExpertLoraLayer>)>,
+    ) -> Result<Self> {
+        let mut s = Self::prepare_linears(model, adapter)?;
+        s.experts = experts;
+        if s.hooks.is_empty() && s.experts.is_empty() {
+            bail!(
+                "lora adapter matched no qwen4_exp projection and carries no expert lora; it has {} \
+                 modules, the first of which is {:?}",
+                adapter.loras.len(),
+                adapter.loras.keys().next()
+            );
+        }
+        Ok(s)
+    }
+
+    pub fn modules(&self) -> usize {
+        self.hooks.len()
+    }
+
+    pub fn expert_layers(&self) -> usize {
+        self.experts.len()
+    }
+
+    pub fn expert_device_bytes(&self) -> usize {
+        self.experts.iter().map(|(_, l)| l.device_bytes()).sum()
+    }
+
+    pub fn attach(&self, model: &nv_models::qwen4_exp::Qwen4Exp) -> Result<()> {
+        model.detach_all_lora();
+        for (li, l) in &self.experts {
+            if let Err(e) = model.attach_expert_lora(*li, l.clone()) {
+                model.detach_all_lora();
+                return Err(e);
+            }
+        }
+        let targets = model.lora_target_linears();
+        for (name, hook) in &self.hooks {
+            let (_, _, _, linear) = targets
+                .iter()
+                .find(|(n, ..)| n == name)
+                .ok_or_else(|| anyhow::anyhow!("{name}: not a projection of this qwen4_exp model"))?;
+            if let Err(e) = linear.attach_lora(hook.clone()) {
+                model.detach_all_lora();
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn detach(model: &nv_models::qwen4_exp::Qwen4Exp) {
+        model.detach_all_lora();
+    }
 }
 
 #[cfg(any(feature = "cuda", feature = "wgpu"))]

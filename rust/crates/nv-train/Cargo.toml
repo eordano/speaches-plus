@@ -11,6 +11,7 @@ candle-core = { workspace = true }
 candle-nn = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 nv-config = { workspace = true }
+nv-laya = { workspace = true }
 nv-layers = { workspace = true }
 nv-kernels = { workspace = true, optional = true }
 nv-quant = { workspace = true }

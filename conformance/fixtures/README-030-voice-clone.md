@@ -1,14 +1,15 @@
 # 030-voice-clone-* family
 
-Voice-profile + TTS-synthesis fixtures: built-in Base voice, VoiceDesign
-parameterized voice, and CustomVoice from a short reference audio clip.
+Voice-profile + TTS-synthesis fixtures: built-in Base voice, a voice designed
+from a description and cloned onto Base, and CustomVoice from a short
+reference audio clip.
 
 ## Fixtures (3)
 
 | ID                                | Coverage                                                                |
 | --------------------------------- | ----------------------------------------------------------------------- |
 | `030-voice-clone-base`            | Built-in `Base` voice; envelope-based audio assertion                   |
-| `030-voice-clone-design-warm`     | VoiceDesign with `warm=1.0`; design_params round-trip                   |
+| `030-voice-clone-design-warm`     | VoiceDesign from `instructions`, enrolled on Base, cloned; STT/F0/ECAPA |
 | `030-voice-clone-custom-from-3sec`| CustomVoice from a 3-second 440 Hz sine; embedding L2-norm assertion    |
 
 ## "Passing" in placeholder mode
@@ -18,9 +19,11 @@ Today (no SpeakerEncoder weights, no Qwen3-TTS weights):
 - `030-voice-clone-base` is **skipped** end-to-end (the TTS handler routes
   to `route_to_kokoro` in `rust/src/oapi/audio_speech.rs` when no nv-tts
   talker is wired). Skip is gated on `skip_when_no_model: true`.
-- `030-voice-clone-design-warm`'s **structural round-trip** (POST profile,
-  GET back the same `design_params`) runs and passes — this only exercises
-  `VoiceProfileStore`, not the model.
+- `030-voice-clone-design-warm` is real synthesis only: its consumer is the
+  `#[ignore]` suite named in its `consumed_by`
+  (`real_voice_design_follows_the_description_repeats_by_seed_and_clones_onto_base`),
+  which reads the requests, the contrast pair, the Python reference token ids
+  and the gates from `fixture.json`.
 - `030-voice-clone-custom-from-3sec`'s **structural round-trip** runs and
   passes; the `embedding_state` assertion is relaxed to accept the
   `no_encoder` fallback in placeholder mode.
@@ -30,7 +33,7 @@ Today (no SpeakerEncoder weights, no Qwen3-TTS weights):
 | Fixture                            | Canonical assertion                                                 |
 | ---------------------------------- | ------------------------------------------------------------------- |
 | `030-voice-clone-base`             | WAV envelope check + token-count proxy inside expected ranges       |
-| `030-voice-clone-design-warm`      | Audible delta vs Base (perceptual A/B); design_params round-trip    |
+| `030-voice-clone-design-warm`      | `gates`: STT WER, F0 per description, ECAPA margins, clone pitch     |
 | `030-voice-clone-custom-from-3sec` | `embedding_state == "encoded"`; L2 norm = 1.0 ± 0.01                |
 
 ## Discovery

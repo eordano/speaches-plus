@@ -319,10 +319,9 @@ func respIDOf(r RespPhase) ResponseID {
 }
 
 type sealedBuffer struct {
-	itemID   ItemID
-	startMs  Millis
-	endMs    Millis
-	sealedAt int64
+	itemID  ItemID
+	startMs Millis
+	endMs   Millis
 }
 
 type itemStatus int
@@ -558,13 +557,6 @@ type bargeInEffect struct {
 	runnerToAbort *eagerRunner
 }
 
-func boolStr(b bool) string {
-	if b {
-		return "speaking"
-	}
-	return "silent"
-}
-
 func (s *phaseState) setSealedRetention(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -794,7 +786,7 @@ func (s *phaseState) onCommitTimerFire() commitEffect {
 		eff.endMs = bs.EndMs
 
 		s.rotateSealed(bs.ItemID, bs.StartMs, bs.EndMs)
-		s.buf = BufCommitted{ItemID: bs.ItemID, StartMs: bs.StartMs, EndMs: bs.EndMs}
+		s.buf = BufCommitted(bs)
 		s.vad = VadSilent{}
 		if s.conv == nil {
 			s.conv = make(map[ItemID]*conversationItem)
@@ -1107,14 +1099,7 @@ func (s *phaseState) onLLMComplete(epoch Epoch) bool {
 			if r.Epoch != epoch {
 				return
 			}
-			s.resp = RespDrain{
-				ID:         r.ID,
-				ItemID:     r.ItemID,
-				Epoch:      r.Epoch,
-				Transcript: r.Transcript,
-				PlannedMs:  r.PlannedMs,
-				PlayedMs:   r.PlayedMs,
-			}
+			s.resp = RespDrain(r)
 			ok = true
 		}
 	})
@@ -1260,16 +1245,6 @@ func (s *phaseState) deleteItem(itemID ItemID) bool {
 		ok = true
 	})
 	return ok
-}
-
-func (s *phaseState) sealedBufferFor(itemID ItemID) (sealedBuffer, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.sealedBufs == nil {
-		return sealedBuffer{}, false
-	}
-	b, ok := s.sealedBufs[itemID]
-	return b, ok
 }
 
 func (s *phaseState) insertItem(item conversationItem) bool {

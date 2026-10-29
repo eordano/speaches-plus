@@ -67,13 +67,13 @@ GEMM.
 
 ## whisper.py
 
-Hosts the *backend-agnostic* surface callers code against: the `Backend`
+Hosts the backend-agnostic surface callers code against: the `Backend`
 enum, `WhisperBackend` Protocol, `TranscriptionResult` and `TimedSegment`
 dataclasses, and the timestamp/segmentation helpers
 (`parse_timestamp_token`, `classify_timestamp`, `split_ct2_segments`,
 `peak_amplitude`, `join_segments`, `strip_special_tokens`).
 
-`TranscriptionResult` + `TimedSegment` are the *canonical* shape --
+`TranscriptionResult` + `TimedSegment` are the canonical shape --
 `stt/ct2.py` re-exports `Segment` as an alias for `TimedSegment` and
 imports `TranscriptionResult` from this module so all backends return the
 same type. Field names + semantics match upstream Rust.
@@ -112,10 +112,10 @@ the actual model id (file basename of the on-disk model path).
 
 ### Translations contract
 
-`task="translate"` instructs the backend to *translate* the input audio to
+`task="translate"` instructs the backend to translate the input audio to
 English (Whisper's standard task), as opposed to transcribing in the source
 language. Setting `language="en"` and calling transcribe -- the earlier
-behaviour -- was wrong: Whisper's language token is the *source* language,
+behaviour -- was wrong: Whisper's language token is the source language,
 not the target, so that produced gibberish for non-English audio. Per
 backend:
 

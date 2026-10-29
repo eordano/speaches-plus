@@ -98,50 +98,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generation_cap_holds_the_exact_64k_boundary() {
+    fn generation_cap_holds_the_exact_64k_boundary_under_completion_precedence() {
         assert_eq!(resolve_max_new_tokens(Some(65_536), 256, 65_536), 65_536);
         assert_eq!(resolve_max_new_tokens(Some(65_537), 256, 65_536), 65_536);
+        {
+            assert_eq!(
+                resolve_request_max_new_tokens(Some(23), Some(17), 256, 65_536),
+                17
+            );
+            assert_eq!(
+                resolve_request_max_new_tokens(Some(23), None, 256, 65_536),
+                23
+            );
+            assert_eq!(
+                resolve_request_max_new_tokens(None, Some(17), 256, 65_536),
+                17
+            );
+            assert_eq!(resolve_request_max_new_tokens(None, None, 256, 65_536), 256);
+            assert_eq!(
+                resolve_request_max_new_tokens(Some(65_536), None, 256, 65_536),
+                65_536
+            );
+            assert_eq!(
+                resolve_request_max_new_tokens(Some(65_537), None, 256, 65_536),
+                65_536
+            );
+        }
     }
     #[test]
-
-    fn request_fields_use_completion_precedence_and_the_exact_cap() {
-        assert_eq!(
-            resolve_request_max_new_tokens(Some(23), Some(17), 256, 65_536),
-            17
-        );
-        assert_eq!(
-            resolve_request_max_new_tokens(Some(23), None, 256, 65_536),
-            23
-        );
-        assert_eq!(
-            resolve_request_max_new_tokens(None, Some(17), 256, 65_536),
-            17
-        );
-        assert_eq!(resolve_request_max_new_tokens(None, None, 256, 65_536), 256);
-        assert_eq!(
-            resolve_request_max_new_tokens(Some(65_536), None, 256, 65_536),
-            65_536
-        );
-        assert_eq!(
-            resolve_request_max_new_tokens(Some(65_537), None, 256, 65_536),
-            65_536
-        );
-    }
-
-    #[test]
-    fn total_window_holds_prompt_plus_generation_boundaries() {
+    fn total_window_holds_prompt_plus_generation_boundaries_at_the_lower_limit() {
         assert_eq!(
             request_window(196_608, 65_536, 262_144, 262_144),
             Ok(262_144)
         );
         assert_eq!(request_window(262_143, 1, 262_144, 262_144), Ok(262_144));
         assert!(request_window(262_143, 2, 262_144, 262_144).is_err());
+        {
+            assert_eq!(request_window(100, 1, 200, 300), Ok(200));
+            assert_eq!(request_window(100, 1, 300, 200), Ok(200));
+            assert!(request_window(199, 2, 300, 200).is_err());
+        }
     }
 
-    #[test]
-    fn total_window_uses_the_lower_configured_or_model_limit() {
-        assert_eq!(request_window(100, 1, 200, 300), Ok(200));
-        assert_eq!(request_window(100, 1, 300, 200), Ok(200));
-        assert!(request_window(199, 2, 300, 200).is_err());
-    }
 }

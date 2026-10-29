@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::{bail, ensure};
 
 struct PendingCommit {
     start: usize,
@@ -36,17 +37,17 @@ impl DflashCtxCommitGraph {
 
     pub(crate) fn new(draft: &LagunaDflash, cache: &DflashCtxCache) -> Result<Self> {
         let Device::Cuda(dev) = &draft.device else {
-            anyhow::bail!("M6 context commit requires CUDA")
+            bail!("M6 context commit requires CUDA")
         };
         let stream = dev.cuda_stream();
-        anyhow::ensure!(!stream.cu_stream().is_null()
+        ensure!(!stream.cu_stream().is_null()
             && !nv_layers::cuda_stream::is_overridden() && !stream.context().is_event_tracking(),
             "M6 context commit requires the explicit model stream with capture event tracking disabled");
         let ring = cache
             .ring
             .as_ref()
             .context("M6 context commit requires a resident draft ring")?;
-        anyhow::ensure!(
+        ensure!(
             draft.dtype == DType::BF16
                 && draft.config.num_aux() == 5
                 && draft.layers.len() == 5
@@ -119,7 +120,7 @@ impl DflashCtxCommitGraph {
     }
 
     pub(crate) fn require_idle(&self) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.healthy && self.pending.is_none(),
             "engine busy: M6 context commit is retired or has unfinished GPU work; try later."
         );
@@ -128,7 +129,7 @@ impl DflashCtxCommitGraph {
 
     fn check_ring(&self, cache: &DflashCtxCache) -> Result<()> {
         let ring = cache.ring.as_ref().context("M6 context ring disappeared")?;
-        anyhow::ensure!(
+        ensure!(
             ring.cap == self.ring.cap
                 && ring.window == self.ring.window
                 && ring.row_elems == self.ring.row_elems
@@ -149,7 +150,7 @@ impl DflashCtxCommitGraph {
                     .chain(std::iter::once(&self.ring.scratch)),
             )
         {
-            anyhow::ensure!(
+            ensure!(
                 actual.id() == bound.id(),
                 "M6 context commit cannot change physical ring pointers after capture"
             );
@@ -167,14 +168,14 @@ impl DflashCtxCommitGraph {
         self.require_idle()?;
         self.check_ring(cache)?;
         let rows = positions.len();
-        anyhow::ensure!(
+        ensure!(
             (1..=3).contains(&rows) && auxiliary.len() == 5,
             "M6 context commit requires consumed lengths 1, 2 or 3 and five auxiliary taps"
         );
         let Device::Cuda(dev) = &draft.device else {
-            anyhow::bail!("M6 context commit requires CUDA")
+            bail!("M6 context commit requires CUDA")
         };
-        anyhow::ensure!(
+        ensure!(
             !nv_layers::cuda_stream::is_overridden()
                 && dev.cuda_stream().cu_stream() == self.stream.cu_stream()
                 && draft.active_rope_theta().to_bits() == self.theta
@@ -183,7 +184,7 @@ impl DflashCtxCommitGraph {
             "M6 context commit stream, RoPE theta or normalization mode changed after binding"
         );
         draft.check_rope_span(cache.len, rows)?;
-        anyhow::ensure!(
+        ensure!(
             positions
                 .iter()
                 .enumerate()
@@ -191,7 +192,7 @@ impl DflashCtxCommitGraph {
             "M6 context commit positions must extend the current draft frontier"
         );
         for source in auxiliary {
-            anyhow::ensure!(
+            ensure!(
                 source.dtype() == DType::BF16
                     && source.dims() == [1, rows, self.hidden]
                     && source.is_contiguous()
@@ -205,7 +206,7 @@ impl DflashCtxCommitGraph {
             let end = src
                 .checked_add(bytes)
                 .context("M6 auxiliary pointer overflow")?;
-            anyhow::ensure!(
+            ensure!(
                 self.staging_ranges
                     .iter()
                     .all(|&(dst, dst_end)| end <= dst || dst_end <= src),
@@ -213,7 +214,7 @@ impl DflashCtxCommitGraph {
             );
         }
         let ring = cache.ring.as_ref().unwrap();
-        anyhow::ensure!(
+        ensure!(
             ring.stored <= ring.window && ring.stored <= cache.len,
             "M6 context commit requires the existing bounded window policy"
         );
@@ -281,7 +282,7 @@ impl DflashCtxCommitGraph {
             ..
         } = self;
         runner.run_on(key, Some(stream), |s| {
-            anyhow::ensure!(
+            ensure!(
                 s.cu_stream() == stream.cu_stream(),
                 "M6 context graph cannot capture on another stream"
             );
@@ -291,7 +292,7 @@ impl DflashCtxCommitGraph {
     }
 
     pub(crate) fn finish_after_sync(&mut self, cache: &mut DflashCtxCache) -> Result<()> {
-        anyhow::ensure!(
+        ensure!(
             self.healthy,
             "M6 context commit cannot finish a retired operation"
         );
@@ -301,7 +302,7 @@ impl DflashCtxCommitGraph {
             .as_ref()
             .context("M6 context commit has no queued operation")?;
         let ring = cache.ring.as_mut().unwrap();
-        anyhow::ensure!(
+        ensure!(
             cache.len == pending.start && ring.stored == pending.stored,
             "M6 context commit frontier changed before completion"
         );
@@ -334,13 +335,13 @@ fn commit_body(
 }
 
 fn pointer_bf16(tensor: &Tensor, stream: &Arc<CudaStream>) -> Result<u64> {
-    anyhow::ensure!(
+    ensure!(
         tensor.dtype() == DType::BF16 && tensor.is_contiguous(),
         "M6 ring/staging tensor must be contiguous BF16"
     );
     let (storage, layout) = tensor.storage_and_layout();
     let candle_core::Storage::Cuda(storage) = &*storage else {
-        anyhow::bail!("M6 ring/staging tensor must be CUDA")
+        bail!("M6 ring/staging tensor must be CUDA")
     };
     let (ptr, _guard) = storage.as_cuda_slice::<bf16>()?.device_ptr(stream);
     ptr.checked_add(
@@ -354,7 +355,7 @@ fn pointer_bf16(tensor: &Tensor, stream: &Arc<CudaStream>) -> Result<u64> {
 fn upload_positions(stream: &Arc<CudaStream>, tensor: &Tensor, values: &[i32]) -> Result<()> {
     let (storage, layout) = tensor.storage_and_layout();
     let candle_core::Storage::Cuda(storage) = &*storage else {
-        anyhow::bail!("M6 positions must be CUDA")
+        bail!("M6 positions must be CUDA")
     };
     let (ptr, _guard) = storage.as_cuda_slice::<i32>()?.device_ptr(stream);
     unsafe {
@@ -388,7 +389,7 @@ fn visible_ring_bits(cache: &DflashCtxCache) -> Result<(usize, usize, Vec<u16>)>
             .narrow(1, 0, ring.stored)?
             .flatten_all()?
             .to_vec1::<bf16>()?;
-        anyhow::ensure!(
+        ensure!(
             host.iter().all(|v| v.is_finite()),
             "real context gate found nonfinite visible KV"
         );
@@ -403,7 +404,7 @@ pub(crate) fn real_weight_context_commit_gate(
     draft: &LagunaDflash,
     tokenizer: &tokenizers::Tokenizer,
 ) -> Result<()> {
-    anyhow::ensure!(
+    ensure!(
         draft.rope_max_seq_len() == 262144 && draft.config.hidden_size == 2048,
         "context gate requires the pinned Laguna XS geometry and 262144 rotary capacity"
     );
@@ -421,7 +422,7 @@ pub(crate) fn real_weight_context_commit_gate(
             .map_err(|error| anyhow::anyhow!("tokenization: {error}"))?
             .get_ids()
             .to_vec();
-        anyhow::ensure!(ids.len() >= 640, "context gate prompt unexpectedly short");
+        ensure!(ids.len() >= 640, "context gate prompt unexpectedly short");
         ids.truncate(640);
         let mut cache = target.new_kv_cache(1024)?;
         let mut pieces = Vec::new();
@@ -442,7 +443,7 @@ pub(crate) fn real_weight_context_commit_gate(
                 true,
                 offset + rows == ids.len(),
             )?;
-            anyhow::ensure!(
+            ensure!(
                 aux.len() == 5
                     && aux
                         .iter()
@@ -468,7 +469,7 @@ pub(crate) fn real_weight_context_commit_gate(
                 .to_vec1::<f32>()?,
         )
         .context("real auxiliary prefill produced invalid target logits")?;
-        anyhow::ensure!(
+        ensure!(
             aux.len() == 5
                 && aux
                     .iter()
@@ -716,7 +717,7 @@ pub(crate) fn real_weight_context_commit_gate(
             target.as_ref(),
             target.lm_head(),
         )?;
-        anyhow::ensure!(
+        ensure!(
             captured_proposer[lane]
                 .recorded_logits_host()?
                 .iter()

@@ -27,6 +27,7 @@ fn g4w_w4_pair_word(tid: u32, total: f32, hi_live: bool) -> u32 {
 
 @compute @workgroup_size(256)
 fn g4w_gemv_w4a16_block_pk(
+    #def b2
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -36,6 +37,7 @@ fn g4w_gemv_w4a16_block_pk(
     let row = (wid.x + wid.y * w4a16_params.groups_x) * W4A16_ROWS + warp;
     let live = row < w4a16_params.n_rows;
     let kv = select(0u, w4a16_params.k_elems >> 5u, live);
+    #end
     let wbase = select(0u, row * w4a16_params.w_row_words, live);
     let sbase = select(0u, row * w4a16_params.scale_row_stride, live);
     let acc = w4a16_row_acc_block(wbase, sbase, kv, lane, w4a16_params.gs);
@@ -48,18 +50,11 @@ fn g4w_gemv_w4a16_block_pk(
 
 @compute @workgroup_size(256)
 fn g4w_gemv_w4a16_block_pk3(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & (W4A16_LANES - 1u);
-    let warp = tid / W4A16_LANES;
-    let row = (wid.x + wid.y * w4a16_params.groups_x) * W4A16_ROWS + warp;
-    let live = row < w4a16_params.n_rows;
-    let kv = select(0u, w4a16_params.k_elems >> 5u, live);
+    #use b2
     let wbase = select(0u, row * w4a16_params.w_row_words, live);
     let sbase = select(0u, row * w4a16_params.scale_row_stride, live);
     let acc = w4a16_row_acc_block(wbase, sbase, kv, lane, w4a16_params.gs);
+    #def b3
     let total = w4a16_lane_reduce(tid, lane, acc);
     if (lane == 0u && live && (warp & 1u) == 0u) {
         let word = g4w_w4_pair_word(tid, total, row + 1u < w4a16_params.n_rows);
@@ -79,18 +74,11 @@ fn g4w_gemv_w4a16_block_pk3(
         }
     }
 }
+    #end
 
 @compute @workgroup_size(256)
 fn g4w_gemv_w4a16_v4_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & (W4A16_LANES - 1u);
-    let warp = tid / W4A16_LANES;
-    let row = (wid.x + wid.y * w4a16_params.groups_x) * W4A16_ROWS + warp;
-    let live = row < w4a16_params.n_rows;
-    let kv = select(0u, w4a16_params.k_elems >> 5u, live);
+    #use b2
     let wbase4 = select(0u, row * (w4a16_params.w_row_words >> 2u), live);
     let sbase = select(0u, row * w4a16_params.scale_row_stride, live);
     let acc = w4a16_row_acc_v4(wbase4, sbase, kv, lane, w4a16_params.gs);
@@ -103,37 +91,11 @@ fn g4w_gemv_w4a16_v4_pk(
 
 @compute @workgroup_size(256)
 fn g4w_gemv_w4a16_v4_pk3(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & (W4A16_LANES - 1u);
-    let warp = tid / W4A16_LANES;
-    let row = (wid.x + wid.y * w4a16_params.groups_x) * W4A16_ROWS + warp;
-    let live = row < w4a16_params.n_rows;
-    let kv = select(0u, w4a16_params.k_elems >> 5u, live);
+    #use b2
     let wbase4 = select(0u, row * (w4a16_params.w_row_words >> 2u), live);
     let sbase = select(0u, row * w4a16_params.scale_row_stride, live);
     let acc = w4a16_row_acc_v4(wbase4, sbase, kv, lane, w4a16_params.gs);
-    let total = w4a16_lane_reduce(tid, lane, acc);
-    if (lane == 0u && live && (warp & 1u) == 0u) {
-        let word = g4w_w4_pair_word(tid, total, row + 1u < w4a16_params.n_rows);
-        if (row < g4w_split_params.q_rows) {
-            g4w_y_q[row >> 1u] = word;
-        } else {
-            let kr = row - g4w_split_params.q_rows;
-            if (kr < g4w_split_params.kv_rows) {
-                g4w_y_k[kr >> 1u] = word;
-            }
-            if (row >= g4w_split_params.v_off) {
-                let vr = row - g4w_split_params.v_off;
-                if (vr < g4w_split_params.kv_rows) {
-                    g4w_y_v[vr >> 1u] = word;
-                }
-            }
-        }
-    }
-}
+    #use b3
 
 struct G4wMkParams {
     m: u32,
@@ -225,6 +187,7 @@ fn g4w_w4_v4_mk_rows(tid: u32, lane: u32, warp: u32, row: u32, live: bool,
 
 fn g4w_w4_mk_store_pk(tid: u32, lane: u32, warp: u32, row: u32, live: bool,
                       accs: ptr<function, array<f32, 8>>) {
+    #def b4
     let mm = g4w_mk_params.m;
     for (var t = 0u; t < 8u; t = t + 1u) {
         if (t >= mm) {
@@ -233,6 +196,7 @@ fn g4w_w4_mk_store_pk(tid: u32, lane: u32, warp: u32, row: u32, live: bool,
         let total = w4a16_lane_reduce(tid, lane, (*accs)[t]);
         if (lane == 0u && live && (warp & 1u) == 0u) {
             let word = g4w_w4_pair_word(tid, total, row + 1u < w4a16_params.n_rows);
+    #end
             w4a16_y[g4w_mk_params.dst_word_off + t * g4w_mk_params.y_stride_words + (row >> 1u)] = word;
         }
         workgroupBarrier();
@@ -241,14 +205,7 @@ fn g4w_w4_mk_store_pk(tid: u32, lane: u32, warp: u32, row: u32, live: bool,
 
 fn g4w_w4_mk_store_pk3(tid: u32, lane: u32, warp: u32, row: u32, live: bool,
                        accs: ptr<function, array<f32, 8>>) {
-    let mm = g4w_mk_params.m;
-    for (var t = 0u; t < 8u; t = t + 1u) {
-        if (t >= mm) {
-            break;
-        }
-        let total = w4a16_lane_reduce(tid, lane, (*accs)[t]);
-        if (lane == 0u && live && (warp & 1u) == 0u) {
-            let word = g4w_w4_pair_word(tid, total, row + 1u < w4a16_params.n_rows);
+    #use b4
             if (row < g4w_split_params.q_rows) {
                 g4w_y_q[t * (g4w_split_params.q_rows >> 1u) + (row >> 1u)] = word;
             } else {
@@ -270,6 +227,7 @@ fn g4w_w4_mk_store_pk3(tid: u32, lane: u32, warp: u32, row: u32, live: bool,
 
 @compute @workgroup_size(256)
 fn g4w_gemm_w4a16_block_mk_pk(
+    #def b1
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -282,60 +240,28 @@ fn g4w_gemm_w4a16_block_mk_pk(
     for (var t = 0u; t < 8u; t = t + 1u) {
         accs[t] = 0.0;
     }
+    #end
     g4w_w4_mk_rows(tid, lane, warp, row, live, &accs);
     g4w_w4_mk_store_pk(tid, lane, warp, row, live, &accs);
 }
 
 @compute @workgroup_size(256)
 fn g4w_gemm_w4a16_block_mk_pk3(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & (W4A16_LANES - 1u);
-    let warp = tid / W4A16_LANES;
-    let row = wid.x * W4A16_ROWS + warp;
-    let live = row < w4a16_params.n_rows;
-    var accs: array<f32, 8>;
-    for (var t = 0u; t < 8u; t = t + 1u) {
-        accs[t] = 0.0;
-    }
+    #use b1
     g4w_w4_mk_rows(tid, lane, warp, row, live, &accs);
     g4w_w4_mk_store_pk3(tid, lane, warp, row, live, &accs);
 }
 
 @compute @workgroup_size(256)
 fn g4w_gemm_w4a16_v4_mk_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & (W4A16_LANES - 1u);
-    let warp = tid / W4A16_LANES;
-    let row = wid.x * W4A16_ROWS + warp;
-    let live = row < w4a16_params.n_rows;
-    var accs: array<f32, 8>;
-    for (var t = 0u; t < 8u; t = t + 1u) {
-        accs[t] = 0.0;
-    }
+    #use b1
     g4w_w4_v4_mk_rows(tid, lane, warp, row, live, &accs);
     g4w_w4_mk_store_pk(tid, lane, warp, row, live, &accs);
 }
 
 @compute @workgroup_size(256)
 fn g4w_gemm_w4a16_v4_mk_pk3(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & (W4A16_LANES - 1u);
-    let warp = tid / W4A16_LANES;
-    let row = wid.x * W4A16_ROWS + warp;
-    let live = row < w4a16_params.n_rows;
-    var accs: array<f32, 8>;
-    for (var t = 0u; t < 8u; t = t + 1u) {
-        accs[t] = 0.0;
-    }
+    #use b1
     g4w_w4_v4_mk_rows(tid, lane, warp, row, live, &accs);
     g4w_w4_mk_store_pk3(tid, lane, warp, row, live, &accs);
 }

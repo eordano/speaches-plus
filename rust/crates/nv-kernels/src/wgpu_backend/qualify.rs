@@ -141,10 +141,6 @@ pub enum CoopDecision {
 }
 
 impl CoopDecision {
-    pub fn should_compile(&self) -> bool {
-        !matches!(self, Self::Skip(_))
-    }
-
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Compile => None,
@@ -617,30 +613,89 @@ mod tests {
     }
 
     #[test]
-    fn baseline_device_qualifies() {
-        let st = qualify(&baseline());
-        assert!(st.qualified, "{:?}", st.reason);
-        assert!(st.reason.is_none());
+    fn qualification_follows_the_workgroup_storage_budget() {
+        {
+            let st = qualify(&baseline());
+            assert!(st.qualified, "{:?}", st.reason);
+            assert!(st.reason.is_none());
+        }
+        {
+            let mut caps = baseline();
+            caps.max_compute_workgroup_storage_size = 8192;
+            let st = qualify(&caps);
+            assert!(!st.qualified);
+            assert!(st
+                .reason
+                .expect("reason")
+                .contains("max_compute_workgroup_storage_size 8192"));
+        }
+        {
+            let caps = baseline();
+            assert!(caps.workgroup_storage_fits(2048 + 64));
+            assert!(!caps.workgroup_storage_fits(18496));
+        }
     }
 
     #[test]
-    fn small_workgroup_storage_disqualifies() {
-        let mut caps = baseline();
-        caps.max_compute_workgroup_storage_size = 8192;
-        let st = qualify(&caps);
-        assert!(!st.qualified);
-        assert!(st
-            .reason
-            .expect("reason")
-            .contains("max_compute_workgroup_storage_size 8192"));
-    }
-
-    #[test]
-    fn coop_mat_bit_selects_the_coop_schedule() {
-        let mut caps = baseline();
-        assert_eq!(caps.gemm_strategy(), GemmStrategy::Scalar);
-        caps.cooperative_matrix = true;
-        assert_eq!(caps.gemm_strategy(), GemmStrategy::CoopMat);
+    fn capability_bits_select_the_schedules_and_the_coop_gemm_tile_needs_the_feature_a_32_wide_subgroup_and_an_f32_accumulator_config(
+    ) {
+        {
+            let mut caps = baseline();
+            assert_eq!(caps.gemm_strategy(), GemmStrategy::Scalar);
+            caps.cooperative_matrix = true;
+            assert_eq!(caps.gemm_strategy(), GemmStrategy::CoopMat);
+        }
+        {
+            let mut caps = baseline();
+            assert_eq!(caps.reduction_strategy(), ReductionStrategy::WorkgroupTree);
+            caps.subgroup = true;
+            caps.subgroup_min_size = 32;
+            caps.subgroup_max_size = 32;
+            assert_eq!(caps.reduction_strategy(), ReductionStrategy::Subgroup);
+        }
+        {
+            let mut caps = baseline();
+            assert_eq!(caps.accum_dtype(), AccumDtype::F32);
+            caps.shader_f16 = true;
+            assert_eq!(caps.accum_dtype(), AccumDtype::F16InputF32Accum);
+        }
+        {
+            let caps = coop_ready();
+            assert_eq!(
+                caps.coop_gemm_tile(),
+                Some(CoopTile {
+                    m: 16,
+                    n: 16,
+                    k: 16
+                })
+            );
+            assert_eq!(caps.coop_gemm_reason(), None);
+        }
+        {
+            let mut caps = coop_ready();
+            caps.cooperative_matrix = false;
+            assert_eq!(caps.coop_gemm_tile(), None);
+            assert!(caps
+                .coop_gemm_reason()
+                .expect("reason")
+                .contains("EXPERIMENTAL_COOPERATIVE_MATRIX"));
+        }
+        {
+            let mut caps = coop_ready();
+            caps.subgroup_min_size = 64;
+            caps.subgroup_max_size = 64;
+            assert_eq!(caps.coop_gemm_tile(), None);
+            assert!(caps.coop_gemm_reason().expect("reason").contains("64..64"));
+        }
+        {
+            let mut caps = coop_ready();
+            caps.coop_configs.retain(|c| !c.cr_f32());
+            assert_eq!(caps.coop_gemm_tile(), None);
+            assert!(caps
+                .coop_gemm_reason()
+                .expect("reason")
+                .contains("16x16x16 f16xf16->f32"));
+        }
     }
 
     fn coop_ready() -> Capabilities {
@@ -665,76 +720,6 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn coop_gemm_tile_needs_a_16x16x16_f16_f32_config() {
-        let caps = coop_ready();
-        assert_eq!(
-            caps.coop_gemm_tile(),
-            Some(CoopTile {
-                m: 16,
-                n: 16,
-                k: 16
-            })
-        );
-        assert_eq!(caps.coop_gemm_reason(), None);
-    }
-
-    #[test]
-    fn coop_gemm_tile_is_refused_without_the_device_feature() {
-        let mut caps = coop_ready();
-        caps.cooperative_matrix = false;
-        assert_eq!(caps.coop_gemm_tile(), None);
-        assert!(caps
-            .coop_gemm_reason()
-            .expect("reason")
-            .contains("EXPERIMENTAL_COOPERATIVE_MATRIX"));
-    }
-
-    #[test]
-    fn coop_gemm_tile_is_refused_on_a_non_32_wide_subgroup() {
-        let mut caps = coop_ready();
-        caps.subgroup_min_size = 64;
-        caps.subgroup_max_size = 64;
-        assert_eq!(caps.coop_gemm_tile(), None);
-        assert!(caps.coop_gemm_reason().expect("reason").contains("64..64"));
-    }
-
-    #[test]
-    fn coop_gemm_tile_is_refused_when_only_f16_accumulators_exist() {
-        let mut caps = coop_ready();
-        caps.coop_configs.retain(|c| !c.cr_f32());
-        assert_eq!(caps.coop_gemm_tile(), None);
-        assert!(caps
-            .coop_gemm_reason()
-            .expect("reason")
-            .contains("16x16x16 f16xf16->f32"));
-    }
-
-    #[test]
-    fn subgroup_bit_selects_the_subgroup_reduction() {
-        let mut caps = baseline();
-        assert_eq!(caps.reduction_strategy(), ReductionStrategy::WorkgroupTree);
-        caps.subgroup = true;
-        caps.subgroup_min_size = 32;
-        caps.subgroup_max_size = 32;
-        assert_eq!(caps.reduction_strategy(), ReductionStrategy::Subgroup);
-    }
-
-    #[test]
-    fn shader_f16_selects_mixed_precision_accumulation() {
-        let mut caps = baseline();
-        assert_eq!(caps.accum_dtype(), AccumDtype::F32);
-        caps.shader_f16 = true;
-        assert_eq!(caps.accum_dtype(), AccumDtype::F16InputF32Accum);
-    }
-
-    #[test]
-    fn workgroup_storage_budget_rejects_the_flash_decode_sacc_tile() {
-        let caps = baseline();
-        assert!(caps.workgroup_storage_fits(2048 + 64));
-        assert!(!caps.workgroup_storage_fits(18496));
-    }
-
     const SWEEP_COMBOS: [(CoopScalar, CoopScalar); 3] = [
         (CoopScalar::F16, CoopScalar::F16),
         (CoopScalar::F16, CoopScalar::F32),
@@ -742,156 +727,150 @@ mod tests {
     ];
 
     #[test]
-    fn the_config_that_crashes_aco_is_the_one_the_filter_removes() {
-        let advertised = strix_halo_advertised();
-        let crasher = CoopRequest::square(16, CoopScalar::F32, CoopScalar::F32);
-        assert!(!crasher.is_advertised(&advertised));
-        let why = coop_skip_reason(&crasher, &advertised).expect("must be skipped");
-        assert!(why.contains("16x16x16 f32xf32->f32"), "{why}");
-        assert!(why.contains("f16xf16->f32"), "{why}");
-        assert_eq!(
-            coop_decide(&crasher, &advertised, false),
-            CoopDecision::Skip(why)
-        );
-    }
-
-    #[test]
-    fn both_advertised_configs_survive_the_filter() {
-        let advertised = strix_halo_advertised();
-        for cfg in &advertised {
-            let req = CoopRequest::new(cfg.m, cfg.n, cfg.k, cfg.ab, cfg.cr);
-            assert_eq!(coop_skip_reason(&req, &advertised), None, "{}", req.label());
+    fn the_filter_removes_the_config_that_crashes_aco_and_keeps_both_advertised() {
+        {
+            let advertised = strix_halo_advertised();
+            let crasher = CoopRequest::square(16, CoopScalar::F32, CoopScalar::F32);
+            assert!(!crasher.is_advertised(&advertised));
+            let why = coop_skip_reason(&crasher, &advertised).expect("must be skipped");
+            assert!(why.contains("16x16x16 f32xf32->f32"), "{why}");
+            assert!(why.contains("f16xf16->f32"), "{why}");
             assert_eq!(
-                coop_decide(&req, &advertised, false),
-                CoopDecision::Compile,
-                "{}",
-                req.label()
+                coop_decide(&crasher, &advertised, false),
+                CoopDecision::Skip(why)
             );
         }
-    }
-
-    #[test]
-    fn the_probe_sweep_shrinks_to_the_advertised_pair_on_strix_halo() {
-        let advertised = strix_halo_advertised();
-        let sweep = coop_square_sweep(&[8, 16], &SWEEP_COMBOS);
-        assert_eq!(sweep.len(), 6);
-        let part = coop_partition(&sweep, &advertised, false);
-        assert_eq!(
-            part.compile,
-            vec![
-                CoopRequest::square(16, CoopScalar::F16, CoopScalar::F16),
-                CoopRequest::square(16, CoopScalar::F16, CoopScalar::F32),
-            ]
-        );
-        assert_eq!(part.skipped.len(), 4);
-        assert!(part.forced.is_empty());
-        let skipped: Vec<String> = part.skipped.iter().map(|(r, _)| r.label()).collect();
-        assert_eq!(
-            skipped,
-            vec![
-                "8x8x8 f16xf16->f16",
-                "8x8x8 f16xf16->f32",
-                "8x8x8 f32xf32->f32",
-                "16x16x16 f32xf32->f32",
-            ]
-        );
-    }
-
-    #[test]
-    fn an_adapter_that_advertises_nothing_gets_nothing_compiled() {
-        let sweep = coop_square_sweep(&[8, 16], &SWEEP_COMBOS);
-        let part = coop_partition(&sweep, &[], false);
-        assert!(part.compile.is_empty());
-        assert_eq!(part.skipped.len(), 6);
-        assert!(part.skipped[0]
-            .1
-            .contains("no cooperative-matrix configurations"));
-    }
-
-    #[test]
-    fn the_unsafe_sweep_flag_restores_every_combination_and_records_why() {
-        let advertised = strix_halo_advertised();
-        let sweep = coop_square_sweep(&[8, 16], &SWEEP_COMBOS);
-        let part = coop_partition(&sweep, &advertised, true);
-        assert_eq!(part.compile, sweep);
-        assert!(part.skipped.is_empty());
-        assert_eq!(part.forced.len(), 4);
-        assert!(matches!(
-            coop_decide(
-                &CoopRequest::square(16, CoopScalar::F32, CoopScalar::F32),
-                &advertised,
-                true,
-            ),
-            CoopDecision::CompileUnadvertised(_)
-        ));
-    }
-
-    #[test]
-    fn the_filter_separates_scalar_types_that_a_boolean_would_merge() {
-        let advertised = vec![CoopConfig::new(
-            16,
-            16,
-            16,
-            CoopScalar::I32,
-            CoopScalar::I32,
-        )];
-        let f32_req = CoopRequest::square(16, CoopScalar::F32, CoopScalar::F32);
-        assert!(!f32_req.is_advertised(&advertised));
-        let i32_req = CoopRequest::square(16, CoopScalar::I32, CoopScalar::I32);
-        assert!(i32_req.is_advertised(&advertised));
-    }
-
-    #[test]
-    fn non_square_and_mismatched_extents_are_not_waved_through() {
-        let advertised = vec![CoopConfig::new(16, 8, 16, CoopScalar::F16, CoopScalar::F32)];
-        assert!(
-            CoopRequest::new(16, 8, 16, CoopScalar::F16, CoopScalar::F32)
-                .is_advertised(&advertised)
-        );
-        for bad in [
-            CoopRequest::new(8, 16, 16, CoopScalar::F16, CoopScalar::F32),
-            CoopRequest::new(16, 8, 8, CoopScalar::F16, CoopScalar::F32),
-            CoopRequest::new(16, 8, 16, CoopScalar::F16, CoopScalar::F16),
-        ] {
-            assert!(!bad.is_advertised(&advertised), "{}", bad.label());
+        {
+            let advertised = strix_halo_advertised();
+            for cfg in &advertised {
+                let req = CoopRequest::new(cfg.m, cfg.n, cfg.k, cfg.ab, cfg.cr);
+                assert_eq!(coop_skip_reason(&req, &advertised), None, "{}", req.label());
+                assert_eq!(
+                    coop_decide(&req, &advertised, false),
+                    CoopDecision::Compile,
+                    "{}",
+                    req.label()
+                );
+            }
         }
     }
 
     #[test]
-    fn wgsl_scan_finds_the_combination_a_shader_will_ask_for() {
-        let src = "enable f16;\nenable wgpu_cooperative_matrix;\n\
-                   alias CA = coop_mat16x16<f16, A>;\n\
-                   alias CB = coop_mat16x16<f16, B>;\n\
-                   alias CC = coop_mat16x16<f32, C>;\n";
-        assert_eq!(
-            coop_requests_in_wgsl(src),
-            vec![CoopRequest::square(16, CoopScalar::F16, CoopScalar::F32)]
-        );
-        let f32_src = src.replace("<f16,", "<f32,");
-        assert_eq!(
-            coop_requests_in_wgsl(&f32_src),
-            vec![CoopRequest::square(16, CoopScalar::F32, CoopScalar::F32)]
-        );
-        assert!(!coop_requests_in_wgsl(&f32_src)[0].is_advertised(&strix_halo_advertised()));
+    fn the_partition_compiles_only_advertised_configs_unless_the_unsafe_flag_forces_the_rest() {
+        {
+            let advertised = strix_halo_advertised();
+            let sweep = coop_square_sweep(&[8, 16], &SWEEP_COMBOS);
+            assert_eq!(sweep.len(), 6);
+            let part = coop_partition(&sweep, &advertised, false);
+            assert_eq!(
+                part.compile,
+                vec![
+                    CoopRequest::square(16, CoopScalar::F16, CoopScalar::F16),
+                    CoopRequest::square(16, CoopScalar::F16, CoopScalar::F32),
+                ]
+            );
+            assert_eq!(part.skipped.len(), 4);
+            assert!(part.forced.is_empty());
+            let skipped: Vec<String> = part.skipped.iter().map(|(r, _)| r.label()).collect();
+            assert_eq!(
+                skipped,
+                vec![
+                    "8x8x8 f16xf16->f16",
+                    "8x8x8 f16xf16->f32",
+                    "8x8x8 f32xf32->f32",
+                    "16x16x16 f32xf32->f32",
+                ]
+            );
+        }
+        {
+            let sweep = coop_square_sweep(&[8, 16], &SWEEP_COMBOS);
+            let part = coop_partition(&sweep, &[], false);
+            assert!(part.compile.is_empty());
+            assert_eq!(part.skipped.len(), 6);
+            assert!(part.skipped[0]
+                .1
+                .contains("no cooperative-matrix configurations"));
+        }
+        {
+            let advertised = strix_halo_advertised();
+            let sweep = coop_square_sweep(&[8, 16], &SWEEP_COMBOS);
+            let part = coop_partition(&sweep, &advertised, true);
+            assert_eq!(part.compile, sweep);
+            assert!(part.skipped.is_empty());
+            assert_eq!(part.forced.len(), 4);
+            assert!(matches!(
+                coop_decide(
+                    &CoopRequest::square(16, CoopScalar::F32, CoopScalar::F32),
+                    &advertised,
+                    true,
+                ),
+                CoopDecision::CompileUnadvertised(_)
+            ));
+        }
     }
 
     #[test]
-    fn wgsl_scan_reads_non_square_declarations_and_ignores_noise() {
-        let src = "alias A0 = coop_mat16x8 < f16 , A > ;\n\
-                   alias B0 = coop_mat8x32<f16, B>;\n\
-                   alias C0 = coop_mat16x32<f32, C>;\n\
-                   // coop_mat99x99<f64, Z> and coop_matNxM<f16, A> are not types\n";
-        assert_eq!(
-            coop_requests_in_wgsl(src),
-            vec![CoopRequest::new(
+    fn is_advertised_and_the_wgsl_scan_separate_scalar_types_and_extents_a_boolean_would_merge() {
+        {
+            let advertised = vec![CoopConfig::new(
                 16,
-                32,
-                8,
-                CoopScalar::F16,
-                CoopScalar::F32
-            )]
-        );
-        assert!(coop_requests_in_wgsl("no coop matrices here").is_empty());
-        assert!(coop_requests_in_wgsl("alias X = coop_mat8x8<f16, A>;").is_empty());
+                16,
+                16,
+                CoopScalar::I32,
+                CoopScalar::I32,
+            )];
+            let f32_req = CoopRequest::square(16, CoopScalar::F32, CoopScalar::F32);
+            assert!(!f32_req.is_advertised(&advertised));
+            let i32_req = CoopRequest::square(16, CoopScalar::I32, CoopScalar::I32);
+            assert!(i32_req.is_advertised(&advertised));
+        }
+        {
+            let advertised = vec![CoopConfig::new(16, 8, 16, CoopScalar::F16, CoopScalar::F32)];
+            assert!(
+                CoopRequest::new(16, 8, 16, CoopScalar::F16, CoopScalar::F32)
+                    .is_advertised(&advertised)
+            );
+            for bad in [
+                CoopRequest::new(8, 16, 16, CoopScalar::F16, CoopScalar::F32),
+                CoopRequest::new(16, 8, 8, CoopScalar::F16, CoopScalar::F32),
+                CoopRequest::new(16, 8, 16, CoopScalar::F16, CoopScalar::F16),
+            ] {
+                assert!(!bad.is_advertised(&advertised), "{}", bad.label());
+            }
+        }
+        {
+            let src = "enable f16;\nenable wgpu_cooperative_matrix;\n\
+                       alias CA = coop_mat16x16<f16, A>;\n\
+                       alias CB = coop_mat16x16<f16, B>;\n\
+                       alias CC = coop_mat16x16<f32, C>;\n";
+            assert_eq!(
+                coop_requests_in_wgsl(src),
+                vec![CoopRequest::square(16, CoopScalar::F16, CoopScalar::F32)]
+            );
+            let f32_src = src.replace("<f16,", "<f32,");
+            assert_eq!(
+                coop_requests_in_wgsl(&f32_src),
+                vec![CoopRequest::square(16, CoopScalar::F32, CoopScalar::F32)]
+            );
+            assert!(!coop_requests_in_wgsl(&f32_src)[0].is_advertised(&strix_halo_advertised()));
+        }
+        {
+            let src = "alias A0 = coop_mat16x8 < f16 , A > ;\n\
+                       alias B0 = coop_mat8x32<f16, B>;\n\
+                       alias C0 = coop_mat16x32<f32, C>;\n\
+                       // coop_mat99x99<f64, Z> and coop_matNxM<f16, A> are not types\n";
+            assert_eq!(
+                coop_requests_in_wgsl(src),
+                vec![CoopRequest::new(
+                    16,
+                    32,
+                    8,
+                    CoopScalar::F16,
+                    CoopScalar::F32
+                )]
+            );
+            assert!(coop_requests_in_wgsl("no coop matrices here").is_empty());
+            assert!(coop_requests_in_wgsl("alias X = coop_mat8x8<f16, A>;").is_empty());
+        }
     }
 }

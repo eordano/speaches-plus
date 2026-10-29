@@ -302,6 +302,7 @@ impl CudaGraphRunner {
     }
 
     pub fn probe_capture(&self) -> Result<()> {
+        let _capture_in_flight = crate::capture_exclusion::capture_in_flight();
         let _capture_guard = capture_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -351,6 +352,7 @@ impl CudaGraphRunner {
             return Ok(());
         }
 
+        let _capture_in_flight = crate::capture_exclusion::capture_in_flight();
         let _capture_guard = capture_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

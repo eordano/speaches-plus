@@ -429,7 +429,6 @@ fn attn_dims(d: &TrainDims, b: usize, t: usize) -> GroupedAttnDims {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn layer_forward(
     ctx: &WgpuContext,
     layer: &TrainLayer,
@@ -500,7 +499,6 @@ async fn layer_forward(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn layer_backward(
     ctx: &WgpuContext,
     layer: &TrainLayer,
@@ -601,7 +599,6 @@ async fn layer_backward(
 
 pub const HEAD_ROWS_PER_CHUNK_64_KEEPS_THE_VOCAB_WIDE_DISPATCH_UNDER_65535_WORKGROUPS: usize = 64;
 
-#[allow(clippy::too_many_arguments)]
 async fn head_ce_rows(
     ctx: &WgpuContext,
     head: &W4Head,

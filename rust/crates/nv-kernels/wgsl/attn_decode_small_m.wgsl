@@ -74,6 +74,7 @@ fn sm_sweep_start(total: i32, mr: u32, win: i32) -> i32 {
 
 @compute @workgroup_size(128)
 fn attn_decode_small_m_f32(
+    #def b1
     @builtin(workgroup_id) wg: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
     @builtin(local_invocation_id) tid: vec3<u32>
@@ -117,7 +118,9 @@ fn attn_decode_small_m_f32(
                 let qoff = qi * hd;
                 var partial = 0.0;
                 for (var d = lid; d < hd; d = d + SM_BLOCK) {
+    #end
                     partial = fma(sm_qsh[qoff + d], sm_k_f32[kbase + d], partial);
+                #def b2
                 }
                 sm_red[lid] = partial;
                 workgroupBarrier();
@@ -137,7 +140,9 @@ fn attn_decode_small_m_f32(
                 for (var i = 0u; i < SM_MAX_PER_THREAD; i = i + 1u) {
                     let d = lid + i * SM_BLOCK;
                     if (d < hd) {
+                #end
                         acc[qi][i] = fma(acc[qi][i], corr, w * sm_v_f32[kbase + d]);
+                    #def b3
                     }
                 }
                 mreg[qi] = m_new;
@@ -158,93 +163,15 @@ fn attn_decode_small_m_f32(
         }
     }
 }
+                    #end
 
 @compute @workgroup_size(128)
 fn attn_decode_small_m_bf16kv(
-    @builtin(workgroup_id) wg: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-    @builtin(local_invocation_id) tid: vec3<u32>
-) {
-    let h = wg.x + wg.y * nwg.x;
-    if (h >= sm_params.n_heads) {
-        return;
-    }
-    let hd = sm_params.head_dim;
-    let nkv = sm_params.n_kv_heads;
-    let group = sm_params.n_heads / nkv;
-    let kvh = h / group;
-    let mr = sm_params.m_rows;
-    let lid = tid.x;
-
-    for (var t = lid; t < mr * hd; t = t + SM_BLOCK) {
-        let qi = t / hd;
-        let d = t - qi * hd;
-        sm_qsh[t] = sm_q[(qi * sm_params.n_heads + h) * hd + d];
-    }
-    workgroupBarrier();
-
-    var acc: array<array<f32, SM_MAX_PER_THREAD>, SM_MAX_M>;
-    var mreg: array<f32, SM_MAX_M>;
-    var lreg: array<f32, SM_MAX_M>;
-    for (var qi = 0u; qi < SM_MAX_M; qi = qi + 1u) {
-        acc[qi] = array<f32, SM_MAX_PER_THREAD>(0.0, 0.0, 0.0, 0.0);
-        mreg[qi] = sm_neg_inf();
-        lreg[qi] = 0.0;
-    }
-
-    let total = i32(sm_params.total);
-    let win = i32(sm_params.window);
-    let p_start = sm_sweep_start(total, mr, win);
-
-    for (var p = p_start; p < total; p = p + 1) {
-        let kbase = (u32(p) * nkv + kvh) * hd;
-        for (var qi = 0u; qi < mr; qi = qi + 1u) {
-            let bounds = sm_row_bounds(total, mr, win, qi);
-            if (p >= bounds.x && p < bounds.y) {
-                let qoff = qi * hd;
-                var partial = 0.0;
-                for (var d = lid; d < hd; d = d + SM_BLOCK) {
+    #use b1
                     partial = fma(sm_qsh[qoff + d], sm_k_bf16(kbase + d), partial);
-                }
-                sm_red[lid] = partial;
-                workgroupBarrier();
-                for (var s = SM_BLOCK / 2u; s > 0u; s = s >> 1u) {
-                    if (lid < s) {
-                        sm_red[lid] = sm_red[lid] + sm_red[lid + s];
-                    }
-                    workgroupBarrier();
-                }
-                let score = sm_red[0] * sm_params.scaling;
-                workgroupBarrier();
-
-                let m_new = max(mreg[qi], score);
-                let corr = sm_fast_exp(mreg[qi] - m_new);
-                let w = sm_fast_exp(score - m_new);
-                lreg[qi] = fma(lreg[qi], corr, w);
-                for (var i = 0u; i < SM_MAX_PER_THREAD; i = i + 1u) {
-                    let d = lid + i * SM_BLOCK;
-                    if (d < hd) {
+                #use b2
                         acc[qi][i] = fma(acc[qi][i], corr, w * sm_v_bf16(kbase + d));
-                    }
-                }
-                mreg[qi] = m_new;
-            }
-        }
-    }
-
-    for (var qi = 0u; qi < mr; qi = qi + 1u) {
-        var inv_l = 0.0;
-        if (lreg[qi] > 0.0) {
-            inv_l = sm_recip(lreg[qi]);
-        }
-        for (var i = 0u; i < SM_MAX_PER_THREAD; i = i + 1u) {
-            let d = lid + i * SM_BLOCK;
-            if (d < hd) {
-                sm_out[(qi * sm_params.n_heads + h) * hd + d] = acc[qi][i] * inv_l;
-            }
-        }
-    }
-}
+                    #use b3
 
 fn smf_expf(x: f32) -> f32 {
     let c = bitcast<f32>(0x3bbb989du);

@@ -149,10 +149,6 @@ fn prefill_scratch_gib(dir: &Path, max_seq: usize) -> f64 {
     }
 }
 
-pub fn estimate_model(dir: &Path) -> Option<ModelEstimate> {
-    estimate_model_with_max_seq(dir, 0)
-}
-
 pub fn estimate_model_with_max_seq(dir: &Path, max_seq: usize) -> Option<ModelEstimate> {
     let weight_gib = weight_file_bytes(dir)? as f64 / (1u64 << 30) as f64;
     let steady_gib = weight_gib * MARGINAL_WEIGHT_FACTOR;
@@ -167,10 +163,6 @@ pub fn estimate_model_with_max_seq(dir: &Path, max_seq: usize) -> Option<ModelEs
         load_peak_gib,
         prefill_scratch_gib: prefill_scratch_gib(dir, max_seq),
     })
-}
-
-pub fn estimate_model_gib(dir: &Path) -> Option<f64> {
-    estimate_model(dir).map(|e| e.steady_gib)
 }
 
 #[cfg(target_os = "macos")]
@@ -207,17 +199,7 @@ pub fn available_memory_gib() -> Option<f64> {
     None
 }
 
-fn guard_disabled() -> bool {
-    matches!(
-        std::env::var("NV_MEM_FIT").ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
-}
-
 pub fn plan(dirs: &[PathBuf]) -> Option<(Vec<Fit>, f64)> {
-    if guard_disabled() {
-        return None;
-    }
     let available = available_memory_gib()?;
     let estimates: Vec<Option<ModelEstimate>> = dirs
         .iter()
@@ -270,23 +252,19 @@ mod tests {
     }
 
     #[test]
-    fn all_fit_under_budget() {
+    fn decide_fits_skips_over_budget_and_never_blocks_on_unknown() {
         let out = decide(&[bf16(10.0), bf16(10.0)], 25.0);
         assert_eq!(out, vec![Fit::Fits, Fit::Fits]);
-    }
-
-    #[test]
-    fn second_model_skipped_when_over_budget() {
-        let out = decide(&[bf16(15.0), bf16(17.0)], 24.0);
-        assert_eq!(out[0], Fit::Fits);
-        assert!(matches!(out[1], Fit::WontFit { .. }));
-    }
-
-    #[test]
-    fn unknown_estimate_never_blocks() {
-        let out = decide(&[None, bf16(1000.0)], 1.0);
-        assert_eq!(out[0], Fit::Fits);
-        assert!(matches!(out[1], Fit::WontFit { .. }));
+        {
+            let out = decide(&[bf16(15.0), bf16(17.0)], 24.0);
+            assert_eq!(out[0], Fit::Fits);
+            assert!(matches!(out[1], Fit::WontFit { .. }));
+        }
+        {
+            let out = decide(&[None, bf16(1000.0)], 1.0);
+            assert_eq!(out[0], Fit::Fits);
+            assert!(matches!(out[1], Fit::WontFit { .. }));
+        }
     }
 
     #[test]
@@ -310,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn load_transient_is_refused_even_when_steady_state_would_fit() {
+    fn load_transients_are_charged_only_to_repacked_weights_and_the_process_cost_once() {
         let est = [repacked(30.392)];
         let steady_only_budget = 40.0;
         assert!(
@@ -318,34 +296,28 @@ mod tests {
             "a budget covering only the steady state must be refused"
         );
         assert_eq!(decide(&est, 75.0), vec![Fit::Fits]);
-    }
-
-    #[test]
-    fn bf16_is_not_charged_the_repack_transient() {
-        assert_eq!(decide(&[bf16(14.894)], 20.0), vec![Fit::Fits]);
-        assert!(matches!(
-            decide(&[repacked(14.894)], 20.0)[0],
-            Fit::WontFit { .. }
-        ));
-    }
-
-    #[test]
-    fn process_fixed_cost_is_charged_once() {
-        let one = decide(&[bf16(10.0)], PROCESS_FIXED_GIB + 9.83 + 0.01);
-        assert_eq!(one, vec![Fit::Fits]);
-        let two = decide(&[bf16(10.0), bf16(10.0)], PROCESS_FIXED_GIB + 19.66 + 0.01);
-        assert_eq!(two, vec![Fit::Fits, Fit::Fits]);
-    }
-
-    #[test]
-    fn native_packed_is_not_charged_the_repack_transient() {
-        let est = [native(23.324)];
-        assert_eq!(decide(&est, 32.4), vec![Fit::Fits]);
-        assert!(matches!(
-            decide(&[repacked(23.324)], 32.4)[0],
-            Fit::WontFit { .. }
-        ));
-        assert!(matches!(decide(&est, 20.0)[0], Fit::WontFit { .. }));
+        {
+            assert_eq!(decide(&[bf16(14.894)], 20.0), vec![Fit::Fits]);
+            assert!(matches!(
+                decide(&[repacked(14.894)], 20.0)[0],
+                Fit::WontFit { .. }
+            ));
+        }
+        {
+            let one = decide(&[bf16(10.0)], PROCESS_FIXED_GIB + 9.83 + 0.01);
+            assert_eq!(one, vec![Fit::Fits]);
+            let two = decide(&[bf16(10.0), bf16(10.0)], PROCESS_FIXED_GIB + 19.66 + 0.01);
+            assert_eq!(two, vec![Fit::Fits, Fit::Fits]);
+        }
+        {
+            let est = [native(23.324)];
+            assert_eq!(decide(&est, 32.4), vec![Fit::Fits]);
+            assert!(matches!(
+                decide(&[repacked(23.324)], 32.4)[0],
+                Fit::WontFit { .. }
+            ));
+            assert!(matches!(decide(&est, 20.0)[0], Fit::WontFit { .. }));
+        }
     }
 
     #[test]
@@ -427,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn load_path_native_for_packed_qwen_moe_and_gpt_oss() {
+    fn load_path_is_native_for_packed_plain_for_unquantized_and_conservative_otherwise() {
         let qwen = fixture_dir(
             "qwen-moe",
             Some(
@@ -440,22 +412,19 @@ mod tests {
             Some(r#"{"model_type":"gpt_oss","quantization_config":{"quant_method":"mxfp4"}}"#),
         );
         assert_eq!(load_path(&oss), LoadPath::NativePacked);
+        {
+            let unknown = fixture_dir(
+                "unknown-arch",
+                Some(r#"{"model_type":"mystery","quantization_config":{"quant_method":"awq"}}"#),
+            );
+            assert_eq!(load_path(&unknown), LoadPath::HostDequant);
+            let missing = fixture_dir("no-config", None);
+            assert_eq!(load_path(&missing), LoadPath::HostDequant);
+        }
+        {
+            let plain = fixture_dir("plain-bf16", Some(r#"{"model_type":"qwen3_5_moe"}"#));
+            assert_eq!(load_path(&plain), LoadPath::PlainWeights);
+        }
     }
 
-    #[test]
-    fn load_path_conservative_for_unknown_and_unreadable() {
-        let unknown = fixture_dir(
-            "unknown-arch",
-            Some(r#"{"model_type":"mystery","quantization_config":{"quant_method":"awq"}}"#),
-        );
-        assert_eq!(load_path(&unknown), LoadPath::HostDequant);
-        let missing = fixture_dir("no-config", None);
-        assert_eq!(load_path(&missing), LoadPath::HostDequant);
-    }
-
-    #[test]
-    fn load_path_plain_for_unquantized_checkpoint() {
-        let plain = fixture_dir("plain-bf16", Some(r#"{"model_type":"qwen3_5_moe"}"#));
-        assert_eq!(load_path(&plain), LoadPath::PlainWeights);
-    }
 }

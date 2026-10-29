@@ -66,9 +66,6 @@ impl SegmentationModel {
     }
 
     fn warmup(&self) {
-        if !super::ep::warmup_enabled() {
-            return;
-        }
         let cfg = super::DiarConfig::from_env();
         let n = (cfg.chunk_seconds * SAMPLE_RATE as f32) as usize;
         if n == 0 {

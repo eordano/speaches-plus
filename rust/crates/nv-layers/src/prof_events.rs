@@ -1,3 +1,4 @@
+#[cfg(feature = "cuda")]
 use std::sync::{Mutex, OnceLock};
 
 pub const NV_TRAIN_PROF_EVENTS_ENV_OPT_IN_1_RECORDS_A_CUDA_EVENT_PAIR_AROUND_EVERY_SPANNED_KERNEL_FAMILY_AND_SUMS_THEM_AT_TAKE: &str =

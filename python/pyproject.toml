@@ -6,34 +6,34 @@ build-backend = "setuptools.build_meta"
 name = "speaches-plus-python"
 version = "0.2.0"
 description = "Minimal Qwen3-Omni multimodal HTTP server (chat + ASR + TTS), vllm-omni-compatible on the wire."
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 license = { file = "LICENSE" }
 readme = "NOTICE.md"
 dependencies = [
-    "fastapi>=0.128",
-    "uvicorn[standard]>=0.40",
+    "fastapi>=0.156",
+    "uvicorn[standard]>=0.54",
     "python-multipart>=0.0.20",
     "pydantic>=2.10",
-    "soundfile>=0.13",
-    "librosa>=0.11",
+    "soundfile>=0.14",
+    "librosa>=1.0",
     "torch>=2.5",
     "numpy>=2.0",
     "transformers>=5.5",
     "accelerate>=1.0",
-    "huggingface_hub>=1.0",
-    "pillow>=12",
-    "torchvision>=0.20",
+    "huggingface_hub>=2.0",
+    "pillow>=13",
+    "torchvision>=0.29",
     "onnxruntime>=1.20",
     "phonemizer>=3.3",
-    "xxhash>=3.0",
+    "xxhash>=4.0",
     "imageio>=2.35",
-    "av>=14",
-    "xgrammar>=0.1.30",
+    "av>=17",
+    "xgrammar>=0.2",
     "aiortc>=1.9",
     "opuslib>=3.0",
     "opentelemetry-sdk>=1.27",
     "opentelemetry-exporter-otlp>=1.27",
-    "httpx>=0.27",
+    "httpx>=0.28",
 ]
 
 [project.optional-dependencies]
@@ -47,14 +47,25 @@ ct2 = [
 whisper_cpp = [
 ]
 test = [
-    "pytest>=8",
-    "pytest-asyncio>=0.24",
+    "pytest>=9",
+    "pytest-asyncio>=1.0",
     "opuslib>=3.0",
     "ctranslate2>=4.5",
 ]
 
 [project.scripts]
 speaches-plus-python = "server:main"
+
+[tool.uv]
+exclude-newer = "7 days"
+no-build-isolation-package = ["flash-attn"]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+requires-dist = ["torch", "einops"]
+
+[tool.uv.workspace]
+members = ["ct2_bindings", "whisper_bindings"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -88,7 +99,7 @@ include = [
 
 [tool.ruff]
 line-length = 110
-target-version = "py311"
+target-version = "py314"
 extend-exclude = [
     "aligner",
     "omni/qwen3/_mps_compat.py",

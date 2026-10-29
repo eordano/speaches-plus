@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 
@@ -143,7 +142,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn canonicalize_replaces_random_ids_with_counters() {
+    fn canonicalize_replaces_ids_strips_timestamps_and_rounds_floats() {
         let trace = vec![
             json!({"type": "session.created", "session": {"id": "sess_abc"}}),
             json!({"type": "input_audio_buffer.speech_started", "item_id": "item_xy"}),
@@ -155,34 +154,30 @@ mod tests {
         assert_eq!(c.events[1]["item_id"], "item_1");
         assert_eq!(c.events[2]["item_id"], "item_1");
         assert_eq!(c.events[3]["response"]["id"], "resp_1");
+        {
+            let trace = vec![json!({
+                "type": "input_audio_buffer.speech_stopped",
+                "audio_end_ms": 12345,
+                "ts_ms": 99999
+            })];
+            let c = canonicalize_trace(&trace);
+            assert_eq!(c.events[0]["audio_end_ms"], 0);
+            assert_eq!(c.events[0]["ts_ms"], 0);
+        }
+        {
+            let trace = vec![json!({
+                "type": "eou.scored",
+                "score": 0.123456789_f64,
+                "threshold": 0.5_f64
+            })];
+            let c = canonicalize_trace(&trace);
+            let s = c.events[0]["score"].as_f64().unwrap();
+            assert!((s - 0.123).abs() < 1e-6, "got {s}");
+        }
     }
 
     #[test]
-    fn canonicalize_strips_timestamps() {
-        let trace = vec![json!({
-            "type": "input_audio_buffer.speech_stopped",
-            "audio_end_ms": 12345,
-            "ts_ms": 99999
-        })];
-        let c = canonicalize_trace(&trace);
-        assert_eq!(c.events[0]["audio_end_ms"], 0);
-        assert_eq!(c.events[0]["ts_ms"], 0);
-    }
-
-    #[test]
-    fn canonicalize_rounds_floats() {
-        let trace = vec![json!({
-            "type": "eou.scored",
-            "score": 0.123456789_f64,
-            "threshold": 0.5_f64
-        })];
-        let c = canonicalize_trace(&trace);
-        let s = c.events[0]["score"].as_f64().unwrap();
-        assert!((s - 0.123).abs() < 1e-6, "got {s}");
-    }
-
-    #[test]
-    fn trace_diff_returns_first_diverging_index() {
+    fn trace_diff_returns_the_first_diverging_index_or_none() {
         let a = canonicalize_trace(&[
             json!({"type": "session.created", "session": {"id": "sess_1"}}),
             json!({"type": "response.created", "response": {"id": "resp_1"}}),
@@ -194,12 +189,11 @@ mod tests {
             json!({"type": "response.done", "response": {"id": "resp_z", "status": "cancelled"}}),
         ]);
         assert_eq!(trace_diff(&a, &b), Some(2));
+        {
+            let a = canonicalize_trace(&[json!({"type": "x", "id": "evt_a"})]);
+            let b = canonicalize_trace(&[json!({"type": "x", "id": "evt_b"})]);
+            assert_eq!(trace_diff(&a, &b), None);
+        }
     }
 
-    #[test]
-    fn trace_diff_returns_none_for_identical() {
-        let a = canonicalize_trace(&[json!({"type": "x", "id": "evt_a"})]);
-        let b = canonicalize_trace(&[json!({"type": "x", "id": "evt_b"})]);
-        assert_eq!(trace_diff(&a, &b), None);
-    }
 }

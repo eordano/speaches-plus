@@ -1,5 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
 use crate::wgpu_backend::device::WgpuContext;
 use crate::wgpu_backend::{compose, dispatch, Result, WgpuError};
 
@@ -149,29 +147,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_flattens_the_cuda_grid() {
-        let p = plan(2 * 4 * 8, 2 * 2 * 8, 16 * 4, 16 * 4, 2, 2, 4, 2, 8).unwrap();
-        assert_eq!(p.half_dim, 4);
-        assert_eq!(p.total_heads, 6);
-        assert_eq!(p.total_pairs, 2 * 6 * 4);
-    }
-
-    #[test]
-    fn odd_head_dim_is_rejected() {
-        let e = plan(0, 0, 0, 0, 0, 0, 0, 0, 7).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn shape_mismatch_is_reported() {
-        let e = plan(10, 0, 8, 8, 1, 1, 2, 0, 4).unwrap_err();
-        assert!(matches!(e, WgpuError::Shape(_)), "{e}");
-    }
-
-    #[test]
-    fn out_of_range_position_is_reported() {
-        assert!(check_positions(&[0, 3], 4).is_ok());
-        assert!(check_positions(&[0, 4], 4).is_err());
-        assert!(check_positions(&[-1], 4).is_err());
+    fn plan_flattens_the_cuda_grid_and_rejects_odd_head_dim_mismatched_shapes_and_bad_positions() {
+        {
+            let p = plan(2 * 4 * 8, 2 * 2 * 8, 16 * 4, 16 * 4, 2, 2, 4, 2, 8).unwrap();
+            assert_eq!(p.half_dim, 4);
+            assert_eq!(p.total_heads, 6);
+            assert_eq!(p.total_pairs, 2 * 6 * 4);
+        }
+        {
+            let e = plan(0, 0, 0, 0, 0, 0, 0, 0, 7).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            let e = plan(10, 0, 8, 8, 1, 1, 2, 0, 4).unwrap_err();
+            assert!(matches!(e, WgpuError::Shape(_)), "{e}");
+        }
+        {
+            assert!(check_positions(&[0, 3], 4).is_ok());
+            assert!(check_positions(&[0, 4], 4).is_err());
+            assert!(check_positions(&[-1], 4).is_err());
+        }
     }
 }

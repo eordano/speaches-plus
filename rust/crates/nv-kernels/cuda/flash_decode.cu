@@ -1381,11 +1381,6 @@ inline int kvshare_env_int_reread_each_launch_so_one_build_sweeps(
     return (x >= lo && x <= hi) ? x : dflt;
 }
 
-inline int kvshare_direct_loads_env() {
-    return kvshare_env_int_reread_each_launch_so_one_build_sweeps(
-        "NV_KVSHARE_DIRECT", 1, 0, 1);
-}
-
 inline bool kvshare_debug_env() {
     const char* e = getenv("NV_KVSHARE_DEBUG");
     return e != nullptr && e[0] == '1';
@@ -1921,146 +1916,6 @@ __global__ void __launch_bounds__(kFlashThreads, 2) flash_splitk_fused_fp8_kvsha
         load_pos(base + warp, live, ksc, vsc, kc, vv);
         kvshare_position_softmax_update<GROUP, HD>(
             qsh, kc, vv, ksc, vsc, scaling, lane, live, m, l, acc);
-    }
-
-    kvshare_split_store_and_final_reduce<GROUP, HD>(
-        acc, m, l, scratch, fan_in, outp, kvh, split, s_eff, lane, warp);
-
-    NVK_PDL_EPILOG();
-}
-
-template <int GROUP, int HD>
-__global__ void __launch_bounds__(kFlashThreads, 2) flash_splitk_fused_fp8_kvshare_kernel(
-    const __nv_bfloat16* __restrict__ q,
-    const uint8_t* __restrict__ k_fp8,
-    const uint8_t* __restrict__ v_fp8,
-    const float* __restrict__ k_scales,
-    const float* __restrict__ v_scales,
-    float* __restrict__ scratch,
-    unsigned int* __restrict__ fan_in,
-    __nv_bfloat16* __restrict__ outp,
-    const int* __restrict__ n_total_dev,
-    int NKV,
-    int SPLITS,
-    int WINDOW,
-    int RING,
-    float scaling,
-    const int* __restrict__ block_table,
-    int block_size,
-    int idle_when_total_at_most,
-    int mid_band_splits,
-    int mid_band_hi_total,
-    int delta,
-    int hole_lo_delta,
-    int hole_hi_delta
-) {
-    static_assert((HD & 127) == 0 && HD <= kMaxHD, "uchar4 K chunks assume 128-dim multiples");
-    const int kvh = blockIdx.x;
-    const int split = blockIdx.y;
-    if (kvh >= NKV) return;
-
-    NVK_PDL_PROLOG();
-
-    const int total = n_total_dev[0] - delta;
-    const int hole_lo = n_total_dev[0] - hole_lo_delta;
-    const int hole_hi = n_total_dev[0] - hole_hi_delta;
-    if (idle_when_total_at_most > 0 && total <= idle_when_total_at_most) return;
-    const int s_eff =
-        (mid_band_splits > 0 && mid_band_splits <= SPLITS && total <= mid_band_hi_total)
-            ? mid_band_splits
-            : SPLITS;
-    if (split >= s_eff) return;
-    const int start = (WINDOW > 0 && total > WINDOW) ? (total - WINDOW) : 0;
-    const int lane = threadIdx.x & (kWarp - 1);
-    const int warp = threadIdx.x >> 5;
-
-    constexpr int vc = HD / kWarp;
-    constexpr int nck = HD >> 7;
-    constexpr int nv2 = vc / 8;
-
-    __shared__ float qsh[GROUP][HD];
-    for (int i = threadIdx.x; i < GROUP * HD; i += kFlashThreads)
-        qsh[i / HD][i % HD] = __bfloat162float(q[(size_t)kvh * GROUP * HD + i]);
-    __syncthreads();
-
-    float acc[GROUP][vc];
-    #pragma unroll
-    for (int g = 0; g < GROUP; ++g) {
-        #pragma unroll
-        for (int i = 0; i < vc; ++i) acc[g][i] = 0.0f;
-    }
-    float m[GROUP];
-    float l[GROUP];
-    #pragma unroll
-    for (int g = 0; g < GROUP; ++g) {
-        m[g] = -INFINITY;
-        l[g] = 0.0f;
-    }
-
-    const int lane_stride = s_eff * kFlashWarps;
-
-    __shared__ uint4 ktile[2][kFlashWarps][HD / 16];
-    __shared__ uint4 vtile[2][kFlashWarps][HD / 16];
-    constexpr int kChunks16 = HD / 16;
-    const int stage_row = (threadIdx.x & 127) / kChunks16;
-    const int stage_chunk = (threadIdx.x & 127) % kChunks16;
-    const bool stage_v = threadIdx.x >= 128;
-
-    const int tile0 = start + split * kFlashWarps;
-    auto stage_tile = [&](int buf, int base) {
-        const int pos = base + stage_row;
-        if (pos < total) {
-            const int sp = kv_phys_slot(block_table, block_size, RING, pos);
-            const uint8_t* src = (stage_v ? v_fp8 : k_fp8)
-                + ((size_t)sp * NKV + kvh) * HD + stage_chunk * 16;
-            uint4* dst = stage_v ? &vtile[buf][stage_row][stage_chunk]
-                                 : &ktile[buf][stage_row][stage_chunk];
-            __pipeline_memcpy_async(dst, src, 16);
-        }
-    };
-
-    stage_tile(0, tile0);
-    __pipeline_commit();
-    float ks = 0.0f;
-    float vs = 0.0f;
-    if (tile0 + warp < total) {
-        const int sp0 = kv_phys_slot(block_table, block_size, RING, tile0 + warp);
-        ks = k_scales[(size_t)sp0 * NKV + kvh];
-        vs = v_scales[(size_t)sp0 * NKV + kvh];
-    }
-
-    int buf = 0;
-    for (int base = tile0; base < total; base += lane_stride, buf ^= 1) {
-        const int nbase = base + lane_stride;
-        if (nbase < total) stage_tile(buf ^ 1, nbase);
-        __pipeline_commit();
-        float ksn = 0.0f;
-        float vsn = 0.0f;
-        if (nbase + warp < total) {
-            const int spn = kv_phys_slot(block_table, block_size, RING, nbase + warp);
-            ksn = k_scales[(size_t)spn * NKV + kvh];
-            vsn = v_scales[(size_t)spn * NKV + kvh];
-        }
-        __pipeline_wait_prior(1);
-        __syncthreads();
-
-        const bool live = base + warp < total
-            && (base + warp < hole_lo || base + warp >= hole_hi);
-        uchar4 kcur[nck];
-        uint2 vcur[nv2];
-        if (live) {
-            const uchar4* krow = reinterpret_cast<const uchar4*>(ktile[buf][warp]);
-            #pragma unroll
-            for (int c = 0; c < nck; ++c) kcur[c] = krow[lane + c * kWarp];
-            const uint2* vrow = reinterpret_cast<const uint2*>(vtile[buf][warp]);
-            #pragma unroll
-            for (int t = 0; t < nv2; ++t) vcur[t] = vrow[lane * nv2 + t];
-        }
-        kvshare_position_softmax_update<GROUP, HD>(
-            qsh, kcur, vcur, ks, vs, scaling, lane, live, m, l, acc);
-        ks = ksn;
-        vs = vsn;
-        __syncthreads();
     }
 
     kvshare_split_store_and_final_reduce<GROUP, HD>(
@@ -2920,7 +2775,6 @@ int kvshare_launch_for_group(
     int hole_lo_delta,
     int hole_hi_delta
 ) {
-    const int direct = splitk::kvshare_direct_loads_env();
     const int tc = (tc_override_minus1_reads_env >= 0)
         ? tc_override_minus1_reads_env
         : splitk::kvshare_qk_tensorcore_env_off_by_default_score_sum_order_differs();
@@ -2947,10 +2801,6 @@ int kvshare_launch_for_group(
     }
     auto kern = splitk::flash_splitk_fused_fp8_kvshare_direct_kernel<
         GROUP, splitk::kKvShareHD>;
-    if (direct == 0) {
-        kern = splitk::flash_splitk_fused_fp8_kvshare_kernel<
-            GROUP, splitk::kKvShareHD>;
-    }
     if (splitk::kvshare_debug_env()) {
         cudaFuncAttributes fa{};
         cudaFuncGetAttributes(&fa, kern);
@@ -2958,9 +2808,9 @@ int kvshare_launch_for_group(
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &occ, kern, splitk::kFlashThreads, 0);
         fprintf(stderr,
-                "[kvshare-debug] direct=%d group=%d regs=%d smem=%zu "
+                "[kvshare-debug] group=%d regs=%d smem=%zu "
                 "local=%zu occ_blocks_per_sm=%d sms=%d\n",
-                direct, GROUP, fa.numRegs, fa.sharedSizeBytes,
+                GROUP, fa.numRegs, fa.sharedSizeBytes,
                 fa.localSizeBytes, occ, splitk::flash_sm_count());
     }
     if (nvk_pdl_enabled()) {
@@ -3498,6 +3348,7 @@ constexpr int kFlashThreads = kWarp * kFlashWarps;
 constexpr int kMaxHDmk = 256;
 constexpr int kMaxAccMk = kMaxHDmk / kWarp;
 constexpr int kMaxMContiguous = 8;
+constexpr int kRowsPerPassIs2SoTheMRowKernelKeepsTheTwoRowRegisterBudgetAndThreeCtasPerSm = 2;
 constexpr int kNoMkRowCaseRcMinus31LoudErrorNotASilentNoLaunch = -31;
 constexpr int
     kMaxMRows24RowsPastContiguousChunkThroughThe8RowTemplatesBoundedByTheCallersScratchPoolOf768RowSplitSlotsAtThe32SplitPick =
@@ -3545,14 +3396,7 @@ __global__ void flash_splitk_fused_mk_kernel(
     if (h >= NH) return;
 
     const int total = pos[0] - delta;
-    int total_q[M];
-    int start_q[M];
-    #pragma unroll
-    for (int qi = 0; qi < M; ++qi) {
-        total_q[qi] = total - (M - 1) + qi;
-        start_q[qi] = (WINDOW > 0 && total_q[qi] > WINDOW) ? (total_q[qi] - WINDOW) : 0;
-    }
-    const int start = start_q[0];
+    const int start = (WINDOW > 0 && total - (M - 1) > WINDOW) ? (total - (M - 1) - WINDOW) : 0;
     const int group = NH / NKV;
     const int kvh = h / group;
 
@@ -3567,183 +3411,216 @@ __global__ void flash_splitk_fused_mk_kernel(
     }
     __syncthreads();
 
-    float acc[M][kMaxAccMk];
-    float m[M];
-    float l[M];
-    #pragma unroll
-    for (int qi = 0; qi < M; ++qi) {
-        #pragma unroll
-        for (int i = 0; i < kMaxAccMk; ++i) acc[qi][i] = 0.0f;
-        m[qi] = -INFINITY;
-        l[qi] = 0.0f;
-    }
+    constexpr int RP = kRowsPerPassIs2SoTheMRowKernelKeepsTheTwoRowRegisterBudgetAndThreeCtasPerSm < M
+        ? kRowsPerPassIs2SoTheMRowKernelKeepsTheTwoRowRegisterBudgetAndThreeCtasPerSm
+        : M;
+    constexpr int kStageFloats = (M * kFlashWarps * (kMaxHDmk / 2) > RP * kFlashWarps * kMaxHDmk)
+        ? M * kFlashWarps * (kMaxHDmk / 2)
+        : RP * kFlashWarps * kMaxHDmk;
+    static_assert(M <= kFlashWarps, "the fan-in combine gives each row to one warp");
+    __shared__ float sm[M][kFlashWarps];
+    __shared__ float sl[M][kFlashWarps];
+    __shared__ float sacc[kStageFloats];
+    const int stage_rows = max(RP, min(M, kStageFloats / (kFlashWarps * HD)));
 
     const bool vec8 = (HD & 7) == 0;
     const int vc = HD / kWarp;
     const bool vecv = (HD % (kWarp * 8)) == 0 && vc <= kMaxAccMk;
     const int lane_stride = SPLITS * kFlashWarps;
 
-    if (vec8 && (HD >> 3) == kWarp && vecv) {
-        int p = start + split * kFlashWarps + warp;
-        uint4 kraw, vraw;
-        if (p < total) {
-            kraw = __ldg(reinterpret_cast<const uint4*>(k + ((size_t)p * NKV + kvh) * HD) + lane);
-            vraw = __ldg(reinterpret_cast<const uint4*>(v + ((size_t)p * NKV + kvh) * HD) + lane);
+    int base = 0;
+    int staged = 0;
+    #pragma unroll 1
+    for (int q0 = 0; q0 < M; q0 += RP) {
+        const int rows = min(RP, M - q0);
+        int total_q[RP];
+        int start_q[RP];
+        #pragma unroll
+        for (int qi = 0; qi < RP; ++qi) {
+            total_q[qi] = total - (M - 1) + min(q0 + qi, M - 1);
+            start_q[qi] = (WINDOW > 0 && total_q[qi] > WINDOW) ? (total_q[qi] - WINDOW) : 0;
         }
-        for (; p < total; p += lane_stride) {
-            const int pn = p + lane_stride;
-            uint4 kn, vn;
-            if (pn < total) {
-                kn = __ldg(reinterpret_cast<const uint4*>(k + ((size_t)pn * NKV + kvh) * HD) + lane);
-                vn = __ldg(reinterpret_cast<const uint4*>(v + ((size_t)pn * NKV + kvh) * HD) + lane);
-            }
-            const __nv_bfloat162* kb = reinterpret_cast<const __nv_bfloat162*>(&kraw);
-            const __nv_bfloat162* vb = reinterpret_cast<const __nv_bfloat162*>(&vraw);
-            float kf[8], vf[8];
+        const int pass_end = total_q[rows - 1];
+        float acc[RP][kMaxAccMk];
+        float m[RP];
+        float l[RP];
+        #pragma unroll
+        for (int qi = 0; qi < RP; ++qi) {
             #pragma unroll
-            for (int t = 0; t < 4; ++t) {
-                float2 kf2 = __bfloat1622float2(kb[t]);
-                kf[2 * t] = kf2.x;
-                kf[2 * t + 1] = kf2.y;
-                float2 vf2 = __bfloat1622float2(vb[t]);
-                vf[2 * t] = vf2.x;
-                vf[2 * t + 1] = vf2.y;
+            for (int i = 0; i < kMaxAccMk; ++i) acc[qi][i] = 0.0f;
+            m[qi] = -INFINITY;
+            l[qi] = 0.0f;
+        }
+
+        if (vec8 && (HD >> 3) == kWarp && vecv) {
+            int p = start + split * kFlashWarps + warp;
+            uint4 kraw, vraw;
+            if (p < pass_end) {
+                kraw = __ldg(reinterpret_cast<const uint4*>(k + ((size_t)p * NKV + kvh) * HD) + lane);
+                vraw = __ldg(reinterpret_cast<const uint4*>(v + ((size_t)p * NKV + kvh) * HD) + lane);
             }
-            #pragma unroll
-            for (int qi = 0; qi < M; ++qi) {
-                if (p < start_q[qi] || p >= total_q[qi]) continue;
-                const float* qp = qsh + qi * HD + lane * 8;
-                float partial = 0.0f;
+            for (; p < pass_end; p += lane_stride) {
+                const int pn = p + lane_stride;
+                uint4 kn, vn;
+                if (pn < pass_end) {
+                    kn = __ldg(reinterpret_cast<const uint4*>(k + ((size_t)pn * NKV + kvh) * HD) + lane);
+                    vn = __ldg(reinterpret_cast<const uint4*>(v + ((size_t)pn * NKV + kvh) * HD) + lane);
+                }
+                const __nv_bfloat162* kb = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+                const __nv_bfloat162* vb = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+                float kf[8], vf[8];
                 #pragma unroll
-                for (int t = 0; t < 4; ++t)
-                    partial += kf[2 * t] * qp[2 * t] + kf[2 * t + 1] * qp[2 * t + 1];
+                for (int t = 0; t < 4; ++t) {
+                    float2 kf2 = __bfloat1622float2(kb[t]);
+                    kf[2 * t] = kf2.x;
+                    kf[2 * t + 1] = kf2.y;
+                    float2 vf2 = __bfloat1622float2(vb[t]);
+                    vf[2 * t] = vf2.x;
+                    vf[2 * t + 1] = vf2.y;
+                }
+                #pragma unroll
+                for (int qi = 0; qi < RP; ++qi) {
+                    if (qi >= rows || p < start_q[qi] || p >= total_q[qi]) continue;
+                    const float* qp = qsh + (q0 + qi) * HD + lane * 8;
+                    float partial = 0.0f;
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t)
+                        partial += kf[2 * t] * qp[2 * t] + kf[2 * t + 1] * qp[2 * t + 1];
+                    float score = splitk::warp_sum(partial);
+                    float m_new = fmaxf(m[qi], score);
+                    float corr = __expf(m[qi] - m_new);
+                    float w = __expf(score - m_new);
+                    l[qi] = l[qi] * corr + w;
+                    #pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        acc[qi][2 * u] = __fmaf_rn(w, vf[2 * u], corr * acc[qi][2 * u]);
+                        acc[qi][2 * u + 1] = __fmaf_rn(w, vf[2 * u + 1], corr * acc[qi][2 * u + 1]);
+                    }
+                    m[qi] = m_new;
+                }
+                if (pn < pass_end) {
+                    kraw = kn;
+                    vraw = vn;
+                }
+            }
+        } else
+        for (int p = start + split * kFlashWarps + warp; p < pass_end; p += lane_stride) {
+            const __nv_bfloat16* kp = k + ((size_t)p * NKV + kvh) * HD;
+            const __nv_bfloat16* vp = v + ((size_t)p * NKV + kvh) * HD;
+            const int n8 = HD >> 3;
+            float kf[8];
+            float vf[kMaxAccMk];
+            if (vec8) {
+                if (lane < n8) {
+                    uint4 raw = __ldg(reinterpret_cast<const uint4*>(kp) + lane);
+                    const __nv_bfloat162* kb = reinterpret_cast<const __nv_bfloat162*>(&raw);
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+                        float2 f = __bfloat1622float2(kb[t]);
+                        kf[2 * t] = f.x;
+                        kf[2 * t + 1] = f.y;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < kMaxAccMk; ++i) {
+                    int d = lane + i * kWarp;
+                    if (d < HD) kf[i] = __bfloat162float(kp[d]);
+                }
+            }
+            #pragma unroll
+            for (int i = 0; i < kMaxAccMk; ++i) {
+                int d = lane + i * kWarp;
+                if (d < HD) vf[i] = __bfloat162float(__ldg(&vp[d]));
+            }
+            #pragma unroll
+            for (int qi = 0; qi < RP; ++qi) {
+                if (qi >= rows || p < start_q[qi] || p >= total_q[qi]) continue;
+                float partial = 0.0f;
+                if (vec8) {
+                    if (lane < n8) {
+                        const float* qp = qsh + (q0 + qi) * HD + lane * 8;
+                        #pragma unroll
+                        for (int t = 0; t < 4; ++t)
+                            partial += kf[2 * t] * qp[2 * t] + kf[2 * t + 1] * qp[2 * t + 1];
+                    }
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < kMaxAccMk; ++i) {
+                        int d = lane + i * kWarp;
+                        if (d < HD) partial += qsh[(q0 + qi) * HD + d] * kf[i];
+                    }
+                }
                 float score = splitk::warp_sum(partial);
                 float m_new = fmaxf(m[qi], score);
                 float corr = __expf(m[qi] - m_new);
                 float w = __expf(score - m_new);
                 l[qi] = l[qi] * corr + w;
                 #pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    acc[qi][2 * u] = __fmaf_rn(w, vf[2 * u], corr * acc[qi][2 * u]);
-                    acc[qi][2 * u + 1] = __fmaf_rn(w, vf[2 * u + 1], corr * acc[qi][2 * u + 1]);
+                for (int i = 0; i < kMaxAccMk; ++i) {
+                    int d = lane + i * kWarp;
+                    if (d < HD) acc[qi][i] = __fmaf_rn(acc[qi][i], corr, w * vf[i]);
                 }
                 m[qi] = m_new;
             }
-            if (pn < total) {
-                kraw = kn;
-                vraw = vn;
-            }
         }
-    } else
-    for (int p = start + split * kFlashWarps + warp; p < total; p += lane_stride) {
-        const __nv_bfloat16* kp = k + ((size_t)p * NKV + kvh) * HD;
-        const __nv_bfloat16* vp = v + ((size_t)p * NKV + kvh) * HD;
-        const int n8 = HD >> 3;
-        float kf[8];
-        float vf[kMaxAccMk];
-        if (vec8) {
-            if (lane < n8) {
-                uint4 raw = __ldg(reinterpret_cast<const uint4*>(kp) + lane);
-                const __nv_bfloat162* kb = reinterpret_cast<const __nv_bfloat162*>(&raw);
+
+        #pragma unroll
+        for (int qi = 0; qi < RP; ++qi) {
+            if (qi >= rows) break;
+            const int qs = staged + qi;
+            if (lane == 0) {
+                sm[qs][warp] = m[qi];
+                sl[qs][warp] = l[qi];
+            }
+            float* st = sacc + ((size_t)qs * kFlashWarps + warp) * HD;
+            if (vecv) {
                 #pragma unroll
-                for (int t = 0; t < 4; ++t) {
-                    float2 f = __bfloat1622float2(kb[t]);
-                    kf[2 * t] = f.x;
-                    kf[2 * t + 1] = f.y;
-                }
-            }
-        } else {
-            #pragma unroll
-            for (int i = 0; i < kMaxAccMk; ++i) {
-                int d = lane + i * kWarp;
-                if (d < HD) kf[i] = __bfloat162float(kp[d]);
-            }
-        }
-        #pragma unroll
-        for (int i = 0; i < kMaxAccMk; ++i) {
-            int d = lane + i * kWarp;
-            if (d < HD) vf[i] = __bfloat162float(__ldg(&vp[d]));
-        }
-        #pragma unroll
-        for (int qi = 0; qi < M; ++qi) {
-            if (p < start_q[qi] || p >= total_q[qi]) continue;
-            float partial = 0.0f;
-            if (vec8) {
-                if (lane < n8) {
-                    const float* qp = qsh + qi * HD + lane * 8;
-                    #pragma unroll
-                    for (int t = 0; t < 4; ++t)
-                        partial += kf[2 * t] * qp[2 * t] + kf[2 * t + 1] * qp[2 * t + 1];
+                for (int i = 0; i < kMaxAccMk; ++i) {
+                    if (i >= vc) break;
+                    st[lane * vc + i] = acc[qi][i];
                 }
             } else {
                 #pragma unroll
                 for (int i = 0; i < kMaxAccMk; ++i) {
                     int d = lane + i * kWarp;
-                    if (d < HD) partial += qsh[qi * HD + d] * kf[i];
+                    if (d < HD) st[d] = acc[qi][i];
                 }
             }
-            float score = splitk::warp_sum(partial);
-            float m_new = fmaxf(m[qi], score);
-            float corr = __expf(m[qi] - m_new);
-            float w = __expf(score - m_new);
-            l[qi] = l[qi] * corr + w;
-            #pragma unroll
-            for (int i = 0; i < kMaxAccMk; ++i) {
-                int d = lane + i * kWarp;
-                if (d < HD) acc[qi][i] = __fmaf_rn(acc[qi][i], corr, w * vf[i]);
-            }
-            m[qi] = m_new;
         }
-    }
-
-    __shared__ float sm[kFlashWarps];
-    __shared__ float sl[kFlashWarps];
-    __shared__ float sacc[kFlashWarps][kMaxHDmk];
-    for (int qi = 0; qi < M; ++qi) {
-        __syncthreads();
-        if (lane == 0) {
-            sm[warp] = m[qi];
-            sl[warp] = l[qi];
-        }
-        if (vecv) {
-            #pragma unroll
-            for (int i = 0; i < kMaxAccMk; ++i) {
-                if (i >= vc) break;
-                sacc[warp][lane * vc + i] = acc[qi][i];
-            }
-        } else {
-            #pragma unroll
-            for (int i = 0; i < kMaxAccMk; ++i) {
-                int d = lane + i * kWarp;
-                if (d < HD) sacc[warp][d] = acc[qi][i];
-            }
-        }
-        __syncthreads();
-
-        float* out = scratch + (((size_t)h * M + qi) * SPLITS + split) * (HD + 2);
-        if (warp == 0) {
-            float m_blk = -INFINITY;
-            #pragma unroll
-            for (int w = 0; w < kFlashWarps; ++w) m_blk = fmaxf(m_blk, sm[w]);
-            float l_blk = 0.0f;
-            #pragma unroll
-            for (int w = 0; w < kFlashWarps; ++w)
-                l_blk += (sm[w] > -INFINITY) ? sl[w] * __expf(sm[w] - m_blk) : 0.0f;
-            if (lane == 0) {
+        staged += rows;
+        if (staged + RP > stage_rows || q0 + RP >= M) {
+            __syncthreads();
+            if (warp == 0 && lane < staged) {
+                const int qs = lane;
+                float m_blk = -INFINITY;
+                #pragma unroll
+                for (int w = 0; w < kFlashWarps; ++w) m_blk = fmaxf(m_blk, sm[qs][w]);
+                float l_blk = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < kFlashWarps; ++w)
+                    l_blk += (sm[qs][w] > -INFINITY) ? sl[qs][w] * __expf(sm[qs][w] - m_blk) : 0.0f;
+                float* out = scratch + (((size_t)h * M + base + qs) * SPLITS + split) * (HD + 2);
                 out[0] = m_blk;
                 out[1] = l_blk;
             }
-        }
-        __syncthreads();
-        float m_blk = -INFINITY;
-        #pragma unroll
-        for (int w = 0; w < kFlashWarps; ++w) m_blk = fmaxf(m_blk, sm[w]);
-        for (int d = threadIdx.x; d < HD; d += kFlashThreads) {
-            float a = 0.0f;
-            #pragma unroll
-            for (int w = 0; w < kFlashWarps; ++w)
-                a += (sm[w] > -INFINITY) ? sacc[w][d] * __expf(sm[w] - m_blk) : 0.0f;
-            out[2 + d] = a;
+            for (int t = threadIdx.x; t < staged * HD; t += kFlashThreads) {
+                const int qs = t / HD;
+                const int d = t - qs * HD;
+                float m_blk = -INFINITY;
+                #pragma unroll
+                for (int w = 0; w < kFlashWarps; ++w) m_blk = fmaxf(m_blk, sm[qs][w]);
+                float a = 0.0f;
+                #pragma unroll
+                for (int w = 0; w < kFlashWarps; ++w)
+                    a += (sm[qs][w] > -INFINITY)
+                        ? sacc[((size_t)qs * kFlashWarps + w) * HD + d] * __expf(sm[qs][w] - m_blk)
+                        : 0.0f;
+                scratch[(((size_t)h * M + base + qs) * SPLITS + split) * (HD + 2) + 2 + d] = a;
+            }
+            __syncthreads();
+            base += staged;
+            staged = 0;
         }
     }
 
@@ -3755,35 +3632,35 @@ __global__ void flash_splitk_fused_mk_kernel(
     if (ticket != SPLITS - 1) return;
     __threadfence();
 
-    __shared__ float ssc[32];
-    __shared__ float sinv_l;
-    for (int qi = 0; qi < M; ++qi) {
+    __shared__ float ssc[M][SPLITS];
+    __shared__ float sinv_l[M];
+    if (lane == 0 && warp < M) {
+        const int qi = warp;
         const float* base = scratch + ((size_t)h * M + qi) * SPLITS * (HD + 2);
-        if (threadIdx.x == 0) {
-            float m_glob = -INFINITY;
-            #pragma unroll
-            for (int s = 0; s < SPLITS; ++s)
-                m_glob = fmaxf(m_glob, base[(size_t)s * (HD + 2)]);
-            float l_glob = 0.0f;
-            #pragma unroll
-            for (int s = 0; s < SPLITS; ++s) {
-                const float* part = base + (size_t)s * (HD + 2);
-                float sc = (part[0] > -INFINITY) ? __expf(part[0] - m_glob) : 0.0f;
-                ssc[s] = sc;
-                l_glob += part[1] * sc;
-            }
-            sinv_l = (l_glob > 0.0f) ? (1.0f / l_glob) : 0.0f;
+        float m_glob = -INFINITY;
+        #pragma unroll
+        for (int s = 0; s < SPLITS; ++s)
+            m_glob = fmaxf(m_glob, base[(size_t)s * (HD + 2)]);
+        float l_glob = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < SPLITS; ++s) {
+            const float* part = base + (size_t)s * (HD + 2);
+            float sc = (part[0] > -INFINITY) ? __expf(part[0] - m_glob) : 0.0f;
+            ssc[qi][s] = sc;
+            l_glob += part[1] * sc;
         }
-        __syncthreads();
-        float inv_l = sinv_l;
-        for (int d = threadIdx.x; d < HD; d += kFlashThreads) {
-            float a = 0.0f;
-            #pragma unroll
-            for (int s = 0; s < SPLITS; ++s)
-                a += base[(size_t)s * (HD + 2) + 2 + d] * ssc[s];
-            outp[((size_t)qi * NH + h) * HD + d] = __float2bfloat16(a * inv_l);
-        }
-        __syncthreads();
+        sinv_l[qi] = (l_glob > 0.0f) ? (1.0f / l_glob) : 0.0f;
+    }
+    __syncthreads();
+    for (int t = threadIdx.x; t < M * HD; t += kFlashThreads) {
+        const int qi = t / HD;
+        const int d = t - qi * HD;
+        const float* base = scratch + ((size_t)h * M + qi) * SPLITS * (HD + 2);
+        float a = 0.0f;
+        #pragma unroll
+        for (int s = 0; s < SPLITS; ++s)
+            a += base[(size_t)s * (HD + 2) + 2 + d] * ssc[qi][s];
+        outp[((size_t)qi * NH + h) * HD + d] = __float2bfloat16(a * sinv_l[qi]);
     }
     if (threadIdx.x == 0) fan_in[h] = 0u;
 }

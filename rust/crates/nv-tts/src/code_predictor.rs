@@ -2,14 +2,12 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use candle_core::{DType, Device, Tensor};
-use nv_layers::{
-    attn::{sdpa, AttnConfig},
-    RmsNorm, Rope, RopeConfig, RopeKind,
-};
+use nv_layers::{RmsNorm, Rope, RopeConfig, RopeKind};
 use nv_weights::WeightLoader;
 
-use crate::dense::DenseLinear;
-use crate::weight_helpers::load_linear;
+use crate::dense::{DenseLinear, LinearQuant};
+use crate::talker::{DecoderLayer, LayerShape, Qwen3TtsKvCache};
+use crate::weight_helpers::{load_linear, load_linear_with_bias};
 use nv_layers::weight_load::load_rmsnorm;
 
 pub const NUM_EXTRA_CODEBOOKS: usize = 15;
@@ -17,6 +15,8 @@ pub const NUM_EXTRA_CODEBOOKS: usize = 15;
 #[derive(Clone, Debug)]
 pub struct CodecDecoderConfig {
     pub hidden_size: usize,
+
+    pub talker_hidden_size: usize,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
@@ -32,12 +32,14 @@ pub struct CodecDecoderConfig {
 
     pub mrope_section: Vec<usize>,
     pub dtype: DType,
+    pub quant: LinearQuant,
 }
 
 impl Default for CodecDecoderConfig {
     fn default() -> Self {
         Self {
             hidden_size: 1024,
+            talker_hidden_size: 1024,
             num_hidden_layers: 5,
             num_attention_heads: 16,
             num_key_value_heads: 8,
@@ -50,6 +52,7 @@ impl Default for CodecDecoderConfig {
             rms_norm_eps: 1e-6,
             mrope_section: vec![24, 20, 20],
             dtype: DType::BF16,
+            quant: LinearQuant::Dense,
         }
     }
 }
@@ -93,6 +96,11 @@ impl CodecDecoderConfig {
         if let Some(n) = cp.get("num_code_groups").and_then(|x| x.as_u64()) {
             cfg.num_extra_codebooks = (n as usize).saturating_sub(1);
         }
+        cfg.talker_hidden_size = v
+            .get("talker_config")
+            .and_then(|t| t.get("hidden_size"))
+            .and_then(|x| x.as_u64())
+            .map_or(cfg.hidden_size, |x| x as usize);
         let half = cfg.head_dim / 2;
         if cfg.mrope_section.iter().sum::<usize>() != half {
             cfg.mrope_section = vec![half];
@@ -101,152 +109,13 @@ impl CodecDecoderConfig {
     }
 }
 
-struct CodecLayer {
-    input_norm: RmsNorm,
-    q_proj: DenseLinear,
-    k_proj: DenseLinear,
-    v_proj: DenseLinear,
-    o_proj: DenseLinear,
-    q_norm: RmsNorm,
-    k_norm: RmsNorm,
-    post_attn_norm: RmsNorm,
-    gate_proj: DenseLinear,
-    up_proj: DenseLinear,
-    down_proj: DenseLinear,
-}
-
-pub struct CpKvCache {
-    layers: Vec<(Tensor, Tensor)>,
-    current_len: usize,
-    max_seq_len: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-}
-
-impl CpKvCache {
-    fn new(cfg: &CodecDecoderConfig, max_seq_len: usize, device: &Device) -> Result<Self> {
-        let shape = (1usize, max_seq_len, cfg.num_key_value_heads, cfg.head_dim);
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for _ in 0..cfg.num_hidden_layers {
-            layers.push((
-                Tensor::zeros(shape, cfg.dtype, device)?,
-                Tensor::zeros(shape, cfg.dtype, device)?,
-            ));
-        }
-        Ok(Self {
-            layers,
-            current_len: 0,
-            max_seq_len,
-            n_kv_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-        })
-    }
-
-    fn write_at(
-        &mut self,
-        layer: usize,
-        start: usize,
-        k_new: &Tensor,
-        v_new: &Tensor,
-    ) -> Result<()> {
-        let t = k_new.dims()[1];
-        let end = start + t;
-        if end > self.max_seq_len {
-            anyhow::bail!("CpKvCache.write_at: end {} > max {}", end, self.max_seq_len);
-        }
-        let (k_buf, v_buf) = &self.layers[layer];
-        let ranges = [0..1, start..end, 0..self.n_kv_heads, 0..self.head_dim];
-        let k_updated = k_buf.slice_assign(&ranges, k_new)?;
-        let v_updated = v_buf.slice_assign(&ranges, v_new)?;
-        self.layers[layer] = (k_updated, v_updated);
-        Ok(())
-    }
-
-    fn view(&self, layer: usize, len: usize) -> Result<(Tensor, Tensor)> {
-        let (k, v) = &self.layers[layer];
-        Ok((k.narrow(1, 0, len)?, v.narrow(1, 0, len)?))
-    }
-}
-
-impl CodecLayer {
-    fn forward(
-        &self,
-        x: &Tensor,
-        positions: &Tensor,
-        rope: &Rope,
-        cfg: &CodecDecoderConfig,
-        cache: Option<(&mut CpKvCache, usize)>,
-    ) -> Result<Tensor> {
-        let dims = x.dims().to_vec();
-        if dims.len() != 3 {
-            anyhow::bail!("CodecLayer.forward: expected [B,T,H], got {:?}", dims);
-        }
-        let (b, t, _h) = (dims[0], dims[1], dims[2]);
-        let h_q = cfg.num_attention_heads * cfg.head_dim;
-
-        let normed = self.input_norm.forward(x)?;
-        let q = self.q_proj.forward(&normed)?;
-        let k = self.k_proj.forward(&normed)?;
-        let v = self.v_proj.forward(&normed)?;
-        let q = q.reshape((b, t, cfg.num_attention_heads, cfg.head_dim))?;
-        let k = k.reshape((b, t, cfg.num_key_value_heads, cfg.head_dim))?;
-        let v = v.reshape((b, t, cfg.num_key_value_heads, cfg.head_dim))?;
-        let q = self.q_norm.forward(&q)?;
-        let k = self.k_norm.forward(&k)?;
-
-        let sections = if cfg.mrope_section.iter().sum::<usize>() == cfg.head_dim / 2 {
-            &cfg.mrope_section[..]
-        } else {
-            anyhow::bail!(
-                "CodecLayer.forward: mrope_section sum != head_dim/2 (cfg={:?})",
-                cfg.mrope_section
-            )
-        };
-
-        let pos_axes: Vec<&Tensor> = vec![positions; sections.len()];
-        let (q_rot, k_rot) = rope.apply_mrope(&q, &k, &pos_axes, sections)?;
-
-        let (k_full, v_full) = if let Some((cache_ref, layer_idx)) = cache {
-            let write_start = cache_ref.current_len;
-            let new_total = write_start + t;
-            cache_ref.write_at(
-                layer_idx,
-                write_start,
-                &k_rot.contiguous()?,
-                &v.contiguous()?,
-            )?;
-            cache_ref.view(layer_idx, new_total)?
-        } else {
-            (k_rot.contiguous()?, v.contiguous()?)
-        };
-
-        let attn_cfg = AttnConfig {
-            num_heads: cfg.num_attention_heads,
-            num_kv_heads: cfg.num_key_value_heads,
-            head_dim: cfg.head_dim,
-            softmax_scale: 1.0 / (cfg.head_dim as f32).sqrt(),
-            causal: true,
-        };
-        let attn_out = sdpa(&q_rot, &k_full, &v_full, &attn_cfg)?;
-        let attn_out = attn_out.reshape((b, t, h_q))?;
-        let attn_out = self.o_proj.forward(&attn_out)?;
-        let x = x.add(&attn_out)?;
-
-        let normed = self.post_attn_norm.forward(&x)?;
-        let gate = self.gate_proj.forward(&normed)?;
-        let up = self.up_proj.forward(&normed)?;
-        let act = candle_nn::ops::silu(&gate)?.mul(&up)?;
-        let mlp_out = self.down_proj.forward(&act)?;
-        Ok(x.add(&mlp_out)?)
-    }
-}
-
 pub struct Qwen3TtsCodecDecoder {
     cfg: CodecDecoderConfig,
     device: Device,
 
     codec_embeddings: Vec<Tensor>,
-    layers: Vec<CodecLayer>,
+    small_to_mtp_projection: Option<DenseLinear>,
+    layers: Vec<DecoderLayer>,
     final_norm: RmsNorm,
 
     lm_heads: Vec<DenseLinear>,
@@ -265,9 +134,7 @@ impl Qwen3TtsCodecDecoder {
     pub fn new(cfg: CodecDecoderConfig, device: &Device) -> Result<Self> {
         let dtype = cfg.dtype;
         let h = cfg.hidden_size;
-        let inter = cfg.intermediate_size;
-        let h_q = cfg.num_attention_heads * cfg.head_dim;
-        let h_kv = cfg.num_key_value_heads * cfg.head_dim;
+        let th = cfg.talker_hidden_size;
 
         let zeros_2d = |out: usize, inp: usize| -> Result<Tensor> {
             Ok(Tensor::zeros((out, inp), dtype, device)?)
@@ -276,25 +143,28 @@ impl Qwen3TtsCodecDecoder {
 
         let mut codec_embeddings = Vec::with_capacity(cfg.num_extra_codebooks);
         for _ in 0..cfg.num_extra_codebooks {
-            codec_embeddings.push(Tensor::zeros((cfg.codebook_vocab_size, h), dtype, device)?);
+            codec_embeddings.push(Tensor::zeros((cfg.codebook_vocab_size, th), dtype, device)?);
         }
+        let small_to_mtp_projection = if th == h {
+            None
+        } else {
+            Some(DenseLinear::new(
+                zeros_2d(h, th)?,
+                Some(Tensor::zeros(h, dtype, device)?),
+            )?)
+        };
 
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        for _ in 0..cfg.num_hidden_layers {
-            layers.push(CodecLayer {
-                input_norm: RmsNorm::new(ones_1d(h)?, cfg.rms_norm_eps),
-                q_proj: DenseLinear::new(zeros_2d(h_q, h)?, None)?,
-                k_proj: DenseLinear::new(zeros_2d(h_kv, h)?, None)?,
-                v_proj: DenseLinear::new(zeros_2d(h_kv, h)?, None)?,
-                o_proj: DenseLinear::new(zeros_2d(h, h_q)?, None)?,
-                q_norm: RmsNorm::new(ones_1d(cfg.head_dim)?, cfg.rms_norm_eps),
-                k_norm: RmsNorm::new(ones_1d(cfg.head_dim)?, cfg.rms_norm_eps),
-                post_attn_norm: RmsNorm::new(ones_1d(h)?, cfg.rms_norm_eps),
-                gate_proj: DenseLinear::new(zeros_2d(inter, h)?, None)?,
-                up_proj: DenseLinear::new(zeros_2d(inter, h)?, None)?,
-                down_proj: DenseLinear::new(zeros_2d(h, inter)?, None)?,
-            });
-        }
+        let shape = LayerShape {
+            hidden: h,
+            heads: cfg.num_attention_heads,
+            kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            inter: cfg.intermediate_size,
+            eps: cfg.rms_norm_eps,
+        };
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|_| DecoderLayer::zeros(shape, dtype, device))
+            .collect::<Result<Vec<_>>>()?;
 
         let final_norm = RmsNorm::new(ones_1d(h)?, cfg.rms_norm_eps);
         let mut lm_heads = Vec::with_capacity(cfg.num_extra_codebooks);
@@ -315,11 +185,11 @@ impl Qwen3TtsCodecDecoder {
             device,
         )?;
 
-        let _ = h_kv;
         Ok(Self {
             cfg,
             device: device.clone(),
             codec_embeddings,
+            small_to_mtp_projection,
             layers,
             final_norm,
             lm_heads,
@@ -329,6 +199,7 @@ impl Qwen3TtsCodecDecoder {
 
     pub fn load_weights(&mut self, weights: &WeightLoader) -> Result<()> {
         let dtype = self.cfg.dtype;
+        let quant = self.cfg.quant.clone();
         let prefix = "talker.code_predictor";
 
         for k in 0..self.cfg.num_extra_codebooks {
@@ -337,96 +208,30 @@ impl Qwen3TtsCodecDecoder {
                 .get(&name, dtype)
                 .with_context(|| format!("load {name}"))?;
             let d = w.dims();
-            if d != [self.cfg.codebook_vocab_size, self.cfg.hidden_size] {
+            if d != [self.cfg.codebook_vocab_size, self.cfg.talker_hidden_size] {
                 anyhow::bail!(
                     "{name}: expected [{}, {}], got {:?}",
                     self.cfg.codebook_vocab_size,
-                    self.cfg.hidden_size,
+                    self.cfg.talker_hidden_size,
                     d
                 );
             }
             self.codec_embeddings[k] = w;
         }
+        if self.small_to_mtp_projection.is_some() {
+            self.small_to_mtp_projection = Some(load_linear_with_bias(
+                weights,
+                &format!("{prefix}.small_to_mtp_projection"),
+                self.cfg.hidden_size,
+                self.cfg.talker_hidden_size,
+                dtype,
+            )?);
+        }
 
         let h = self.cfg.hidden_size;
-        let h_q = self.cfg.num_attention_heads * self.cfg.head_dim;
-        let h_kv = self.cfg.num_key_value_heads * self.cfg.head_dim;
-        let inter = self.cfg.intermediate_size;
         let eps = self.cfg.rms_norm_eps;
-        for i in 0..self.cfg.num_hidden_layers {
-            let p = format!("{prefix}.model.layers.{i}");
-            let l = &mut self.layers[i];
-            l.input_norm = load_rmsnorm(
-                weights,
-                &format!("{p}.input_layernorm.weight"),
-                h,
-                eps,
-                dtype,
-            )?;
-            l.post_attn_norm = load_rmsnorm(
-                weights,
-                &format!("{p}.post_attention_layernorm.weight"),
-                h,
-                eps,
-                dtype,
-            )?;
-            l.q_proj = load_linear(
-                weights,
-                &format!("{p}.self_attn.q_proj.weight"),
-                h_q,
-                h,
-                dtype,
-            )?;
-            l.k_proj = load_linear(
-                weights,
-                &format!("{p}.self_attn.k_proj.weight"),
-                h_kv,
-                h,
-                dtype,
-            )?;
-            l.v_proj = load_linear(
-                weights,
-                &format!("{p}.self_attn.v_proj.weight"),
-                h_kv,
-                h,
-                dtype,
-            )?;
-            l.o_proj = load_linear(
-                weights,
-                &format!("{p}.self_attn.o_proj.weight"),
-                h,
-                h_q,
-                dtype,
-            )?;
-            l.q_norm = load_rmsnorm(
-                weights,
-                &format!("{p}.self_attn.q_norm.weight"),
-                self.cfg.head_dim,
-                eps,
-                dtype,
-            )?;
-            l.k_norm = load_rmsnorm(
-                weights,
-                &format!("{p}.self_attn.k_norm.weight"),
-                self.cfg.head_dim,
-                eps,
-                dtype,
-            )?;
-            l.gate_proj = load_linear(
-                weights,
-                &format!("{p}.mlp.gate_proj.weight"),
-                inter,
-                h,
-                dtype,
-            )?;
-            l.up_proj = load_linear(weights, &format!("{p}.mlp.up_proj.weight"), inter, h, dtype)?;
-            l.down_proj = load_linear(
-                weights,
-                &format!("{p}.mlp.down_proj.weight"),
-                h,
-                inter,
-                dtype,
-            )?;
+        for (i, l) in self.layers.iter_mut().enumerate() {
+            l.load(weights, &format!("{prefix}.model.layers.{i}"), dtype, &quant)?;
         }
 
         self.final_norm = load_rmsnorm(
@@ -439,7 +244,14 @@ impl Qwen3TtsCodecDecoder {
 
         for k in 0..self.cfg.num_extra_codebooks {
             let name = format!("{prefix}.lm_head.{k}.weight");
-            self.lm_heads[k] = load_linear(weights, &name, self.cfg.codebook_vocab_size, h, dtype)?;
+            self.lm_heads[k] = load_linear(
+                weights,
+                &name,
+                self.cfg.codebook_vocab_size,
+                h,
+                dtype,
+                &LinearQuant::Dense,
+            )?;
         }
         Ok(())
     }
@@ -466,13 +278,17 @@ impl Qwen3TtsCodecDecoder {
         let positions = Tensor::from_vec(pos_tiled, (b, t), &self.device)?;
         let mut x = residual.clone();
         for layer in &self.layers {
-            x = layer.forward(&x, &positions, &self.rope, &self.cfg, None)?;
+            x = layer.forward(&x, &positions, &self.rope, &self.cfg.mrope_section, None)?;
         }
         let x = self.final_norm.forward(&x)?;
         Ok(x.narrow(1, t - 1, 1)?.squeeze(1)?)
     }
 
-    fn forward_step_cached(&self, new_embeds: &Tensor, cache: &mut CpKvCache) -> Result<Tensor> {
+    fn forward_step_cached(
+        &self,
+        new_embeds: &Tensor,
+        cache: &mut Qwen3TtsKvCache,
+    ) -> Result<Tensor> {
         let dims = new_embeds.dims().to_vec();
         if dims.len() != 3 || dims[0] != 1 || dims[2] != self.cfg.hidden_size {
             anyhow::bail!(
@@ -482,16 +298,29 @@ impl Qwen3TtsCodecDecoder {
             );
         }
         let t = dims[1];
-        let start = cache.current_len;
+        let start = cache.current_len();
         let pos_row: Vec<u32> = (start as u32..(start + t) as u32).collect();
         let positions = Tensor::from_vec(pos_row, (1usize, t), &self.device)?;
         let mut x = new_embeds.clone();
         for (i, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(&x, &positions, &self.rope, &self.cfg, Some((cache, i)))?;
+            x = layer.forward(
+                &x,
+                &positions,
+                &self.rope,
+                &self.cfg.mrope_section,
+                Some((cache, i)),
+            )?;
         }
-        cache.current_len += t;
+        cache.advance(t);
         let x = self.final_norm.forward(&x)?;
         Ok(x.narrow(1, t - 1, 1)?.squeeze(1)?)
+    }
+
+    fn to_mtp_width(&self, x: &Tensor) -> Result<Tensor> {
+        match &self.small_to_mtp_projection {
+            Some(p) => p.forward(x),
+            None => Ok(x.clone()),
+        }
     }
 
     fn embed_extra(&self, k: usize, tok: u32) -> Result<Tensor> {
@@ -506,7 +335,7 @@ impl Qwen3TtsCodecDecoder {
         }
         let id = Tensor::from_vec(vec![tok], 1usize, &self.device)?;
         let emb = self.codec_embeddings[k].index_select(&id, 0)?;
-        Ok(emb.reshape((1usize, 1usize, self.cfg.hidden_size))?)
+        Ok(emb.reshape((1usize, 1usize, self.cfg.talker_hidden_size))?)
     }
 
     pub fn predict(
@@ -516,10 +345,11 @@ impl Qwen3TtsCodecDecoder {
         _prev_codec_tokens: &[[u32; NUM_EXTRA_CODEBOOKS]],
     ) -> Result<[u32; NUM_EXTRA_CODEBOOKS]> {
         let dims = talker_hidden.dims();
-        if dims.len() != 3 || dims[0] != 1 || dims[1] != 1 || dims[2] != self.cfg.hidden_size {
+        if dims.len() != 3 || dims[0] != 1 || dims[1] != 1 || dims[2] != self.cfg.talker_hidden_size
+        {
             anyhow::bail!(
                 "predict: talker_hidden must be [1, 1, {}], got {:?}",
-                self.cfg.hidden_size,
+                self.cfg.talker_hidden_size,
                 dims
             );
         }
@@ -536,7 +366,7 @@ impl Qwen3TtsCodecDecoder {
             .enumerate()
             .take(self.cfg.num_extra_codebooks)
         {
-            let h = self.forward_last_hidden(&residual)?;
+            let h = self.forward_last_hidden(&self.to_mtp_width(&residual)?)?;
             let logits = self.lm_heads[k].forward(&h)?;
             let tok = argmax_u32(&logits)?;
             *o = tok;
@@ -555,26 +385,32 @@ impl Qwen3TtsCodecDecoder {
         sampler: &mut crate::sampling::Sampler,
     ) -> Result<[u32; NUM_EXTRA_CODEBOOKS]> {
         let dims = talker_hidden.dims();
-        if dims.len() != 3 || dims[0] != 1 || dims[1] != 1 || dims[2] != self.cfg.hidden_size {
+        let th = self.cfg.talker_hidden_size;
+        if dims.len() != 3 || dims[0] != 1 || dims[1] != 1 || dims[2] != th {
             anyhow::bail!(
-                "predict_sampled: talker_hidden must be [1, 1, {}], got {:?}",
-                self.cfg.hidden_size,
+                "predict_sampled: talker_hidden must be [1, 1, {th}], got {:?}",
                 dims
             );
         }
         let bd = base_embed.dims();
-        if bd != [1, 1, self.cfg.hidden_size] {
+        if bd != [1, 1, th] {
             anyhow::bail!(
-                "predict_sampled: base_embed must be [1, 1, {}], got {:?}",
-                self.cfg.hidden_size,
+                "predict_sampled: base_embed must be [1, 1, {th}], got {:?}",
                 bd
             );
         }
         let dtype = self.cfg.dtype;
         let hid = talker_hidden.to_dtype(dtype)?;
         let base = base_embed.to_dtype(dtype)?;
-        let prefill = Tensor::cat(&[&hid, &base], 1)?;
-        let mut cache = CpKvCache::new(&self.cfg, 2 + self.cfg.num_extra_codebooks, &self.device)?;
+        let prefill = self.to_mtp_width(&Tensor::cat(&[&hid, &base], 1)?)?;
+        let mut cache = Qwen3TtsKvCache::for_layers(
+            self.cfg.num_hidden_layers,
+            self.cfg.num_key_value_heads,
+            self.cfg.head_dim,
+            self.cfg.dtype,
+            2 + self.cfg.num_extra_codebooks,
+            &self.device,
+        )?;
 
         let mut out = [0u32; NUM_EXTRA_CODEBOOKS];
         let mut h = self.forward_step_cached(&prefill, &mut cache)?;
@@ -591,7 +427,7 @@ impl Qwen3TtsCodecDecoder {
             let tok = sampler.sample(&row, &[], |_| true)?;
             *o = tok;
             if k + 1 < self.cfg.num_extra_codebooks {
-                let emb = self.embed_extra(k, tok)?;
+                let emb = self.to_mtp_width(&self.embed_extra(k, tok)?)?;
                 h = self.forward_step_cached(&emb, &mut cache)?;
             }
         }
@@ -644,6 +480,7 @@ mod tests {
     fn tiny_cfg() -> CodecDecoderConfig {
         CodecDecoderConfig {
             hidden_size: 32,
+            talker_hidden_size: 32,
             num_hidden_layers: 2,
             num_attention_heads: 4,
             num_key_value_heads: 2,
@@ -660,20 +497,13 @@ mod tests {
     }
 
     #[test]
-    fn builds_on_cpu_with_zero_weights() {
+    fn a_zero_weight_decoder_builds_and_predicts_15_tokens_in_range() {
         let cfg = tiny_cfg();
         let dev = Device::Cpu;
         let dec = Qwen3TtsCodecDecoder::new(cfg.clone(), &dev).expect("build");
         assert_eq!(dec.codec_embeddings.len(), cfg.num_extra_codebooks);
         assert_eq!(dec.lm_heads.len(), cfg.num_extra_codebooks);
         assert_eq!(dec.layers.len(), cfg.num_hidden_layers);
-    }
-
-    #[test]
-    fn predict_emits_15_tokens_in_range() {
-        let cfg = tiny_cfg();
-        let dev = Device::Cpu;
-        let dec = Qwen3TtsCodecDecoder::new(cfg.clone(), &dev).expect("build");
         let h = Tensor::ones((1usize, 1usize, cfg.hidden_size), DType::F32, &dev).unwrap();
         let toks = dec.predict(&h, 0, &[]).expect("predict");
         for (i, &t) in toks.iter().enumerate() {
@@ -685,6 +515,41 @@ mod tests {
         }
 
         assert_eq!(toks, [0u32; 15]);
+    }
+
+    #[test]
+    fn a_talker_wider_than_the_predictor_projects_into_it_and_sums_extras_at_talker_width() {
+        let cfg = CodecDecoderConfig {
+            talker_hidden_size: 48,
+            ..tiny_cfg()
+        };
+        let dev = Device::Cpu;
+        let dec = Qwen3TtsCodecDecoder::new(cfg.clone(), &dev).expect("build");
+        assert!(dec.small_to_mtp_projection.is_some());
+        let h = Tensor::ones((1usize, 1usize, 48), DType::F32, &dev).unwrap();
+        assert_eq!(dec.predict(&h, 0, &[]).expect("predict"), [0u32; 15]);
+        let mut sampler = crate::sampling::Sampler::new(crate::sampling::SamplerConfig {
+            do_sample: false,
+            ..Default::default()
+        });
+        let extras = dec.predict_sampled(&h, &h, &mut sampler).expect("sampled");
+        assert!(extras
+            .iter()
+            .all(|&t| (t as usize) < cfg.codebook_vocab_size));
+        assert_eq!(dec.sum_extra_embeds(&extras).unwrap().dims(), &[1, 1, 48]);
+        let narrow = Tensor::ones((1usize, 1usize, 32), DType::F32, &dev).unwrap();
+        assert!(
+            dec.predict(&narrow, 0, &[]).is_err(),
+            "the talker hidden state arrives at talker width, not predictor width"
+        );
+        let parsed = CodecDecoderConfig::from_hf_config_str(
+            r#"{"talker_config":{"hidden_size":2048,"code_predictor_config":{"hidden_size":1024}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (parsed.hidden_size, parsed.talker_hidden_size),
+            (1024, 2048)
+        );
     }
 
     #[test]

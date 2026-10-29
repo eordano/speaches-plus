@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 pub mod clustering;
 pub mod embedding;
@@ -9,8 +8,6 @@ pub mod http;
 pub mod powerset;
 pub mod segmentation;
 
-#[cfg(test)]
-mod bench;
 #[cfg(test)]
 mod hop_sweep;
 

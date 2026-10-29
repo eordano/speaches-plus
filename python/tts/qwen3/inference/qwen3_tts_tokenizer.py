@@ -177,17 +177,11 @@ class Qwen3TTSTokenizer:
         if hasattr(encoded, "audio_codes"):
 
             audio_codes_list = encoded.audio_codes
-            xvectors_list = getattr(encoded, "xvectors", None)
-            ref_mels_list = getattr(encoded, "ref_mels", None)
         elif isinstance(encoded, dict):
             audio_codes_list = encoded["audio_codes"]
-            xvectors_list = encoded.get("xvectors", None)
-            ref_mels_list = encoded.get("ref_mels", None)
         elif isinstance(encoded, list):
 
             audio_codes_list = [e["audio_codes"] for e in encoded]
-            xvectors_list = [e["xvectors"] for e in encoded] if ("xvectors" in encoded[0]) else None
-            ref_mels_list = [e["ref_mels"] for e in encoded] if ("ref_mels" in encoded[0]) else None
         else:
             raise TypeError("`encoded` must be an encode output, a dict, or a list of dicts.")
 

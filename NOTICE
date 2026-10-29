@@ -77,3 +77,31 @@ a use-restricted custom license -- review it before any deployment; the
 Qwen-family weights (Qwen/Qwen3.5-*, Qwen3-Embedding, Qwen3-Omni,
 Qwen3-TTS, Qwen3-ForcedAligner, unsloth/Qwen3.8-27B-NVFP4) ship under
 Apache-2.0.
+
+----------------------------------------------------------------------
+System One decisions (rust/crates/nv-laya)
+----------------------------------------------------------------------
+
+Laya and its pretrained checkpoints are by Convai Innovations and the
+Laya contributors (https://github.com/NandhaKishorM/laya, Apache-2.0);
+the weights are downloaded separately and are not bundled.
+
+rust/crates/nv-laya/tests/fixtures/upstream_parity_cases.json reproduces
+the parity cases and recorded sequence lengths of laya-mlx
+(https://github.com/mizorewww/laya-mlx, commit fc1df628, Apache-2.0,
+copyright 2026 laya-mlx contributors). The final-head pruning and the
+length-grouped padded pass in the crate follow that project's published
+performance research.
+
+----------------------------------------------------------------------
+Contrastive Language Models (System One CLM)
+----------------------------------------------------------------------
+
+The CLM head architecture, typed-question schema and bidirectional contrastive
+objective follow Contrastive-LM/CLM, revision
+bb42c6c5bf914fd449bed2f6ca65be80602cb1f7 (Apache-2.0), by Jacky Kwok and the
+CLM contributors: https://github.com/Contrastive-LM/CLM . The training scripts
+import that implementation from a separately downloaded checkout. CLM-v0.1-8B
+and its Qwen3-8B encoder weights are Apache-2.0 and downloaded separately.
+Public training dataset sources and exact revisions accompany each run's
+public/manifest.json; their licenses continue to apply to those datasets.

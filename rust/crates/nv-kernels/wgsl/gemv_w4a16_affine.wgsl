@@ -93,6 +93,7 @@ fn w4aff_row_acc_block(wbase4: u32, sbase: u32, kv: u32, lane: u32, gs: u32) -> 
 
 @compute @workgroup_size(256)
 fn gemv_w4a16_affine_block(
+    #def b3
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -107,6 +108,7 @@ fn gemv_w4a16_affine_block(
 
     let acc = w4aff_row_acc_block(wbase, sbase, kv, lane, w4aff_params.gs);
     let total = w4aff_lane_reduce(tid, lane, acc);
+    #end
     if (lane == 0u && live) {
         w4aff_y[row] = bf16_encode(total);
     }
@@ -114,20 +116,7 @@ fn gemv_w4a16_affine_block(
 
 @compute @workgroup_size(256)
 fn gemv_w4a16_affine_block_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & (W4AFF_LANES - 1u);
-    let warp = tid / W4AFF_LANES;
-    let row = (wid.x + wid.y * w4aff_params.groups_x) * W4AFF_ROWS + warp;
-    let live = row < w4aff_params.n_rows;
-    let kv = select(0u, w4aff_params.k_elems >> 5u, live);
-    let wbase = select(0u, row * (w4aff_params.w_row_words >> 2u), live);
-    let sbase = select(0u, row * w4aff_params.scale_row_stride, live);
-
-    let acc = w4aff_row_acc_block(wbase, sbase, kv, lane, w4aff_params.gs);
-    let total = w4aff_lane_reduce(tid, lane, acc);
+    #use b3
     if (lane == 0u) {
         w4aff_warp_sums[warp] = total;
     }
@@ -177,6 +166,7 @@ fn w4aff_mrow4_total(row0: u32, rlive: u32, kv: u32, lane: u32) -> vec4<f32> {
     let ss = w4aff_params.scale_row_stride;
     let gs = w4aff_params.gs;
     var acc = vec4<f32>(0.0);
+    #def b1
     for (var v = lane; v < kv; v = v + 32u) {
         let xa = w4aff_x[v * 4u];
         let xb = w4aff_x[v * 4u + 1u];
@@ -197,6 +187,7 @@ fn w4aff_mrow4_total(row0: u32, rlive: u32, kv: u32, lane: u32) -> vec4<f32> {
         let g = (v * 32u) / gs;
         for (var r = 0u; r < rlive; r = r + 1u) {
             let row = row0 + r;
+    #end
             let wv = w4aff_packed[row * rw4 + v];
             var qd = w4aff_qdot8v(wv.x, xf0, xf1);
             qd = qd + w4aff_qdot8v(wv.y, xf2, xf3);
@@ -219,26 +210,7 @@ fn w4aff_mrow8_total(row0: u32, rlive: u32, kv: u32, lane: u32) -> array<vec4<f3
     let gs = w4aff_params.gs;
     var acc0 = vec4<f32>(0.0);
     var acc1 = vec4<f32>(0.0);
-    for (var v = lane; v < kv; v = v + 32u) {
-        let xa = w4aff_x[v * 4u];
-        let xb = w4aff_x[v * 4u + 1u];
-        let xc = w4aff_x[v * 4u + 2u];
-        let xd = w4aff_x[v * 4u + 3u];
-        let xf0 = w4aff_xf_pair(xa.xy);
-        let xf1 = w4aff_xf_pair(xa.zw);
-        let xf2 = w4aff_xf_pair(xb.xy);
-        let xf3 = w4aff_xf_pair(xb.zw);
-        let xf4 = w4aff_xf_pair(xc.xy);
-        let xf5 = w4aff_xf_pair(xc.zw);
-        let xf6 = w4aff_xf_pair(xd.xy);
-        let xf7 = w4aff_xf_pair(xd.zw);
-        let xsum = dot(
-            ((xf0 + xf1) + (xf2 + xf3)) + ((xf4 + xf5) + (xf6 + xf7)),
-            vec4<f32>(1.0)
-        );
-        let g = (v * 32u) / gs;
-        for (var r = 0u; r < rlive; r = r + 1u) {
-            let row = row0 + r;
+    #use b1
             let wv = w4aff_packed[row * rw4 + v];
             var qd = w4aff_qdot8v(wv.x, xf0, xf1);
             qd = qd + w4aff_qdot8v(wv.y, xf2, xf3);
@@ -282,6 +254,7 @@ fn gemv_w4a16_affine_mrow8(
 
 @compute @workgroup_size(128)
 fn gemv_w4a16_affine_mrow4h(
+    #def b4
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -294,6 +267,7 @@ fn gemv_w4a16_affine_mrow4h(
     let kv = select(0u, w4aff_params.k_elems >> 5u, live);
     let total = w4aff_mrow4_total(row0, rlive, kv, lane);
     if (lane == 0u) {
+    #end
         for (var r = 0u; r < rlive; r = r + 1u) {
             w4aff_y[row0 + r] = bf16_encode(total[r]);
         }
@@ -309,26 +283,7 @@ fn w4aff_mrow4_total_b(row0: u32, rlive: u32, kv: u32, lane: u32) -> vec4<f32> {
     let ss = w4aff_params.scale_row_stride;
     let gs = w4aff_params.gs;
     var acc = vec4<f32>(0.0);
-    for (var v = lane; v < kv; v = v + 32u) {
-        let xa = w4aff_x[v * 4u];
-        let xb = w4aff_x[v * 4u + 1u];
-        let xc = w4aff_x[v * 4u + 2u];
-        let xd = w4aff_x[v * 4u + 3u];
-        let xf0 = w4aff_xf_pair(xa.xy);
-        let xf1 = w4aff_xf_pair(xa.zw);
-        let xf2 = w4aff_xf_pair(xb.xy);
-        let xf3 = w4aff_xf_pair(xb.zw);
-        let xf4 = w4aff_xf_pair(xc.xy);
-        let xf5 = w4aff_xf_pair(xc.zw);
-        let xf6 = w4aff_xf_pair(xd.xy);
-        let xf7 = w4aff_xf_pair(xd.zw);
-        let xsum = dot(
-            ((xf0 + xf1) + (xf2 + xf3)) + ((xf4 + xf5) + (xf6 + xf7)),
-            vec4<f32>(1.0)
-        );
-        let g = (v * 32u) / gs;
-        for (var r = 0u; r < rlive; r = r + 1u) {
-            let row = row0 + r;
+    #use b1
             let wv = w4aff_packed_b[row * rw4 + v];
             var qd = w4aff_qdot8v(wv.x, xf0, xf1);
             qd = qd + w4aff_qdot8v(wv.y, xf2, xf3);
@@ -385,18 +340,8 @@ fn gemv_w4a16_affine_mrow4h_gu_pk(
 
 @compute @workgroup_size(128)
 fn gemv_w4a16_affine_mrow4h_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & 31u;
-    let warp = tid >> 5u;
-    let row0 = ((wid.x + wid.y * w4aff_params.groups_x) * 4u + warp) * 4u;
-    let live = row0 < w4aff_params.n_rows;
-    let rlive = select(0u, min(w4aff_params.n_rows - row0, 4u), live);
-    let kv = select(0u, w4aff_params.k_elems >> 5u, live);
-    let total = w4aff_mrow4_total(row0, rlive, kv, lane);
-    if (lane == 0u) {
+    #use b4
+        #def b5
         for (var rp = 0u; rp * 2u < rlive; rp = rp + 1u) {
             let lo = bf16_encode(total[rp * 2u]) & 0xffffu;
             var hi = 0u;
@@ -407,9 +352,11 @@ fn gemv_w4a16_affine_mrow4h_pk(
         }
     }
 }
+        #end
 
 @compute @workgroup_size(256)
 fn gemv_w4a16_affine_mrow4(
+    #def b2
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>
 ) {
@@ -422,6 +369,7 @@ fn gemv_w4a16_affine_mrow4(
     let kv = select(0u, w4aff_params.k_elems >> 5u, live);
     let total = w4aff_mrow4_total(row0, rlive, kv, lane);
     if (lane == 0u) {
+    #end
         for (var r = 0u; r < rlive; r = r + 1u) {
             w4aff_y[row0 + r] = bf16_encode(total[r]);
         }
@@ -430,43 +378,12 @@ fn gemv_w4a16_affine_mrow4(
 
 @compute @workgroup_size(256)
 fn gemv_w4a16_affine_mrow4_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & 31u;
-    let warp = tid >> 5u;
-    let row0 = ((wid.x + wid.y * w4aff_params.groups_x) * 8u + warp) * 4u;
-    let live = row0 < w4aff_params.n_rows;
-    let rlive = select(0u, min(w4aff_params.n_rows - row0, 4u), live);
-    let kv = select(0u, w4aff_params.k_elems >> 5u, live);
-    let total = w4aff_mrow4_total(row0, rlive, kv, lane);
-    if (lane == 0u) {
-        for (var rp = 0u; rp * 2u < rlive; rp = rp + 1u) {
-            let lo = bf16_encode(total[rp * 2u]) & 0xffffu;
-            var hi = 0u;
-            if (rp * 2u + 1u < rlive) {
-                hi = bf16_encode(total[rp * 2u + 1u]) & 0xffffu;
-            }
-            w4aff_y[(row0 >> 1u) + rp] = lo | (hi << 16u);
-        }
-    }
-}
+    #use b2
+        #use b5
 
 @compute @workgroup_size(256)
 fn gemv_w4a16_affine_mrow4_qkv_pk(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>
-) {
-    let tid = lid.x;
-    let lane = tid & 31u;
-    let warp = tid >> 5u;
-    let row0 = ((wid.x + wid.y * w4aff_params.groups_x) * 8u + warp) * 4u;
-    let live = row0 < w4aff_params.n_rows;
-    let rlive = select(0u, min(w4aff_params.n_rows - row0, 4u), live);
-    let kv = select(0u, w4aff_params.k_elems >> 5u, live);
-    let total = w4aff_mrow4_total(row0, rlive, kv, lane);
-    if (lane == 0u) {
+    #use b2
         for (var rp = 0u; rp * 2u < rlive; rp = rp + 1u) {
             let row = row0 + rp * 2u;
             let lo = bf16_encode(total[rp * 2u]) & 0xffffu;

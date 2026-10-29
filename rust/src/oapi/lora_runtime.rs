@@ -23,6 +23,13 @@ fn parse_json_400_like_vllm<T: serde::de::DeserializeOwned>(
 
 pub const RUNTIME_LORA_ENV: &str = "NV_ALLOW_RUNTIME_LORA_UPDATING";
 
+#[cfg(feature = "cuda")]
+pub const QWEN4_EXP_LOADS_HOT_SWAP_ON_THE_RESIDENT_ENGINE_AND_LOAD_INPLACE_REPLACES_THE_VERSION_ATOMICALLY: &str =
+    "with a qwen4_exp engine resident, load_lora_adapter stages the adapter in pinned host RAM, \
+     validates it against the resident weights, uploads it and swaps the id's live version; \
+     in-flight requests finish on the version they started with, a refused file leaves the live \
+     version serving, and unload_lora_adapter parks the version's host copy for rollback";
+
 pub fn enabled() -> bool {
     match std::env::var(RUNTIME_LORA_ENV) {
         Ok(v) => {
@@ -186,6 +193,8 @@ async fn handle_unload(
     }
     match state.registry.remove(&req.lora_name) {
         Ok(()) => {
+            #[cfg(feature = "cuda")]
+            super::chat_engine::unload_qwen4_exp_adapter(&req.lora_name);
             super::lora::deregister_adapter(&req.lora_name);
             unmark_loaded(&req.lora_name);
             #[cfg(feature = "wgpu")]
@@ -381,6 +390,51 @@ async fn handle_load(
             );
         }
     };
+    if super::chat_engine::qwen4_exp_adapter_registry().is_some() {
+        let _ = QWEN4_EXP_LOADS_HOT_SWAP_ON_THE_RESIDENT_ENGINE_AND_LOAD_INPLACE_REPLACES_THE_VERSION_ATOMICALLY;
+        let (name, adapter_dir) = (req.lora_name.clone(), entry.dir.clone());
+        let swapped = tokio::task::spawn_blocking(move || {
+            super::chat_engine::hot_swap_qwen4_exp_adapter(&name, &adapter_dir)
+        })
+        .await;
+        return match swapped {
+            Ok(Some(Ok((version, existed)))) => {
+                if !existed || !state.registry.contains(&req.lora_name) {
+                    match super::chat_engine::qwen4_exp_adapter_engine(&req.lora_name) {
+                        Some(eng) => state.registry.insert(eng),
+                        None => {
+                            return openai_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("adapter {:?} loaded but no qwen4_exp engine parts are recorded", req.lora_name),
+                                kind::SERVER,
+                                None,
+                                None,
+                            )
+                        }
+                    }
+                }
+                super::lora::register_adapter(entry);
+                mark_loaded_now(&req.lora_name);
+                tracing::info!(adapter = %req.lora_name, version = %version, replaced = existed, "qwen4_exp runtime lora hot-swapped");
+                (StatusCode::OK, load_success_body(&req.lora_name)).into_response()
+            }
+            Ok(Some(Err(err))) => openai_error(
+                StatusCode::BAD_REQUEST,
+                format!("loading adapter {:?}: {err:#}", req.lora_name),
+                kind::INVALID_REQUEST,
+                Some("lora_path"),
+                None,
+            ),
+            Ok(None) => openai_error(StatusCode::INTERNAL_SERVER_ERROR, "qwen4_exp adapter registry vanished".to_string(), kind::SERVER, None, None),
+            Err(join) => openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("adapter load worker panicked: {join}"),
+                kind::SERVER,
+                None,
+                None,
+            ),
+        };
+    }
     let bases = super::chat_engine::cuda_base_dirs();
     let base = match super::chat_engine::select_cuda_base(entry.base_model.as_deref(), &bases) {
         Ok(b) => b.clone(),

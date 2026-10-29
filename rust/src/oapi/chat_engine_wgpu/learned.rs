@@ -16,55 +16,11 @@ use nv_specdecode::gemma4_assistant::{
     MoeSharedKvEngineTap, MoeSharedKvGeometry,
 };
 
-use super::spec::{SpecKnobs, SPEC_ASSISTANT_DIR_ENV, SPEC_DRAFTER_ENV, SPEC_K_MAX};
+use super::spec::{SPEC_ASSISTANT_DIR_ENV, SPEC_K_MAX};
 
 const EMBED_NAME: &str = "model.language_model.embed_tokens.weight";
 const ASSISTANT_REPO_CACHE: &str =
     ".cache/huggingface/hub/models--google--gemma-4-E4B-it-qat-q4_0-unquantized-assistant/snapshots";
-pub const SPEC_ASSISTANT_HOST_ENV: &str = "NV_WGPU_SPEC_ASSISTANT_HOST";
-
-pub fn dequant_kv_rows(
-    fp8: &[u32],
-    scales: &[f32],
-    n_kv: usize,
-    head_dim: usize,
-    start: usize,
-    len: usize,
-) -> Result<Tensor> {
-    anyhow::ensure!(n_kv > 0 && head_dim > 0 && len > 0, "empty kv view");
-    let end = start + len;
-    anyhow::ensure!(
-        fp8.len() * 4 >= end * n_kv * head_dim,
-        "fp8 kv buffer holds {} bytes, need {}",
-        fp8.len() * 4,
-        end * n_kv * head_dim
-    );
-    anyhow::ensure!(
-        scales.len() >= end * n_kv,
-        "kv scales hold {}, need {}",
-        scales.len(),
-        end * n_kv
-    );
-    let mut lut = [0f32; 256];
-    for (b, slot) in lut.iter_mut().enumerate() {
-        *slot = decode_e4m3(b as u8);
-    }
-    let mut out = vec![0f32; n_kv * len * head_dim];
-    for h in 0..n_kv {
-        for i in 0..len {
-            let slot = start + i;
-            let scale = scales[slot * n_kv + h];
-            let base = (slot * n_kv + h) * head_dim;
-            let obase = (h * len + i) * head_dim;
-            for d in 0..head_dim {
-                let idx = base + d;
-                let byte = (fp8[idx / 4] >> (8 * (idx % 4))) & 0xff;
-                out[obase + d] = lut[byte as usize] * scale;
-            }
-        }
-    }
-    Ok(Tensor::from_vec(out, (n_kv, len, head_dim), &Device::Cpu)?)
-}
 
 fn e4m3_lut() -> [f32; 256] {
     let mut lut = [0f32; 256];
@@ -278,32 +234,16 @@ impl AssistantSpecDrafter {
     }
 
     pub fn from_env(model_dir: &Path, model: &Gemma4E4bWgpu) -> Option<Self> {
-        if !SpecKnobs::from_env().enabled {
-            return None;
-        }
-        let sel = std::env::var(SPEC_DRAFTER_ENV).ok();
-        let sel = sel.as_deref().map(str::trim);
-        let explicit = sel == Some("assistant");
-        if !explicit && sel.is_some() {
-            return None;
-        }
         let assistant_dir = match std::env::var(SPEC_ASSISTANT_DIR_ENV) {
             Ok(d) => PathBuf::from(d),
             Err(_) => match default_assistant_dir() {
                 Some(d) => d,
                 None => {
-                    if explicit {
-                        tracing::warn!(
-                            "{SPEC_DRAFTER_ENV}=assistant but no checkpoint in the HF cache and \
-                             {SPEC_ASSISTANT_DIR_ENV} unset; falling back to suffix drafting"
-                        );
-                    } else {
-                        tracing::info!(
-                            "no assistant drafter checkpoint in the HF cache and \
-                             {SPEC_ASSISTANT_DIR_ENV} unset; spec decode drafts from the suffix \
-                             automaton"
-                        );
-                    }
+                    tracing::info!(
+                        "no assistant drafter checkpoint in the HF cache and \
+                         {SPEC_ASSISTANT_DIR_ENV} unset; spec decode drafts from the suffix \
+                         automaton"
+                    );
                     return None;
                 }
             },
@@ -316,9 +256,7 @@ impl AssistantSpecDrafter {
                     full_layer = d.full_layer,
                     "wgpu spec decode uses the learned assistant drafter"
                 );
-                if std::env::var(SPEC_ASSISTANT_HOST_ENV).ok().as_deref() != Some("1") {
-                    d.attach_gpu(model);
-                }
+                d.attach_gpu(model);
                 Some(d)
             }
             Err(e) => {
@@ -624,7 +562,7 @@ pub struct MoeAssistantSpecDrafter {
 
 impl MoeAssistantSpecDrafter {
     pub fn from_env(model_dir: &Path, model: &Gemma4MoeWgpu) -> Option<Self> {
-        if !g4moe_assistant_opted_in() || !SpecKnobs::from_env().enabled {
+        if !g4moe_assistant_opted_in() {
             return None;
         }
         if nv_models::gemma4_moe_wgpu::flash_decode_enabled() {

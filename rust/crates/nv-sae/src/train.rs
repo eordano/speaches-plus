@@ -239,10 +239,7 @@ fn eval_chunks(sae: &Sae, z_host: &Tensor, dev: &Device) -> Result<Eval> {
         for (acc, c) in per_feature.iter_mut().zip(active.sum(0)?.to_vec1::<f32>()?) {
             *acc += c;
         }
-        active_total += active
-            .sum_all()?
-            .to_dtype(DType::F64)?
-            .to_scalar::<f64>()?;
+        active_total += active.sum_all()?.to_dtype(DType::F64)?.to_scalar::<f64>()?;
         start += len;
     }
     Ok(Eval {
@@ -346,7 +343,11 @@ pub fn train(
     )?;
     let ev_t = eval_chunks(&sae, &zt, dev)?;
     let ev_v = eval_chunks(&sae, &zv, dev)?;
-    let dead = ev_v.active_per_feature.iter().filter(|&&c| c <= 0.0).count();
+    let dead = ev_v
+        .active_per_feature
+        .iter()
+        .filter(|&&c| c <= 0.0)
+        .count();
     let mean_active = ev_v.active_total / val_idx.len() as f64;
     let report = TrainReport {
         config: cfg.clone(),

@@ -9,17 +9,11 @@ import (
 
 const imageUploadLimit = 50 << 20
 
-type analyzeTokenJSON struct {
-	Start        int  `json:"start"`
-	EndExclusive int  `json:"endExclusive"`
-	Rect         Rect `json:"rect"`
-}
-
 type analyzeResponse struct {
-	Text   string             `json:"text"`
-	Tokens []analyzeTokenJSON `json:"tokens"`
-	Spans  []PiiSpan          `json:"spans"`
-	Rects  []LabeledRect      `json:"rects"`
+	Text   string        `json:"text"`
+	Tokens []OCRToken    `json:"tokens"`
+	Spans  []PiiSpan     `json:"spans"`
+	Rects  []LabeledRect `json:"rects"`
 }
 
 func AnalyzeHandler(c *Classifier) http.HandlerFunc {
@@ -61,14 +55,7 @@ func AnalyzeHandler(c *Classifier) http.HandlerFunc {
 		bounds := img.Bounds()
 		rects := MapSpansToRects(ocrResult.Tokens, spans, bounds.Dx(), bounds.Dy())
 
-		tokens := make([]analyzeTokenJSON, len(ocrResult.Tokens))
-		for i, t := range ocrResult.Tokens {
-			tokens[i] = analyzeTokenJSON{
-				Start:        t.Start,
-				EndExclusive: t.EndExclusive,
-				Rect:         t.Rect,
-			}
-		}
+		tokens := append([]OCRToken{}, ocrResult.Tokens...)
 
 		writeJSON(w, http.StatusOK, analyzeResponse{
 			Text:   ocrResult.Text,

@@ -61,7 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn panic_inside_the_scope_does_not_leak_the_override_to_the_next_caller() {
+    fn a_panic_inside_a_scope_restores_the_outer_stream_and_leaks_nothing_to_the_next_caller() {
         let Ok(dev) = candle_core::Device::new_cuda(0) else {
             eprintln!("SKIP: no cuda device");
             return;
@@ -71,12 +71,10 @@ mod tests {
             return;
         };
         let stream = cd.cuda_stream();
-
         assert!(
             !is_overridden(),
             "a fresh thread must start with no override"
         );
-
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             with_stream(stream.clone(), || panic!("kernel blew up mid-scope"));
         }));
@@ -84,7 +82,6 @@ mod tests {
             caught.is_err(),
             "the panic must propagate, not be swallowed"
         );
-
         assert!(
             !is_overridden(),
             "with_stream restored the thread-local only on the normal-return path, so an \
@@ -93,19 +90,8 @@ mod tests {
              next request scheduled onto this thread would run its kernels on a stream \
              belonging to a dropped graph."
         );
-    }
 
-    #[test]
-    fn nested_scopes_restore_the_outer_stream_even_when_the_inner_one_panics() {
-        let Ok(dev) = candle_core::Device::new_cuda(0) else {
-            eprintln!("SKIP: no cuda device");
-            return;
-        };
-        let candle_core::Device::Cuda(cd) = &dev else {
-            eprintln!("SKIP: device is not cuda");
-            return;
-        };
-        let ctx = cd.cuda_stream().context().clone();
+        let ctx = stream.context().clone();
         let outer = ctx.new_stream().expect("fork outer stream");
         let inner = ctx.new_stream().expect("fork inner stream");
         assert_ne!(

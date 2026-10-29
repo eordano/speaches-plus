@@ -27,7 +27,13 @@ pub fn new_call_id() -> String {
 
 pub fn parse_tool_calls(text: &str, force_name: Option<&str>) -> ParsedOutput {
     if let Some(name) = force_name {
-        let args = extract_json_object(text).unwrap_or_else(|| "{}".to_string());
+        let Some(args) = extract_json_object(text) else {
+            let t = text.trim();
+            return ParsedOutput {
+                content: (!t.is_empty()).then(|| t.to_string()),
+                tool_calls: Vec::new(),
+            };
+        };
         return ParsedOutput {
             content: None,
             tool_calls: vec![ToolCall {
@@ -233,7 +239,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_tool_call_block() {
+    fn tool_call_blocks_forced_objects_and_plain_text_parse_as_expected() {
         let p = parse_tool_calls(
             r#"sure <tool_call>{"name":"get","arguments":{"x":1}}</tool_call>"#,
             None,
@@ -242,26 +248,30 @@ mod tests {
         assert_eq!(p.tool_calls[0].function.name, "get");
         assert_eq!(p.tool_calls[0].function.arguments, r#"{"x":1}"#);
         assert_eq!(p.content.as_deref(), Some("sure"));
+        {
+            let p = parse_tool_calls(r#"{"x":1}"#, Some("f"));
+            assert_eq!(p.tool_calls.len(), 1);
+            assert_eq!(p.tool_calls[0].function.name, "f");
+            assert_eq!(p.tool_calls[0].function.arguments, r#"{"x":1}"#);
+            assert!(p.content.is_none());
+        }
+        {
+            let p = parse_tool_calls(r#"{"location": "Lis"#, Some("f"));
+            assert!(
+                p.tool_calls.is_empty(),
+                "inventing {{}} arguments hands the caller a call its schema rejects"
+            );
+            assert_eq!(p.content.as_deref(), Some(r#"{"location": "Lis"#));
+        }
+        {
+            let p = parse_tool_calls("just a normal answer", None);
+            assert!(p.tool_calls.is_empty());
+            assert_eq!(p.content.as_deref(), Some("just a normal answer"));
+        }
     }
 
     #[test]
-    fn forced_bare_object() {
-        let p = parse_tool_calls(r#"{"x":1}"#, Some("f"));
-        assert_eq!(p.tool_calls.len(), 1);
-        assert_eq!(p.tool_calls[0].function.name, "f");
-        assert_eq!(p.tool_calls[0].function.arguments, r#"{"x":1}"#);
-        assert!(p.content.is_none());
-    }
-
-    #[test]
-    fn plain_text_no_calls() {
-        let p = parse_tool_calls("just a normal answer", None);
-        assert!(p.tool_calls.is_empty());
-        assert_eq!(p.content.as_deref(), Some("just a normal answer"));
-    }
-
-    #[test]
-    fn qwen_xml_dialect_inside_tool_call_block() {
+    fn qwen_xml_dialect_parses_with_and_without_the_wrapper_and_keeps_param_shapes() {
         let p = parse_tool_calls(
             "<tool_call>\n<function=get_weather>\n<parameter=city>Oslo</parameter>\n</function>\n</tool_call>",
             None,
@@ -270,56 +280,48 @@ mod tests {
         assert_eq!(p.tool_calls[0].function.name, "get_weather");
         assert_eq!(p.tool_calls[0].function.arguments, r#"{"city":"Oslo"}"#);
         assert!(p.content.is_none());
+        {
+            let p = parse_tool_calls(
+                "sure\n<function=get_weather>\n<parameter=city>Oslo</parameter>\n<parameter=days>3</parameter>\n<parameter=metric>true</parameter>\n</function>",
+                None,
+            );
+            assert_eq!(p.tool_calls.len(), 1);
+            assert_eq!(p.tool_calls[0].function.name, "get_weather");
+            assert_eq!(
+                p.tool_calls[0].function.arguments,
+                r#"{"city":"Oslo","days":3,"metric":true}"#
+            );
+            assert_eq!(p.content.as_deref(), Some("sure"));
+        }
+        {
+            let p = parse_tool_calls(
+                "<function=a><parameter=x>1</parameter></function><function=b><parameter=y>z</parameter></function>",
+                None,
+            );
+            assert_eq!(p.tool_calls.len(), 2);
+            assert_eq!(p.tool_calls[0].function.name, "a");
+            assert_eq!(p.tool_calls[1].function.name, "b");
+            assert_eq!(p.tool_calls[1].function.arguments, r#"{"y":"z"}"#);
+        }
+        {
+            assert_eq!(xml_param_value("007"), serde_json::json!("007"));
+            assert_eq!(xml_param_value("3"), serde_json::json!(3));
+            assert_eq!(
+                xml_param_value("123 Main St"),
+                serde_json::json!("123 Main St")
+            );
+            assert_eq!(xml_param_value(r#"{"a":1}"#), serde_json::json!({"a":1}));
+            assert_eq!(xml_param_value("null"), serde_json::Value::Null);
+        }
+        {
+            let p = parse_tool_calls("<parameter=x>1</parameter>", None);
+            assert!(p.tool_calls.is_empty());
+            assert_eq!(p.content.as_deref(), Some("<parameter=x>1</parameter>"));
+        }
     }
 
     #[test]
-    fn qwen_xml_dialect_without_tool_call_wrapper() {
-        let p = parse_tool_calls(
-            "sure\n<function=get_weather>\n<parameter=city>Oslo</parameter>\n<parameter=days>3</parameter>\n<parameter=metric>true</parameter>\n</function>",
-            None,
-        );
-        assert_eq!(p.tool_calls.len(), 1);
-        assert_eq!(p.tool_calls[0].function.name, "get_weather");
-        assert_eq!(
-            p.tool_calls[0].function.arguments,
-            r#"{"city":"Oslo","days":3,"metric":true}"#
-        );
-        assert_eq!(p.content.as_deref(), Some("sure"));
-    }
-
-    #[test]
-    fn qwen_xml_two_calls() {
-        let p = parse_tool_calls(
-            "<function=a><parameter=x>1</parameter></function><function=b><parameter=y>z</parameter></function>",
-            None,
-        );
-        assert_eq!(p.tool_calls.len(), 2);
-        assert_eq!(p.tool_calls[0].function.name, "a");
-        assert_eq!(p.tool_calls[1].function.name, "b");
-        assert_eq!(p.tool_calls[1].function.arguments, r#"{"y":"z"}"#);
-    }
-
-    #[test]
-    fn xml_param_values_keep_string_shape_unless_json_round_trips() {
-        assert_eq!(xml_param_value("007"), serde_json::json!("007"));
-        assert_eq!(xml_param_value("3"), serde_json::json!(3));
-        assert_eq!(
-            xml_param_value("123 Main St"),
-            serde_json::json!("123 Main St")
-        );
-        assert_eq!(xml_param_value(r#"{"a":1}"#), serde_json::json!({"a":1}));
-        assert_eq!(xml_param_value("null"), serde_json::Value::Null);
-    }
-
-    #[test]
-    fn xml_without_a_function_tag_is_left_as_content() {
-        let p = parse_tool_calls("<parameter=x>1</parameter>", None);
-        assert!(p.tool_calls.is_empty());
-        assert_eq!(p.content.as_deref(), Some("<parameter=x>1</parameter>"));
-    }
-
-    #[test]
-    fn laguna_arg_tag_dialect_string_value_stays_raw() {
+    fn laguna_arg_tag_dialect_parses_raw_typed_bare_and_multi_calls_but_not_prose() {
         let p = parse_tool_calls(
             "<tool_call>read<arg_key>path</arg_key><arg_value>src/main.rs</arg_value></tool_call>",
             None,
@@ -331,45 +333,38 @@ mod tests {
             r#"{"path":"src/main.rs"}"#
         );
         assert!(p.content.is_none());
+        {
+            let p = parse_tool_calls(
+                "<tool_call>search<arg_key>limit</arg_key><arg_value>3</arg_value><arg_key>filters</arg_key><arg_value>{\"lang\":\"rs\"}</arg_value><arg_key>fuzzy</arg_key><arg_value>true</arg_value></tool_call>",
+                None,
+            );
+            assert_eq!(p.tool_calls.len(), 1);
+            assert_eq!(p.tool_calls[0].function.name, "search");
+            assert_eq!(
+                p.tool_calls[0].function.arguments,
+                r#"{"filters":{"lang":"rs"},"fuzzy":true,"limit":3}"#
+            );
+        }
+        {
+            let p = parse_tool_calls("<tool_call>list_files</tool_call>", None);
+            assert_eq!(p.tool_calls.len(), 1);
+            assert_eq!(p.tool_calls[0].function.name, "list_files");
+            assert_eq!(p.tool_calls[0].function.arguments, "{}");
+        }
+        {
+            let p = parse_tool_calls(
+                "looking\n<tool_call>read<arg_key>path</arg_key><arg_value>a.rs</arg_value></tool_call><tool_call>read<arg_key>path</arg_key><arg_value>b.rs</arg_value></tool_call>",
+                None,
+            );
+            assert_eq!(p.tool_calls.len(), 2);
+            assert_eq!(p.tool_calls[0].function.arguments, r#"{"path":"a.rs"}"#);
+            assert_eq!(p.tool_calls[1].function.arguments, r#"{"path":"b.rs"}"#);
+            assert_eq!(p.content.as_deref(), Some("looking"));
+        }
+        {
+            let p = parse_tool_calls("<tool_call>not a call</tool_call>", None);
+            assert!(p.tool_calls.is_empty());
+        }
     }
 
-    #[test]
-    fn laguna_arg_tag_dialect_typed_values_round_trip_like_xml_params() {
-        let p = parse_tool_calls(
-            "<tool_call>search<arg_key>limit</arg_key><arg_value>3</arg_value><arg_key>filters</arg_key><arg_value>{\"lang\":\"rs\"}</arg_value><arg_key>fuzzy</arg_key><arg_value>true</arg_value></tool_call>",
-            None,
-        );
-        assert_eq!(p.tool_calls.len(), 1);
-        assert_eq!(p.tool_calls[0].function.name, "search");
-        assert_eq!(
-            p.tool_calls[0].function.arguments,
-            r#"{"filters":{"lang":"rs"},"fuzzy":true,"limit":3}"#
-        );
-    }
-
-    #[test]
-    fn laguna_arg_tag_dialect_bare_name_is_a_no_arg_call() {
-        let p = parse_tool_calls("<tool_call>list_files</tool_call>", None);
-        assert_eq!(p.tool_calls.len(), 1);
-        assert_eq!(p.tool_calls[0].function.name, "list_files");
-        assert_eq!(p.tool_calls[0].function.arguments, "{}");
-    }
-
-    #[test]
-    fn laguna_arg_tag_dialect_two_calls_with_surrounding_prose() {
-        let p = parse_tool_calls(
-            "looking\n<tool_call>read<arg_key>path</arg_key><arg_value>a.rs</arg_value></tool_call><tool_call>read<arg_key>path</arg_key><arg_value>b.rs</arg_value></tool_call>",
-            None,
-        );
-        assert_eq!(p.tool_calls.len(), 2);
-        assert_eq!(p.tool_calls[0].function.arguments, r#"{"path":"a.rs"}"#);
-        assert_eq!(p.tool_calls[1].function.arguments, r#"{"path":"b.rs"}"#);
-        assert_eq!(p.content.as_deref(), Some("looking"));
-    }
-
-    #[test]
-    fn prose_inside_a_tool_call_block_is_not_a_bare_name_call() {
-        let p = parse_tool_calls("<tool_call>not a call</tool_call>", None);
-        assert!(p.tool_calls.is_empty());
-    }
 }

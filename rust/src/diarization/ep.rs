@@ -29,7 +29,7 @@ fn env_i32(key: &str) -> Option<i32> {
 }
 
 fn cuda_dispatch() -> ExecutionProviderDispatch {
-    let mut cuda = ort::ep::CUDAExecutionProvider::default();
+    let mut cuda = ort::ep::CUDA::default();
     if let Some(id) = env_i32(ENV_DEVICE_ID) {
         cuda = cuda.with_device_id(id);
     }
@@ -76,35 +76,19 @@ fn candidates() -> Vec<(&'static str, ExecutionProviderDispatch)> {
         out.push((EP_CUDA, cuda_dispatch()));
     }
     if cfg!(target_os = "linux") && want("rocm") {
-        out.push((EP_ROCM, ort::ep::ROCmExecutionProvider::default().build()));
+        out.push((EP_ROCM, ort::ep::ROCm::default().build()));
     }
     if cfg!(target_os = "linux") && requested.as_deref() == Some("migraphx") {
-        out.push((
-            EP_MIGRAPHX,
-            ort::ep::MIGraphXExecutionProvider::default().build(),
-        ));
+        out.push((EP_MIGRAPHX, ort::ep::MIGraphX::default().build()));
     }
     if cfg!(any(target_os = "macos", target_os = "ios")) && want("coreml") {
-        out.push((
-            EP_COREML,
-            ort::ep::CoreMLExecutionProvider::default().build(),
-        ));
+        out.push((EP_COREML, ort::ep::CoreML::default().build()));
     }
     if cfg!(target_os = "windows") && want("directml") {
-        out.push((
-            EP_DIRECTML,
-            ort::ep::DirectMLExecutionProvider::default().build(),
-        ));
+        out.push((EP_DIRECTML, ort::ep::DirectML::default().build()));
     }
-    out.push((EP_CPU, ort::ep::CPUExecutionProvider::default().build()));
+    out.push((EP_CPU, ort::ep::CPU::default().build()));
     out
-}
-
-pub fn warmup_enabled() -> bool {
-    !matches!(
-        std::env::var("DIAR_WARMUP").unwrap_or_default().trim(),
-        "0" | "false" | "no"
-    )
 }
 
 pub fn is_gpu(provider: &str) -> bool {

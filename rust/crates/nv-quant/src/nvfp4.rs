@@ -270,19 +270,6 @@ impl Nvfp4Tensor {
         }
     }
 
-    pub fn scales_column_major(&self) -> Vec<u8> {
-        let blocks_per_row = self.cols / BLOCK_SIZE;
-        let mut out = vec![0u8; self.rows * blocks_per_row];
-        for r in 0..self.rows {
-            for b in 0..blocks_per_row {
-                let src = r * blocks_per_row + b;
-                let dst = b * self.rows + r;
-                out[dst] = self.scales[src];
-            }
-        }
-        out
-    }
-
     pub fn scales_swizzled(&self) -> Vec<u8> {
         let blocks_per_row = self.cols / BLOCK_SIZE;
         swizzle_scales(&self.scales, self.rows, blocks_per_row)
@@ -366,14 +353,6 @@ pub fn diagfold_scale_rows_pow2_negated(rows: &mut [Vec<f32>], exps: &[i32]) {
             *v *= s;
         }
     }
-}
-
-pub fn skinny_lt_from(raw: Option<&str>) -> bool {
-    raw != Some("0")
-}
-
-pub fn k256_from(raw: Option<&str>) -> bool {
-    raw != Some("0")
 }
 
 pub fn streamk_k256_from(raw: Option<&str>) -> bool {
@@ -577,7 +556,6 @@ mod cuda {
 
     #[derive(Clone, Copy, PartialEq)]
     enum StreamkMode {
-        Never,
         Always,
         Auto,
     }
@@ -585,27 +563,13 @@ mod cuda {
     fn streamk_mode() -> StreamkMode {
         static MODE: std::sync::OnceLock<StreamkMode> = std::sync::OnceLock::new();
         *MODE.get_or_init(|| match std::env::var("NV_NVFP4_STREAMK").ok().as_deref() {
-            Some("0") => StreamkMode::Never,
             Some("1") => StreamkMode::Always,
             _ => StreamkMode::Auto,
         })
     }
 
-    fn skinny_lt_enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            super::skinny_lt_from(std::env::var("NV_NVFP4_SKINNY_LT").ok().as_deref())
-        })
-    }
-
-    fn k256_enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| super::k256_from(std::env::var("NV_NVFP4_K256").ok().as_deref()))
-    }
-
     fn v192_12warp_cta_env_opt_in_never_default_until_certified() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("NV_NVFP4_V192").is_ok_and(|v| v == "1"))
+        nv_config::env_arm_opt_in_eq_some_1_cached_first_read_wins!("NV_NVFP4_V192")
     }
 
     fn streamk_k256_enabled() -> bool {
@@ -633,38 +597,39 @@ mod cuda {
     }
 
     fn lt_algo_log() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("NV_NVFP4_LT_ALGO_LOG").is_ok_and(|v| v != "0"))
+        nv_config::env_arm_opt_in_set_to_anything_but_0_cached_first_read_wins!("NV_NVFP4_LT_ALGO_LOG")
     }
 
     pub(crate) unsafe fn algo_config_summary(algo: &sys::cublasLtMatmulAlgo_t) -> String {
-        use sys::cublasLtMatmulAlgoConfigAttributes_t as cfg;
-        let mut vals = [0i32; 6];
-        let attrs = [
-            cfg::CUBLASLT_ALGO_CONFIG_ID,
-            cfg::CUBLASLT_ALGO_CONFIG_TILE_ID,
-            cfg::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
-            cfg::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
-            cfg::CUBLASLT_ALGO_CONFIG_STAGES_ID,
-            cfg::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID,
-        ];
-        for (v, a) in vals.iter_mut().zip(attrs) {
-            let mut written = 0usize;
-            let st = sys::cublasLtMatmulAlgoConfigGetAttribute(
-                algo as *const _,
-                a,
-                v as *mut i32 as *mut c_void,
-                mem::size_of::<i32>(),
-                &mut written,
-            );
-            if st != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                *v = -1;
+        unsafe {
+            use sys::cublasLtMatmulAlgoConfigAttributes_t as cfg;
+            let mut vals = [0i32; 6];
+            let attrs = [
+                cfg::CUBLASLT_ALGO_CONFIG_ID,
+                cfg::CUBLASLT_ALGO_CONFIG_TILE_ID,
+                cfg::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                cfg::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                cfg::CUBLASLT_ALGO_CONFIG_STAGES_ID,
+                cfg::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID,
+            ];
+            for (v, a) in vals.iter_mut().zip(attrs) {
+                let mut written = 0usize;
+                let st = sys::cublasLtMatmulAlgoConfigGetAttribute(
+                    algo as *const _,
+                    a,
+                    v as *mut i32 as *mut c_void,
+                    mem::size_of::<i32>(),
+                    &mut written,
+                );
+                if st != sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    *v = -1;
+                }
             }
+            format!(
+                "id={} tile={} splitk={} red={} stages={} cluster={}",
+                vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
+            )
         }
-        format!(
-            "id={} tile={} splitk={} red={} stages={} cluster={}",
-            vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
-        )
     }
 
     #[derive(Hash, PartialEq, Eq, Copy, Clone)]
@@ -758,7 +723,6 @@ mod cuda {
             let lt_reroute = use_cutlass
                 && self.backend == Nvfp4Backend::Auto
                 && m >= min
-                && skinny_lt_enabled()
                 && Self::skinny_regime(m, n);
             if use_cutlass && !lt_reroute {
                 unsafe {
@@ -794,43 +758,6 @@ mod cuda {
         pub const LT_NARROW_M_FLOOR_SET_BY_FP4_LT_B_DIM_GRANULARITY_SCALES_STILL_PAD_ROWS_TO_128:
             u64 = 16;
 
-        pub fn matmul_scaled_lt_narrow_m(
-            &mut self,
-            a_data: &CudaSlice<u8>,
-            a_scales_cm: &CudaSlice<u8>,
-            b_data: &CudaSlice<u8>,
-            b_scales_cm: &CudaSlice<u8>,
-            d: &mut CudaSlice<bf16>,
-            m: u64,
-            n: u64,
-            k: u64,
-            alpha_host: f32,
-        ) -> Result<()> {
-            if !k.is_multiple_of(BLOCK_SIZE as u64) {
-                anyhow::bail!("k={k} must be a multiple of {BLOCK_SIZE}");
-            }
-            let floor = Self::LT_NARROW_M_FLOOR_SET_BY_FP4_LT_B_DIM_GRANULARITY_SCALES_STILL_PAD_ROWS_TO_128;
-            if m < floor || !m.is_multiple_of(floor) || n < MIN_TILE as u64 || k < MIN_TILE as u64 {
-                anyhow::bail!(
-                    "NVFP4 LT narrow-m route requires m a multiple of {floor} and n,k >= \
-                     {MIN_TILE}; got m={m} n={n} k={k}"
-                );
-            }
-            unsafe {
-                self.matmul_unchecked(
-                    a_data,
-                    a_scales_cm,
-                    b_data,
-                    b_scales_cm,
-                    d,
-                    m,
-                    n,
-                    k,
-                    alpha_host,
-                )
-            }
-        }
-
         fn skinny_tiles(m: u64, n: u64) -> bool {
             let m_tiles = m.div_ceil(CUTLASS_SM120_TILE_M);
             let n_tiles = n.div_ceil(CUTLASS_SM120_TILE_N);
@@ -846,7 +773,6 @@ mod cuda {
                 return false;
             }
             match streamk_mode() {
-                StreamkMode::Never => false,
                 StreamkMode::Always => true,
                 StreamkMode::Auto => Self::skinny_tiles(m, n),
             }
@@ -864,12 +790,38 @@ mod cuda {
             k: u64,
             alpha_dev: &CudaSlice<f32>,
         ) -> Result<()> {
-            let ws = workspace_handle(&self.stream)?;
-            let mut ws = ws
-                .lock()
-                .map_err(|e| anyhow::anyhow!("nvfp4 workspace poisoned: {e}"))?;
-            if self.streamk_wanted(m, n) {
-                match cutlass_launch_impl(
+            unsafe {
+                let ws = workspace_handle(&self.stream)?;
+                let mut ws = ws
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("nvfp4 workspace poisoned: {e}"))?;
+                if self.streamk_wanted(m, n) {
+                    match cutlass_launch_impl(
+                        &self.stream,
+                        &mut ws,
+                        WORKSPACE_BYTES,
+                        a_data,
+                        a_scales,
+                        b_data,
+                        b_scales,
+                        d,
+                        m,
+                        n,
+                        k,
+                        alpha_dev,
+                        true,
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            eprintln!(
+                                "[nvfp4] Stream-K launch failed for m={m} n={n} k={k} ({e}); \
+                                 falling back to the DP scheduler permanently"
+                            );
+                            self.streamk_failed = true;
+                        }
+                    }
+                }
+                cutlass_launch_impl(
                     &self.stream,
                     &mut ws,
                     WORKSPACE_BYTES,
@@ -882,33 +834,9 @@ mod cuda {
                     n,
                     k,
                     alpha_dev,
-                    true,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        eprintln!(
-                            "[nvfp4] Stream-K launch failed for m={m} n={n} k={k} ({e}); \
-                             falling back to the DP scheduler permanently"
-                        );
-                        self.streamk_failed = true;
-                    }
-                }
+                    false,
+                )
             }
-            cutlass_launch_impl(
-                &self.stream,
-                &mut ws,
-                WORKSPACE_BYTES,
-                a_data,
-                a_scales,
-                b_data,
-                b_scales,
-                d,
-                m,
-                n,
-                k,
-                alpha_dev,
-                false,
-            )
         }
     }
 
@@ -927,34 +855,84 @@ mod cuda {
         gsf: &CudaSlice<f32>,
         stream_k: bool,
     ) -> Result<()> {
-        let stream_raw = stream.cu_stream() as *mut c_void;
-        let (a_ptr, _ga) = a_data.device_ptr(stream);
-        let (a_sf_ptr, _gas) = a_scales.device_ptr(stream);
-        let (b_ptr, _gb) = b_data.device_ptr(stream);
-        let (b_sf_ptr, _gbs) = b_scales.device_ptr(stream);
-        let (gsf_ptr, _ggsf) = gsf.device_ptr(stream);
-        let (d_ptr, _gd) = d.device_ptr_mut(stream);
-        let (ws_ptr, _gws) = workspace.device_ptr_mut(stream);
-        let splits = streamk_down_splits();
-        let res = if stream_k && splits >= 2 {
-            nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_tiled(
-                stream_raw,
-                a_ptr as *const c_void,
-                a_sf_ptr as *const c_void,
-                b_ptr as *const c_void,
-                b_sf_ptr as *const c_void,
-                gsf_ptr as *const f32,
-                d_ptr as *mut c_void,
-                m as i32,
-                n as i32,
-                k as i32,
-                0,
-                splits,
-                ws_ptr as *mut c_void,
-                workspace_bytes,
-            )
-        } else if stream_k {
-            if k.is_multiple_of(256) && streamk_k256_enabled() {
+        unsafe {
+            let stream_raw = stream.cu_stream() as *mut c_void;
+            let (a_ptr, _ga) = a_data.device_ptr(stream);
+            let (a_sf_ptr, _gas) = a_scales.device_ptr(stream);
+            let (b_ptr, _gb) = b_data.device_ptr(stream);
+            let (b_sf_ptr, _gbs) = b_scales.device_ptr(stream);
+            let (gsf_ptr, _ggsf) = gsf.device_ptr(stream);
+            let (d_ptr, _gd) = d.device_ptr_mut(stream);
+            let (ws_ptr, _gws) = workspace.device_ptr_mut(stream);
+            let splits = streamk_down_splits();
+            let res = if stream_k && splits >= 2 {
+                nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_tiled(
+                    stream_raw,
+                    a_ptr as *const c_void,
+                    a_sf_ptr as *const c_void,
+                    b_ptr as *const c_void,
+                    b_sf_ptr as *const c_void,
+                    gsf_ptr as *const f32,
+                    d_ptr as *mut c_void,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    0,
+                    splits,
+                    ws_ptr as *mut c_void,
+                    workspace_bytes,
+                )
+            } else if stream_k {
+                if k.is_multiple_of(256) && streamk_k256_enabled() {
+                    nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_tiled(
+                        stream_raw,
+                        a_ptr as *const c_void,
+                        a_sf_ptr as *const c_void,
+                        b_ptr as *const c_void,
+                        b_sf_ptr as *const c_void,
+                        gsf_ptr as *const f32,
+                        d_ptr as *mut c_void,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        1,
+                        1,
+                        ws_ptr as *mut c_void,
+                        workspace_bytes,
+                    )
+                } else {
+                    nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_streamk(
+                        stream_raw,
+                        a_ptr as *const c_void,
+                        a_sf_ptr as *const c_void,
+                        b_ptr as *const c_void,
+                        b_sf_ptr as *const c_void,
+                        gsf_ptr as *const f32,
+                        d_ptr as *mut c_void,
+                        m as i32,
+                        n as i32,
+                        k as i32,
+                        ws_ptr as *mut c_void,
+                        workspace_bytes,
+                    )
+                }
+            } else if k.is_multiple_of(128)
+                && v192_12warp_cta_env_opt_in_never_default_until_certified()
+            {
+                nv_kernels::cuda::nvfp4_gemm_sm120_v192_bf16(
+                    stream_raw,
+                    a_ptr as *const c_void,
+                    a_sf_ptr as *const c_void,
+                    b_ptr as *const c_void,
+                    b_sf_ptr as *const c_void,
+                    gsf_ptr as *const f32,
+                    d_ptr as *mut c_void,
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                )
+                .map(|()| 0usize)
+            } else if k.is_multiple_of(256) {
                 nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_tiled(
                     stream_raw,
                     a_ptr as *const c_void,
@@ -967,12 +945,12 @@ mod cuda {
                     n as i32,
                     k as i32,
                     1,
-                    1,
+                    0,
                     ws_ptr as *mut c_void,
                     workspace_bytes,
                 )
             } else {
-                nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_streamk(
+                nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16(
                     stream_raw,
                     a_ptr as *const c_void,
                     a_sf_ptr as *const c_void,
@@ -986,63 +964,15 @@ mod cuda {
                     ws_ptr as *mut c_void,
                     workspace_bytes,
                 )
-            }
-        } else if k.is_multiple_of(128)
-            && v192_12warp_cta_env_opt_in_never_default_until_certified()
-        {
-            nv_kernels::cuda::nvfp4_gemm_sm120_v192_bf16(
-                stream_raw,
-                a_ptr as *const c_void,
-                a_sf_ptr as *const c_void,
-                b_ptr as *const c_void,
-                b_sf_ptr as *const c_void,
-                gsf_ptr as *const f32,
-                d_ptr as *mut c_void,
-                m as i32,
-                n as i32,
-                k as i32,
-            )
-            .map(|()| 0usize)
-        } else if k.is_multiple_of(256) && k256_enabled() {
-            nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16_tiled(
-                stream_raw,
-                a_ptr as *const c_void,
-                a_sf_ptr as *const c_void,
-                b_ptr as *const c_void,
-                b_sf_ptr as *const c_void,
-                gsf_ptr as *const f32,
-                d_ptr as *mut c_void,
-                m as i32,
-                n as i32,
-                k as i32,
-                1,
-                0,
-                ws_ptr as *mut c_void,
-                workspace_bytes,
-            )
-        } else {
-            nv_kernels::cuda::cutlass_fp4_gemm_sm120_bf16(
-                stream_raw,
-                a_ptr as *const c_void,
-                a_sf_ptr as *const c_void,
-                b_ptr as *const c_void,
-                b_sf_ptr as *const c_void,
-                gsf_ptr as *const f32,
-                d_ptr as *mut c_void,
-                m as i32,
-                n as i32,
-                k as i32,
-                ws_ptr as *mut c_void,
-                workspace_bytes,
-            )
-        };
-        let _needed = res.map_err(|rc| {
-            anyhow::anyhow!(
-                "cutlass_fp4_gemm_sm120_bf16{} returned rc={rc}",
-                if stream_k { "_streamk" } else { "" }
-            )
-        })?;
-        Ok(())
+            };
+            let _needed = res.map_err(|rc| {
+                anyhow::anyhow!(
+                    "cutlass_fp4_gemm_sm120_bf16{} returned rc={rc}",
+                    if stream_k { "_streamk" } else { "" }
+                )
+            })?;
+            Ok(())
+        }
     }
 
     impl Nvfp4GemmRunner {
@@ -1058,192 +988,194 @@ mod cuda {
             k: u64,
             alpha: f32,
         ) -> Result<()> {
-            let handle = self.handle;
-            let stream_raw = self.stream.cu_stream();
-            let stream_arc = self.stream.clone();
+            unsafe {
+                let handle = self.handle;
+                let stream_raw = self.stream.cu_stream();
+                let stream_arc = self.stream.clone();
 
-            let (a_scale_ptr_val, _g_a_scale) = b_scales.device_ptr(&stream_arc);
-            let (b_scale_ptr_val, _g_b_scale) = a_scales.device_ptr(&stream_arc);
-            let key = DescKey {
-                m,
-                n,
-                k,
-                a_scale_ptr: a_scale_ptr_val,
-            };
+                let (a_scale_ptr_val, _g_a_scale) = b_scales.device_ptr(&stream_arc);
+                let (b_scale_ptr_val, _g_b_scale) = a_scales.device_ptr(&stream_arc);
+                let key = DescKey {
+                    m,
+                    n,
+                    k,
+                    a_scale_ptr: a_scale_ptr_val,
+                };
 
-            if let Entry::Vacant(entry) = self.desc_cache.entry(key) {
-                let dtype_fp4 = sys::cudaDataType_t::CUDA_R_4F_E2M1;
-                let dtype_bf16 = sys::cudaDataType_t::CUDA_R_16BF;
-                let compute = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
-                let scale_type = sys::cudaDataType_t::CUDA_R_32F;
+                if let Entry::Vacant(entry) = self.desc_cache.entry(key) {
+                    let dtype_fp4 = sys::cudaDataType_t::CUDA_R_4F_E2M1;
+                    let dtype_bf16 = sys::cudaDataType_t::CUDA_R_16BF;
+                    let compute = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
+                    let scale_type = sys::cudaDataType_t::CUDA_R_32F;
 
-                let a_layout = cublaslt::create_matrix_layout(dtype_fp4, k, n, k as i64)?;
-                let b_layout = cublaslt::create_matrix_layout(dtype_fp4, k, m, k as i64)?;
-                let d_layout = cublaslt::create_matrix_layout(dtype_bf16, n, m, n as i64)?;
+                    let a_layout = cublaslt::create_matrix_layout(dtype_fp4, k, n, k as i64)?;
+                    let b_layout = cublaslt::create_matrix_layout(dtype_fp4, k, m, k as i64)?;
+                    let d_layout = cublaslt::create_matrix_layout(dtype_bf16, n, m, n as i64)?;
 
-                let desc = cublaslt::create_matmul_desc(compute, scale_type)?;
+                    let desc = cublaslt::create_matmul_desc(compute, scale_type)?;
 
-                let transa = cublasOperation_t::CUBLAS_OP_T;
-                let transb = cublasOperation_t::CUBLAS_OP_N;
-                cublaslt::set_matmul_desc_attribute(
-                    desc,
-                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-                    &transa as *const _ as *const c_void,
-                    mem::size_of::<cublasOperation_t>(),
-                )?;
-                cublaslt::set_matmul_desc_attribute(
-                    desc,
-                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-                    &transb as *const _ as *const c_void,
-                    mem::size_of::<cublasOperation_t>(),
-                )?;
+                    let transa = cublasOperation_t::CUBLAS_OP_T;
+                    let transb = cublasOperation_t::CUBLAS_OP_N;
+                    cublaslt::set_matmul_desc_attribute(
+                        desc,
+                        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                        &transa as *const _ as *const c_void,
+                        mem::size_of::<cublasOperation_t>(),
+                    )?;
+                    cublaslt::set_matmul_desc_attribute(
+                        desc,
+                        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                        &transb as *const _ as *const c_void,
+                        mem::size_of::<cublasOperation_t>(),
+                    )?;
 
-                let scale_mode =
-                    sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
-                cublaslt::set_matmul_desc_attribute(
-                    desc,
-                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
-                    &scale_mode as *const _ as *const c_void,
-                    mem::size_of::<sys::cublasLtMatmulMatrixScale_t>(),
-                )?;
-                cublaslt::set_matmul_desc_attribute(
-                    desc,
-                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
-                    &scale_mode as *const _ as *const c_void,
-                    mem::size_of::<sys::cublasLtMatmulMatrixScale_t>(),
-                )?;
+                    let scale_mode =
+                        sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+                    cublaslt::set_matmul_desc_attribute(
+                        desc,
+                        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                        &scale_mode as *const _ as *const c_void,
+                        mem::size_of::<sys::cublasLtMatmulMatrixScale_t>(),
+                    )?;
+                    cublaslt::set_matmul_desc_attribute(
+                        desc,
+                        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                        &scale_mode as *const _ as *const c_void,
+                        mem::size_of::<sys::cublasLtMatmulMatrixScale_t>(),
+                    )?;
 
-                cublaslt::set_matmul_desc_attribute(
-                    desc,
-                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
-                    &a_scale_ptr_val as *const _ as *const c_void,
-                    mem::size_of::<CUdeviceptr>(),
-                )?;
+                    cublaslt::set_matmul_desc_attribute(
+                        desc,
+                        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                        &a_scale_ptr_val as *const _ as *const c_void,
+                        mem::size_of::<CUdeviceptr>(),
+                    )?;
 
-                let pref = cublaslt::create_matmul_pref()?;
-                let ws_bytes = WORKSPACE_BYTES;
-                cublaslt::set_matmul_pref_attribute(
-                    pref,
-                    sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                    &ws_bytes as *const _ as *const c_void,
-                    mem::size_of::<usize>(),
-                )?;
+                    let pref = cublaslt::create_matmul_pref()?;
+                    let ws_bytes = WORKSPACE_BYTES;
+                    cublaslt::set_matmul_pref_attribute(
+                        pref,
+                        sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                        &ws_bytes as *const _ as *const c_void,
+                        mem::size_of::<usize>(),
+                    )?;
 
-                cublaslt::set_matmul_desc_attribute(
-                    desc,
-                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-                    &b_scale_ptr_val as *const _ as *const c_void,
-                    mem::size_of::<CUdeviceptr>(),
-                )?;
-                let pin = lt_algo_pins().get(&(m, n, k)).copied();
-                let algo = if pin.is_some() || lt_algo_log() {
-                    const MAX_CANDS: usize = 24;
-                    let mut results: [sys::cublasLtMatmulHeuristicResult_t; MAX_CANDS] =
-                        mem::zeroed();
-                    let mut returned: i32 = 0;
-                    let st = sys::cublasLtMatmulAlgoGetHeuristic(
-                        handle,
+                    cublaslt::set_matmul_desc_attribute(
+                        desc,
+                        sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                        &b_scale_ptr_val as *const _ as *const c_void,
+                        mem::size_of::<CUdeviceptr>(),
+                    )?;
+                    let pin = lt_algo_pins().get(&(m, n, k)).copied();
+                    let algo = if pin.is_some() || lt_algo_log() {
+                        const MAX_CANDS: usize = 24;
+                        let mut results: [sys::cublasLtMatmulHeuristicResult_t; MAX_CANDS] =
+                            mem::zeroed();
+                        let mut returned: i32 = 0;
+                        let st = sys::cublasLtMatmulAlgoGetHeuristic(
+                            handle,
+                            desc,
+                            a_layout,
+                            b_layout,
+                            d_layout,
+                            d_layout,
+                            pref,
+                            MAX_CANDS as i32,
+                            results.as_mut_ptr(),
+                            &mut returned,
+                        );
+                        anyhow::ensure!(
+                            st == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS && returned > 0,
+                            "cublasLtMatmulAlgoGetHeuristic nvfp4: {st:?} returned={returned}"
+                        );
+                        let cands: Vec<&sys::cublasLtMatmulHeuristicResult_t> = results
+                            [..returned as usize]
+                            .iter()
+                            .filter(|r| r.state == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS)
+                            .collect();
+                        anyhow::ensure!(!cands.is_empty(), "no valid nvfp4 heuristic candidates");
+                        let idx = match pin {
+                            Some(i) if i < cands.len() => i,
+                            Some(i) => {
+                                eprintln!(
+                                    "[nvfp4-lt] pin idx {i} out of range for {m}x{n}x{k} \
+                                     ({} cands); using 0",
+                                    cands.len()
+                                );
+                                0
+                            }
+                            None => 0,
+                        };
+                        if lt_algo_log() {
+                            for (ci, cand) in cands.iter().enumerate() {
+                                eprintln!(
+                                    "[nvfp4-lt] shape {m}x{n}x{k} cand {ci}{}: {} waves={:.2} ws={}",
+                                    if ci == idx { " (chosen)" } else { "" },
+                                    algo_config_summary(&cand.algo),
+                                    cand.wavesCount,
+                                    cand.workspaceSize,
+                                );
+                            }
+                        }
+                        cands[idx].algo
+                    } else {
+                        let heur = cublaslt::get_matmul_algo_heuristic(
+                            handle, desc, a_layout, b_layout, d_layout, d_layout, pref,
+                        )?;
+                        heur.algo
+                    };
+                    cublaslt::destroy_matmul_pref(pref)?;
+
+                    entry.insert(CachedDesc {
                         desc,
                         a_layout,
                         b_layout,
                         d_layout,
-                        d_layout,
-                        pref,
-                        MAX_CANDS as i32,
-                        results.as_mut_ptr(),
-                        &mut returned,
-                    );
-                    anyhow::ensure!(
-                        st == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS && returned > 0,
-                        "cublasLtMatmulAlgoGetHeuristic nvfp4: {st:?} returned={returned}"
-                    );
-                    let cands: Vec<&sys::cublasLtMatmulHeuristicResult_t> = results
-                        [..returned as usize]
-                        .iter()
-                        .filter(|r| r.state == sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS)
-                        .collect();
-                    anyhow::ensure!(!cands.is_empty(), "no valid nvfp4 heuristic candidates");
-                    let idx = match pin {
-                        Some(i) if i < cands.len() => i,
-                        Some(i) => {
-                            eprintln!(
-                                "[nvfp4-lt] pin idx {i} out of range for {m}x{n}x{k} \
-                                 ({} cands); using 0",
-                                cands.len()
-                            );
-                            0
-                        }
-                        None => 0,
-                    };
-                    if lt_algo_log() {
-                        for (ci, cand) in cands.iter().enumerate() {
-                            eprintln!(
-                                "[nvfp4-lt] shape {m}x{n}x{k} cand {ci}{}: {} waves={:.2} ws={}",
-                                if ci == idx { " (chosen)" } else { "" },
-                                algo_config_summary(&cand.algo),
-                                cand.wavesCount,
-                                cand.workspaceSize,
-                            );
-                        }
-                    }
-                    cands[idx].algo
-                } else {
-                    let heur = cublaslt::get_matmul_algo_heuristic(
-                        handle, desc, a_layout, b_layout, d_layout, d_layout, pref,
-                    )?;
-                    heur.algo
-                };
-                cublaslt::destroy_matmul_pref(pref)?;
+                        algo,
+                    });
+                }
 
-                entry.insert(CachedDesc {
-                    desc,
-                    a_layout,
-                    b_layout,
-                    d_layout,
-                    algo,
-                });
+                let cached = self.desc_cache.get(&key).expect("just inserted");
+
+                cublaslt::set_matmul_desc_attribute(
+                    cached.desc,
+                    sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                    &b_scale_ptr_val as *const _ as *const c_void,
+                    mem::size_of::<CUdeviceptr>(),
+                )?;
+
+                let beta = 0.0f32;
+                let ws = workspace_handle(&stream_arc)?;
+                let mut ws = ws
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("nvfp4 workspace poisoned: {e}"))?;
+                let (a_ptr, _ga) = a_data.device_ptr(&stream_arc);
+                let (b_ptr, _gb) = b_data.device_ptr(&stream_arc);
+                let (d_ptr, _gd) = d.device_ptr_mut(&stream_arc);
+                let (ws_ptr, _gw) = ws.device_ptr_mut(&stream_arc);
+
+                let rc = cublaslt::matmul(
+                    handle,
+                    cached.desc,
+                    &alpha as *const _ as *const c_void,
+                    &beta as *const _ as *const c_void,
+                    b_ptr as *const c_void,
+                    cached.a_layout,
+                    a_ptr as *const c_void,
+                    cached.b_layout,
+                    d_ptr as *const c_void,
+                    cached.d_layout,
+                    d_ptr as *mut c_void,
+                    cached.d_layout,
+                    &cached.algo as *const _,
+                    ws_ptr as *mut c_void,
+                    WORKSPACE_BYTES,
+                    stream_raw as sys::cudaStream_t,
+                );
+
+                rc.map_err(|e| anyhow::anyhow!("cublasLtMatmul nvfp4: {e:?}"))?;
+                Ok(())
             }
-
-            let cached = self.desc_cache.get(&key).expect("just inserted");
-
-            cublaslt::set_matmul_desc_attribute(
-                cached.desc,
-                sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
-                &b_scale_ptr_val as *const _ as *const c_void,
-                mem::size_of::<CUdeviceptr>(),
-            )?;
-
-            let beta = 0.0f32;
-            let ws = workspace_handle(&stream_arc)?;
-            let mut ws = ws
-                .lock()
-                .map_err(|e| anyhow::anyhow!("nvfp4 workspace poisoned: {e}"))?;
-            let (a_ptr, _ga) = a_data.device_ptr(&stream_arc);
-            let (b_ptr, _gb) = b_data.device_ptr(&stream_arc);
-            let (d_ptr, _gd) = d.device_ptr_mut(&stream_arc);
-            let (ws_ptr, _gw) = ws.device_ptr_mut(&stream_arc);
-
-            let rc = cublaslt::matmul(
-                handle,
-                cached.desc,
-                &alpha as *const _ as *const c_void,
-                &beta as *const _ as *const c_void,
-                b_ptr as *const c_void,
-                cached.a_layout,
-                a_ptr as *const c_void,
-                cached.b_layout,
-                d_ptr as *const c_void,
-                cached.d_layout,
-                d_ptr as *mut c_void,
-                cached.d_layout,
-                &cached.algo as *const _,
-                ws_ptr as *mut c_void,
-                WORKSPACE_BYTES,
-                stream_raw as sys::cudaStream_t,
-            );
-
-            rc.map_err(|e| anyhow::anyhow!("cublasLtMatmul nvfp4: {e:?}"))?;
-            Ok(())
         }
     }
 
@@ -1315,45 +1247,12 @@ mod streamk_k256_gate_tests {
     use super::streamk_k256_from;
 
     #[test]
-    fn ships_default_off() {
+    fn ships_default_off_and_only_an_explicit_env_enables() {
         assert!(!streamk_k256_from(None));
         assert!(!streamk_k256_from(Some("")));
         assert!(!streamk_k256_from(Some("0")));
-    }
-
-    #[test]
-    fn env_one_enables() {
         assert!(streamk_k256_from(Some("1")));
         assert!(streamk_k256_from(Some("on")));
-    }
-}
-
-#[cfg(test)]
-mod b2_trio_default_pin_tests {
-    use super::{k256_from, skinny_lt_from};
-
-    #[test]
-    fn skinny_lt_ships_default_on() {
-        assert!(skinny_lt_from(None));
-        assert!(skinny_lt_from(Some("1")));
-        assert!(skinny_lt_from(Some("")));
-    }
-
-    #[test]
-    fn skinny_lt_env_zero_disables() {
-        assert!(!skinny_lt_from(Some("0")));
-    }
-
-    #[test]
-    fn k256_ships_default_on() {
-        assert!(k256_from(None));
-        assert!(k256_from(Some("1")));
-        assert!(k256_from(Some("")));
-    }
-
-    #[test]
-    fn k256_env_zero_disables() {
-        assert!(!k256_from(Some("0")));
     }
 }
 
@@ -1369,33 +1268,6 @@ mod ue4m3_tests {
         } else {
             (1.0 + m / 8.0) * (2f32).powi(e as i32 - 7)
         }
-    }
-
-    #[test]
-    fn decode_matches_hardware_for_every_byte() {
-        for byte in 0u8..=0x7E {
-            assert_eq!(
-                decode_ue4m3(byte),
-                hw_decode(byte),
-                "byte 0x{byte:02x} decodes differently from hardware"
-            );
-        }
-    }
-
-    #[test]
-    fn subnormal_grid_points_round_trip_exactly() {
-        let step = 2f32.powi(-9);
-        for m in 0u8..=7 {
-            let v = m as f32 * step;
-            if m > 0 {
-                assert_eq!(encode_ue4m3(v), m, "encode({m} * 2^-9)");
-            }
-            assert_eq!(decode_ue4m3(m), v, "decode(byte {m})");
-            assert_eq!(hw_decode(m), v, "hw_decode(byte {m})");
-        }
-
-        assert_eq!(encode_ue4m3(8.0 * step), 0x08);
-        assert_eq!(decode_ue4m3(0x08), 2f32.powi(-6));
     }
 
     #[test]
@@ -1437,19 +1309,6 @@ mod ue4m3_tests {
             );
 
             assert_eq!(decode_ue4m3(b), hw);
-        }
-    }
-
-    #[test]
-    fn normal_range_encoding_unchanged() {
-        assert_eq!(encode_ue4m3(1.0), 0x38);
-        assert_eq!(decode_ue4m3(0x38), 1.0);
-        assert_eq!(encode_ue4m3(448.0), 0x7E);
-        assert_eq!(encode_ue4m3(1e9), 0x7E);
-        assert_eq!(encode_ue4m3(2f32.powi(-6)), 0x08);
-        for byte in 0x08u8..=0x7E {
-            let v = hw_decode(byte);
-            assert_eq!(encode_ue4m3(v), byte, "normal round trip byte 0x{byte:02x}");
         }
     }
 }
@@ -1581,10 +1440,6 @@ mod paper_validation {
                 }
             }
         }
-    }
-
-    #[test]
-    fn block_quantize_zero_block_is_exact() {
         let vals = vec![0.0f32; BLOCK_SIZE];
         let (packed, scale_byte) = quantize_block(&vals);
         let deq = dequantize_block(&packed, scale_byte);
@@ -1595,7 +1450,7 @@ mod paper_validation {
     }
 
     #[test]
-    fn swizzle_scales_matches_cutlass_sm1xx_layout_and_is_injective() {
+    fn swizzle_scales_matches_cutlass_sm1xx_layout_is_injective_and_unswizzle_inverts_it() {
         fn reference_dst(m: usize, kb: usize, k_blocks: usize) -> usize {
             let k_tiles = k_blocks.div_ceil(4);
             let tile = (m / 128) * k_tiles + kb / 4;
@@ -1620,6 +1475,11 @@ mod paper_validation {
                     seen[dst] = true;
                 }
             }
+            let back = unswizzle_scales(&sw, rows, k_blocks);
+            assert_eq!(
+                back, linear,
+                "unswizzle(swizzle(x)) != x for {rows}x{k_blocks}"
+            );
         }
     }
 
@@ -1642,19 +1502,6 @@ mod paper_validation {
             den += (*y as f64).powi(2);
         }
         (num / den.max(1e-30)).sqrt() as f32
-    }
-
-    #[test]
-    fn unswizzle_inverts_swizzle() {
-        for (rows, k_blocks) in [(1usize, 1usize), (7, 3), (128, 4), (130, 9), (256, 8)] {
-            let linear: Vec<u8> = (0..rows * k_blocks).map(|i| (i % 251) as u8 + 1).collect();
-            let sw = swizzle_scales(&linear, rows, k_blocks);
-            let back = unswizzle_scales(&sw, rows, k_blocks);
-            assert_eq!(
-                back, linear,
-                "unswizzle(swizzle(x)) != x for {rows}x{k_blocks}"
-            );
-        }
     }
 
     #[test]

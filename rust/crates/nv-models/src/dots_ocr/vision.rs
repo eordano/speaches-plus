@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use nv_layers::attn::AttnConfig;
 use nv_layers::linear::Linear;
@@ -94,7 +94,7 @@ fn load_linear(
         w
     };
     let d = w.dims2()?;
-    anyhow::ensure!(
+    ensure!(
         d == (out_dim, in_dim),
         "{name}: expected [{out_dim}, {in_dim}], got {:?}",
         w.dims()
@@ -212,7 +212,7 @@ impl PatchMerger {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let n = x.dim(0)?;
-        anyhow::ensure!(
+        ensure!(
             n % self.merge_units == 0,
             "PatchMerger: {n} patches not divisible by {}",
             self.merge_units
@@ -374,7 +374,7 @@ impl DotsVisionTower {
         grid_w: usize,
     ) -> Result<Tensor> {
         let n = patches.dim(0)?;
-        anyhow::ensure!(
+        ensure!(
             n == grid_h * grid_w,
             "forward_patches: {n} rows != grid {grid_h}x{grid_w}"
         );
@@ -419,14 +419,14 @@ impl DotsVisionTower {
             let normed2 = blk.norm2.forward(&x)?.to_dtype(self.dtype)?;
             let mlp_out = blk.mlp.forward(&normed2)?;
             x = x.add(&mlp_out)?;
-            anyhow::ensure!(x.dims() == [n, dim], "vision block shape {:?}", x.dims());
+            ensure!(x.dims() == [n, dim], "vision block shape {:?}", x.dims());
         }
 
         if let Some(norm) = &self.post_trunk_norm {
             x = norm.forward(&x)?.to_dtype(self.dtype)?;
         }
         let merged = self.merger.forward(&x)?;
-        anyhow::ensure!(
+        ensure!(
             merged.dim(0)? == n / (MERGE_SIZE * MERGE_SIZE),
             "merger produced {} rows for {n} patches",
             merged.dim(0)?
@@ -440,8 +440,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rope_tables_are_axial_and_duplicated() {
+    fn rope_tables_are_axial_and_duplicated_and_rotate_half_swaps_and_negates() {
         let dev = Device::Cpu;
+        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 1, 4), &dev).unwrap();
+        let r = rotate_half(&x).unwrap();
+        let v: Vec<f32> = r.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(v, vec![-3.0, -4.0, 1.0, 2.0]);
         let head_dim = 128usize;
         let (cos, sin) = vision_rope_tables(2, 4, head_dim, &dev).unwrap();
         assert_eq!(cos.dims(), &[1, 8, 1, head_dim]);
@@ -471,14 +475,5 @@ mod tests {
         let expect_h = (1.0f64).cos() as f32;
         assert!((c[row3] - expect_h).abs() < 1e-6);
         assert!((c[row3 + quarter] - expect_h).abs() < 1e-6);
-    }
-
-    #[test]
-    fn rotate_half_swaps_and_negates() {
-        let dev = Device::Cpu;
-        let x = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 1, 4), &dev).unwrap();
-        let r = rotate_half(&x).unwrap();
-        let v: Vec<f32> = r.flatten_all().unwrap().to_vec1().unwrap();
-        assert_eq!(v, vec![-3.0, -4.0, 1.0, 2.0]);
     }
 }

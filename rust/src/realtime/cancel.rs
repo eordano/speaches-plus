@@ -53,10 +53,6 @@ impl SessionCancel {
         }
     }
 
-    pub(super) fn token(&self) -> CancellationToken {
-        self.token.clone()
-    }
-
     pub(super) fn is_cancelled(&self) -> bool {
         self.token.is_cancelled()
     }
@@ -65,7 +61,7 @@ impl SessionCancel {
         self.inflight.load(Ordering::Acquire)
     }
 
-    pub(super) fn wrap<F>(&self, fut: F) -> impl Future<Output = Option<F::Output>> + Send
+    pub(super) fn wrap<F>(&self, fut: F) -> impl Future<Output = Option<F::Output>> + Send + use<F>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -78,7 +74,7 @@ impl SessionCancel {
         }
     }
 
-    pub(super) fn wrap_unit<F>(&self, fut: F) -> impl Future<Output = ()> + Send
+    pub(super) fn wrap_unit<F>(&self, fut: F) -> impl Future<Output = ()> + Send + use<F>
     where
         F: Future<Output = ()> + Send + 'static,
     {

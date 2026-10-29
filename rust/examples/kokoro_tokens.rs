@@ -16,7 +16,7 @@ fn main() -> Result<()> {
         for s in sentences.iter() {
             let raw = speaches_plus::tts::phonemize::phonemize(s, "en-us")
                 .with_context(|| format!("phonemize {s:?}"))?;
-            let cleaned = speaches_plus::tts::vocab::clean_phonemes(&raw);
+            let cleaned = speaches_plus::tts::vocab::clean_phonemes(&raw, "en-us");
             let tokens = speaches_plus::tts::vocab::tokenize(&cleaned);
             rows.push(serde_json::json!({"text": s, "phonemes": cleaned, "tokens": tokens}));
         }

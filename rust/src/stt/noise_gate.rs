@@ -75,42 +75,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn effective_returns_base_at_or_below_full_ms() {
+    fn effective_threshold_holds_relaxes_linearly_then_switches_off() {
         assert_eq!(effective_avg_logprob_threshold(Some(-1.0), 0), Some(-1.0));
         assert_eq!(
             effective_avg_logprob_threshold(Some(-1.0), 1500),
             Some(-1.0)
         );
+        {
+            assert_eq!(effective_avg_logprob_threshold(Some(-1.0), 5000), None);
+            assert_eq!(effective_avg_logprob_threshold(Some(-1.0), 60_000), None);
+        }
+        {
+            let t = effective_avg_logprob_threshold(Some(-1.0), 3250).unwrap();
+            assert!((t - (-2.0)).abs() < 1e-3, "got {t}");
+        }
+        {
+            assert_eq!(effective_avg_logprob_threshold(None, 1000), None);
+            assert_eq!(effective_avg_logprob_threshold(None, 8000), None);
+        }
     }
 
     #[test]
-    fn effective_returns_none_at_or_above_off_ms() {
-        assert_eq!(effective_avg_logprob_threshold(Some(-1.0), 5000), None);
-        assert_eq!(effective_avg_logprob_threshold(Some(-1.0), 60_000), None);
-    }
-
-    #[test]
-    fn effective_relaxes_linearly_in_window() {
-        let t = effective_avg_logprob_threshold(Some(-1.0), 3250).unwrap();
-        assert!((t - (-2.0)).abs() < 1e-3, "got {t}");
-    }
-
-    #[test]
-    fn effective_disabled_when_base_none() {
-        assert_eq!(effective_avg_logprob_threshold(None, 1000), None);
-        assert_eq!(effective_avg_logprob_threshold(None, 8000), None);
-    }
-
-    #[test]
-    fn evaluate_passes_when_thresholds_disabled() {
-        assert_eq!(
-            evaluate(Some(0.99), Some(-10.0), 1000, GateThresholds::disabled()),
-            None
-        );
-    }
-
-    #[test]
-    fn evaluate_rejects_on_nsp_first() {
+    fn evaluate_rejects_nsp_first_then_logprob_and_passes_disabled_long_or_statless_audio() {
         let thr = GateThresholds {
             no_speech_prob_threshold: Some(0.6),
             avg_logprob_threshold: Some(-1.0),
@@ -120,35 +106,36 @@ mod tests {
             evaluate(Some(0.9), Some(-5.0), 500, thr),
             Some(NoiseRejection::NoSpeechProb)
         );
+        {
+            assert_eq!(
+                evaluate(Some(0.99), Some(-10.0), 1000, GateThresholds::disabled()),
+                None
+            );
+        }
+        {
+            let thr = GateThresholds {
+                no_speech_prob_threshold: Some(0.6),
+                avg_logprob_threshold: Some(-1.0),
+            };
+            assert_eq!(
+                evaluate(Some(0.1), Some(-2.0), 500, thr),
+                Some(NoiseRejection::AvgLogprob)
+            );
+        }
+        {
+            let thr = GateThresholds {
+                no_speech_prob_threshold: Some(0.6),
+                avg_logprob_threshold: Some(-0.5),
+            };
+            assert_eq!(evaluate(Some(0.1), Some(-10.0), 6_000, thr), None);
+        }
+        {
+            let thr = GateThresholds {
+                no_speech_prob_threshold: Some(0.0),
+                avg_logprob_threshold: Some(0.0),
+            };
+            assert_eq!(evaluate(None, None, 1_000, thr), None);
+        }
     }
 
-    #[test]
-    fn evaluate_rejects_on_logprob() {
-        let thr = GateThresholds {
-            no_speech_prob_threshold: Some(0.6),
-            avg_logprob_threshold: Some(-1.0),
-        };
-        assert_eq!(
-            evaluate(Some(0.1), Some(-2.0), 500, thr),
-            Some(NoiseRejection::AvgLogprob)
-        );
-    }
-
-    #[test]
-    fn evaluate_passes_long_audio_through_avg_logprob_gate() {
-        let thr = GateThresholds {
-            no_speech_prob_threshold: Some(0.6),
-            avg_logprob_threshold: Some(-0.5),
-        };
-        assert_eq!(evaluate(Some(0.1), Some(-10.0), 6_000, thr), None);
-    }
-
-    #[test]
-    fn evaluate_skips_when_stats_missing() {
-        let thr = GateThresholds {
-            no_speech_prob_threshold: Some(0.0),
-            avg_logprob_threshold: Some(0.0),
-        };
-        assert_eq!(evaluate(None, None, 1_000, thr), None);
-    }
 }

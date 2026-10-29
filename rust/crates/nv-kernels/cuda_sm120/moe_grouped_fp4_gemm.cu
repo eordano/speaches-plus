@@ -91,10 +91,8 @@ struct GemmCfg {
 };
 
 using MmaTileShape       = Shape<_128, _128, _128>;
-using MmaTileShapeDecode = Shape<_128, _128, _128>;
 
 using PrefillCfg = GemmCfg<MmaTileShape>;
-using DecodeCfg  = GemmCfg<MmaTileShapeDecode>;
 
 using StrideA     = PrefillCfg::StrideA;
 using StrideB     = PrefillCfg::StrideB;
@@ -430,38 +428,6 @@ extern "C" int nv_kernels_cutlass_moe_grouped_fp4_gemm_sm120_bf16(
     size_t* required_workspace
 ) {
     return launch_grouped_fp4<PrefillCfg>(
-        stream, a_packed, a_scales, b_packed, b_scales, alphas, d_bf16,
-        expert_offsets, sf_offsets, problem_sizes, active_expert_indices,
-        N, K, num_experts, a_row_stride_elems, b_row_stride_elems,
-        c_row_stride_elems, meta_scratch, meta_scratch_bytes, gemm_workspace,
-        gemm_workspace_bytes, required_workspace);
-}
-
-extern "C" int nv_kernels_cutlass_moe_grouped_fp4_gemm_sm120_bf16_decode(
-    void* stream,
-    const void* a_packed,
-    const void* a_scales,
-    const void* b_packed,
-    const void* b_scales,
-    const float* alphas,
-    void* d_bf16,
-    const int32_t* expert_offsets,
-    const int32_t* sf_offsets,
-    const int32_t* problem_sizes,
-    const int32_t* active_expert_indices,
-    int N,
-    int K,
-    int num_experts,
-    int64_t a_row_stride_elems,
-    int64_t b_row_stride_elems,
-    int64_t c_row_stride_elems,
-    void* meta_scratch,
-    size_t meta_scratch_bytes,
-    void* gemm_workspace,
-    size_t gemm_workspace_bytes,
-    size_t* required_workspace
-) {
-    return launch_grouped_fp4<DecodeCfg>(
         stream, a_packed, a_scales, b_packed, b_scales, alphas, d_bf16,
         expert_offsets, sf_offsets, problem_sizes, active_expert_indices,
         N, K, num_experts, a_row_stride_elems, b_row_stride_elems,
