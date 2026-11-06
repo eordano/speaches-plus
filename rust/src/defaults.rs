@@ -228,6 +228,7 @@ pub mod env {
 
     pub const WHISPER_MODEL: &str = "WHISPER_MODEL";
     pub const CT2_MODEL: &str = "CT2_MODEL";
+    pub const CT2_COMPUTE_TYPE: &str = "CT2_COMPUTE_TYPE";
 
     pub const NV_SERVE_BACKEND: &str = "NV_SERVE_BACKEND";
 

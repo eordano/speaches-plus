@@ -22,11 +22,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1793211691,
-        "narHash": "sha256-XLC3eHznkF/6I4nkSgDGtHzKWgrztFghXSF8W/y9BLE=",
+        "lastModified": 1793316756,
+        "narHash": "sha256-5frf1EWsBzs/XiP/Pki9GweSUfqdM56RhhwQZaPDiiI=",
         "owner": "eordano",
         "repo": "nix-hug",
-        "rev": "1038d3a6dae820e8220e245abf78a0901cc1608f",
+        "rev": "bb0556aa0bb3d3f25b99a2e873d79bb8ce8a25f2",
         "type": "github"
       },
       "original": {

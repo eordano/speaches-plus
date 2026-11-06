@@ -2839,6 +2839,7 @@ mod tests {
             embedding: true,
             tts_talker: true,
             tts_talker_on_cuda: false,
+            tts_talker_1p7b: false,
             tts_voice_design: false,
             tts_voice_design_on_cuda: false,
             dots_ocr: true,

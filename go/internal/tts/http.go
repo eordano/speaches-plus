@@ -1,6 +1,7 @@
 package tts
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -197,18 +198,20 @@ func (h *SpeechHandler) streamAudio(
 	w.Header().Set("Content-Type", MimeTypeForFormat(format))
 	w.WriteHeader(http.StatusOK)
 
-	flusher, _ := w.(http.Flusher)
 	target := KokoroSampleRate
 	if sampleRate != nil && *sampleRate > 0 {
 		target = *sampleRate
 	}
 
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 	pipe := make(chan []float32, 4)
-	errCh := make(chan error, 1)
+	synthesized := make(chan struct{})
 	go func() {
+		defer close(synthesized)
 		defer close(pipe)
 		for _, chunk := range chunks {
-			if r.Context().Err() != nil {
+			if ctx.Err() != nil {
 				return
 			}
 			a, err := h.syn.Synthesize(chunk, voice, h.lang, speed)
@@ -216,18 +219,31 @@ func (h *SpeechHandler) streamAudio(
 				slog.Warn("synthesize chunk failed", "err", err, "chunk_len", len(chunk))
 				continue
 			}
-			pipe <- a.Samples
-			if flusher != nil {
-				flusher.Flush()
+			select {
+			case pipe <- a.Samples:
+			case <-ctx.Done():
+				return
 			}
 		}
-		errCh <- nil
 	}()
 
-	if err := EncodeAudio(r.Context(), w, pipe, KokoroSampleRate, target, format); err != nil {
+	if err := EncodeAudio(ctx, flushAfterWrite{w}, pipe, KokoroSampleRate, target, format); err != nil {
 		slog.Error("encode audio failed", "err", err)
 	}
-	<-errCh
+	cancel()
+	<-synthesized
+}
+
+type flushAfterWrite struct {
+	w http.ResponseWriter
+}
+
+func (f flushAfterWrite) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if flusher, ok := f.w.(http.Flusher); ok && err == nil {
+		flusher.Flush()
+	}
+	return n, err
 }
 
 func (h *SpeechHandler) streamSSE(

@@ -367,10 +367,11 @@ identical prompt assembly, identical `avg_logprob` computation, and the same
 Why two Whisper backends at all: kernel coverage — CTranslate2 has no
 Metal kernels so Apple silicon uses whisper.cpp, while CTranslate2 is the
 path with a real CUDA build (`ct2_config()` is `#[cfg(feature = "cuda")]`
-gated to `Ct2Device::CUDA` + `Ct2ComputeType::FLOAT16`); **quantization
-control** — Go threads `CT2_COMPUTE_TYPE` into
-`ctranslate2::str_to_compute_type` so `int8` / `float16` / `int8_float16` are
-reachable, with no whisper.cpp analogue; word timestamps — whisper.cpp
+gated to `Ct2Device::CUDA`); **quantization control** — Rust
+(`ct2_compute_type` in `rust/src/stt/mod.rs`) and Go
+(`ctranslate2::str_to_compute_type`) both read `CT2_COMPUTE_TYPE`, so `int8`
+/ `int8_float16` / `float16` are reachable, with no whisper.cpp analogue;
+unset, Rust runs the checkpoint at its saved precision; word timestamps — whisper.cpp
 exposes per-token timings, ct2rs does not; artifact format — ggml `.bin`
 and CT2 `model.bin` + `tokenizer.json` are disjoint, so the checkpoint forces
 the backend; concurrency — whisper.cpp needs `ctx.create_state()` per

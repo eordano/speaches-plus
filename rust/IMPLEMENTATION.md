@@ -756,7 +756,13 @@ Two backends in one binary, picked at startup via
 `ct2`: `Whisper::generate(samples, lang, timestamp, opts)` runs
 mel-spec -> encode -> detect-lang -> decode -> tokenizer.decode
 end-to-end and takes `&self` (no Mutex on the inference path);
-`beam_size = 1` (greedy) for realtime. Model dir requires `model.bin`,
+`beam_size = 1` (greedy) for realtime. `CT2_COMPUTE_TYPE` picks the
+precision (`int8`, `int8_float16`, `int8_float32`, `int8_bfloat16`,
+`float16`, `bfloat16`, `float32`, `int16`, `auto`, `default`); CTranslate2
+quantizes a float checkpoint at load, so one `whisper-ct2/` dir serves
+int8 too. Unset (`default`), it runs at the checkpoint's saved precision on
+every device: an int8 conversion runs int8, a float16 one float16. An
+unknown value fails the load. Model dir requires `model.bin`,
 `config.json`, `tokenizer.json`, `vocabulary.json`,
 `preprocessor_config.json`. Raw output may include `<|...|>` markers;
 `strip_special_tokens` peels them.

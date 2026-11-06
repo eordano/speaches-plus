@@ -8,8 +8,9 @@ use ct2rs::sys::{
 };
 use ct2rs::tokenizers::hf::Tokenizer as Ct2Tokenizer;
 use ct2rs::Tokenizer as Ct2TokenizerTrait;
+use ct2rs::ComputeType as Ct2ComputeType;
 #[cfg(feature = "cuda")]
-use ct2rs::{ComputeType as Ct2ComputeType, Device as Ct2Device};
+use ct2rs::Device as Ct2Device;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext as CppContext, WhisperContextParameters,
 };
@@ -224,7 +225,7 @@ impl WhisperEngine {
                     .and_then(|s| s.to_str())
                     .unwrap_or("ct2-model")
                     .to_string();
-                let model = Ct2Whisper::new(&dir, ct2_config())
+                let model = Ct2Whisper::new(&dir, ct2_config()?)
                     .with_context(|| format!("load whisper-ct2 model: {}", dir.display()))?;
                 let tokenizer = Ct2Tokenizer::new(&dir)
                     .with_context(|| format!("load ct2 tokenizer.json from {}", dir.display()))?;
@@ -1310,18 +1311,40 @@ fn join_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> String {
     out
 }
 
-fn ct2_config() -> Ct2Config {
+fn ct2_compute_type(value: &str) -> Result<Ct2ComputeType> {
+    Ok(match value.trim().to_ascii_lowercase().as_str() {
+        "default" => Ct2ComputeType::DEFAULT,
+        "auto" => Ct2ComputeType::AUTO,
+        "float32" | "f32" => Ct2ComputeType::FLOAT32,
+        "int8" => Ct2ComputeType::INT8,
+        "int8_float32" => Ct2ComputeType::INT8_FLOAT32,
+        "int8_float16" => Ct2ComputeType::INT8_FLOAT16,
+        "int8_bfloat16" => Ct2ComputeType::INT8_BFLOAT16,
+        "int16" => Ct2ComputeType::INT16,
+        "float16" | "f16" => Ct2ComputeType::FLOAT16,
+        "bfloat16" | "bf16" => Ct2ComputeType::BFLOAT16,
+        other => anyhow::bail!(
+            "{}={other:?} is not a CTranslate2 compute type; expected one of default, auto, \
+             float32, int8, int8_float32, int8_float16, int8_bfloat16, int16, float16, bfloat16",
+            super::defaults::env::CT2_COMPUTE_TYPE
+        ),
+    })
+}
+
+fn ct2_config() -> Result<Ct2Config> {
+    let mut cfg = Ct2Config::default();
     #[cfg(feature = "cuda")]
     {
-        let mut cfg = Ct2Config::default();
         cfg.device = Ct2Device::CUDA;
-        cfg.compute_type = Ct2ComputeType::FLOAT16;
-        cfg
     }
-    #[cfg(not(feature = "cuda"))]
+    if let Some(raw) = std::env::var(super::defaults::env::CT2_COMPUTE_TYPE)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
     {
-        Ct2Config::default()
+        cfg.compute_type = ct2_compute_type(&raw)?;
     }
+    tracing::info!(compute_type = %cfg.compute_type, "ct2 compute type");
+    Ok(cfg)
 }
 
 fn env_checkpoint_override(name: &str) -> Option<PathBuf> {
@@ -1461,6 +1484,15 @@ fn num_cpus() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ct2_compute_type_accepts_int8_family_and_refuses_unknown() {
+        assert_eq!(ct2_compute_type("int8").unwrap(), Ct2ComputeType::INT8);
+        assert_eq!(ct2_compute_type(" INT8_Float16 ").unwrap(), Ct2ComputeType::INT8_FLOAT16);
+        assert_eq!(ct2_compute_type("int8_float32").unwrap(), Ct2ComputeType::INT8_FLOAT32);
+        assert_eq!(ct2_compute_type("float16").unwrap(), Ct2ComputeType::FLOAT16);
+        assert!(ct2_compute_type("int4").is_err());
+    }
 
     #[test]
     fn strips_whisper_specials() {
@@ -1864,7 +1896,7 @@ mod tests {
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
 
-        let model = Ct2Whisper::new(&dir, ct2_config()).expect("load ct2 model");
+        let model = Ct2Whisper::new(&dir, ct2_config().unwrap()).expect("load ct2 model");
         let tokenizer = Ct2Tokenizer::new(&dir).expect("load tokenizer");
         let n_mels = model.n_mels();
         let timestamp_begin_id = tokenizer.token_to_id("<|0.00|>");
@@ -1952,7 +1984,7 @@ mod tests {
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
 
-        let model = Ct2Whisper::new(&dir, ct2_config()).expect("load ct2 model");
+        let model = Ct2Whisper::new(&dir, ct2_config().unwrap()).expect("load ct2 model");
         let tokenizer = Ct2Tokenizer::new(&dir).expect("load tokenizer");
         let n_mels = model.n_mels();
         let timestamp_begin_id = tokenizer.token_to_id("<|0.00|>");
