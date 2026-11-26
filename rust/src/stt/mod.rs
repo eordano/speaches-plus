@@ -69,6 +69,7 @@ pub fn is_translate_unsupported(err: &anyhow::Error) -> bool {
 pub struct SttRequestOptions {
     pub language: Option<String>,
     pub initial_prompt: Option<String>,
+    pub beam_size: Option<usize>,
 }
 
 impl SttRequestOptions {}
@@ -261,15 +262,11 @@ impl WhisperEngine {
             }
             Backend::Parakeet => {
                 let dir = parakeet::parakeet_dir()?;
-                let id = dir
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .and_then(|p| p.file_name())
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.trim_start_matches("models--").replace("--", "/"))
-                    .unwrap_or_else(|| "parakeet-tdt-0.6b-v2".to_string());
                 let model = parakeet::ParakeetTdt::load(&dir)
                     .with_context(|| format!("load parakeet-tdt from {}", dir.display()))?;
+                let id = parakeet::hub_id(&dir)
+                    .or_else(|| std::fs::canonicalize(&dir).ok().and_then(|d| parakeet::hub_id(&d)))
+                    .unwrap_or_else(|| model.default_id().to_string());
                 tracing::info!(dir = %dir.display(), id, ep = model.ep(), "parakeet-tdt backend loaded");
                 WhisperHandle::Parakeet {
                     inner: Arc::new(model),
@@ -377,6 +374,16 @@ impl WhisperHandle {
         let full = normalize_stt_model_id(loaded);
         let base = normalize_stt_model_id(loaded.rsplit('/').next().unwrap_or(loaded));
         full.starts_with(&req) || base.starts_with(&req)
+    }
+
+    pub fn languages(&self) -> Option<&'static [&'static str]> {
+        match self {
+            WhisperHandle::Parakeet { inner, .. } if inner.multilingual() => {
+                Some(&parakeet::V3_LANGUAGES)
+            }
+            WhisperHandle::Parakeet { .. } => Some(&["en"]),
+            _ => None,
+        }
     }
 
     pub fn supports_translate(&self) -> bool {
@@ -520,14 +527,20 @@ impl WhisperHandle {
                 );
             }
         }
-        if let WhisperHandle::Parakeet { id, .. } = self {
+        if let WhisperHandle::Parakeet { id, inner } = self {
             if let Some(lang) = opts.language.as_deref() {
-                if lang != "en" {
+                if !inner.supports_language(lang) {
+                    let scope = if inner.multilingual() {
+                        "parakeet-tdt v3 covers bg cs da de el en es et fi fr hr hu it lt lv mt nl \
+                         pl pt ro ru sk sl sv uk"
+                    } else {
+                        "this parakeet-tdt checkpoint is English-only; v3 is multilingual"
+                    };
                     return Err(anyhow::Error::new(SttParamUnsupported {
                         param: "language",
                         message: format!(
                             "language={lang:?} is not supported by the loaded STT model {id:?} \
-                             (parakeet-tdt is English-only); omit the field or send \"en\""
+                             ({scope}); omit the field to auto-detect"
                         ),
                     }));
                 }
@@ -561,7 +574,7 @@ impl WhisperHandle {
                 transcribe_whisper_cpp(inner, audio_16k_mono, task, opts)
             }
             WhisperHandle::Parakeet { inner, .. } => {
-                transcribe_parakeet(inner, audio_16k_mono, task)
+                transcribe_parakeet(inner, audio_16k_mono, task, opts)
             }
             WhisperHandle::Voxtral { inner, .. } => transcribe_voxtral(inner, audio_16k_mono, task),
         }
@@ -613,6 +626,7 @@ fn transcribe_parakeet(
     model: &parakeet::ParakeetTdt,
     audio_16k_mono: &[f32],
     task: WhisperTask,
+    opts: &SttRequestOptions,
 ) -> Result<TranscriptionResult> {
     let (text, tokens) = model.transcribe_scored(audio_16k_mono)?;
     let avg_logprob = mean_logprob(&tokens);
@@ -636,7 +650,11 @@ fn transcribe_parakeet(
         compression_ratio: None,
         tokens,
         segments,
-        language: Some("en".to_string()),
+        language: if model.multilingual() {
+            opts.language.clone()
+        } else {
+            Some("en".to_string())
+        },
         duration_s: Some(audio_16k_mono.len() as f32 / 16_000.0),
         task,
     })
@@ -879,7 +897,10 @@ fn transcribe_ct2(
     prompt_tokens.extend(["<|startoftranscript|>", language_token.as_str(), task_token]);
     let prompts: Vec<Vec<&str>> = vec![prompt_tokens];
     let mut options = Ct2WhisperOptions {
-        beam_size: crate::defaults::stt::BEAM_SIZE,
+        beam_size: opts
+            .beam_size
+            .unwrap_or(crate::defaults::stt::BEAM_SIZE)
+            .clamp(1, crate::defaults::stt::BEAM_SIZE_MAX),
         ..Default::default()
     };
     options.return_scores = true;
@@ -1337,13 +1358,18 @@ fn ct2_config() -> Result<Ct2Config> {
     {
         cfg.device = Ct2Device::CUDA;
     }
+    cfg.num_threads_per_replica = ct2_threads();
     if let Some(raw) = std::env::var(super::defaults::env::CT2_COMPUTE_TYPE)
         .ok()
         .filter(|v| !v.trim().is_empty())
     {
         cfg.compute_type = ct2_compute_type(&raw)?;
     }
-    tracing::info!(compute_type = %cfg.compute_type, "ct2 compute type");
+    tracing::info!(
+        compute_type = %cfg.compute_type,
+        threads = cfg.num_threads_per_replica,
+        "ct2 config"
+    );
     Ok(cfg)
 }
 
@@ -1473,6 +1499,17 @@ fn strip_special_tokens(s: &str) -> String {
         }
     }
     out
+}
+
+const CT2_THREADS_ARE_PHYSICAL_CORES_BECAUSE_AN_OPENMP_TEAM_ON_EVERY_SMT_SIBLING_SPINS_ON_A_SHARED_BOX: &str =
+    "CTranslate2's own default is min(4, cores), which left large-v3-turbo's encoder on 4 of 32 \
+     threads; a oneDNN/OpenMP team sized to all 32 SMT threads of a 16-core Zen 5 busy-waits at \
+     every barrier once anything else runs, multiplying decode time, while one thread per \
+     physical core holds";
+
+fn ct2_threads() -> usize {
+    let _ = CT2_THREADS_ARE_PHYSICAL_CORES_BECAUSE_AN_OPENMP_TEAM_ON_EVERY_SMT_SIBLING_SPINS_ON_A_SHARED_BOX;
+    (num_cpus() as usize).min(::num_cpus::get_physical()).max(1)
 }
 
 fn num_cpus() -> i32 {

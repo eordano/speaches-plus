@@ -10,7 +10,6 @@ let
     version = "0.2.129";
     src = pkgs.fetchzip {
       urls = [
-        "https://git.decent.foundation/api/packages/mirrors/generic/wasm-bindgen-cli/${version}/wasm-bindgen-cli-${version}.crate"
         "https://static.crates.io/crates/wasm-bindgen-cli/wasm-bindgen-cli-${version}.crate"
       ];
       extension = "tar.gz";

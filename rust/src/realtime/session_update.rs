@@ -40,7 +40,8 @@ const SESSION_APPLIED_KEYS: &[&str] = &[
     "model",
 ];
 
-const INPUT_AUDIO_TRANSCRIPTION_KEYS: &[&str] = &["model", "language"];
+const INPUT_AUDIO_TRANSCRIPTION_KEYS: &[&str] =
+    &["model", "language", "beam_size", "partial_beam_size"];
 
 const SESSION_ACCEPTED_UNAPPLIED_KEYS: &[&str] = &[
     "id",
@@ -80,6 +81,7 @@ const TURN_DETECTION_KEYS: &[&str] = &[
     "silence_duration_ms",
     "barge_in_delay_ms",
     "create_response",
+    "early_final_ms",
     "eou",
     "idle_timeout_ms",
     "interrupt_response",
@@ -157,6 +159,8 @@ pub(super) enum StagedInstructions {
 pub(super) struct StagedInputAudioTranscription {
     pub model: Option<String>,
     pub language: Option<String>,
+    pub beam_size: Option<u32>,
+    pub partial_beam_size: Option<u32>,
 }
 
 #[derive(Default, Debug)]
@@ -169,6 +173,7 @@ pub(super) struct StagedTurnDetection {
     pub silence_duration_ms: Option<u32>,
     pub barge_in_delay_ms: Option<u32>,
     pub create_response: Option<bool>,
+    pub early_final_ms: Option<u32>,
     pub eou: Option<StagedEou>,
 }
 
@@ -438,6 +443,25 @@ fn parse_input_audio_transcription(v: &Value) -> Result<StagedInputAudioTranscri
             out.language = Some(code);
         }
     }
+    let max_beam = crate::defaults::stt::BEAM_SIZE_MAX as u64;
+    if let Some(v) = obj.get("beam_size") {
+        out.beam_size = Some(parse_bounded_u64(
+            v,
+            1,
+            max_beam,
+            "session.input_audio_transcription.beam_size",
+            "input_audio_transcription.beam_size",
+        )? as u32);
+    }
+    if let Some(v) = obj.get("partial_beam_size") {
+        out.partial_beam_size = Some(parse_bounded_u64(
+            v,
+            1,
+            max_beam,
+            "session.input_audio_transcription.partial_beam_size",
+            "input_audio_transcription.partial_beam_size",
+        )? as u32);
+    }
     Ok(out)
 }
 
@@ -594,6 +618,15 @@ fn parse_turn_detection_update(
                 .into());
         }
         staged.barge_in_delay_ms = Some(n as u32);
+    }
+    if let Some(v) = obj.get("early_final_ms") {
+        staged.early_final_ms = Some(parse_bounded_u64(
+            v,
+            0,
+            defaults::turn_detection::EARLY_FINAL_MS_MAX as u64,
+            "session.turn_detection.early_final_ms",
+            "turn_detection.early_final_ms",
+        )? as u32);
     }
     if let Some(v) = obj.get("create_response") {
         staged.create_response = Some(v.as_bool().ok_or((
@@ -953,6 +986,36 @@ mod tests {
             let e = parse(json!({"speed": bad})).err().expect("expected err");
             assert_eq!(e.param, "session.speed");
             assert!(e.message.contains("[0.5,2.0]"), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn beam_sizes_and_early_final_are_staged_within_bounds() {
+        let s = parse(json!({
+            "input_audio_transcription": {"beam_size": 2, "partial_beam_size": 1},
+            "turn_detection": {"type": "server_vad", "early_final_ms": 250},
+        }))
+        .unwrap();
+        let iat = s.input_audio_transcription.expect("staged");
+        assert_eq!(iat.beam_size, Some(2));
+        assert_eq!(iat.partial_beam_size, Some(1));
+        assert_eq!(s.turn_detection.expect("td").early_final_ms, Some(250));
+        for (body, param) in [
+            (
+                json!({"input_audio_transcription": {"beam_size": 0}}),
+                "session.input_audio_transcription.beam_size",
+            ),
+            (
+                json!({"input_audio_transcription": {"partial_beam_size": 11}}),
+                "session.input_audio_transcription.partial_beam_size",
+            ),
+            (
+                json!({"turn_detection": {"type": "server_vad", "early_final_ms": 5001}}),
+                "session.turn_detection.early_final_ms",
+            ),
+        ] {
+            let e = parse(body).err().expect("expected err");
+            assert_eq!(e.param, param);
         }
     }
 

@@ -17,6 +17,8 @@ pub mod turn_detection {
     pub const SILENCE_DURATION_MS_MIN: u32 = 50;
     pub const SILENCE_DURATION_MS_MAX: u32 = 5000;
     pub const BARGE_IN_DELAY_MS_MAX: u32 = 1000;
+    pub const EARLY_FINAL_MS: u32 = 0;
+    pub const EARLY_FINAL_MS_MAX: u32 = 5000;
 }
 
 pub mod eou {
@@ -78,7 +80,9 @@ pub mod buffer {
     pub const MIN_SPEECH_MS: u64 = 100;
     pub const MIN_SPEECH_FOR_RESPONSE_MS: u64 = 600;
     pub const SEALED_BUFFER_RETENTION_COUNT: usize = 4;
-    pub const PARTIAL_INTERVAL_MS: u64 = 500;
+    pub const PARTIAL_INTERVAL_MIN_MS: u64 = 500;
+    pub const PARTIAL_INTERVAL_MAX_MS: u64 = 2_000;
+    pub const PARTIAL_INTERVAL_UTTERANCE_DIVISOR: usize = 3;
 
     pub const MIN_SPEECH_MS_MAX: u64 = 60_000;
     pub const MIN_SPEECH_FOR_RESPONSE_MS_MAX: u64 = 60_000;
@@ -189,6 +193,7 @@ pub mod stt {
     pub const CT2_THREADS_DEFAULT: usize = 2;
 
     pub const BEAM_SIZE: usize = 5;
+    pub const BEAM_SIZE_MAX: usize = 10;
 }
 
 pub mod kokoro {
@@ -217,6 +222,9 @@ pub mod env {
     pub const SESSION_MAX_DURATION_S: &str = "SESSION_MAX_DURATION_S";
     pub const BARGE_IN_DELAY_MS: &str = "BARGE_IN_DELAY_MS";
     pub const PARTIAL_STT_ENABLED: &str = "PARTIAL_STT_ENABLED";
+    pub const PARTIAL_STT_BEAM_SIZE: &str = "PARTIAL_STT_BEAM_SIZE";
+    pub const REALTIME_FINAL_BEAM_SIZE: &str = "REALTIME_FINAL_BEAM_SIZE";
+    pub const REALTIME_EARLY_FINAL_MS: &str = "REALTIME_EARLY_FINAL_MS";
     pub const SPEACHES_PLUS_MODELS: &str = "SPEACHES_PLUS_MODELS";
 
     pub const WS_MAX_MESSAGE_BYTES: &str = "WS_MAX_MESSAGE_BYTES";

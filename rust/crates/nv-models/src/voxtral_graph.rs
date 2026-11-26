@@ -15,6 +15,14 @@ pub const TOKEN_RING_SLOTS: usize = 64;
 pub const REPLAYS_PER_BATCH_TRADE_EOS_LATENCY_AGAINST_HOST_ROUND_TRIPS: usize = 16;
 pub const VOXTRAL_SPEC_ROWS_ENV: &str = "NV_VOXTRAL_SPEC_ROWS";
 pub const PAD_DRAFT_ROWS_DEFAULT_FOR_NVFP4: usize = 4;
+pub const PAD_DRAFT_ROWS_DEFAULT_FOR_Q8_0: usize = 4;
+
+pub const Q8_0_DRAFTS_FOUR_PADS_BY_THE_LIBRISPEECH_73_CLIP_TRANSCRIPTS: &str =
+    "voxtral-tune eval over the 73 clips of hf-internal-testing/librispeech_asr_dummy with \
+     NV_VOXTRAL_QUANT=q8_0 on an RTX PRO 6000 Blackwell: 2 and 4 drafted rows \
+     transcribe all 73 clips exactly as 1 row does (76 word errors of 1150 each) at 233 and 222 ms \
+     a clip against 334, committing 2.14 tokens a step at 4; 8 rows changes one transcript and is \
+     no faster (233 ms). The Q8_0 m-row linear stays on the GGML kernels, unlike bf16's cuBLAS tile";
 
 pub const THE_STEP_IS_CAPTURED_ON_THE_DEVICE_STREAM_SO_CANDLE_OPS_AND_NV_KERNELS_LAND_IN_ONE_GRAPH:
     &str = "candle ops run on the device's own stream while nv-layers kernels run on \
@@ -112,7 +120,7 @@ fn draft_accept_kernel(dev: &CudaDevice) -> Result<CudaFunction> {
 pub const BF16_KEEPS_ONE_ROW_BECAUSE_ITS_M_ROW_LINEAR_IS_A_CUBLAS_TILE: &str =
     "the bf16 Linear routes rows 2..16 through a cuBLAS tile whose reduction differs from \
      gemv_bf16, so the dense grade decodes one row per step unless NV_VOXTRAL_SPEC_ROWS opts \
-     in; the NVFP4 grade drafts pads by default";
+     in; the NVFP4 and Q8_0 grades draft pads by default";
 
 fn cuda_ptr<T: candle_core::cuda_backend::CudaDType + cudarc::driver::DeviceRepr>(
     t: &Tensor,
@@ -155,9 +163,11 @@ fn gather_rows(table: &Tensor, idx_i32_ptr: u64, m: usize, dev: &CudaDevice) -> 
 
 pub fn pad_draft_rows_for(quant: VoxtralQuant) -> Result<usize> {
     let _ = BF16_KEEPS_ONE_ROW_BECAUSE_ITS_M_ROW_LINEAR_IS_A_CUBLAS_TILE;
+    let _ = Q8_0_DRAFTS_FOUR_PADS_BY_THE_LIBRISPEECH_73_CLIP_TRANSCRIPTS;
     let rows = match std::env::var(VOXTRAL_SPEC_ROWS_ENV).ok().as_deref() {
         None | Some("") => match quant {
             VoxtralQuant::Nvfp4 => PAD_DRAFT_ROWS_DEFAULT_FOR_NVFP4,
+            VoxtralQuant::GgmlQ8_0 => PAD_DRAFT_ROWS_DEFAULT_FOR_Q8_0,
             _ => 1,
         },
         Some(v) => v.parse().map_err(|_| {

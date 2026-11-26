@@ -1300,6 +1300,21 @@ __global__ void gemv_e4m3_m1_rows2_per_warp_kernel(
     int K
 ) {
     extern __shared__ float2 xshf[];
+    int lane = threadIdx.x & (kWarpSize - 1);
+    int warp = threadIdx.x / kWarpSize;
+    int n0 = blockIdx.x * (2 * kRowsPerBlock) + warp;
+    int n1 = n0 + kRowsPerBlock;
+    bool has0 = n0 < N;
+    bool has1 = n1 < N;
+    const int4* wa = reinterpret_cast<const int4*>(wq + (size_t)(has0 ? n0 : 0) * K);
+    const int4* wb = reinterpret_cast<const int4*>(wq + (size_t)(has1 ? n1 : 0) * K);
+    int Kv = K / 16;
+    int v = lane;
+    int4 ra = (has0 && v < Kv) ? __ldcs(&wa[v]) : make_int4(0, 0, 0, 0);
+    int4 rb = (has1 && v < Kv) ? __ldcs(&wb[v]) : make_int4(0, 0, 0, 0);
+
+    NVK_PDL_PROLOG();
+
     const int kp = K >> 1;
     float r = kPreNormFoldRoundsToBf16MatchingTheDeadRmsnormKernel ? rstd[0] : 0.0f;
     for (int idx = threadIdx.x; idx < kp; idx += kBlockDim) {
@@ -1317,22 +1332,13 @@ __global__ void gemv_e4m3_m1_rows2_per_warp_kernel(
     }
     __syncthreads();
 
-    int lane = threadIdx.x & (kWarpSize - 1);
-    int warp = threadIdx.x / kWarpSize;
-    int n0 = blockIdx.x * (2 * kRowsPerBlock) + warp;
-    int n1 = n0 + kRowsPerBlock;
-    if (n0 >= N) return;
-    bool has1 = n1 < N;
+    if (!has0) {
+        NVK_PDL_EPILOG();
+        return;
+    }
 
-    const int4* wa = reinterpret_cast<const int4*>(wq + (size_t)n0 * K);
-    const int4* wb = reinterpret_cast<const int4*>(wq + (size_t)n1 * K);
-    int Kv = K / 16;
     float acc0 = 0.0f;
     float acc1 = 0.0f;
-
-    int v = lane;
-    int4 ra = (v < Kv) ? __ldcs(&wa[v]) : make_int4(0, 0, 0, 0);
-    int4 rb = (has1 && v < Kv) ? __ldcs(&wb[v]) : make_int4(0, 0, 0, 0);
     while (v < Kv) {
         int vn = v + kWarpSize;
         int4 na = (vn < Kv) ? __ldcs(&wa[vn]) : make_int4(0, 0, 0, 0);
@@ -1370,6 +1376,7 @@ __global__ void gemv_e4m3_m1_rows2_per_warp_kernel(
         y[n0] = __float2bfloat16(acc0 * __ldg(&row_scale[n0]));
         if (has1) y[n1] = __float2bfloat16(acc1 * __ldg(&row_scale[n1]));
     }
+    NVK_PDL_EPILOG();
 }
 
 template <int TM>
@@ -1443,6 +1450,21 @@ __global__ void gemv_e4m3_mk_xf32_rows2_kernel(
     int K
 ) {
     extern __shared__ float2 xshf[];
+    int lane = threadIdx.x & (kWarpSize - 1);
+    int warp = threadIdx.x / kWarpSize;
+    int n0 = blockIdx.x * (2 * kRowsPerBlock) + warp;
+    int n1 = n0 + kRowsPerBlock;
+    bool has0 = n0 < N;
+    bool has1 = n1 < N;
+    const int4* wa = reinterpret_cast<const int4*>(wq + (size_t)(has0 ? n0 : 0) * K);
+    const int4* wb = reinterpret_cast<const int4*>(wq + (size_t)(has1 ? n1 : 0) * K);
+    int Kv = K / 16;
+    int v = lane;
+    int4 ra = (has0 && v < Kv) ? __ldcs(&wa[v]) : make_int4(0, 0, 0, 0);
+    int4 rb = (has1 && v < Kv) ? __ldcs(&wb[v]) : make_int4(0, 0, 0, 0);
+
+    NVK_PDL_PROLOG();
+
     const int rowpad = (K >> 4) * 9;
     const int kp = K >> 1;
     for (int idx = threadIdx.x; idx < TM * kp; idx += kBlockDim) {
@@ -1455,16 +1477,11 @@ __global__ void gemv_e4m3_mk_xf32_rows2_kernel(
     }
     __syncthreads();
 
-    int lane = threadIdx.x & (kWarpSize - 1);
-    int warp = threadIdx.x / kWarpSize;
-    int n0 = blockIdx.x * (2 * kRowsPerBlock) + warp;
-    int n1 = n0 + kRowsPerBlock;
-    if (n0 >= N) return;
-    bool has1 = n1 < N;
+    if (!has0) {
+        NVK_PDL_EPILOG();
+        return;
+    }
 
-    const int4* wa = reinterpret_cast<const int4*>(wq + (size_t)n0 * K);
-    const int4* wb = reinterpret_cast<const int4*>(wq + (size_t)n1 * K);
-    int Kv = K / 16;
     float acc0[TM];
     float acc1[TM];
     #pragma unroll
@@ -1473,9 +1490,6 @@ __global__ void gemv_e4m3_mk_xf32_rows2_kernel(
         acc1[j] = 0.0f;
     }
 
-    int v = lane;
-    int4 ra = (v < Kv) ? __ldcs(&wa[v]) : make_int4(0, 0, 0, 0);
-    int4 rb = (has1 && v < Kv) ? __ldcs(&wb[v]) : make_int4(0, 0, 0, 0);
     while (v < Kv) {
         int vn = v + kWarpSize;
         int4 na = (vn < Kv) ? __ldcs(&wa[vn]) : make_int4(0, 0, 0, 0);
@@ -1516,6 +1530,7 @@ __global__ void gemv_e4m3_mk_xf32_rows2_kernel(
             if (has1) y[(size_t)j * N + n1] = __float2bfloat16(a1 * rs1);
         }
     }
+    NVK_PDL_EPILOG();
 }
 
 constexpr int kMkRows2MaxTmBeforeAccPlusDualDeqRegsSpill = 6;
@@ -1536,10 +1551,18 @@ static int launch_gemv_e4m3_mk_xf32_rows2(
         optin, (const void*)gemv_e4m3_mk_xf32_rows2_kernel<TM>, smem);
     if (orc != 0) return orc;
     dim3 grid((unsigned)((N + 2 * kRowsPerBlock - 1) / (2 * kRowsPerBlock)));
-    gemv_e4m3_mk_xf32_rows2_kernel<TM><<<grid, dim3(kBlockDim), smem, s>>>(
-        wq, row_scale,
-        reinterpret_cast<const __nv_bfloat16*>(x),
-        reinterpret_cast<__nv_bfloat16*>(y), N, K);
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(cfg, grid, dim3(kBlockDim), smem, s);
+        cudaLaunchKernelEx(&cfg, gemv_e4m3_mk_xf32_rows2_kernel<TM>,
+            wq, row_scale,
+            reinterpret_cast<const __nv_bfloat16*>(x),
+            reinterpret_cast<__nv_bfloat16*>(y), N, K);
+    } else {
+        gemv_e4m3_mk_xf32_rows2_kernel<TM><<<grid, dim3(kBlockDim), smem, s>>>(
+            wq, row_scale,
+            reinterpret_cast<const __nv_bfloat16*>(x),
+            reinterpret_cast<__nv_bfloat16*>(y), N, K);
+    }
     return (int)cudaGetLastError();
 }
 
@@ -1629,11 +1652,20 @@ extern "C" int nv_kernels_gemv_e4m3_mk(
         int orc = raise_dynamic_smem_optin_never_lowering_it(
             optin_r2, (const void*)gemv_e4m3_m1_rows2_per_warp_kernel<false>, smem1);
         if (orc != 0) return orc;
-        gemv_e4m3_m1_rows2_per_warp_kernel<false><<<grid, dim3(kBlockDim), smem1, s>>>(
-            wq, row_scale,
-            reinterpret_cast<const __nv_bfloat16*>(x),
-            nullptr, nullptr,
-            reinterpret_cast<__nv_bfloat16*>(y), N, K);
+        if (nvk_pdl_enabled()) {
+            NVK_PDL_ATTR(cfg, grid, dim3(kBlockDim), smem1, s);
+            cudaLaunchKernelEx(&cfg, gemv_e4m3_m1_rows2_per_warp_kernel<false>,
+                wq, row_scale,
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                nullptr, nullptr,
+                reinterpret_cast<__nv_bfloat16*>(y), N, K);
+        } else {
+            gemv_e4m3_m1_rows2_per_warp_kernel<false><<<grid, dim3(kBlockDim), smem1, s>>>(
+                wq, row_scale,
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                nullptr, nullptr,
+                reinterpret_cast<__nv_bfloat16*>(y), N, K);
+        }
         return (int)cudaGetLastError();
     }
     switch (M) {

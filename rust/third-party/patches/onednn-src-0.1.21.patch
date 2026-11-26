@@ -1,0 +1,10 @@
+--- a/build.rs
++++ b/build.rs
+@@ -18,6 +18,7 @@
+ 
+     let cmake = Config::new("oneDNN")
+         .define("ONEDNN_LIBRARY_TYPE", "STATIC")
++        .define("CMAKE_INSTALL_LIBDIR", "lib")
+         .define("ONEDNN_BUILD_DOC", "OFF")
+         .define("ONEDNN_BUILD_EXAMPLES", "OFF")
+         .define("ONEDNN_BUILD_TESTS", "OFF")

@@ -41,6 +41,7 @@ pub(super) async fn try_eager_dispatch(
         whisper.clone(),
         crate::types::MonoF32At16k::new(audio),
         session.stt_language(),
+        session.final_beam_size(),
     );
     let llm_runner_opt = if session.intent == Intent::Conversation {
         if let Some(llm_cfg) = session.llm_config_for_turn() {

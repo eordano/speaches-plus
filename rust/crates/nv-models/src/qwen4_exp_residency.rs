@@ -15,7 +15,7 @@ pub const NV_Q4EXP_SESSION_SPILL_MAX_AGE_SECS_DEFAULT_28800_A_SPILLED_SESSION_ID
 pub const KV_CACHE_DIR_ENV: &str = "NV_KV_CACHE_DIR";
 pub const SPILL_SUBDIR: &str = "q4exp-sessions";
 const SPILL_PREFIX: &str = "q4kv-";
-const SPILL_FORMAT_VERSION: u32 = 1;
+const SPILL_FORMAT_VERSION: u32 = 2;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 
@@ -246,7 +246,7 @@ impl Qwen4Exp {
         let kv: u64 = Self::attn_slots(st)
             .map(|s| {
                 let row = |t: &Tensor| tensor_bytes(t) / t.dim(0).unwrap_or(1).max(1) as u64;
-                (row(&s.k) + row(&s.v) + row(&s.raw_idx_k)) * pos as u64 + row(&s.cmp_k) * (pos / r) as u64
+                (row(&s.k) + row(&s.v)) * pos as u64 + row(&s.cmp_k) * (pos / r) as u64
             })
             .sum();
         let gdn: u64 = st.gdn.iter().map(|g| tensor_bytes(g.conv_state()) + tensor_bytes(g.recurrent_state())).sum();
@@ -260,7 +260,7 @@ impl Qwen4Exp {
         let place = |t: Tensor| -> Result<Tensor> { Ok(if host { t.to_device(&Device::Cpu)? } else { t }) };
         let mut kv = Vec::new();
         for slot in Self::attn_slots(&s.state) {
-            for (t, n) in [(&slot.k, pos), (&slot.v, pos), (&slot.raw_idx_k, pos), (&slot.cmp_k, pos / r)] {
+            for (t, n) in [(&slot.k, pos), (&slot.v, pos), (&slot.cmp_k, pos / r)] {
                 kv.push(place(deep_copy_rows(t, n)?)?);
             }
         }
@@ -309,7 +309,7 @@ impl Qwen4Exp {
         let mut m = candle_core::safetensors::load(path, &Device::Cpu)?;
         let mut take = |k: &str| m.remove(k).ok_or_else(|| anyhow::anyhow!("spill {} lacks {k}", path.display()));
         let meta = take("meta")?.to_vec1::<u32>()?;
-        let n_kv = 4 * Self::attn_slots(live).count();
+        let n_kv = 3 * Self::attn_slots(live).count();
         let n_gdn = live.gdn.len();
         let want = vec![SPILL_FORMAT_VERSION, e.pos as u32, *spec_k as u32, (tag >> 32) as u32, tag as u32, n_kv as u32, n_gdn as u32];
         ensure!(meta == want, "spill header {meta:?} does not match {want:?}");
@@ -317,11 +317,11 @@ impl Qwen4Exp {
         let r = self.cfg.indexer_compress_ratio;
         let mut kv = Vec::with_capacity(n_kv);
         for (j, slot) in Self::attn_slots(live).enumerate() {
-            for (k, (t, n)) in [(&slot.k, e.pos), (&slot.v, e.pos), (&slot.raw_idx_k, e.pos), (&slot.cmp_k, e.pos / r)].into_iter().enumerate() {
-                let h = take(&format!("kv.{}", 4 * j + k))?;
+            for (k, (t, n)) in [(&slot.k, e.pos), (&slot.v, e.pos), (&slot.cmp_k, e.pos / r)].into_iter().enumerate() {
+                let h = take(&format!("kv.{}", 3 * j + k))?;
                 let mut dims = t.dims().to_vec();
                 dims[0] = n;
-                ensure!(h.dims() == dims.as_slice() && h.dtype() == t.dtype(), "spilled kv.{} has {:?}, expected {dims:?}", 4 * j + k, h.dims());
+                ensure!(h.dims() == dims.as_slice() && h.dtype() == t.dtype(), "spilled kv.{} has {:?}, expected {dims:?}", 3 * j + k, h.dims());
                 kv.push(h.to_device(&self.device)?);
             }
         }
@@ -400,7 +400,7 @@ impl Qwen4Exp {
         METRICS.set_resident(&res.lru);
     }
 
-    pub(super) fn park_working(&self, res: &mut Residency, s: &Qwen4ExpSession) {
+    pub(super) fn park_working(&self, res: &mut Residency, s: &Qwen4ExpSession, device: bool) {
         let Some(i) = res.lru.find_in_place(res.tag) else { return };
         let e = res.lru.remove(i);
         if e.tokens != s.prefix || !s.ckpts.iter().any(|c| c.pos == e.pos) {
@@ -408,7 +408,7 @@ impl Qwen4Exp {
         }
         let bytes = self.parked_bytes(&s.state, e.pos);
         let spec_k = s.spec_k();
-        let device_ok = res.lru.fits_device(bytes) && free_vram().is_some_and(|f| f > bytes + res.cfg.min_free_bytes);
+        let device_ok = device && res.lru.fits_device(bytes) && free_vram().is_some_and(|f| f > bytes + res.cfg.min_free_bytes);
         if device_ok {
             match self.snapshot(s, e.pos, false) {
                 Ok(state) => {
@@ -452,9 +452,9 @@ impl Qwen4Exp {
         sess.prefix.clear();
         sess.ckpts.clear();
         let slots: Vec<&AttnSlot> = Self::attn_slots(&sess.state).collect();
-        ensure!(st.kv.len() == 4 * slots.len(), "parked state has {} kv tensors for {} attention slots", st.kv.len(), slots.len());
-        for (slot, rows) in slots.into_iter().zip(st.kv.chunks(4)) {
-            for (t, h) in [&slot.k, &slot.v, &slot.raw_idx_k, &slot.cmp_k].into_iter().zip(rows) {
+        ensure!(st.kv.len() == 3 * slots.len(), "parked state has {} kv tensors for {} attention slots", st.kv.len(), slots.len());
+        for (slot, rows) in slots.into_iter().zip(st.kv.chunks(3)) {
+            for (t, h) in [&slot.k, &slot.v, &slot.cmp_k].into_iter().zip(rows) {
                 if h.dim(0)? > 0 {
                     t.slice_set(h, 0, 0)?;
                 }
@@ -492,6 +492,46 @@ impl Qwen4Exp {
             .collect();
         cands.sort_by_key(|&(i, r)| (std::cmp::Reverse(r), res.lru.get(i).value.tier()));
         cands.first().map(|&(i, _)| i)
+    }
+
+    pub(super) fn touch_session(&self, slot: usize) {
+        if let Some(Ok(mut t)) = self.last_put.get(slot).map(|m| m.lock()) {
+            *t = Some(std::time::Instant::now());
+        }
+    }
+
+    fn held_slot(&self, slot: usize) -> Option<&std::sync::Mutex<Option<Qwen4ExpSession>>> {
+        if slot == super::ADAPTER_SESSION_IS_HELD_SLOT_2_AGED_AND_RELEASED_BY_THE_COLD_TIER_LIKE_THE_TWO_BASE_SLOTS {
+            Some(&self.adapter_session)
+        } else {
+            self.sessions.get(slot)
+        }
+    }
+
+    pub fn held_session(&self, slot: usize) -> Option<(u64, std::time::Instant)> {
+        let bytes = self.held_slot(slot)?.try_lock().ok()?.as_ref().map(|s| {
+            let ring: u64 = Self::attn_slots(&s.state).map(|a| tensor_bytes(&a.raw_idx_k)).sum();
+            self.parked_bytes(&s.state, s.state.max_len) + ring
+        })?;
+        Some((bytes, (*self.last_put.get(slot)?.lock().ok()?)?))
+    }
+
+    pub fn release_sessions_to_disk(&self, slots: &[usize]) -> bool {
+        let mut held = Vec::new();
+        for &i in slots {
+            let Some(Ok(mut slot)) = self.held_slot(i).map(|m| m.lock()) else { continue };
+            if let (1, Some(w), Ok(mut res)) = (i, slot.as_ref(), self.residency.lock()) {
+                self.park_working(&mut res, w, false);
+            }
+            held.extend(slot.take());
+        }
+        let freed = !held.is_empty();
+        drop(held);
+        if let Ok(stream) = stream_of(&self.device) {
+            let _ = stream.synchronize();
+            nv_kernels::graph::trim_device_graph_mempool_because_graph_destroy_keeps_the_reserved_pages(stream.context().ordinal());
+        }
+        freed
     }
 
     pub(super) fn register_working(&self, res: &mut Residency, s: &Qwen4ExpSession) {

@@ -5,7 +5,7 @@ use half::bf16;
 use nv_kernels::cuda as nvk;
 use nv_layers::attn::{flash_attn, AttnConfig};
 use nv_layers::linear::Linear;
-use nv_layers::linear_attn::{LinAttnState, LinearAttention, LinearAttentionConfig};
+use nv_layers::linear_attn::{BatchedRollbackPlan, LinAttnState, LinearAttention, LinearAttentionConfig};
 use nv_layers::moe_grouped::{
     forward_grouped_device_routing,
     route_topk_and_plan_padded_on_device_for_prefill_dispatch, swizzled_scale_bytes,
@@ -28,6 +28,10 @@ pub const NV_Q4EXP_EAGER_GLUE_1_ROUTES_HC_AND_ROW_ATTENTION_THROUGH_CANDLE_OPS_F
 pub const NV_Q4EXP_PLE_HOST_1_GATHERS_THE_NGRAM_ROWS_ON_THE_CPU_FROM_THE_MMAP_INSTEAD_OF_PINNING_51_GB: &str =
     "NV_Q4EXP_PLE_HOST";
 pub const MOE_FUSED_TAIL_ROWS_MAX_6_MATCHES_THE_E4M3_MK_ROWS2_FAMILY_THE_SHARED_EXPERT_REPRODUCES: usize = 6;
+pub const RAW_IDX_K_RING_CAP_4096_HOLDS_ONE_PREFILL_CHUNK_PLUS_TAIL_SAVING_819_MIB_AT_256K: usize = 4096;
+const ATTN_ROWS_TARGET_CTAS_192_FILLS_A_188_SM_GPU_ACROSS_KV_HEADS_AND_SPLITS: usize = 372;
+const ATTN_ROWS_SPLITS_MIN_16: usize = 16;
+const ATTN_ROWS_SPLITS_MAX_64: usize = 94;
 
 fn uninit<T: candle_core::cuda_backend::CudaDType + cudarc::driver::DeviceRepr>(device: &Device, shape: &[usize]) -> Result<Tensor> {
     let dev = cuda_dev(device)?;
@@ -319,22 +323,36 @@ fn load_linear_side(
     fp8: Option<&Fp8Runner>,
     device: &Device,
 ) -> Result<Linear> {
-    let w = load_bf16(weights, name)?;
-    ensure!(
-        w.dims() == [out, inp],
-        "{name}: expected [{out}, {inp}], got {:?}",
-        w.dims()
-    );
     match fp8 {
         Some(runner) if inp.is_multiple_of(16) && out > 1 => {
-            let host: Vec<bf16> = w.flatten_all()?.to_vec1()?;
-            let (bytes, rows) = nv_layers::linear::fp8_weight_payload(
-                &host,
-                out,
-                inp,
-                None,
-                nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
-            )?;
+            let direct_bf16 = (weights.dtype_of(name) == Some(DType::BF16))
+                .then(|| weights.raw_bytes(name).ok())
+                .flatten();
+            let (bytes, rows) = if let Some(raw) = direct_bf16 {
+                let shape = weights
+                    .shape_of(name)
+                    .ok_or_else(|| anyhow::anyhow!("missing {name}"))?;
+                ensure!(
+                    shape == [out, inp],
+                    "{name}: expected [{out}, {inp}], got {shape:?}"
+                );
+                nv_quant::fp8::quantize_e4m3_per_row_from_bf16_le_bytes(raw, out, inp)?
+            } else {
+                let w = load_bf16(weights, name)?;
+                ensure!(
+                    w.dims() == [out, inp],
+                    "{name}: expected [{out}, {inp}], got {:?}",
+                    w.dims()
+                );
+                let host: Vec<bf16> = w.flatten_all()?.to_vec1()?;
+                nv_layers::linear::fp8_weight_payload(
+                    &host,
+                    out,
+                    inp,
+                    None,
+                    nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
+                )?
+            };
             let stream = stream_of(device)?;
             let weight_u8 = stream.clone_htod(&bytes)?;
             Linear::new_fp8_e4m3_row_scales_without_the_cublaslt_probe(
@@ -348,7 +366,15 @@ fn load_linear_side(
                 nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
             )
         }
-        _ => Linear::new_no_pretranspose(w.contiguous()?, None),
+        _ => {
+            let w = load_bf16(weights, name)?;
+            ensure!(
+                w.dims() == [out, inp],
+                "{name}: expected [{out}, {inp}], got {:?}",
+                w.dims()
+            );
+            Linear::new_no_pretranspose(w.contiguous()?, None)
+        }
     }
 }
 
@@ -419,12 +445,27 @@ impl HcGate {
         }
     }
 
-    fn load(weights: &WeightLoader, prefix: &str, cfg: &Qwen4ExpConfig, with_inject: bool) -> Result<Self> {
+    fn load(
+        weights: &WeightLoader,
+        prefix: &str,
+        cfg: &Qwen4ExpConfig,
+        with_inject: bool,
+        fp8: Option<&Fp8Runner>,
+        device: &Device,
+    ) -> Result<Self> {
         let hh = cfg.hc_hidden();
+        let hc_fp8 = fp8.filter(|_| std::env::var("NV_Q4EXP_HC_BF16").as_deref() != Ok("1"));
+        let down = load_linear_side(weights, &format!("{prefix}.input_mix_weight_down.weight"), cfg.hc_lowrank, hh, hc_fp8, device)?;
+        let up = load_linear_side(weights, &format!("{prefix}.input_mix_weight_up.weight"), hh, cfg.hc_lowrank, hc_fp8, device)?;
+        if std::env::var("NV_Q4EXP_HC_W4A8").as_deref() == Ok("1") {
+            let stream = stream_of(device)?;
+            let _ = down.build_nvfp4_fast_twin(&stream)?;
+            let _ = up.build_nvfp4_fast_twin(&stream)?;
+        }
         Ok(Self {
             norm_w: load_norm_plus_one_f32(weights, &format!("{prefix}.hc_norm.weight"), hh)?,
-            down: load_linear_bf16(weights, &format!("{prefix}.input_mix_weight_down.weight"), cfg.hc_lowrank, hh)?,
-            up: load_linear_bf16(weights, &format!("{prefix}.input_mix_weight_up.weight"), hh, cfg.hc_lowrank)?,
+            down,
+            up,
             inject: if with_inject {
                 Some(load_linear_bf16(weights, &format!("{prefix}.block_inject_weight.weight"), cfg.hc_count, hh)?)
             } else {
@@ -584,15 +625,100 @@ impl HcGate {
             let (mixed, inject) = self.mix_prefill_after_norm(&xn, cfg)?;
             return Ok((hc_new, mixed, inject));
         }
-        let lora = uninit::<f32>(device, &[t, rank])?;
-        let inject = uninit::<f32>(device, &[t, n])?;
-        let mixed = uninit::<bf16>(device, &[t, h])?;
-        let w_down = self.down.weight().context("hc down weight not bf16-resident")?;
-        let w_up = self.up.weight().context("hc up weight not bf16-resident")?;
         let w_inject = match &self.inject {
             Some(l) => cuda_ptr::<bf16>(l.weight().context("hc inject weight not bf16-resident")?, &stream)?,
             None => 0,
         };
+        if t <= FUSED_GLUE_ROWS_MAX_8_THE_HC_AND_ATTENTION_ROW_KERNELS_ARE_SIZED_FOR_DECODE_AND_VERIFY_ROWS {
+            if rank == 320 && n == 4 {
+                if let (Some(td), Some(tu)) = (self.down.nvfp4_fast_twin(), self.up.nvfp4_fast_twin()) {
+                    let lora = uninit::<f32>(device, &[t, rank])?;
+                    let inject = uninit::<f32>(device, &[t, n])?;
+                    let mixed = uninit::<bf16>(device, &[t, h])?;
+                    let rc = unsafe {
+                        nvk::q4exp_hc_down_nvfp4(
+                            stream.cu_stream() as *mut c_void,
+                            cuda_ptr::<bf16>(&xn, &stream)? as *const u16,
+                            slice_ptr(&td.wq, &stream) as *const u8,
+                            slice_ptr(&td.scales, &stream) as *const u8,
+                            td.alpha_over_2g,
+                            w_inject as *const u16,
+                            cuda_ptr::<f32>(&lora, &stream)? as *mut f32,
+                            cuda_ptr::<f32>(&inject, &stream)? as *mut f32,
+                            t as i32,
+                            hh as i32,
+                            n as i32,
+                            rank as i32,
+                        )
+                    };
+                    ensure!(rc == 0, "q4exp_hc_down_nvfp4 rc={rc}");
+                    let rc = unsafe {
+                        nvk::q4exp_hc_up_mix_nvfp4(
+                            stream.cu_stream() as *mut c_void,
+                            cuda_ptr::<f32>(&lora, &stream)? as *const f32,
+                            slice_ptr(&tu.wq, &stream) as *const u8,
+                            slice_ptr(&tu.scales, &stream) as *const u8,
+                            tu.alpha_over_2g,
+                            cuda_ptr::<bf16>(&xn, &stream)? as *const u16,
+                            cuda_ptr::<bf16>(&mixed, &stream)? as *mut u16,
+                            t as i32,
+                            h as i32,
+                            n as i32,
+                            rank as i32,
+                        )
+                    };
+                    ensure!(rc == 0, "q4exp_hc_up_mix_nvfp4 rc={rc}");
+                    return Ok((hc_new, mixed, self.inject.as_ref().map(|_| inject)));
+                }
+            }
+            if let (Some((wd, rsd)), Some((wu, rsu))) = (
+                self.down.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+                self.up.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+            ) {
+                let lora = uninit::<f32>(device, &[t, rank])?;
+                let inject = uninit::<f32>(device, &[t, n])?;
+                let mixed = uninit::<bf16>(device, &[t, h])?;
+                let rc = unsafe {
+                    nvk::q4exp_hc_down_fp8(
+                        stream.cu_stream() as *mut c_void,
+                        cuda_ptr::<bf16>(&xn, &stream)? as *const u16,
+                        slice_ptr(wd, &stream) as *const u8,
+                        slice_ptr(rsd, &stream) as *const f32,
+                        w_inject as *const u16,
+                        cuda_ptr::<f32>(&lora, &stream)? as *mut f32,
+                        cuda_ptr::<f32>(&inject, &stream)? as *mut f32,
+                        t as i32,
+                        hh as i32,
+                        n as i32,
+                        rank as i32,
+                    )
+                };
+                ensure!(rc == 0, "q4exp_hc_down_fp8 rc={rc}");
+                let rc = unsafe {
+                    nvk::q4exp_hc_up_mix_fp8(
+                        stream.cu_stream() as *mut c_void,
+                        cuda_ptr::<f32>(&lora, &stream)? as *const f32,
+                        slice_ptr(wu, &stream) as *const u8,
+                        slice_ptr(rsu, &stream) as *const f32,
+                        cuda_ptr::<bf16>(&xn, &stream)? as *const u16,
+                        cuda_ptr::<bf16>(&mixed, &stream)? as *mut u16,
+                        t as i32,
+                        h as i32,
+                        n as i32,
+                        rank as i32,
+                    )
+                };
+                ensure!(rc == 0, "q4exp_hc_up_mix_fp8 rc={rc}");
+                return Ok((hc_new, mixed, self.inject.as_ref().map(|_| inject)));
+            }
+        }
+        let (Some(w_down), Some(w_up)) = (self.down.weight(), self.up.weight()) else {
+            let (mixed, inject) = self.mix_prefill_after_norm(&xn, cfg)?;
+            return Ok((hc_new, mixed, inject));
+        };
+        let lora = uninit::<f32>(device, &[t, rank])?;
+        let inject = uninit::<f32>(device, &[t, n])?;
+        let mixed = uninit::<bf16>(device, &[t, h])?;
         let rc = unsafe {
             nvk::q4exp_hc_down(
                 stream.cu_stream() as *mut c_void,
@@ -626,57 +752,8 @@ impl HcGate {
     }
 
     pub fn mix_fused(&self, hc: &Tensor, cfg: &Qwen4ExpConfig) -> Result<(Tensor, Option<Tensor>)> {
-        let (t, hh) = hc.dims2()?;
-        let n = cfg.hc_count;
-        let h = cfg.hidden_size;
-        let rank = cfg.hc_lowrank;
-        let dev = cuda_dev(hc.device())?;
-        let stream = stream_of(hc.device())?;
-        let hc = hc.contiguous()?;
-        let xn = Tensor::zeros((t, hh), DType::BF16, hc.device())?;
-        let lora = Tensor::zeros((t, rank), DType::F32, hc.device())?;
-        let inject = Tensor::zeros((t, n), DType::F32, hc.device())?;
-        let mixed = Tensor::zeros((t, h), DType::BF16, hc.device())?;
-        let w_down = self.down.weight().context("hc down weight not bf16-resident")?;
-        let w_up = self.up.weight().context("hc up weight not bf16-resident")?;
-        let w_inject = match &self.inject {
-            Some(l) => cuda_ptr::<bf16>(l.weight().context("hc inject weight not bf16-resident")?, &stream)?,
-            None => 0,
-        };
-        let rc = unsafe {
-            nvk::q4exp_hc_norm_down(
-                stream.cu_stream() as *mut c_void,
-                cuda_ptr::<bf16>(&hc, &stream)? as *const u16,
-                cuda_ptr::<f32>(&self.norm_w, &stream)? as *const f32,
-                cuda_ptr::<bf16>(w_down, &stream)? as *const u16,
-                w_inject as *const u16,
-                cuda_ptr::<bf16>(&xn, &stream)? as *mut u16,
-                cuda_ptr::<f32>(&lora, &stream)? as *mut f32,
-                cuda_ptr::<f32>(&inject, &stream)? as *mut f32,
-                t as i32,
-                hh as i32,
-                n as i32,
-                rank as i32,
-                cfg.rms_norm_eps as f32,
-            )
-        };
-        ensure!(rc == 0, "q4exp_hc_norm_down rc={rc}");
-        let rc = unsafe {
-            nvk::q4exp_hc_up_mix(
-                stream.cu_stream() as *mut c_void,
-                cuda_ptr::<f32>(&lora, &stream)? as *const f32,
-                cuda_ptr::<bf16>(w_up, &stream)? as *const u16,
-                cuda_ptr::<bf16>(&xn, &stream)? as *const u16,
-                cuda_ptr::<bf16>(&mixed, &stream)? as *mut u16,
-                t as i32,
-                h as i32,
-                n as i32,
-                rank as i32,
-            )
-        };
-        ensure!(rc == 0, "q4exp_hc_up_mix rc={rc}");
-        let _ = dev;
-        Ok((mixed, self.inject.as_ref().map(|_| inject)))
+        let (_, mixed, inject) = self.mix_combined(hc, None, cfg)?;
+        Ok((mixed, inject))
     }
 }
 
@@ -752,14 +829,27 @@ impl Attention {
         let nq = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
         let idx_out = (cfg.indexer_n_heads + cfg.indexer_kv_heads) * cfg.indexer_head_dim;
+        let q_proj = load_linear_side(weights, &format!("{prefix}.q_proj.weight"), nq * hd * 2, h, fp8, device)?;
+        let k_proj = load_linear_side(weights, &format!("{prefix}.k_proj.weight"), nkv * hd, h, fp8, device)?;
+        let v_proj = load_linear_side(weights, &format!("{prefix}.v_proj.weight"), nkv * hd, h, fp8, device)?;
+        let o_proj = load_linear_side(weights, &format!("{prefix}.o_proj.weight"), h, nq * hd, fp8, device)?;
+        let idx_qk_proj = load_linear_side(weights, &format!("{prefix}.indexer.index_qk_proj.weight"), idx_out, h, fp8, device)?;
+        if std::env::var("NV_Q4EXP_QSA_W4A8").as_deref() == Ok("1") {
+            let stream = stream_of(device)?;
+            let _ = q_proj.build_nvfp4_fast_twin(&stream)?;
+            let _ = k_proj.build_nvfp4_fast_twin(&stream)?;
+            let _ = v_proj.build_nvfp4_fast_twin(&stream)?;
+            let _ = o_proj.build_nvfp4_fast_twin(&stream)?;
+            let _ = idx_qk_proj.build_nvfp4_fast_twin(&stream)?;
+        }
         Ok(Self {
-            q_proj: load_linear_side(weights, &format!("{prefix}.q_proj.weight"), nq * hd * 2, h, fp8, device)?,
-            k_proj: load_linear_side(weights, &format!("{prefix}.k_proj.weight"), nkv * hd, h, fp8, device)?,
-            v_proj: load_linear_side(weights, &format!("{prefix}.v_proj.weight"), nkv * hd, h, fp8, device)?,
-            o_proj: load_linear_side(weights, &format!("{prefix}.o_proj.weight"), h, nq * hd, fp8, device)?,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
             q_norm_w: load_norm_plus_one_f32(weights, &format!("{prefix}.q_norm.weight"), hd)?,
             k_norm_w: load_norm_plus_one_f32(weights, &format!("{prefix}.k_norm.weight"), hd)?,
-            idx_qk_proj: load_linear_side(weights, &format!("{prefix}.indexer.index_qk_proj.weight"), idx_out, h, fp8, device)?,
+            idx_qk_proj,
             idx_q_norm_w: load_norm_plus_one_f32(weights, &format!("{prefix}.indexer.q_layernorm.weight"), cfg.indexer_head_dim)?,
             idx_k_norm_w: load_norm_plus_one_f32(weights, &format!("{prefix}.indexer.k_layernorm.weight"), cfg.indexer_head_dim)?,
         })
@@ -903,7 +993,7 @@ fn assemble_grouped(
     stream: &Arc<CudaStream>,
 ) -> Result<MoeGroupedWeights> {
     let GroupedParts { gate_w, gate_s, gate_alpha, up_w, up_s, up_alpha, down_w, down_s, down_alpha, gu_global, dn_global } = p;
-    let built = MoeGroupedWeights {
+    let mut built = MoeGroupedWeights {
         num_experts: e,
         hidden_size: h,
         intermediate_size: inter,
@@ -929,7 +1019,9 @@ fn assemble_grouped(
         input_globals_gate_up_host: gu_global,
         input_globals_down_host: dn_global,
         marlin_moe_twin_built_once_from_the_resident_grouped_buffers: std::sync::OnceLock::new(),
+        linear_decode_scales: None,
     };
+    let _ = built.build_linear_decode_scales(stream, 12 * 1024 * 1024 * 1024)?;
     stream.synchronize()?;
     Ok(built)
 }
@@ -1065,12 +1157,19 @@ impl MoeLayer {
     ) -> Result<Self> {
         let h = cfg.hidden_size;
         let si = cfg.shared_expert_intermediate_size;
+        let shared_gate_proj = load_linear_side(weights, &format!("{prefix}.shared_expert.gate_proj.weight"), si, h, fp8, device)?;
+        let shared_up_proj = load_linear_side(weights, &format!("{prefix}.shared_expert.up_proj.weight"), si, h, fp8, device)?;
+        let shared_down_proj = load_linear_side(weights, &format!("{prefix}.shared_expert.down_proj.weight"), h, si, fp8, device)?;
+        if std::env::var("NV_Q4EXP_SHARED_W4A8").as_deref() == Ok("1") {
+            let stream = stream_of(device)?;
+            let _ = shared_down_proj.build_nvfp4_fast_twin(&stream)?;
+        }
         Ok(Self {
             router: load_linear_bf16(weights, &format!("{prefix}.gate.weight"), cfg.num_experts, h)?,
             grouped: Arc::new(grouped),
-            shared_gate_proj: load_linear_side(weights, &format!("{prefix}.shared_expert.gate_proj.weight"), si, h, fp8, device)?,
-            shared_up_proj: load_linear_side(weights, &format!("{prefix}.shared_expert.up_proj.weight"), si, h, fp8, device)?,
-            shared_down_proj: load_linear_side(weights, &format!("{prefix}.shared_expert.down_proj.weight"), h, si, fp8, device)?,
+            shared_gate_proj,
+            shared_up_proj,
+            shared_down_proj,
             shared_expert_gate: load_linear_bf16(weights, &format!("{prefix}.shared_expert_gate.weight"), 1, h)?,
             expert_lora: std::sync::RwLock::new(None),
         })
@@ -1128,24 +1227,46 @@ impl MoeLayer {
         let act = uninit::<bf16>(&device, &[t, si])?;
         let fork = stream.record_event(None).map_err(|e| anyhow::anyhow!("moe shared-expert fork event: {e:?}"))?;
         aux.wait(&fork).map_err(|e| anyhow::anyhow!("moe shared-expert fork wait: {e:?}"))?;
-        let rc = unsafe {
-            nvk::q4exp_fp8_gateup_silu(
-                aux.cu_stream() as *mut c_void,
-                slice_ptr(gw, aux) as *const u8,
-                slice_ptr(gs, aux) as *const f32,
-                slice_ptr(uw, aux) as *const u8,
-                slice_ptr(us, aux) as *const f32,
-                xp as *const u16,
-                cuda_ptr::<bf16>(&act, aux)? as *mut u16,
-                t as i32,
-                si as i32,
-                h as i32,
-            )
+        let rc = if let (Some(gt), Some(ut)) = (self.shared_gate_proj.nvfp4_fast_twin(), self.shared_up_proj.nvfp4_fast_twin()) {
+            unsafe {
+                nvk::q4exp_nvfp4_gateup_silu(
+                    aux.cu_stream() as *mut c_void,
+                    slice_ptr(&gt.wq, aux) as *const u8,
+                    slice_ptr(&gt.scales, aux) as *const u8,
+                    gt.alpha_over_2g,
+                    slice_ptr(&ut.wq, aux) as *const u8,
+                    slice_ptr(&ut.scales, aux) as *const u8,
+                    ut.alpha_over_2g,
+                    xp as *const u16,
+                    cuda_ptr::<bf16>(&act, aux)? as *mut u16,
+                    t as i32,
+                    si as i32,
+                    h as i32,
+                )
+            }
+        } else {
+            unsafe {
+                nvk::q4exp_fp8_gateup_silu(
+                    aux.cu_stream() as *mut c_void,
+                    slice_ptr(gw, aux) as *const u8,
+                    slice_ptr(gs, aux) as *const f32,
+                    slice_ptr(uw, aux) as *const u8,
+                    slice_ptr(us, aux) as *const f32,
+                    xp as *const u16,
+                    cuda_ptr::<bf16>(&act, aux)? as *mut u16,
+                    t as i32,
+                    si as i32,
+                    h as i32,
+                )
+            }
         };
-        ensure!(rc == 0, "q4exp_fp8_gateup_silu rc={rc}");
+        ensure!(rc == 0, "q4exp_gateup_silu rc={rc}");
         let join = aux.record_event(None).map_err(|e| anyhow::anyhow!("moe shared-expert join event: {e:?}"))?;
         let sg_rows_from_the_multi_row_gemm_kept_alive_until_the_tail_reads_them: Option<Tensor>;
-        let sg_ptr = if t == 1 {
+        let sg_ptr = if t <= nv_layers::moe_grouped::ROUTE_FUSE_ONE_CTA_PER_TOKEN_HOLDS_TO_8_VERIFY_ROWS
+            && h <= 4096
+            && h.is_multiple_of(8)
+        {
             let router_w = cuda_ptr::<bf16>(self.router.weight().context("router weight not bf16")?, &stream)?;
             let sg_w = cuda_ptr::<bf16>(self.shared_expert_gate.weight().context("shared gate weight not bf16")?, &stream)?;
             ctx.fused_router_gemv_sg_and_x_stage_replacing_gate_gemm_cast_and_dtod(&stream, xp, router_w, Some(sg_w))?;
@@ -1165,24 +1286,45 @@ impl MoeLayer {
         nv_layers::moe_grouped::forward_grouped_decode_into(&self.grouped, &mut ctx, 0, 0, 0.0, true, 1.0, false, &stream, None, None)?;
         stream.wait(&join).map_err(|e| anyhow::anyhow!("moe shared-expert join wait: {e:?}"))?;
         let out = uninit::<bf16>(&device, &[t, h])?;
-        let rc = unsafe {
-            nvk::q4exp_fp8_down_tail(
-                stream.cu_stream() as *mut c_void,
-                slice_ptr(dw, &stream) as *const u8,
-                slice_ptr(ds, &stream) as *const f32,
-                cuda_ptr::<bf16>(&act, &stream)? as *const u16,
-                slice_ptr(&ctx.y_down, &stream) as *const u16,
-                (nv_quant::nvfp4::MIN_TILE * h) as i64,
-                slice_ptr(&ctx.topk_weights, &stream) as *const f32,
-                k as i32,
-                sg_ptr as *const u16,
-                cuda_ptr::<bf16>(&out, &stream)? as *mut u16,
-                t as i32,
-                h as i32,
-                si as i32,
-            )
+        let rc = if let Some(td) = self.shared_down_proj.nvfp4_fast_twin() {
+            unsafe {
+                nvk::q4exp_nvfp4_down_tail(
+                    stream.cu_stream() as *mut c_void,
+                    slice_ptr(&td.wq, &stream) as *const u8,
+                    slice_ptr(&td.scales, &stream) as *const u8,
+                    td.alpha_over_2g,
+                    cuda_ptr::<bf16>(&act, &stream)? as *const u16,
+                    slice_ptr(&ctx.y_down, &stream) as *const u16,
+                    (nv_quant::nvfp4::MIN_TILE * h) as i64,
+                    slice_ptr(&ctx.topk_weights, &stream) as *const f32,
+                    k as i32,
+                    sg_ptr as *const u16,
+                    cuda_ptr::<bf16>(&out, &stream)? as *mut u16,
+                    t as i32,
+                    h as i32,
+                    si as i32,
+                )
+            }
+        } else {
+            unsafe {
+                nvk::q4exp_fp8_down_tail(
+                    stream.cu_stream() as *mut c_void,
+                    slice_ptr(dw, &stream) as *const u8,
+                    slice_ptr(ds, &stream) as *const f32,
+                    cuda_ptr::<bf16>(&act, &stream)? as *const u16,
+                    slice_ptr(&ctx.y_down, &stream) as *const u16,
+                    (nv_quant::nvfp4::MIN_TILE * h) as i64,
+                    slice_ptr(&ctx.topk_weights, &stream) as *const f32,
+                    k as i32,
+                    sg_ptr as *const u16,
+                    cuda_ptr::<bf16>(&out, &stream)? as *mut u16,
+                    t as i32,
+                    h as i32,
+                    si as i32,
+                )
+            }
         };
-        ensure!(rc == 0, "q4exp_fp8_down_tail rc={rc}");
+        ensure!(rc == 0, "q4exp_down_tail rc={rc}");
         drop(sg_rows_from_the_multi_row_gemm_kept_alive_until_the_tail_reads_them);
         Ok(out)
     }
@@ -1260,18 +1402,60 @@ impl MoeLayer {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SendPtr(*mut u8);
+
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
+impl SendPtr {
+    unsafe fn copy_from_slice_at(self, offset: usize, src: &[u8]) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), self.0.add(offset), src.len());
+        }
+    }
+}
+
+const PINNED_COPY_PARALLEL_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+const PINNED_COPY_MAX_THREADS: usize = 32;
+
 pub struct PinnedTable {
     ptr: *mut c_void,
     bytes: usize,
 }
 
 impl PinnedTable {
-    fn from_bytes(src: &[u8], what: &str) -> Result<Self> {
-        let bytes = src.len();
+    fn alloc(bytes: usize, what: &str) -> Result<Self> {
         let ptr = unsafe { cudarc::driver::result::malloc_host(bytes, 0) }
             .map_err(|e| anyhow::anyhow!("cuMemHostAlloc {bytes} bytes for {what}: {e:?}"))?;
-        unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, bytes) }.copy_from_slice(src);
         Ok(Self { ptr, bytes })
+    }
+
+    fn from_bytes(src: &[u8], what: &str) -> Result<Self> {
+        let bytes = src.len();
+        let table = Self::alloc(bytes, what)?;
+        if bytes == 0 {
+            return Ok(table);
+        }
+        let base = SendPtr(table.ptr as *mut u8);
+        if bytes < PINNED_COPY_PARALLEL_THRESHOLD_BYTES {
+            unsafe { base.copy_from_slice_at(0, src) };
+            return Ok(table);
+        }
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+            .clamp(1, PINNED_COPY_MAX_THREADS);
+        let chunk = bytes.div_ceil(threads);
+        std::thread::scope(|sc| {
+            for (ti, part) in src.chunks(chunk).enumerate() {
+                let off = ti * chunk;
+                sc.spawn(move || {
+                    unsafe { base.copy_from_slice_at(off, part) };
+                });
+            }
+        });
+        Ok(table)
     }
 
     fn device_ptr(&self) -> u64 {
@@ -1472,22 +1656,54 @@ impl PleLayer {
             None
         } else {
             let t0 = std::time::Instant::now();
-            let bytes = shard_names.len() * rows_per_shard * row_bytes;
-            let ptr = unsafe { cudarc::driver::result::malloc_host(bytes, 0) }
-                .map_err(|e| anyhow::anyhow!("cuMemHostAlloc {bytes} bytes for the PLE table: {e:?}"))?;
-            let dst = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, bytes) };
             let per = rows_per_shard * row_bytes;
-            for (s, name) in shard_names.iter().enumerate() {
-                let src = weights.raw_bytes(name)?;
-                ensure!(src.len() == per, "{name}: {} bytes, expected {per}", src.len());
-                dst[s * per..(s + 1) * per].copy_from_slice(src);
+            let bytes = shard_names.len() * per;
+            let table = PinnedTable::alloc(bytes, "the PLE table")?;
+            if !shard_names.is_empty() && per > 0 {
+                let threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+                    .clamp(1, PINNED_COPY_MAX_THREADS)
+                    .min(shard_names.len());
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let base = SendPtr(table.ptr as *mut u8);
+                let shard_names_ref = &shard_names;
+                std::thread::scope(|sc| -> Result<()> {
+                    let handles: Vec<_> = (0..threads)
+                        .map(|_| {
+                            let next = &next;
+                            sc.spawn(move || -> Result<()> {
+                                loop {
+                                    let s = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if s >= shard_names_ref.len() {
+                                        break;
+                                    }
+                                    let name = &shard_names_ref[s];
+                                    let src = weights.raw_bytes(name)?;
+                                    ensure!(
+                                        src.len() == per,
+                                        "{name}: {} bytes, expected {per}",
+                                        src.len()
+                                    );
+                                    unsafe { base.copy_from_slice_at(s * per, src) };
+                                }
+                                Ok(())
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        h.join()
+                            .map_err(|_| anyhow::anyhow!("PLE pinned table copy thread panicked"))??;
+                    }
+                    Ok(())
+                })?;
             }
             eprintln!(
                 "[qwen4_exp] PLE table pinned in host memory: {:.1} GiB in {:.1}s",
                 bytes as f64 / (1u64 << 30) as f64,
                 t0.elapsed().as_secs_f64()
             );
-            Some(PinnedTable { ptr, bytes })
+            Some(table)
         };
         let multipliers_dev = stream.clone_htod(&multipliers)?;
         let vocab_sizes_dev = stream.clone_htod(&vocab_sizes)?;
@@ -1521,16 +1737,17 @@ impl PleLayer {
         &self,
         weights: &WeightLoader,
         cfg: &Qwen4ExpConfig,
-        tokens: &[u32],
+        tokens: Option<&[u32]>,
         history_host: &[u32],
-        tokens_dev: &CudaSlice<u32>,
+        tokens_ptr: u64,
+        t: usize,
         history_dev: &CudaSlice<u32>,
         device: &Device,
     ) -> Result<Tensor> {
         let heads = cfg.ngram_heads();
         let hd = self.row_bytes;
-        let t = tokens.len();
         let Some(table) = &self.table else {
+            let tokens = tokens.context("NV_Q4EXP_PLE_HOST=1 requires host tokens")?;
             let ids = self.ngram_ids_host(cfg, history_host, tokens);
             let mut host = vec![bf16::ZERO; t * heads * hd];
             for (i, &id) in ids.iter().enumerate() {
@@ -1549,7 +1766,7 @@ impl PleLayer {
         let rc = unsafe {
             nvk::q4exp_ngram_ids(
                 stream.cu_stream() as *mut c_void,
-                slice_ptr(tokens_dev, &stream) as *const u32,
+                tokens_ptr as *const u32,
                 slice_ptr(history_dev, &stream) as *const u32,
                 slice_ptr(&self.multipliers_dev, &stream) as *const i64,
                 slice_ptr(&self.vocab_sizes_dev, &stream) as *const i64,
@@ -1712,6 +1929,124 @@ fn mtp_on() -> bool {
     std::env::var(NV_Q4EXP_MTP_DEFAULT_ON_0_SKIPS_THE_DRAFT_HEAD).as_deref() != Ok("0")
 }
 
+struct DraftLmHeadNvfp4 {
+    wq: CudaSlice<u8>,
+    scales: CudaSlice<u8>,
+    w_sign: Option<CudaSlice<u32>>,
+    row_scale: Option<CudaSlice<f32>>,
+    vocab: usize,
+    hidden: usize,
+}
+
+impl DraftLmHeadNvfp4 {
+    fn load(weights: &WeightLoader, vocab: usize, hidden: usize, stream: &Arc<CudaStream>) -> Result<Option<Self>> {
+        if std::env::var("NV_Q4EXP_DRAFT_LM_FP8").as_deref() == Ok("1") || !hidden.is_multiple_of(16) {
+            return Ok(None);
+        }
+        if weights.dtype_of("lm_head.weight") != Some(DType::BF16) {
+            return Ok(None);
+        }
+        let Ok(raw) = weights.raw_bytes("lm_head.weight") else {
+            return Ok(None);
+        };
+        if raw.len() != vocab * hidden * 2 {
+            return Ok(None);
+        }
+        let t0 = std::time::Instant::now();
+        let half_k = hidden / 2;
+        let kb_total = hidden / 16;
+        let build_sign = hidden == 2560
+            && vocab >= 4096
+            && (std::env::var("NV_Q4EXP_DRAFT_LM_SCREEN").as_deref() == Ok("1")
+                || std::env::var("NV_Q4EXP_VERIFY_LM_SCREEN").as_deref() == Ok("1"));
+        let sign_words = if build_sign { hidden / 32 } else { 0 };
+        let mut wq_host = vec![0u8; vocab * half_k];
+        let mut sc_host = vec![0u8; vocab * kb_total];
+        let mut w_sign_host = vec![0u32; vocab * sign_words];
+        let mut row_scale_host = vec![0f32; if build_sign { vocab } else { 0 }];
+        const STORED_GLOBAL: f32 = 64.0;
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).min(32).min(vocab.max(1));
+        let rows_per = vocab.div_ceil(threads);
+        std::thread::scope(|s| {
+            let mut wq_rem = wq_host.as_mut_slice();
+            let mut sc_rem = sc_host.as_mut_slice();
+            let mut ws_rem = w_sign_host.as_mut_slice();
+            let mut rs_rem = row_scale_host.as_mut_slice();
+            for t in 0..threads {
+                let r0 = t * rows_per;
+                if r0 >= vocab {
+                    break;
+                }
+                let r1 = (r0 + rows_per).min(vocab);
+                let count = r1 - r0;
+                let (wq_chunk, wq_rest) = wq_rem.split_at_mut(count * half_k);
+                let (sc_chunk, sc_rest) = sc_rem.split_at_mut(count * kb_total);
+                let (ws_chunk, ws_rest) = ws_rem.split_at_mut(count * sign_words);
+                let (rs_chunk, rs_rest) = rs_rem.split_at_mut(if build_sign { count } else { 0 });
+                wq_rem = wq_rest;
+                sc_rem = sc_rest;
+                ws_rem = ws_rest;
+                rs_rem = rs_rest;
+                s.spawn(move || {
+                    let mut block_vals = [0f32; 16];
+                    for local_r in 0..count {
+                        let r = r0 + local_r;
+                        let row_off = r * hidden * 2;
+                        let wq_row = &mut wq_chunk[local_r * half_k..(local_r + 1) * half_k];
+                        let sc_row = &mut sc_chunk[local_r * kb_total..(local_r + 1) * kb_total];
+                        let mut abs_sum = 0.0f32;
+                        for kb in 0..kb_total {
+                            let b_off = row_off + kb * 32;
+                            let mut bits16 = 0u32;
+                            for j in 0..16 {
+                                let o = b_off + 2 * j;
+                                let v = bf16::from_bits(u16::from_le_bytes([raw[o], raw[o + 1]])).to_f32();
+                                block_vals[j] = v;
+                                if build_sign {
+                                    abs_sum += v.abs();
+                                    if v >= 0.0 {
+                                        bits16 |= 1u32 << j;
+                                    }
+                                }
+                            }
+                            if build_sign {
+                                let w_idx = local_r * sign_words + (kb >> 1);
+                                if (kb & 1) == 0 {
+                                    ws_chunk[w_idx] = bits16;
+                                } else {
+                                    ws_chunk[w_idx] |= bits16 << 16;
+                                }
+                            }
+                            let (packed, sb) = nv_quant::nvfp4::quantize_block_with_global(&block_vals, STORED_GLOBAL);
+                            wq_row[kb * 8..kb * 8 + 8].copy_from_slice(&packed);
+                            sc_row[kb] = sb;
+                        }
+                        if build_sign {
+                            rs_chunk[local_r] = abs_sum / (hidden as f32);
+                        }
+                    }
+                });
+            }
+        });
+        let wq = stream.clone_htod(&wq_host)?;
+        let scales = stream.clone_htod(&sc_host)?;
+        let (w_sign, row_scale) = if build_sign {
+            (Some(stream.clone_htod(&w_sign_host)?), Some(stream.clone_htod(&row_scale_host)?))
+        } else {
+            (None, None)
+        };
+        let extra_mib = (w_sign_host.len() * 4 + row_scale_host.len() * 4) as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "[qwen4_exp] draft nvfp4 lm_head quantized in {:.2}s ({:.1} MiB, sign {:.1} MiB), device {:.2} GiB used",
+            t0.elapsed().as_secs_f64(),
+            (wq_host.len() + sc_host.len()) as f64 / (1024.0 * 1024.0),
+            extra_mib,
+            vram_used_gib()
+        );
+        Ok(Some(Self { wq, scales, w_sign, row_scale, vocab, hidden }))
+    }
+}
+
 pub struct MtpHead {
     pre_norm_emb: Tensor,
     pre_norm_hidden: Tensor,
@@ -1720,6 +2055,7 @@ pub struct MtpHead {
     layer: Layer,
     mixer_hc: HcGate,
     inject_ones: Tensor,
+    draft_lm_head: Option<DraftLmHeadNvfp4>,
 }
 
 impl MtpHead {
@@ -1746,22 +2082,28 @@ impl MtpHead {
         let grouped = load_grouped_experts_requantized_from_fp8_block_scales(weights, &format!("{p}.mlp"), cfg, runner, stream, is_gu, is_dn)?;
         eprintln!("[qwen4_exp] mtp experts requantized fp8-block -> nvfp4 in {:.1}s (input_scale gate/up {is_gu:.4e}, down {is_dn:.4e}), device {:.2} GiB used", t0.elapsed().as_secs_f64(), vram_used_gib());
         let attn = Attention::load(weights, &format!("{p}.self_attn"), cfg, fp8, device)?;
+        let draft_lm_head = if cfg.tie_word_embeddings {
+            None
+        } else {
+            DraftLmHeadNvfp4::load(weights, cfg.vocab_size, h, stream)?
+        };
         Ok(Self {
             pre_norm_emb: load_norm_plus_one_f32(weights, "mtp.pre_fc_norm_embedding.weight", h)?,
             pre_norm_hidden: load_norm_plus_one_f32(weights, "mtp.pre_fc_norm_hidden.weight", hh)?,
             fc_embedding: load_linear_side(weights, "mtp.fc_embedding.weight", h, h, fp8, device)?,
             fc_hidden: load_linear_side(weights, "mtp.fc_hidden.weight", h, h, fp8, device)?,
             layer: Layer {
-                attn_hc: HcGate::load(weights, &format!("{p}.attn_hyper_connection"), cfg, true)?,
-                mlp_hc: HcGate::load(weights, &format!("{p}.mlp_hyper_connection"), cfg, true)?,
+                attn_hc: HcGate::load(weights, &format!("{p}.attn_hyper_connection"), cfg, true, fp8, device)?,
+                mlp_hc: HcGate::load(weights, &format!("{p}.mlp_hyper_connection"), cfg, true, fp8, device)?,
                 mixer: Mixer::Attn(attn),
                 moe: MoeLayer::load_with_grouped(weights, &format!("{p}.mlp"), cfg, grouped, fp8, device)?,
                 ple: None,
                 gdn_slot: None,
                 attn_slot: None,
             },
-            mixer_hc: HcGate::load(weights, "mtp.hyper_connection_mixer", cfg, false)?,
+            mixer_hc: HcGate::load(weights, "mtp.hyper_connection_mixer", cfg, false, fp8, device)?,
             inject_ones: Tensor::ones((MTP_PREFILL_ROWS_MAX_2048_MATCHES_THE_SERVING_PREFILL_CHUNK, cfg.hc_count), DType::F32, device)?,
+            draft_lm_head,
         })
     }
 }
@@ -1797,10 +2139,16 @@ pub struct Qwen4Exp {
     mtp: Option<MtpHead>,
     sessions: [Mutex<Option<Qwen4ExpSession>>; 2],
     adapter_session: Mutex<Option<Qwen4ExpSession>>,
+    last_put: [Mutex<Option<std::time::Instant>>; 3],
     base_identity: std::sync::OnceLock<String>,
     residency: Mutex<residency::Residency>,
     prefill_ctxs: Mutex<std::collections::HashMap<usize, Arc<Mutex<GroupedDecodeContext>>>>,
     moe_aux_stream: Arc<CudaStream>,
+}
+
+struct AttnSlotCmpKI8 {
+    cmp_k: CudaSlice<u8>,
+    cmp_k_sc: CudaSlice<f32>,
 }
 
 pub struct AttnSlot {
@@ -1808,6 +2156,7 @@ pub struct AttnSlot {
     v: Tensor,
     raw_idx_k: Tensor,
     cmp_k: Tensor,
+    cmp_k_i8: Option<AttnSlotCmpKI8>,
 }
 
 pub struct Qwen4ExpState {
@@ -1820,6 +2169,7 @@ pub struct Qwen4ExpState {
     ple_conv: Tensor,
     rows_cap: usize,
     gdn_ckpts: Vec<Vec<LinAttnState>>,
+    gdn_rollback_plans: Vec<BatchedRollbackPlan>,
     ple_gvn: Option<Tensor>,
     mtp_attn: Option<AttnSlot>,
     mm: mm::StateMm,
@@ -1855,6 +2205,10 @@ pub struct DecodeBufs {
     tok_buf: CudaSlice<u32>,
     pos_buf: CudaSlice<i32>,
     logits_buf: CudaSlice<f32>,
+    argmax_part_val: CudaSlice<f32>,
+    argmax_part_idx: CudaSlice<i32>,
+    verify_packed_best: CudaSlice<u64>,
+    verify_cand_ids: CudaSlice<u32>,
     hidden_buf: Option<Tensor>,
 }
 
@@ -1862,16 +2216,31 @@ pub struct Qwen4ExpDecodeGraph {
     runner: nv_kernels::graph::CudaGraphRunner,
     bufs: DecodeBufs,
     captured: bool,
-    verify_ctx: Vec<Mutex<GroupedDecodeContext>>,
+    verify_ctx: Option<Mutex<GroupedDecodeContext>>,
 }
 
 pub const DECODE_GRAPH_SHAPE_TOKEN_ONE_GRAPH_PER_STATE_BECAUSE_EVERY_BUFFER_ADDRESS_IS_BAKED: u64 = 0x4e1;
+pub const DECODE_ARGMAX_GRAPH_SHAPE_TOKEN: u64 = 0x4f1;
+pub const MTP_CHAIN_GRAPH_SHAPE_TOKEN_BASE: u64 = 0x6e0;
+pub const VERIFY_ARGMAX_GRAPH_SHAPE_TOKEN_BASE: u64 = 0x6f0;
 
 struct FwdMode<'a> {
-    pos_buf: Option<&'a CudaSlice<i32>>,
+    pos_ptr: Option<u64>,
     moe_ctx: Option<&'a Mutex<GroupedDecodeContext>>,
     verify_rows: bool,
     last_layer: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepTokInput {
+    CopyFromHost,
+    AlreadyOnDevice,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepOutMode {
+    LogitsF32,
+    ArgmaxU32,
 }
 
 impl Qwen4ExpDecodeGraph {
@@ -1889,21 +2258,32 @@ impl Qwen4ExpDecodeGraph {
         ensure!(rows_cap >= 1, "qwen4_exp decode graph needs rows_cap >= 1");
         nv_quant::nvfp4::ensure_workspace_for_stream(&stream)?;
         let cfg = &model.cfg;
-        let tok_buf = stream.alloc_zeros::<u32>(rows_cap)?;
+        let tok_buf = stream.alloc_zeros::<u32>(2 * rows_cap)?;
         let pos_buf = stream.alloc_zeros::<i32>(1)?;
         let logits_buf = stream.alloc_zeros::<f32>(rows_cap * cfg.vocab_size)?;
-        let hidden_buf = if keep_hidden { Some(Tensor::zeros((rows_cap, cfg.hc_hidden()), DType::BF16, &model.device)?) } else { None };
-        let mut verify_ctx = Vec::new();
-        for rows in 2..=rows_cap {
-            verify_ctx.push(Mutex::new(GroupedDecodeContext::new_multi(
+        let argmax_parts = unsafe { nvk::q4exp_argmax_bf16_rows_parts() } as usize;
+        ensure!(argmax_parts > 0, "q4exp_argmax_bf16_rows_parts returned 0");
+        let argmax_part_val = stream.alloc_zeros::<f32>(rows_cap * argmax_parts)?;
+        let argmax_part_idx = stream.alloc_zeros::<i32>(rows_cap * argmax_parts)?;
+        let verify_packed_best = stream.alloc_zeros::<u64>(rows_cap)?;
+        let verify_cand_ids = stream.alloc_zeros::<u32>(rows_cap * 376 * 4)?;
+        let hidden_buf = if keep_hidden {
+            Some(Tensor::zeros((rows_cap, cfg.hc_hidden()), DType::BF16, &model.device)?)
+        } else {
+            None
+        };
+        let verify_ctx = if rows_cap >= 2 {
+            Some(Mutex::new(GroupedDecodeContext::new_multi(
                 cfg.hidden_size,
                 cfg.moe_intermediate_size,
                 cfg.num_experts_per_tok,
                 cfg.num_experts,
-                rows,
+                rows_cap,
                 &stream,
-            )?));
-        }
+            )?))
+        } else {
+            None
+        };
         stream.synchronize()?;
         Ok(Self {
             runner: nv_kernels::graph::CudaGraphRunner::new(stream),
@@ -1914,6 +2294,10 @@ impl Qwen4ExpDecodeGraph {
                 tok_buf,
                 pos_buf,
                 logits_buf,
+                argmax_part_val,
+                argmax_part_idx,
+                verify_packed_best,
+                verify_cand_ids,
                 hidden_buf,
             },
             captured: false,
@@ -1930,10 +2314,31 @@ impl Qwen4ExpDecodeGraph {
     }
 }
 
-fn wrap_i32(buf: &CudaSlice<i32>, dev: &CudaDevice, n: usize) -> Result<Tensor> {
-    let clone = buf.try_clone()?;
-    let storage = candle_core::CudaStorage::wrap_cuda_slice(clone, dev.clone());
-    Ok(Tensor::from_storage(Storage::Cuda(storage), (n,), candle_core::op::BackpropOp::none(), false))
+fn argmax_bf16_rows(
+    logits: &Tensor,
+    rows: usize,
+    vocab: usize,
+    part_val: &mut CudaSlice<f32>,
+    part_idx: &mut CudaSlice<i32>,
+    out_ptr: u64,
+    stream: &Arc<CudaStream>,
+) -> Result<()> {
+    let logits = logits.contiguous()?;
+    ensure!(logits.dtype() == DType::BF16, "argmax_bf16_rows: expected BF16, got {:?}", logits.dtype());
+    ensure!(logits.elem_count() == rows * vocab, "argmax_bf16_rows: {} elems != {rows}x{vocab}", logits.elem_count());
+    let rc = unsafe {
+        nvk::q4exp_argmax_bf16_rows(
+            stream.cu_stream() as *mut c_void,
+            cuda_ptr::<bf16>(&logits, stream)? as *const u16,
+            rows as i32,
+            vocab as i32,
+            slice_ptr_mut(part_val, stream) as *mut f32,
+            slice_ptr_mut(part_idx, stream) as *mut i32,
+            out_ptr as *mut u32,
+        )
+    };
+    ensure!(rc == 0, "q4exp_argmax_bf16_rows rc={rc}");
+    Ok(())
 }
 
 pub fn qsa_compress_blocks(
@@ -1950,11 +2355,13 @@ pub fn qsa_compress_blocks(
     if end_block <= first_block {
         return Ok(());
     }
+    let raw_cap = raw_idx_k.dim(0)?;
     let stream = stream_of(raw_idx_k.device())?;
     let rc = unsafe {
         nvk::q4exp_qsa_compress(
             stream.cu_stream() as *mut c_void,
             cuda_ptr::<bf16>(raw_idx_k, &stream)? as *const u16,
+            raw_cap as i32,
             first_block as i32,
             (end_block - first_block) as i32,
             cuda_ptr::<f32>(idx_k_norm_w, &stream)? as *const f32,
@@ -2060,7 +2467,10 @@ pub fn qsa_row_attention(
             }
             max_count = max_ctx;
         }
-        let splits = (max_count.div_ceil(64)).clamp(1, 32);
+        let max_splits = (ATTN_ROWS_TARGET_CTAS_192_FILLS_A_188_SM_GPU_ACROSS_KV_HEADS_AND_SPLITS
+            / (rows * nkv).max(1))
+        .clamp(ATTN_ROWS_SPLITS_MIN_16, ATTN_ROWS_SPLITS_MAX_64);
+        let splits = max_count.div_ceil(32).clamp(1, max_splits);
         let mut partial: CudaSlice<f32> = unsafe { stream.alloc::<f32>(rows * nq * splits * (hd + 2))? };
         let out = uninit::<bf16>(&device, &[rows, nq * hd])?;
         let rc = unsafe {
@@ -2129,14 +2539,55 @@ impl Qwen4Exp {
         let fp8_runner = Arc::new(Mutex::new(nv_quant::fp8::Fp8GemmRunner::new(stream.clone())?));
         let fp8_side: Option<&Fp8Runner> = Some(&fp8_runner);
         let t0 = std::time::Instant::now();
-        let embed = load_bf16(&weights, "model.language_model.embed_tokens.weight")?;
-        ensure!(
-            embed.dims() == [cfg.vocab_size, cfg.hidden_size],
-            "embed_tokens shape {:?}",
-            embed.dims()
-        );
+        let keep_embed_on_device = cfg.tie_word_embeddings
+            || std::env::var(NV_Q4EXP_EMBED_DEVICE_1_KEEPS_THE_TOKEN_TABLE_IN_VRAM_INSTEAD_OF_PINNED_HOST_RAM).as_deref() == Ok("1");
+        let embed_name = "model.language_model.embed_tokens.weight";
+        let embed = if keep_embed_on_device {
+            let t = load_bf16(&weights, embed_name)?;
+            ensure!(
+                t.dims() == [cfg.vocab_size, cfg.hidden_size],
+                "embed_tokens shape {:?}",
+                t.dims()
+            );
+            EmbedTable::Device(t)
+        } else if let Some(raw) = (weights.dtype_of(embed_name) == Some(DType::BF16))
+            .then(|| weights.raw_bytes(embed_name).ok())
+            .flatten()
+        {
+            let shape = weights
+                .shape_of(embed_name)
+                .ok_or_else(|| anyhow::anyhow!("missing {embed_name}"))?;
+            ensure!(
+                shape == [cfg.vocab_size, cfg.hidden_size],
+                "embed_tokens shape {shape:?}"
+            );
+            let expected_bytes = cfg.vocab_size * cfg.hidden_size * std::mem::size_of::<bf16>();
+            ensure!(
+                raw.len() == expected_bytes,
+                "{embed_name}: {} bytes, expected {expected_bytes}",
+                raw.len()
+            );
+            EmbedTable::Host(PinnedTable::from_bytes(
+                raw,
+                "the token embedding table",
+            )?)
+        } else {
+            let t = load_bf16(&weights, embed_name)?;
+            ensure!(
+                t.dims() == [cfg.vocab_size, cfg.hidden_size],
+                "embed_tokens shape {:?}",
+                t.dims()
+            );
+            let host: Vec<bf16> = t.flatten_all()?.to_vec1()?;
+            drop(t);
+            let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            EmbedTable::Host(PinnedTable::from_bytes(
+                &bytes,
+                "the token embedding table",
+            )?)
+        };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
-        eprintln!("[qwen4_exp] embeddings loaded, device {:.2} GiB used", vram_used_gib());
+        eprintln!("[qwen4_exp] embeddings loaded in {:.2}s, device {:.2} GiB used", t0.elapsed().as_secs_f64(), vram_used_gib());
         let mut n_gdn = 0usize;
         let mut n_attn = 0usize;
         for i in 0..cfg.num_hidden_layers {
@@ -2146,14 +2597,36 @@ impl Qwen4Exp {
                 n_attn += 1;
                 (Mixer::Attn(a), None, Some(n_attn - 1))
             } else {
-                let mut la = LinearAttention::from_loader_bf16_checkpoint_projections_quantized_to_fp8_resident_halving_gdn_decode_weight_traffic(
-                    cfg.linear_attn_config(),
-                    &format!("{prefix}.linear_attn"),
-                    &weights,
-                    DType::BF16,
-                    device,
-                    &fp8_runner,
-                )?;
+                let mut la = if nv_layers::linear_attn::gdn_nvfp4_env_opt_in_double_quants_the_fp8_gdn_projections_to_half_byte_resident_needs_a_ppl_gate_before_any_flip() {
+                    LinearAttention::from_loader_nvfp4_projections_resident_half_byte_per_param_double_quant_from_the_fp8_checkpoint(
+                        cfg.linear_attn_config(),
+                        &format!("{prefix}.linear_attn"),
+                        &weights,
+                        DType::BF16,
+                        device,
+                        &runner,
+                        &fp8_runner,
+                        i,
+                    )?
+                } else {
+                    LinearAttention::from_loader_bf16_checkpoint_projections_quantized_to_fp8_resident_halving_gdn_decode_weight_traffic(
+                        cfg.linear_attn_config(),
+                        &format!("{prefix}.linear_attn"),
+                        &weights,
+                        DType::BF16,
+                        device,
+                        &fp8_runner,
+                    )?
+                };
+                if let Device::Cuda(dev) = device {
+                    la.prebuild_nvfp4_verify_twins_from_the_fp8_residents_the_disk_itself_stores_qkv_z_as_f8e4m3(dev);
+                }
+                match std::env::var("NV_Q4EXP_GDN_W4A8").as_deref() {
+                    Ok("1") => la.build_nvfp4_fast_twins(&stream, true, true, true)?,
+                    Ok("qkv_out") => la.build_nvfp4_fast_twins(&stream, true, false, true)?,
+                    Ok("out") => la.build_nvfp4_fast_twins(&stream, false, false, true)?,
+                    _ => {}
+                }
                 la.set_output_gate_sigmoid_process_wide_because_the_gdn_kernels_read_one_constant_flag(true)?;
                 n_gdn += 1;
                 (Mixer::Gdn(la), Some(n_gdn - 1), None)
@@ -2164,8 +2637,8 @@ impl Qwen4Exp {
                 None
             };
             layers.push(Layer {
-                attn_hc: HcGate::load(&weights, &format!("{prefix}.attn_hyper_connection"), &cfg, true)?,
-                mlp_hc: HcGate::load(&weights, &format!("{prefix}.mlp_hyper_connection"), &cfg, true)?,
+                attn_hc: HcGate::load(&weights, &format!("{prefix}.attn_hyper_connection"), &cfg, true, fp8_side, device)?,
+                mlp_hc: HcGate::load(&weights, &format!("{prefix}.mlp_hyper_connection"), &cfg, true, fp8_side, device)?,
                 mixer,
                 moe: MoeLayer::load(&weights, &format!("{prefix}.mlp"), &cfg, runner.clone(), &stream, fp8_side, device)?,
                 ple,
@@ -2176,21 +2649,14 @@ impl Qwen4Exp {
                 eprintln!("[qwen4_exp] loaded {} / {} layers in {:.1}s, device {:.2} GiB used", i + 1, cfg.num_hidden_layers, t0.elapsed().as_secs_f64(), vram_used_gib());
             }
         }
-        let final_hc = HcGate::load(&weights, "model.language_model.hyper_connection_mixer", &cfg, false)?;
-        let keep_embed_on_device = cfg.tie_word_embeddings
-            || std::env::var(NV_Q4EXP_EMBED_DEVICE_1_KEEPS_THE_TOKEN_TABLE_IN_VRAM_INSTEAD_OF_PINNED_HOST_RAM).as_deref() == Ok("1");
+        let final_hc = HcGate::load(&weights, "model.language_model.hyper_connection_mixer", &cfg, false, fp8_side, device)?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new_no_pretranspose(embed.clone(), None)?
+            let EmbedTable::Device(t) = &embed else {
+                bail!("tied word embeddings must stay on device");
+            };
+            Linear::new_no_pretranspose(t.clone(), None)?
         } else {
             load_linear_side(&weights, "lm_head.weight", cfg.vocab_size, cfg.hidden_size, fp8_side, device)?
-        };
-        let embed = if keep_embed_on_device {
-            EmbedTable::Device(embed)
-        } else {
-            let host: Vec<bf16> = embed.flatten_all()?.to_vec1()?;
-            drop(embed);
-            let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-            EmbedTable::Host(PinnedTable::from_bytes(&bytes, "the token embedding table")?)
         };
         let rope = Rope::new(
             RopeConfig {
@@ -2234,6 +2700,7 @@ impl Qwen4Exp {
             mtp,
             sessions: [Mutex::new(None), Mutex::new(None)],
             adapter_session: Mutex::new(None),
+            last_put: [Mutex::new(None), Mutex::new(None), Mutex::new(None)],
             base_identity: std::sync::OnceLock::new(),
             residency: Mutex::new(residency::Residency::new()),
             prefill_ctxs: Mutex::new(std::collections::HashMap::new()),
@@ -2293,12 +2760,28 @@ impl Qwen4Exp {
         let cfg = &self.cfg;
         let nkv = cfg.num_key_value_heads;
         let hd = cfg.head_dim;
+        let ih = cfg.indexer_head_dim;
         let r = cfg.indexer_compress_ratio;
+        let raw_cap = max_len
+            .min(RAW_IDX_K_RING_CAP_4096_HOLDS_ONE_PREFILL_CHUNK_PLUS_TAIL_SAVING_819_MIB_AT_256K)
+            .next_multiple_of(r)
+            .max(r);
+        let nb = max_len.div_ceil(r);
+        let cmp_k_i8 = if std::env::var("NV_Q4EXP_CMPK_I8").as_deref() == Ok("1") && ih == 128 {
+            let stream = stream_of(&self.device)?;
+            Some(AttnSlotCmpKI8 {
+                cmp_k: stream.alloc_zeros::<u8>(nb * ih)?,
+                cmp_k_sc: stream.alloc_zeros::<f32>(nb)?,
+            })
+        } else {
+            None
+        };
         Ok(AttnSlot {
             k: Tensor::zeros((max_len, nkv, hd), DType::BF16, &self.device)?,
             v: Tensor::zeros((max_len, nkv, hd), DType::BF16, &self.device)?,
-            raw_idx_k: Tensor::zeros((max_len, cfg.indexer_head_dim), DType::BF16, &self.device)?,
-            cmp_k: Tensor::zeros((max_len.div_ceil(r), cfg.indexer_head_dim), DType::BF16, &self.device)?,
+            raw_idx_k: Tensor::zeros((raw_cap, ih), DType::BF16, &self.device)?,
+            cmp_k: Tensor::zeros((nb, ih), DType::BF16, &self.device)?,
+            cmp_k_i8,
         })
     }
 
@@ -2324,6 +2807,18 @@ impl Qwen4Exp {
                 }
             }
         }
+        let mut gdn_rollback_plans = Vec::new();
+        if rows_cap > 1 && !gdn.is_empty() {
+            gdn_rollback_plans.reserve(rows_cap - 1);
+            for j in 0..rows_cap - 1 {
+                let pairs: Vec<(&LinAttnState, &LinAttnState)> = gdn
+                    .iter()
+                    .zip(gdn_ckpts.iter())
+                    .map(|(live, ck)| (live, &ck[j]))
+                    .collect();
+                gdn_rollback_plans.push(BatchedRollbackPlan::build(&pairs, &self.device)?);
+            }
+        }
         let ple_gvn = if rows_cap > 1 {
             Some(Tensor::zeros((rows_cap, cfg.hc_hidden()), DType::F32, &self.device)?)
         } else {
@@ -2344,6 +2839,7 @@ impl Qwen4Exp {
             ple_conv: Tensor::zeros((win, cfg.hc_hidden()), DType::F32, &self.device)?,
             rows_cap,
             gdn_ckpts,
+            gdn_rollback_plans,
             ple_gvn,
             mtp_attn,
             mm: mm::StateMm::new(&self.rope, max_len)?,
@@ -2391,6 +2887,169 @@ impl Qwen4Exp {
         self.attention_forward_rope(attn, x, slot, pos, positions, &self.rope)
     }
 
+    fn attention_prep_fused(
+        &self,
+        attn: &Attention,
+        x: &Tensor,
+        slot: &AttnSlot,
+        pos_ptr: u64,
+        rope: &Rope,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let cfg = &self.cfg;
+        let (t, _) = x.dims2()?;
+        let nq = cfg.num_attention_heads;
+        let nkv = cfg.num_key_value_heads;
+        let hd = cfg.head_dim;
+        let ih = cfg.indexer_head_dim;
+        let inh = cfg.indexer_n_heads;
+        let stream = stream_of(&self.device)?;
+        let x = x.contiguous()?;
+        let (q_raw, k_raw, v_raw, idx_raw) = if t <= FUSED_GLUE_ROWS_MAX_8_THE_HC_AND_ATTENTION_ROW_KERNELS_ARE_SIZED_FOR_DECODE_AND_VERIFY_ROWS
+            && !attn.q_proj.has_lora()
+            && !attn.k_proj.has_lora()
+            && !attn.v_proj.has_lora()
+            && !attn.idx_qk_proj.has_lora()
+        {
+            if let (Some(tq), Some(tk), Some(tv), Some(ti)) = (
+                attn.q_proj.nvfp4_fast_twin(),
+                attn.k_proj.nvfp4_fast_twin(),
+                attn.v_proj.nvfp4_fast_twin(),
+                attn.idx_qk_proj.nvfp4_fast_twin(),
+            ) {
+                let nq_rows = nq * hd * 2;
+                let nk_rows = nkv * hd;
+                let nv_rows = nkv * hd;
+                let ni_rows = (inh + 1) * ih;
+                let h = cfg.hidden_size;
+                let qr = uninit::<bf16>(&self.device, &[t, nq_rows])?;
+                let kr = uninit::<bf16>(&self.device, &[t, nk_rows])?;
+                let vr = uninit::<bf16>(&self.device, &[t, nv_rows])?;
+                let ir = uninit::<bf16>(&self.device, &[t, ni_rows])?;
+                let rc = unsafe {
+                    nvk::q4exp_nvfp4_qkv_idx_gemv_mt(
+                        stream.cu_stream() as *mut c_void,
+                        slice_ptr(&tq.wq, &stream) as *const u8,
+                        slice_ptr(&tq.scales, &stream) as *const u8,
+                        tq.alpha_over_2g,
+                        slice_ptr(&tk.wq, &stream) as *const u8,
+                        slice_ptr(&tk.scales, &stream) as *const u8,
+                        tk.alpha_over_2g,
+                        slice_ptr(&tv.wq, &stream) as *const u8,
+                        slice_ptr(&tv.scales, &stream) as *const u8,
+                        tv.alpha_over_2g,
+                        slice_ptr(&ti.wq, &stream) as *const u8,
+                        slice_ptr(&ti.scales, &stream) as *const u8,
+                        ti.alpha_over_2g,
+                        cuda_ptr::<bf16>(&x, &stream)? as *const u16,
+                        cuda_ptr::<bf16>(&qr, &stream)? as *mut u16,
+                        cuda_ptr::<bf16>(&kr, &stream)? as *mut u16,
+                        cuda_ptr::<bf16>(&vr, &stream)? as *mut u16,
+                        cuda_ptr::<bf16>(&ir, &stream)? as *mut u16,
+                        nq_rows as i32,
+                        nk_rows as i32,
+                        nv_rows as i32,
+                        ni_rows as i32,
+                        h as i32,
+                        t as i32,
+                    )
+                };
+                ensure!(rc == 0, "q4exp_nvfp4_qkv_idx_gemv_mt rc={rc}");
+                (qr, kr, vr, ir)
+            } else if let (Some((wq, rsq)), Some((wk, rsk)), Some((wv, rsv)), Some((wi, rsi))) = (
+                attn.q_proj.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+                attn.k_proj.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+                attn.v_proj.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+                attn.idx_qk_proj.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+            ) {
+                let nq_rows = nq * hd * 2;
+                let nk_rows = nkv * hd;
+                let nv_rows = nkv * hd;
+                let ni_rows = (inh + 1) * ih;
+                let h = cfg.hidden_size;
+                let qr = uninit::<bf16>(&self.device, &[t, nq_rows])?;
+                let kr = uninit::<bf16>(&self.device, &[t, nk_rows])?;
+                let vr = uninit::<bf16>(&self.device, &[t, nv_rows])?;
+                let ir = uninit::<bf16>(&self.device, &[t, ni_rows])?;
+                let rc = unsafe {
+                    nvk::q4exp_fp8_qkv_idx_gemv(
+                        stream.cu_stream() as *mut c_void,
+                        slice_ptr(wq, &stream) as *const u8,
+                        slice_ptr(rsq, &stream) as *const f32,
+                        slice_ptr(wk, &stream) as *const u8,
+                        slice_ptr(rsk, &stream) as *const f32,
+                        slice_ptr(wv, &stream) as *const u8,
+                        slice_ptr(rsv, &stream) as *const f32,
+                        slice_ptr(wi, &stream) as *const u8,
+                        slice_ptr(rsi, &stream) as *const f32,
+                        cuda_ptr::<bf16>(&x, &stream)? as *const u16,
+                        cuda_ptr::<bf16>(&qr, &stream)? as *mut u16,
+                        cuda_ptr::<bf16>(&kr, &stream)? as *mut u16,
+                        cuda_ptr::<bf16>(&vr, &stream)? as *mut u16,
+                        cuda_ptr::<bf16>(&ir, &stream)? as *mut u16,
+                        nq_rows as i32,
+                        nk_rows as i32,
+                        nv_rows as i32,
+                        ni_rows as i32,
+                        h as i32,
+                        t as i32,
+                    )
+                };
+                ensure!(rc == 0, "q4exp_fp8_qkv_idx_gemv rc={rc}");
+                (qr, kr, vr, ir)
+            } else {
+                (
+                    attn.q_proj.forward(&x)?.contiguous()?,
+                    attn.k_proj.forward(&x)?.contiguous()?,
+                    attn.v_proj.forward(&x)?.contiguous()?,
+                    attn.idx_qk_proj.forward(&x)?.contiguous()?,
+                )
+            }
+        } else {
+            (
+                attn.q_proj.forward(&x)?.contiguous()?,
+                attn.k_proj.forward(&x)?.contiguous()?,
+                attn.v_proj.forward(&x)?.contiguous()?,
+                attn.idx_qk_proj.forward(&x)?.contiguous()?,
+            )
+        };
+        let q = uninit::<bf16>(&self.device, &[t, nq, hd])?;
+        let gate = uninit::<bf16>(&self.device, &[t, nq * hd])?;
+        let iq = uninit::<bf16>(&self.device, &[t, inh, ih])?;
+        let raw_cap = slot.raw_idx_k.dim(0)?;
+        let rc = unsafe {
+            nvk::q4exp_attn_prep(
+                stream.cu_stream() as *mut c_void,
+                cuda_ptr::<bf16>(&q_raw, &stream)? as *const u16,
+                cuda_ptr::<bf16>(&k_raw, &stream)? as *const u16,
+                cuda_ptr::<bf16>(&v_raw, &stream)? as *const u16,
+                cuda_ptr::<bf16>(&idx_raw, &stream)? as *const u16,
+                cuda_ptr::<f32>(&attn.q_norm_w, &stream)? as *const f32,
+                cuda_ptr::<f32>(&attn.k_norm_w, &stream)? as *const f32,
+                cuda_ptr::<f32>(&attn.idx_q_norm_w, &stream)? as *const f32,
+                cuda_ptr::<f32>(rope.cos(), &stream)? as *const f32,
+                cuda_ptr::<f32>(rope.sin(), &stream)? as *const f32,
+                pos_ptr as *const i32,
+                t as i32,
+                nq as i32,
+                nkv as i32,
+                hd as i32,
+                inh as i32,
+                ih as i32,
+                cfg.rotary_dim as i32,
+                cfg.rms_norm_eps as f32,
+                cuda_ptr::<bf16>(&q, &stream)? as *mut u16,
+                cuda_ptr::<bf16>(&gate, &stream)? as *mut u16,
+                cuda_ptr::<bf16>(&slot.k, &stream)? as *mut u16,
+                cuda_ptr::<bf16>(&slot.v, &stream)? as *mut u16,
+                cuda_ptr::<bf16>(&slot.raw_idx_k, &stream)? as *mut u16,
+                raw_cap as i32,
+                cuda_ptr::<bf16>(&iq, &stream)? as *mut u16,
+            )
+        };
+        ensure!(rc == 0, "q4exp_attn_prep rc={rc}");
+        Ok((q, gate, iq))
+    }
+
     fn attention_forward_rope(
         &self,
         attn: &Attention,
@@ -2405,13 +3064,76 @@ impl Qwen4Exp {
         let nq = cfg.num_attention_heads;
         let nkv = cfg.num_key_value_heads;
         let hd = cfg.head_dim;
-        let (q, gate, k, v, iq, ik) = self.attention_project(attn, x, positions, rope)?;
-        slot.k.slice_set(&k, 0, pos)?;
-        slot.v.slice_set(&v, 0, pos)?;
-        slot.raw_idx_k.slice_set(&ik, 0, pos)?;
+        let ih = cfg.indexer_head_dim;
         let new_ctx = pos + t;
         let r = cfg.indexer_compress_ratio;
-        qsa_compress_blocks(cfg, &slot.raw_idx_k, &slot.cmp_k, &attn.idx_k_norm_w, rope, pos / r, new_ctx / r)?;
+        let raw_cap = slot.raw_idx_k.dim(0)?;
+        ensure!(
+            raw_cap >= r && raw_cap.is_multiple_of(r),
+            "raw_idx_k {:?}: expected ring capacity >= {r} and divisible by {r}",
+            slot.raw_idx_k.dims()
+        );
+        let can_fuse_prep = !eager_glue()
+            && t <= PREFILL_CHUNK_2048_IS_THE_PREFIX_CHECKPOINT_GRID_SO_A_RESUMED_PREFILL_CHUNKS_EXACTLY_AS_A_COLD_ONE
+            && (pos % r) + t <= raw_cap
+            && hd.is_multiple_of(32)
+            && hd <= 1024
+            && ih <= hd
+            && ih.is_multiple_of(32)
+            && cfg.rotary_dim.is_multiple_of(2)
+            && cfg.rotary_dim <= ih;
+        let (q, gate, iq) = if can_fuse_prep {
+            ensure!(
+                new_ctx <= slot.k.dim(0)?,
+                "attn slot overflow: {pos} + {t} > {}",
+                slot.k.dim(0)?
+            );
+            let stream = stream_of(&self.device)?;
+            let pos_c = positions.contiguous()?;
+            let res = self.attention_prep_fused(attn, x, slot, cuda_ptr::<i32>(&pos_c, &stream)?, rope)?;
+            qsa_compress_blocks(cfg, &slot.raw_idx_k, &slot.cmp_k, &attn.idx_k_norm_w, rope, pos / r, new_ctx / r)?;
+            res
+        } else {
+            let (q, gate, k, v, iq, ik) = self.attention_project(attn, x, positions, rope)?;
+            slot.k.slice_set(&k, 0, pos)?;
+            slot.v.slice_set(&v, 0, pos)?;
+            let stride = (raw_cap - (r - 1)).max(1);
+            let mut done = 0usize;
+            while done < t {
+                let take = (t - done).min(stride);
+                let p = pos + done;
+                let start = p % raw_cap;
+                let first = take.min(raw_cap - start);
+                slot.raw_idx_k.slice_set(&ik.narrow(0, done, first)?, 0, start)?;
+                if first < take {
+                    slot.raw_idx_k.slice_set(&ik.narrow(0, done + first, take - first)?, 0, 0)?;
+                }
+                qsa_compress_blocks(cfg, &slot.raw_idx_k, &slot.cmp_k, &attn.idx_k_norm_w, rope, p / r, (p + take) / r)?;
+                done += take;
+            }
+            (q, gate, iq)
+        };
+        if let Some(i8k) = &mut slot.cmp_k_i8 {
+            let stream = stream_of(&self.device)?;
+            let b0 = pos / r;
+            let b1 = new_ctx / r;
+            if b1 > b0 {
+                let rc = unsafe {
+                    nvk::q4exp_quant_rows_to_i8(
+                        stream.cu_stream() as *mut c_void,
+                        cuda_ptr::<bf16>(&slot.cmp_k, &stream)? as *const u16,
+                        slice_ptr_mut(&mut i8k.cmp_k, &stream) as *mut u8,
+                        slice_ptr_mut(&mut i8k.cmp_k_sc, &stream) as *mut f32,
+                        std::ptr::null(),
+                        b0 as i32,
+                        (b1 - b0) as i32,
+                        1,
+                        ih as i32,
+                    )
+                };
+                ensure!(rc == 0, "q4exp_quant_rows_to_i8 cmp_k prefill rc={rc}");
+            }
+        }
 
         let dense_limit = cfg.dense_attention_context_limit();
         let fused_rows = t <= FUSED_GLUE_ROWS_MAX_8_THE_HC_AND_ATTENTION_ROW_KERNELS_ARE_SIZED_FOR_DECODE_AND_VERIFY_ROWS;
@@ -2459,9 +3181,22 @@ impl Qwen4Exp {
         attn: &Attention,
         x: &Tensor,
         slot: &AttnSlot,
-        pos_buf: &CudaSlice<i32>,
-        positions: &Tensor,
+        pos_ptr: u64,
         rope: &Rope,
+    ) -> Result<Tensor> {
+        self.attention_forward_devpos_topk(attn, x, slot, pos_ptr, rope, None, None, false)
+    }
+
+    fn attention_forward_devpos_topk(
+        &self,
+        attn: &Attention,
+        x: &Tensor,
+        slot: &AttnSlot,
+        pos_ptr: u64,
+        rope: &Rope,
+        reuse_topk: Option<(u64, u64)>,
+        save_last_row_topk: Option<(u64, u64)>,
+        last_row_only: bool,
     ) -> Result<Tensor> {
         let cfg = &self.cfg;
         let (t, _) = x.dims2()?;
@@ -2471,51 +3206,14 @@ impl Qwen4Exp {
         let ih = cfg.indexer_head_dim;
         let r = cfg.indexer_compress_ratio;
         let stream = stream_of(&self.device)?;
-        let _ = positions;
-        let inh = cfg.indexer_n_heads;
-        let x = x.contiguous()?;
-        let q_raw = attn.q_proj.forward(&x)?.contiguous()?;
-        let k_raw = attn.k_proj.forward(&x)?.contiguous()?;
-        let v_raw = attn.v_proj.forward(&x)?.contiguous()?;
-        let idx_raw = attn.idx_qk_proj.forward(&x)?.contiguous()?;
-        let q = uninit::<bf16>(&self.device, &[t, nq, hd])?;
-        let gate = uninit::<bf16>(&self.device, &[t, nq * hd])?;
-        let iq = uninit::<bf16>(&self.device, &[t, inh, ih])?;
-        let rc = unsafe {
-            nvk::q4exp_attn_prep(
-                stream.cu_stream() as *mut c_void,
-                cuda_ptr::<bf16>(&q_raw, &stream)? as *const u16,
-                cuda_ptr::<bf16>(&k_raw, &stream)? as *const u16,
-                cuda_ptr::<bf16>(&v_raw, &stream)? as *const u16,
-                cuda_ptr::<bf16>(&idx_raw, &stream)? as *const u16,
-                cuda_ptr::<f32>(&attn.q_norm_w, &stream)? as *const f32,
-                cuda_ptr::<f32>(&attn.k_norm_w, &stream)? as *const f32,
-                cuda_ptr::<f32>(&attn.idx_q_norm_w, &stream)? as *const f32,
-                cuda_ptr::<f32>(rope.cos(), &stream)? as *const f32,
-                cuda_ptr::<f32>(rope.sin(), &stream)? as *const f32,
-                slice_ptr(pos_buf, &stream) as *const i32,
-                t as i32,
-                nq as i32,
-                nkv as i32,
-                hd as i32,
-                inh as i32,
-                ih as i32,
-                cfg.rotary_dim as i32,
-                cfg.rms_norm_eps as f32,
-                cuda_ptr::<bf16>(&q, &stream)? as *mut u16,
-                cuda_ptr::<bf16>(&gate, &stream)? as *mut u16,
-                cuda_ptr::<bf16>(&slot.k, &stream)? as *mut u16,
-                cuda_ptr::<bf16>(&slot.v, &stream)? as *mut u16,
-                cuda_ptr::<bf16>(&slot.raw_idx_k, &stream)? as *mut u16,
-                cuda_ptr::<bf16>(&iq, &stream)? as *mut u16,
-            )
-        };
-        ensure!(rc == 0, "q4exp_attn_prep rc={rc}");
+        let (q, gate, iq) = self.attention_prep_fused(attn, x, slot, pos_ptr, rope)?;
+        let raw_cap = slot.raw_idx_k.dim(0)?;
         let rc = unsafe {
             nvk::q4exp_qsa_compress_devpos(
                 stream.cu_stream() as *mut c_void,
                 cuda_ptr::<bf16>(&slot.raw_idx_k, &stream)? as *const u16,
-                slice_ptr(pos_buf, &stream) as *const i32,
+                raw_cap as i32,
+                pos_ptr as *const i32,
                 t as i32,
                 cuda_ptr::<f32>(&attn.idx_k_norm_w, &stream)? as *const f32,
                 cuda_ptr::<f32>(rope.cos(), &stream)? as *const f32,
@@ -2528,6 +3226,23 @@ impl Qwen4Exp {
             )
         };
         ensure!(rc == 0, "q4exp_qsa_compress_devpos rc={rc}");
+        if let Some(i8k) = &slot.cmp_k_i8 {
+            let max_new_blks = t.div_ceil(r) + 1;
+            let rc = unsafe {
+                nvk::q4exp_quant_rows_to_i8(
+                    stream.cu_stream() as *mut c_void,
+                    cuda_ptr::<bf16>(&slot.cmp_k, &stream)? as *const u16,
+                    slice_ptr(&i8k.cmp_k, &stream) as *mut u8,
+                    slice_ptr(&i8k.cmp_k_sc, &stream) as *mut f32,
+                    pos_ptr as *const i32,
+                    t as i32,
+                    max_new_blks as i32,
+                    -(r as i32),
+                    ih as i32,
+                )
+            };
+            ensure!(rc == 0, "q4exp_quant_rows_to_i8 cmp_k devpos rc={rc}");
+        }
         let block_topk = cfg.qsa_block_topk();
         let width = cfg.indexer_budget + r - 1;
         let nb_stride = slot.cmp_k.dim(0)?;
@@ -2536,7 +3251,7 @@ impl Qwen4Exp {
         let rc = unsafe {
             nvk::q4exp_decode_meta(
                 stream.cu_stream() as *mut c_void,
-                slice_ptr(pos_buf, &stream) as *const i32,
+                pos_ptr as *const i32,
                 t as i32,
                 r as i32,
                 slice_ptr_mut(&mut positions_dev, &stream) as *mut i32,
@@ -2544,46 +3259,88 @@ impl Qwen4Exp {
             )
         };
         ensure!(rc == 0, "q4exp_decode_meta rc={rc}");
-        let mut scores: CudaSlice<f32> = unsafe { stream.alloc::<f32>(t * nb_stride)? };
-        let rc = unsafe {
-            nvk::q4exp_qsa_scores(
-                stream.cu_stream() as *mut c_void,
-                cuda_ptr::<bf16>(&iq, &stream)? as *const u16,
-                cuda_ptr::<bf16>(&slot.cmp_k, &stream)? as *const u16,
-                slice_ptr(&nb_dev, &stream) as *const i32,
-                t as i32,
-                cfg.indexer_n_heads as i32,
-                ih as i32,
-                nb_stride as i32,
-                1.0 / (ih as f32).sqrt(),
-                slice_ptr_mut(&mut scores, &stream) as *mut f32,
-            )
+        let out_t = if last_row_only && t > 1 { 1 } else { t };
+        let row_off = t - out_t;
+        let q = if row_off > 0 { q.narrow(0, row_off, out_t)?.contiguous()? } else { q };
+        let gate = if row_off > 0 { gate.narrow(0, row_off, out_t)?.contiguous()? } else { gate };
+        let iq = if row_off > 0 { iq.narrow(0, row_off, out_t)?.contiguous()? } else { iq };
+        let positions_ptr = slice_ptr(&positions_dev, &stream) + (row_off * 4) as u64;
+        let nb_ptr = slice_ptr(&nb_dev, &stream) + (row_off * 4) as u64;
+        let reuse_on = out_t == 1
+            && reuse_topk.is_some()
+            && std::env::var("NV_Q4EXP_MTP_REUSE_TOPK").as_deref() == Ok("1");
+        let mut _owned_blocks: Option<CudaSlice<i32>> = None;
+        let mut _owned_block_count: Option<CudaSlice<i32>> = None;
+        let (blocks_ptr, block_count_ptr) = if reuse_on {
+            reuse_topk.unwrap()
+        } else {
+            let mut scores: CudaSlice<f32> = unsafe { stream.alloc::<f32>(out_t * nb_stride)? };
+            let rc = if let Some(i8k) = &slot.cmp_k_i8 {
+                unsafe {
+                    nvk::q4exp_qsa_scores_i8_hd128(
+                        stream.cu_stream() as *mut c_void,
+                        cuda_ptr::<bf16>(&iq, &stream)? as *const u16,
+                        slice_ptr(&i8k.cmp_k, &stream) as *const u8,
+                        slice_ptr(&i8k.cmp_k_sc, &stream) as *const f32,
+                        nb_ptr as *const i32,
+                        out_t as i32,
+                        cfg.indexer_n_heads as i32,
+                        nb_stride as i32,
+                        1.0 / (ih as f32).sqrt(),
+                        slice_ptr_mut(&mut scores, &stream) as *mut f32,
+                    )
+                }
+            } else {
+                unsafe {
+                    nvk::q4exp_qsa_scores(
+                        stream.cu_stream() as *mut c_void,
+                        cuda_ptr::<bf16>(&iq, &stream)? as *const u16,
+                        cuda_ptr::<bf16>(&slot.cmp_k, &stream)? as *const u16,
+                        nb_ptr as *const i32,
+                        out_t as i32,
+                        cfg.indexer_n_heads as i32,
+                        ih as i32,
+                        nb_stride as i32,
+                        1.0 / (ih as f32).sqrt(),
+                        slice_ptr_mut(&mut scores, &stream) as *mut f32,
+                    )
+                }
+            };
+            ensure!(rc == 0, "q4exp_qsa_scores rc={rc}");
+            let mut blocks: CudaSlice<i32> = unsafe { stream.alloc::<i32>(out_t * block_topk)? };
+            let mut block_count: CudaSlice<i32> = unsafe { stream.alloc::<i32>(out_t)? };
+            let rc = unsafe {
+                nvk::q4exp_qsa_topk(
+                    stream.cu_stream() as *mut c_void,
+                    slice_ptr(&scores, &stream) as *const f32,
+                    nb_ptr as *const i32,
+                    out_t as i32,
+                    block_topk as i32,
+                    nb_stride as i32,
+                    slice_ptr_mut(&mut blocks, &stream) as *mut i32,
+                    slice_ptr_mut(&mut block_count, &stream) as *mut i32,
+                )
+            };
+            ensure!(rc == 0, "q4exp_qsa_topk rc={rc}");
+            let bp = slice_ptr(&blocks, &stream);
+            let cp = slice_ptr(&block_count, &stream);
+            if let Some((dst_blk, dst_cnt)) = save_last_row_topk {
+                dtod_raw(dst_blk, bp + ((out_t - 1) * block_topk * 4) as u64, block_topk * 4, &stream)?;
+                dtod_raw(dst_cnt, cp + ((out_t - 1) * 4) as u64, 4, &stream)?;
+            }
+            _owned_blocks = Some(blocks);
+            _owned_block_count = Some(block_count);
+            (bp, cp)
         };
-        ensure!(rc == 0, "q4exp_qsa_scores rc={rc}");
-        let mut blocks: CudaSlice<i32> = unsafe { stream.alloc::<i32>(t * block_topk)? };
-        let mut block_count: CudaSlice<i32> = unsafe { stream.alloc::<i32>(t)? };
-        let rc = unsafe {
-            nvk::q4exp_qsa_topk(
-                stream.cu_stream() as *mut c_void,
-                slice_ptr(&scores, &stream) as *const f32,
-                slice_ptr(&nb_dev, &stream) as *const i32,
-                t as i32,
-                block_topk as i32,
-                nb_stride as i32,
-                slice_ptr_mut(&mut blocks, &stream) as *mut i32,
-                slice_ptr_mut(&mut block_count, &stream) as *mut i32,
-            )
-        };
-        ensure!(rc == 0, "q4exp_qsa_topk rc={rc}");
-        let mut idx: CudaSlice<i32> = unsafe { stream.alloc::<i32>(t * width)? };
-        let mut count: CudaSlice<i32> = unsafe { stream.alloc::<i32>(t)? };
+        let mut idx: CudaSlice<i32> = unsafe { stream.alloc::<i32>(out_t * width)? };
+        let mut count: CudaSlice<i32> = unsafe { stream.alloc::<i32>(out_t)? };
         let rc = unsafe {
             nvk::q4exp_qsa_expand(
                 stream.cu_stream() as *mut c_void,
-                slice_ptr(&blocks, &stream) as *const i32,
-                slice_ptr(&block_count, &stream) as *const i32,
-                slice_ptr(&positions_dev, &stream) as *const i32,
-                t as i32,
+                blocks_ptr as *const i32,
+                block_count_ptr as *const i32,
+                positions_ptr as *const i32,
+                out_t as i32,
                 r as i32,
                 block_topk as i32,
                 width as i32,
@@ -2592,9 +3349,11 @@ impl Qwen4Exp {
             )
         };
         ensure!(rc == 0, "q4exp_qsa_expand rc={rc}");
-        let splits = 16usize;
-        let mut partial: CudaSlice<f32> = unsafe { stream.alloc::<f32>(t * nq * splits * (hd + 2))? };
-        let out = uninit::<bf16>(&self.device, &[t, nq * hd])?;
+        let splits = (ATTN_ROWS_TARGET_CTAS_192_FILLS_A_188_SM_GPU_ACROSS_KV_HEADS_AND_SPLITS
+            / (out_t * nkv).max(1))
+        .clamp(ATTN_ROWS_SPLITS_MIN_16, ATTN_ROWS_SPLITS_MAX_64);
+        let mut partial: CudaSlice<f32> = unsafe { stream.alloc::<f32>(out_t * nq * splits * (hd + 2))? };
+        let out = uninit::<bf16>(&self.device, &[out_t, nq * hd])?;
         let rc = unsafe {
             nvk::q4exp_attn_rows(
                 stream.cu_stream() as *mut c_void,
@@ -2603,7 +3362,7 @@ impl Qwen4Exp {
                 cuda_ptr::<bf16>(&slot.v, &stream)? as *const u16,
                 slice_ptr(&idx, &stream) as *const i32,
                 slice_ptr(&count, &stream) as *const i32,
-                t as i32,
+                out_t as i32,
                 nq as i32,
                 nkv as i32,
                 hd as i32,
@@ -2619,7 +3378,7 @@ impl Qwen4Exp {
                 stream.cu_stream() as *mut c_void,
                 slice_ptr(&partial, &stream) as *const f32,
                 cuda_ptr::<bf16>(&gate, &stream)? as *const u16,
-                t as i32,
+                out_t as i32,
                 nq as i32,
                 hd as i32,
                 splits as i32,
@@ -2655,17 +3414,18 @@ impl Qwen4Exp {
     fn layers_forward(
         &self,
         hc: Tensor,
-        tokens: &[u32],
-        tokens_dev: &CudaSlice<u32>,
+        tokens: Option<&[u32]>,
+        tokens_ptr: u64,
+        t: usize,
         state: &mut Qwen4ExpState,
         pos: usize,
-        positions: &Tensor,
+        positions: Option<&Tensor>,
         mode: FwdMode<'_>,
         prof: &mut PhaseProf,
         trace: bool,
     ) -> Result<(Tensor, Option<(Tensor, Tensor)>)> {
         let cfg = &self.cfg;
-        let pos_buf = mode.pos_buf;
+        let pos_ptr = mode.pos_ptr;
         let mut hc = hc;
         let fused = !eager_glue();
         let mut pending: Option<(Tensor, Tensor)> = None;
@@ -2678,11 +3438,12 @@ impl Qwen4Exp {
                     cfg,
                     tokens,
                     &state.ple_history,
-                    tokens_dev,
+                    tokens_ptr,
+                    t,
                     &state.ple_history_dev,
                     &self.device,
                 )?;
-                let add = if pos_buf.is_some() || (!eager_glue() && tokens.len() <= FUSED_GLUE_ROWS_MAX_8_THE_HC_AND_ATTENTION_ROW_KERNELS_ARE_SIZED_FOR_DECODE_AND_VERIFY_ROWS) {
+                let add = if pos_ptr.is_some() || (!eager_glue() && t <= FUSED_GLUE_ROWS_MAX_8_THE_HC_AND_ATTENTION_ROW_KERNELS_ARE_SIZED_FOR_DECODE_AND_VERIFY_ROWS) {
                     let (slab, update) = if mode.verify_rows {
                         (state.ple_gvn.as_ref(), false)
                     } else {
@@ -2717,9 +3478,12 @@ impl Qwen4Exp {
                 Mixer::Attn(a) => {
                     let slot = &mut state.attn[layer.attn_slot.unwrap()];
                     let rope = &state.mm.rope;
-                    let y = match pos_buf {
-                        Some(pb) => self.attention_forward_devpos(a, &mixed, slot, pb, positions, rope)?,
-                        None => self.attention_forward_rope(a, &mixed, slot, pos, positions, rope)?,
+                    let y = match pos_ptr {
+                        Some(pp) => self.attention_forward_devpos(a, &mixed, slot, pp, rope)?,
+                        None => {
+                            let positions = positions.context("eager attention requires host positions")?;
+                            self.attention_forward_rope(a, &mixed, slot, pos, positions, rope)?
+                        }
                     };
                     prof.lap("attn");
                     y
@@ -2754,10 +3518,15 @@ impl Qwen4Exp {
     }
 
     fn embed_hc(&self, tokens_dev: &CudaSlice<u32>, t: usize) -> Result<Tensor> {
-        self.embed_rows(tokens_dev, t, self.cfg.hc_count)
+        let stream = stream_of(&self.device)?;
+        self.embed_rows_ptr(slice_ptr(tokens_dev, &stream), t, self.cfg.hc_count)
     }
 
-    fn embed_rows(&self, tokens_dev: &CudaSlice<u32>, t: usize, nb: usize) -> Result<Tensor> {
+    fn embed_hc_ptr(&self, tokens_ptr: u64, t: usize) -> Result<Tensor> {
+        self.embed_rows_ptr(tokens_ptr, t, self.cfg.hc_count)
+    }
+
+    fn embed_rows_ptr(&self, tokens_ptr: u64, t: usize, nb: usize) -> Result<Tensor> {
         let cfg = &self.cfg;
         let stream = stream_of(&self.device)?;
         let hc = Tensor::zeros((t, nb * cfg.hidden_size), DType::BF16, &self.device)?;
@@ -2765,7 +3534,7 @@ impl Qwen4Exp {
             nvk::q4exp_embed_hc(
                 stream.cu_stream() as *mut c_void,
                 self.embed.ptr(&stream)? as *const u16,
-                slice_ptr(tokens_dev, &stream) as *const u32,
+                tokens_ptr as *const u32,
                 t as i32,
                 cfg.hidden_size as i32,
                 nb as i32,
@@ -2780,24 +3549,27 @@ impl Qwen4Exp {
         self.layers.iter().find_map(|l| l.ple.as_ref())
     }
 
-    fn mtp_forward(
+    fn mtp_forward_mixed(
         &self,
         mtp: &MtpHead,
         hidden: &Tensor,
-        tokens_dev: &CudaSlice<u32>,
+        tokens_ptr: u64,
         t: usize,
         pos: usize,
-        positions: &Tensor,
-        pos_buf: Option<&CudaSlice<i32>>,
+        positions: Option<&Tensor>,
+        pos_ptr: Option<u64>,
         moe_ctx: Option<&Mutex<GroupedDecodeContext>>,
+        last_row_only: bool,
+        reuse_topk: Option<(u64, u64)>,
+        save_last_row_topk: Option<(u64, u64)>,
         state: &mut Qwen4ExpState,
     ) -> Result<(Tensor, Tensor)> {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let hh = cfg.hc_hidden();
         let n = cfg.hc_count;
-        let emb = self.embed_rows(tokens_dev, t, 1)?;
-        let emb = if pos_buf.is_none() { self.mm_splice_rows(state, emb, pos + 1, t, 1)? } else { emb };
+        let emb = self.embed_rows_ptr(tokens_ptr, t, 1)?;
+        let emb = if pos_ptr.is_none() { self.mm_splice_rows(state, emb, pos + 1, t, 1)? } else { emb };
         let en = rmsnorm_rows(&emb, &mtp.pre_norm_emb, cfg.rms_norm_eps)?;
         let e = mtp.fc_embedding.forward(&en)?;
         let hn = rmsnorm_rows(&hidden.contiguous()?, &mtp.pre_norm_hidden, cfg.rms_norm_eps)?;
@@ -2818,21 +3590,35 @@ impl Qwen4Exp {
         };
         let slot = state.mtp_attn.as_mut().ok_or_else(|| anyhow::anyhow!("state has no mtp attention slot"))?;
         let rope = &state.mm.rope;
-        let y = match pos_buf {
-            Some(pb) => self.attention_forward_devpos(a, &mixed, slot, pb, positions, rope)?,
-            None => self.attention_forward_rope(a, &mixed, slot, pos, positions, rope)?,
+        let y = match pos_ptr {
+            Some(pp) => self.attention_forward_devpos_topk(a, &mixed, slot, pp, rope, reuse_topk, save_last_row_topk, last_row_only)?,
+            None => {
+                let positions = positions.context("mtp eager attention requires host positions")?;
+                self.attention_forward_rope(a, &mixed, slot, pos, positions, rope)?
+            }
         };
         let inject = inject.context("mtp attention hyper-connection carries no inject weights")?;
-        let (hc, mixed, inject) = if fused {
+        let (hc, y, inject) = if last_row_only && t > 1 {
+            let y1 = if y.dim(0)? > 1 { y.narrow(0, t - 1, 1)?.contiguous()? } else { y };
+            (
+                hc.narrow(0, t - 1, 1)?.contiguous()?,
+                y1,
+                inject.narrow(0, t - 1, 1)?.contiguous()?,
+            )
+        } else {
+            (hc, y, inject)
+        };
+        let tail_fused = !eager_glue() && (last_row_only || t <= HC_FUSED_ROWS_MAX_64_BELOW_WHICH_THE_DOT_GRID_BEATS_THREE_CUBLAS_CALLS_PER_MIX);
+        let (hc, mixed, inject) = if tail_fused {
             layer.mlp_hc.mix_combined(&hc, Some((y, inject)), cfg)?
         } else {
             let hc = hc_combine(&hc, &y, &inject, cfg)?;
             let (mixed, inject) = layer.mlp_hc.mix(&hc, cfg)?;
             (hc, mixed, inject)
         };
-        let y = layer.moe.forward_maybe_fused(&mixed, cfg, moe_ctx, fused.then_some(&self.moe_aux_stream))?;
+        let y = layer.moe.forward_maybe_fused(&mixed, cfg, moe_ctx, tail_fused.then_some(&self.moe_aux_stream))?;
         let inject = inject.context("mtp mlp hyper-connection carries no inject weights")?;
-        let (hc, mixed) = if fused {
+        let (hc, mixed) = if tail_fused {
             let (hc, mixed, _) = mtp.mixer_hc.mix_combined(&hc, Some((y, inject)), cfg)?;
             (hc, mixed)
         } else {
@@ -2840,11 +3626,103 @@ impl Qwen4Exp {
             let (mixed, _) = mtp.mixer_hc.mix(&hc, cfg)?;
             (hc, mixed)
         };
-        let logits = self.lm_head.forward(&mixed)?.to_dtype(DType::F32)?.contiguous()?;
-        Ok((hc, logits))
+        Ok((hc, mixed))
     }
 
-    fn push_history_device(&self, state: &mut Qwen4ExpState, tokens_dev: &CudaSlice<u32>, t: usize) -> Result<()> {
+    fn mtp_prefill_kv(
+        &self,
+        mtp: &MtpHead,
+        hidden: &Tensor,
+        tokens_dev: &CudaSlice<u32>,
+        t: usize,
+        pos: usize,
+        positions: &Tensor,
+        state: &mut Qwen4ExpState,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let hh = cfg.hc_hidden();
+        let n = cfg.hc_count;
+        let stream = stream_of(&self.device)?;
+        let emb = self.embed_rows_ptr(slice_ptr(tokens_dev, &stream), t, 1)?;
+        let emb = self.mm_splice_rows(state, emb, pos + 1, t, 1)?;
+        let en = rmsnorm_rows(&emb, &mtp.pre_norm_emb, cfg.rms_norm_eps)?;
+        let e = mtp.fc_embedding.forward(&en)?;
+        let hn = rmsnorm_rows(&hidden.contiguous()?, &mtp.pre_norm_hidden, cfg.rms_norm_eps)?;
+        let fh = mtp.fc_hidden.forward(&hn.reshape((t * n, h))?)?.reshape((t, hh))?;
+        ensure!(
+            t <= MTP_PREFILL_ROWS_MAX_2048_MATCHES_THE_SERVING_PREFILL_CHUNK,
+            "mtp prefill kv: {t} rows exceed the {} row inject buffer",
+            MTP_PREFILL_ROWS_MAX_2048_MATCHES_THE_SERVING_PREFILL_CHUNK
+        );
+        let ones = mtp.inject_ones.narrow(0, 0, t)?;
+        let fused = !eager_glue()
+            && t <= HC_FUSED_ROWS_MAX_64_BELOW_WHICH_THE_DOT_GRID_BEATS_THREE_CUBLAS_CALLS_PER_MIX;
+        let layer = &mtp.layer;
+        let mixed = if fused {
+            let (_, mixed, _) = layer.attn_hc.mix_combined(&fh, Some((e, ones)), cfg)?;
+            mixed
+        } else {
+            let hc = hc_combine(&fh, &e, &ones, cfg)?;
+            let (mixed, _) = layer.attn_hc.mix(&hc, cfg)?;
+            mixed
+        };
+        let Mixer::Attn(a) = &layer.mixer else {
+            bail!("mtp layer is not an attention layer")
+        };
+        let slot = state
+            .mtp_attn
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("state has no mtp attention slot"))?;
+        let rope = &state.mm.rope;
+        let nkv = cfg.num_key_value_heads;
+        let hd = cfg.head_dim;
+        let ih = cfg.indexer_head_dim;
+        let inh = cfg.indexer_n_heads;
+        let k = a.k_proj.forward(&mixed)?.reshape((t, nkv, hd))?;
+        let v = a.v_proj.forward(&mixed)?.reshape((t, nkv, hd))?.contiguous()?;
+        let k = head_rmsnorm_bf16(&k, &a.k_norm_w, cfg.rms_norm_eps)?;
+        let (k, _) = rope
+            .apply_partial_oop_bf16_cuda_one_launch_replacing_slice_cast_rope_cast_concat(
+                &k, &k, positions, hd,
+            )?;
+        let idx = a.idx_qk_proj.forward(&mixed)?;
+        let ik = idx.narrow(1, inh * ih, ih)?.contiguous()?;
+        slot.k.slice_set(&k.contiguous()?, 0, pos)?;
+        slot.v.slice_set(&v, 0, pos)?;
+        let r = cfg.indexer_compress_ratio;
+        let raw_cap = slot.raw_idx_k.dim(0)?;
+        ensure!(
+            raw_cap >= r && raw_cap.is_multiple_of(r),
+            "raw_idx_k {:?}: expected ring capacity >= {r} and divisible by {r}",
+            slot.raw_idx_k.dims()
+        );
+        let stride = (raw_cap - (r - 1)).max(1);
+        let mut done = 0usize;
+        while done < t {
+            let take = (t - done).min(stride);
+            let p = pos + done;
+            let start = p % raw_cap;
+            let first = take.min(raw_cap - start);
+            slot.raw_idx_k.slice_set(&ik.narrow(0, done, first)?, 0, start)?;
+            if first < take {
+                slot.raw_idx_k.slice_set(&ik.narrow(0, done + first, take - first)?, 0, 0)?;
+            }
+            qsa_compress_blocks(
+                cfg,
+                &slot.raw_idx_k,
+                &slot.cmp_k,
+                &a.idx_k_norm_w,
+                rope,
+                p / r,
+                (p + take) / r,
+            )?;
+            done += take;
+        }
+        Ok(())
+    }
+
+    fn push_history_device_ptr(&self, state: &mut Qwen4ExpState, tokens_ptr: u64, t: usize) -> Result<()> {
         let cfg = &self.cfg;
         if cfg.ple_layer_ids_zero_based.is_empty() {
             return Ok(());
@@ -2854,7 +3732,7 @@ impl Qwen4Exp {
             nvk::q4exp_history_push(
                 stream.cu_stream() as *mut c_void,
                 slice_ptr_mut(&mut state.ple_history_dev, &stream) as *mut u32,
-                slice_ptr(tokens_dev, &stream) as *const u32,
+                tokens_ptr as *const u32,
                 (cfg.ngram_size - 1) as i32,
                 t as i32,
             )
@@ -2886,25 +3764,24 @@ impl Qwen4Exp {
         );
         let pos = state.pos;
         let stream = stream_of(&self.device)?;
-        let ids = ();
         let tokens_dev: CudaSlice<u32> = stream.clone_htod(tokens)?;
+        let tokens_ptr = slice_ptr(&tokens_dev, &stream);
         let positions: Vec<i32> = (pos..pos + t).map(|p| p as i32).collect();
         let positions = Tensor::from_vec(positions, (t,), &self.device)?;
         let mut prof = PhaseProf::begin(&self.device);
-        let _ = ids;
-        let hc = self.mm_splice_rows(state, self.embed_hc(&tokens_dev, t)?, pos, t, cfg.hc_count)?;
+        let hc = self.mm_splice_rows(state, self.embed_hc_ptr(tokens_ptr, t)?, pos, t, cfg.hc_count)?;
         let trace = std::env::var("NV_Q4EXP_TRACE").as_deref() == Ok("1");
         prof.lap("embed");
         let staged = self.staged_moe_ctx_for_rows(t)?;
         let mode = FwdMode {
-            pos_buf: None,
+            pos_ptr: None,
             moe_ctx: if t == 1 { Some(&self.decode_ctx) } else { staged.as_deref() },
             verify_rows: false,
             last_layer: None,
         };
-        let (hc, pending) = self.layers_forward(hc, tokens, &tokens_dev, state, pos, &positions, mode, &mut prof, trace)?;
+        let (hc, pending) = self.layers_forward(hc, Some(tokens), tokens_ptr, t, state, pos, Some(&positions), mode, &mut prof, trace)?;
         let hc = hc_settle(hc, pending, cfg)?;
-        self.push_history_device(state, &tokens_dev, t)?;
+        self.push_history_device_ptr(state, tokens_ptr, t)?;
         self.push_history_host(state, tokens);
         state.pos += t;
         let last = hc.narrow(0, t - 1, 1)?.contiguous()?;
@@ -2940,19 +3817,20 @@ impl Qwen4Exp {
             let c = (tokens.len() - off).min(PREFILL_CHUNK_2048_IS_THE_PREFIX_CHECKPOINT_GRID_SO_A_RESUMED_PREFILL_CHUNKS_EXACTLY_AS_A_COLD_ONE);
             let part = &tokens[off..off + c];
             let tokens_dev: CudaSlice<u32> = stream.clone_htod(part)?;
+            let tokens_ptr = slice_ptr(&tokens_dev, &stream);
             let positions: Vec<i32> = (off..off + c).map(|p| p as i32).collect();
             let positions = Tensor::from_vec(positions, (c,), &self.device)?;
-            let hc = self.embed_hc(&tokens_dev, c)?;
+            let hc = self.embed_hc_ptr(tokens_ptr, c)?;
             let staged = self.staged_moe_ctx_for_rows(c)?;
             let mode = FwdMode {
-                pos_buf: None,
+                pos_ptr: None,
                 moe_ctx: if c == 1 { Some(&self.decode_ctx) } else { staged.as_deref() },
                 verify_rows: false,
                 last_layer: Some(layer),
             };
-            let (hc, pending) = self.layers_forward(hc, part, &tokens_dev, state, off, &positions, mode, &mut prof, false)?;
+            let (hc, pending) = self.layers_forward(hc, Some(part), tokens_ptr, c, state, off, Some(&positions), mode, &mut prof, false)?;
             let hc = hc_settle(hc, pending, cfg)?;
-            self.push_history_device(state, &tokens_dev, c)?;
+            self.push_history_device_ptr(state, tokens_ptr, c)?;
             self.push_history_host(state, part);
             state.pos += c;
             rows.push(
@@ -2965,35 +3843,40 @@ impl Qwen4Exp {
         Ok(Tensor::cat(&rows, 0)?)
     }
 
-    fn step_captured(
+    fn step_captured_with(
         &self,
         state: &mut Qwen4ExpState,
         g: &mut DecodeBufs,
         rows: usize,
         moe_ctx: &Mutex<GroupedDecodeContext>,
+        tok_in: StepTokInput,
+        out_mode: StepOutMode,
     ) -> Result<()> {
         let cfg = &self.cfg;
-        let dev = cuda_dev(&self.device)?;
         let stream = stream_of(&self.device)?;
         ensure!(rows >= 1 && rows <= g.rows_cap, "qwen4_exp step rows {rows} outside 1..={}", g.rows_cap);
-        {
+        if tok_in == StepTokInput::CopyFromHost {
             stream.memcpy_htod(&g.host_tok[..rows], &mut g.tok_buf.slice_mut(0..rows))?;
-            stream.memcpy_htod(&g.host_pos[..], &mut g.pos_buf)?;
         }
-        let positions = wrap_i32(&g.pos_buf, &dev, 1)?;
+        stream.memcpy_htod(&g.host_pos[..], &mut g.pos_buf)?;
+        let tok_ptr = slice_ptr(&g.tok_buf, &stream);
+        let pos_ptr = slice_ptr(&g.pos_buf, &stream);
         let mut prof = PhaseProf::disabled();
-        let tokens_host: Vec<u32> = g.host_tok[..rows].to_vec();
-        let tok_buf = g.tok_buf.try_clone()?;
-        let hc = self.embed_hc(&tok_buf, rows)?;
+        let tokens_host = if tok_in == StepTokInput::CopyFromHost {
+            Some(&g.host_tok[..rows])
+        } else {
+            None
+        };
+        let hc = self.embed_hc_ptr(tok_ptr, rows)?;
         let mode = FwdMode {
-            pos_buf: Some(&g.pos_buf),
+            pos_ptr: Some(pos_ptr),
             moe_ctx: Some(moe_ctx),
             verify_rows: rows > 1,
             last_layer: None,
         };
-        let (hc, pending) = self.layers_forward(hc, &tokens_host, &tok_buf, state, state.pos, &positions, mode, &mut prof, false)?;
+        let (hc, pending) = self.layers_forward(hc, tokens_host, tok_ptr, rows, state, state.pos, None, mode, &mut prof, false)?;
         if rows == 1 {
-            self.push_history_device(state, &tok_buf, 1)?;
+            self.push_history_device_ptr(state, tok_ptr, 1)?;
         }
         let (hc, mixed) = match pending {
             Some(p) => {
@@ -3010,14 +3893,104 @@ impl Qwen4Exp {
             let hc = hc.contiguous()?;
             dtod_raw(cuda_ptr::<bf16>(hbuf, &stream)?, cuda_ptr::<bf16>(&hc, &stream)?, rows * hh * 2, &stream)?;
         }
-        let logits = self.lm_head.forward(&mixed)?.to_dtype(DType::F32)?.contiguous()?;
-        let (storage, layout) = logits.storage_and_layout();
-        let Storage::Cuda(s) = &*storage else {
-            bail!("logits not on CUDA")
-        };
-        let n = rows * cfg.vocab_size;
-        let src = s.as_cuda_slice::<f32>()?.slice(layout.start_offset()..layout.start_offset() + n);
-        stream.memcpy_dtod(&src, &mut g.logits_buf.slice_mut(0..n))?;
+        match out_mode {
+            StepOutMode::LogitsF32 => {
+                let logits_bf16 = self.lm_head.forward(&mixed)?;
+                let logits = logits_bf16.to_dtype(DType::F32)?.contiguous()?;
+                let (storage, layout) = logits.storage_and_layout();
+                let Storage::Cuda(s) = &*storage else {
+                    bail!("logits not on CUDA")
+                };
+                let n = rows * cfg.vocab_size;
+                let src = s.as_cuda_slice::<f32>()?.slice(layout.start_offset()..layout.start_offset() + n);
+                stream.memcpy_dtod(&src, &mut g.logits_buf.slice_mut(0..n))?;
+            }
+            StepOutMode::ArgmaxU32 => {
+                let out_ptr = slice_ptr_mut(&mut g.tok_buf, &stream) + (rows * 4) as u64;
+                if rows <= 8 && !self.lm_head.has_lora() {
+                    let verify_lm_screen = std::env::var("NV_Q4EXP_VERIFY_LM_SCREEN").as_deref() == Ok("1");
+                    if verify_lm_screen {
+                        if let (Some(dlm), Some((wq, rs))) = (
+                            self.mtp.as_ref().and_then(|m| m.draft_lm_head.as_ref()),
+                            self.lm_head.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+                        ) {
+                            if let (Some(ws), Some(rsc)) = (&dlm.w_sign, &dlm.row_scale) {
+                                let mixed_c = mixed.contiguous()?;
+                                let rc = unsafe {
+                                    nvk::q4exp_lm_head_sign_screen_fp8_argmax_mt(
+                                        stream.cu_stream() as *mut c_void,
+                                        slice_ptr(ws, &stream) as *const u32,
+                                        slice_ptr(rsc, &stream) as *const f32,
+                                        slice_ptr(wq, &stream) as *const u8,
+                                        slice_ptr(rs, &stream) as *const f32,
+                                        cuda_ptr::<bf16>(&mixed_c, &stream)? as *const u16,
+                                        slice_ptr_mut(&mut g.verify_cand_ids, &stream) as *mut u32,
+                                        slice_ptr_mut(&mut g.verify_packed_best, &stream) as *mut u64,
+                                        out_ptr as *mut u32,
+                                        rows as i32,
+                                        cfg.vocab_size as i32,
+                                        cfg.hidden_size as i32,
+                                    )
+                                };
+                                if rc != -3 {
+                                    ensure!(rc == 0, "q4exp_lm_head_sign_screen_fp8_argmax_mt rc={rc}");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                    let verify_lm_nvfp4 = std::env::var("NV_Q4EXP_VERIFY_LM_NVFP4").as_deref() == Ok("1");
+                    if verify_lm_nvfp4 {
+                        if let Some(dlm) = self.mtp.as_ref().and_then(|m| m.draft_lm_head.as_ref()) {
+                            let mixed_c = mixed.contiguous()?;
+                            let rc = unsafe {
+                                nvk::q4exp_lm_head_nvfp4_argmax_mt(
+                                    stream.cu_stream() as *mut c_void,
+                                    slice_ptr(&dlm.wq, &stream) as *const u8,
+                                    slice_ptr(&dlm.scales, &stream) as *const u8,
+                                    cuda_ptr::<bf16>(&mixed_c, &stream)? as *const u16,
+                                    slice_ptr_mut(&mut g.verify_packed_best, &stream) as *mut u64,
+                                    out_ptr as *mut u32,
+                                    rows as i32,
+                                    dlm.vocab as i32,
+                                    dlm.hidden as i32,
+                                )
+                            };
+                            ensure!(rc == 0, "q4exp_lm_head_nvfp4_argmax_mt rc={rc}");
+                            return Ok(());
+                        }
+                    }
+                    if let Some((wq, rs)) = self.lm_head.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h() {
+                        let mixed_c = mixed.contiguous()?;
+                        let rc = unsafe {
+                            nvk::q4exp_lm_head_fp8_argmax_mt(
+                                stream.cu_stream() as *mut c_void,
+                                slice_ptr(wq, &stream) as *const u8,
+                                slice_ptr(rs, &stream) as *const f32,
+                                cuda_ptr::<bf16>(&mixed_c, &stream)? as *const u16,
+                                slice_ptr_mut(&mut g.verify_packed_best, &stream) as *mut u64,
+                                out_ptr as *mut u32,
+                                rows as i32,
+                                cfg.vocab_size as i32,
+                                cfg.hidden_size as i32,
+                            )
+                        };
+                        ensure!(rc == 0, "q4exp_lm_head_fp8_argmax_mt rc={rc}");
+                        return Ok(());
+                    }
+                }
+                let logits_bf16 = self.lm_head.forward(&mixed)?;
+                argmax_bf16_rows(
+                    &logits_bf16,
+                    rows,
+                    cfg.vocab_size,
+                    &mut g.argmax_part_val,
+                    &mut g.argmax_part_idx,
+                    out_ptr,
+                    &stream,
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -3038,7 +4011,9 @@ impl Qwen4Exp {
         bufs.host_pos[0] = state.pos as i32;
         let stream = runner.stream().clone();
         let result = runner.run(DECODE_GRAPH_SHAPE_TOKEN_ONE_GRAPH_PER_STATE_BECAUSE_EVERY_BUFFER_ADDRESS_IS_BAKED, |s| {
-            nv_layers::cuda_stream::with_stream(s.clone(), || self.step_captured(state, bufs, 1, &self.decode_ctx))
+            nv_layers::cuda_stream::with_stream(s.clone(), || {
+                self.step_captured_with(state, bufs, 1, &self.decode_ctx, StepTokInput::CopyFromHost, StepOutMode::LogitsF32)
+            })
         });
         match result {
             Ok(()) => {}
@@ -3055,15 +4030,58 @@ impl Qwen4Exp {
         let out: Vec<f32> = stream.clone_dtoh(&bufs.logits_buf.slice(0..self.cfg.vocab_size))?;
         Ok(out)
     }
+
+    pub fn decode_graphed_argmax(&self, token: u32, state: &mut Qwen4ExpState, g: &mut Qwen4ExpDecodeGraph) -> Result<u32> {
+        ensure!(state.pos + 1 <= state.max_len, "qwen4_exp decode: state is full");
+        if self.has_expert_lora() {
+            let _ = lora::EXPERT_LORA_DECODE_RUNS_EAGER_BECAUSE_ITS_ROUTED_ROWS_ARE_PLANNED_ON_THE_HOST;
+            let row = self.forward(&[token], state)?.flatten_all()?.to_vec1::<f32>()?;
+            return Ok(crate::spec_pick::first_argmax(&row));
+        }
+        let Qwen4ExpDecodeGraph { runner, bufs, captured, .. } = g;
+        if !*captured && !runner.has_cached() {
+            let warm = self.forward(&[token], state)?;
+            let row: Vec<f32> = warm.flatten_all()?.to_vec1::<f32>()?;
+            *captured = true;
+            return Ok(crate::spec_pick::first_argmax(&row));
+        }
+        bufs.host_tok[0] = token;
+        bufs.host_pos[0] = state.pos as i32;
+        let stream = runner.stream().clone();
+        let result = runner.run(DECODE_ARGMAX_GRAPH_SHAPE_TOKEN, |s| {
+            nv_layers::cuda_stream::with_stream(s.clone(), || {
+                self.step_captured_with(state, bufs, 1, &self.decode_ctx, StepTokInput::CopyFromHost, StepOutMode::ArgmaxU32)
+            })
+        });
+        match result {
+            Ok(()) => {}
+            Err(e) => {
+                runner.invalidate();
+                *captured = false;
+                return Err(e).context("qwen4_exp decode argmax graph capture/replay failed");
+            }
+        }
+        *captured = true;
+        self.push_history_host(state, &[token]);
+        state.pos += 1;
+        let tok: Vec<u32> = stream.clone_dtoh(&bufs.tok_buf.slice(1..2))?;
+        Ok(tok[0])
+    }
 }
 
 pub struct MtpBufs {
     host_tok: Vec<u32>,
     host_pos: Box<[i32; 1]>,
+    host_pos_chain: Vec<i32>,
     tok_buf: CudaSlice<u32>,
     pos_buf: CudaSlice<i32>,
+    pos_chain_buf: CudaSlice<i32>,
     logits_buf: CudaSlice<f32>,
     mh_buf: Tensor,
+    draft_packed_best: CudaSlice<u64>,
+    draft_cand_ids: CudaSlice<u32>,
+    topk_blocks: CudaSlice<i32>,
+    topk_count: CudaSlice<i32>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -3148,6 +4166,8 @@ pub const ADAPTER_SESSIONS_NEVER_ENTER_THE_BASE_SESSION_CACHE_OR_ITS_RESIDENCY_T
 pub const NV_Q4EXP_LORA_SESSION_CACHE_1_KEEPS_ONE_ADAPTER_SESSION_REUSED_ONLY_UNDER_THE_SAME_ADAPTER_ID_AND_VERSION: &str =
     "NV_Q4EXP_LORA_SESSION_CACHE";
 
+pub const ADAPTER_SESSION_IS_HELD_SLOT_2_AGED_AND_RELEASED_BY_THE_COLD_TIER_LIKE_THE_TWO_BASE_SLOTS: usize = 2;
+
 pub const MTP_GRAPH_SHAPE_TOKEN_BASE_0X5E0_PLUS_ROWS: u64 = 0x5e0;
 
 pub const SESSION_MIN_LEN_8192_SHORT_REQUESTS_SHARE_ONE_STATE_SO_THEY_NEVER_OVERWRITE_THE_LONG_SESSIONS_PREFIX: usize = 8192;
@@ -3178,25 +4198,35 @@ impl Qwen4Exp {
             let mut mb = MtpBufs {
                 host_tok: vec![cfg.eos_token_id; rows_cap],
                 host_pos: Box::new([0i32; 1]),
+                host_pos_chain: vec![0i32; k],
                 tok_buf: stream.alloc_zeros::<u32>(rows_cap)?,
                 pos_buf: stream.alloc_zeros::<i32>(1)?,
+                pos_chain_buf: stream.alloc_zeros::<i32>(k)?,
                 logits_buf: stream.alloc_zeros::<f32>(cfg.vocab_size)?,
                 mh_buf: Tensor::zeros((1, cfg.hc_hidden()), DType::BF16, &self.device)?,
+                draft_packed_best: stream.alloc_zeros::<u64>(1)?,
+                draft_cand_ids: stream.alloc_zeros::<u32>(376 * 4)?,
+                topk_blocks: stream.alloc_zeros::<i32>(cfg.qsa_block_topk())?,
+                topk_count: stream.alloc_zeros::<i32>(1)?,
             };
             stream.synchronize()?;
             let t0 = std::time::Instant::now();
-            for rows in 1..=rows_cap {
-                self.mtp_step_run(&mut state, &mut graph, &mut mb, rows, false)?;
-                self.mtp_step_run(&mut state, &mut graph, &mut mb, rows, true)?;
+            graph.bufs.host_tok[..rows_cap].fill(cfg.eos_token_id);
+            graph.bufs.host_pos[0] = 0;
+            for c in 1..=rows_cap {
+                mb.host_tok[..c].fill(cfg.eos_token_id);
+                mb.host_pos_chain.fill(0);
+                self.mtp_chain_run(&mut state, &mut graph, &mut mb, c, k, false)?;
+                self.mtp_chain_run(&mut state, &mut graph, &mut mb, c, k, true)?;
             }
-            for rows in 2..=rows_cap {
-                graph.bufs.host_tok[..rows].fill(cfg.eos_token_id);
-                graph.bufs.host_pos[0] = 0;
-                self.verify_run(&mut state, &mut graph, rows, false)?;
-                self.verify_run(&mut state, &mut graph, rows, true)?;
-            }
+            self.verify_argmax_run(&mut state, &mut graph, rows_cap, false)?;
+            self.verify_argmax_run(&mut state, &mut graph, rows_cap, true)?;
             stream.synchronize()?;
-            eprintln!("[qwen4_exp] spec session k={k} len={max_len}: captured {} verify + {} draft graph shapes in {:.2}s", rows_cap - 1, rows_cap, t0.elapsed().as_secs_f64());
+            eprintln!(
+                "[qwen4_exp] spec session k={k} len={max_len}: captured 1 verify + {} draft-chain graph shapes in {:.2}s",
+                rows_cap,
+                t0.elapsed().as_secs_f64()
+            );
             state.reset(cfg, &self.device)?;
             mtp = Some(mb);
         }
@@ -3235,7 +4265,7 @@ impl Qwen4Exp {
             let parked = self.best_parked(&res, prompt, reusable[from], want_k);
             if parked.is_some() || from != 1 || reusable[1] == 0 {
                 if let Some(w) = slots[1].as_ref() {
-                    self.park_working(&mut res, w);
+                    self.park_working(&mut res, w, true);
                 }
             }
             if let Some(i) = self.best_parked(&res, prompt, reusable[from], want_k).filter(|_| parked.is_some()) {
@@ -3290,6 +4320,7 @@ impl Qwen4Exp {
             return;
         }
         let home = Self::home_slot(prompt);
+        self.touch_session(home);
         if home == 1 {
             if let Ok(mut res) = self.residency.lock() {
                 self.register_working(&mut res, &s);
@@ -3314,6 +4345,7 @@ impl Qwen4Exp {
     pub fn put_adapter_session(&self, s: Qwen4ExpSession) {
         let keep = std::env::var(NV_Q4EXP_LORA_SESSION_CACHE_1_KEEPS_ONE_ADAPTER_SESSION_REUSED_ONLY_UNDER_THE_SAME_ADAPTER_ID_AND_VERSION).as_deref() == Ok("1");
         if keep && s.lora_tag.is_some() {
+            self.touch_session(ADAPTER_SESSION_IS_HELD_SLOT_2_AGED_AND_RELEASED_BY_THE_COLD_TIER_LIKE_THE_TWO_BASE_SLOTS);
             if let Ok(mut slot) = self.adapter_session.lock() {
                 *slot = Some(s);
             }
@@ -3330,9 +4362,10 @@ impl Qwen4Exp {
         let t0 = std::time::Instant::now();
         let keep = old.ckpts.last().map_or(0, |c| c.pos);
         let r = self.cfg.indexer_compress_ratio;
+        ensure!(keep % r == 0, "grow_session checkpoint {keep} is not a multiple of the indexer compress ratio {r}");
         let mut host = Vec::new();
         for slot in old.state.attn.iter().chain(old.state.mtp_attn.as_ref()) {
-            for (t, n) in [(&slot.k, keep), (&slot.v, keep), (&slot.raw_idx_k, keep), (&slot.cmp_k, keep / r)] {
+            for (t, n) in [(&slot.k, keep), (&slot.v, keep), (&slot.cmp_k, keep / r)] {
                 host.push(t.narrow(0, 0, n)?.to_device(&Device::Cpu)?);
             }
         }
@@ -3340,9 +4373,9 @@ impl Qwen4Exp {
         drop((state, graph, mtp));
         let mut s = self.new_session(max_len, k)?;
         let slots: Vec<&AttnSlot> = s.state.attn.iter().chain(s.state.mtp_attn.as_ref()).collect();
-        ensure!(host.len() == 4 * slots.len(), "grown session has {} attention slots, the old one {}", slots.len(), host.len() / 4);
-        for (slot, rows) in slots.into_iter().zip(host.chunks(4)) {
-            for (t, h) in [&slot.k, &slot.v, &slot.raw_idx_k, &slot.cmp_k].into_iter().zip(rows) {
+        ensure!(host.len() == 3 * slots.len(), "grown session has {} attention slots, the old one {}", slots.len(), host.len() / 3);
+        for (slot, rows) in slots.into_iter().zip(host.chunks(3)) {
+            for (t, h) in [&slot.k, &slot.v, &slot.cmp_k].into_iter().zip(rows) {
                 t.slice_set(&h.to_device(&self.device)?, 0, 0)?;
             }
         }
@@ -3414,9 +4447,7 @@ impl Qwen4Exp {
                     let positions: Vec<i32> = (off..e).map(|p| p as i32).collect();
                     let positions = Tensor::from_vec(positions, (rows,), &self.device)?;
                     let hidden = hc.narrow(0, 0, rows)?;
-                    let staged = self.staged_moe_ctx_for_rows(rows)?;
-                    let ctx = if rows == 1 { Some(&self.decode_ctx) } else { staged.as_deref() };
-                    let _ = self.mtp_forward(mtp, &hidden, &toks, rows, off, &positions, None, ctx, &mut sess.state)?;
+                    self.mtp_prefill_kv(mtp, &hidden, &toks, rows, off, &positions, &mut sess.state)?;
                 }
             }
             last = Some((logits, hc.narrow(0, c - 1, 1)?.contiguous()?));
@@ -3432,53 +4463,285 @@ impl Qwen4Exp {
     }
 
     fn verify_run(&self, state: &mut Qwen4ExpState, g: &mut Qwen4ExpDecodeGraph, rows: usize, captured: bool) -> Result<()> {
-        ensure!(rows >= 2 && rows <= g.bufs.rows_cap, "verify rows {rows} outside 2..={}", g.bufs.rows_cap);
+        ensure!(rows >= 2 && rows == g.bufs.rows_cap, "verify rows {rows} != rows_cap {}", g.bufs.rows_cap);
         let Qwen4ExpDecodeGraph { runner, bufs, verify_ctx, .. } = g;
-        let ctx = &verify_ctx[rows - 2];
+        let ctx = verify_ctx.as_ref().context("verify_run requires rows_cap >= 2")?;
         if !captured {
             let stream = runner.stream().clone();
-            return nv_layers::cuda_stream::with_stream(stream, || self.step_captured(state, bufs, rows, ctx));
+            return nv_layers::cuda_stream::with_stream(stream, || {
+                self.step_captured_with(state, bufs, rows, ctx, StepTokInput::CopyFromHost, StepOutMode::LogitsF32)
+            });
         }
         runner
             .run(DECODE_GRAPH_SHAPE_TOKEN_ONE_GRAPH_PER_STATE_BECAUSE_EVERY_BUFFER_ADDRESS_IS_BAKED + rows as u64, |s| {
-                nv_layers::cuda_stream::with_stream(s.clone(), || self.step_captured(state, bufs, rows, ctx))
+                nv_layers::cuda_stream::with_stream(s.clone(), || {
+                    self.step_captured_with(state, bufs, rows, ctx, StepTokInput::CopyFromHost, StepOutMode::LogitsF32)
+                })
             })
             .context("qwen4_exp verify graph")
     }
 
-    fn mtp_step_captured(&self, mtp: &MtpHead, state: &mut Qwen4ExpState, g: &DecodeBufs, mb: &mut MtpBufs, rows: usize, moe_ctx: &Mutex<GroupedDecodeContext>) -> Result<()> {
-        let cfg = &self.cfg;
-        let dev = cuda_dev(&self.device)?;
-        let stream = stream_of(&self.device)?;
-        {
-            stream.memcpy_htod(&mb.host_tok[..rows], &mut mb.tok_buf.slice_mut(0..rows))?;
-            stream.memcpy_htod(&mb.host_pos[..], &mut mb.pos_buf)?;
+    fn verify_argmax_run(&self, state: &mut Qwen4ExpState, g: &mut Qwen4ExpDecodeGraph, rows: usize, captured: bool) -> Result<()> {
+        ensure!(rows >= 2 && rows == g.bufs.rows_cap, "verify argmax rows {rows} != rows_cap {}", g.bufs.rows_cap);
+        let Qwen4ExpDecodeGraph { runner, bufs, verify_ctx, .. } = g;
+        let ctx = verify_ctx.as_ref().context("verify_argmax_run requires rows_cap >= 2")?;
+        if !captured {
+            let stream = runner.stream().clone();
+            return nv_layers::cuda_stream::with_stream(stream, || {
+                self.step_captured_with(state, bufs, rows, ctx, StepTokInput::AlreadyOnDevice, StepOutMode::ArgmaxU32)
+            });
         }
-        let positions = wrap_i32(&mb.pos_buf, &dev, 1)?;
-        let tok_buf = mb.tok_buf.try_clone()?;
+        runner
+            .run(VERIFY_ARGMAX_GRAPH_SHAPE_TOKEN_BASE + rows as u64, |s| {
+                nv_layers::cuda_stream::with_stream(s.clone(), || {
+                    self.step_captured_with(state, bufs, rows, ctx, StepTokInput::AlreadyOnDevice, StepOutMode::ArgmaxU32)
+                })
+            })
+            .context("qwen4_exp verify argmax graph")
+    }
+
+    fn mtp_step_captured(&self, mtp: &MtpHead, state: &mut Qwen4ExpState, g: &DecodeBufs, mb: &mut MtpBufs, rows: usize) -> Result<()> {
+        let cfg = &self.cfg;
+        let stream = stream_of(&self.device)?;
+        stream.memcpy_htod(&mb.host_tok[..rows], &mut mb.tok_buf.slice_mut(0..rows))?;
+        stream.memcpy_htod(&mb.host_pos[..], &mut mb.pos_buf)?;
+        let tok_ptr = slice_ptr(&mb.tok_buf, &stream);
+        let pos_ptr = slice_ptr(&mb.pos_buf, &stream);
         let hidden = g.hidden_buf.as_ref().ok_or_else(|| anyhow::anyhow!("mtp step needs the hidden rows buffer"))?.narrow(0, 0, rows)?;
-        let (hc, logits) = self.mtp_forward(mtp, &hidden, &tok_buf, rows, 0, &positions, Some(&mb.pos_buf), Some(moe_ctx), state)?;
+        let (hc, mixed) = self.mtp_forward_mixed(mtp, &hidden, tok_ptr, rows, 0, None, Some(pos_ptr), Some(&self.decode_ctx), true, None, None, state)?;
         let hh = cfg.hc_hidden();
         let hc = hc.contiguous()?;
-        dtod_raw(cuda_ptr::<bf16>(&mb.mh_buf, &stream)?, cuda_ptr::<bf16>(&hc, &stream)? + ((rows - 1) * hh * 2) as u64, hh * 2, &stream)?;
+        dtod_raw(cuda_ptr::<bf16>(&mb.mh_buf, &stream)?, cuda_ptr::<bf16>(&hc, &stream)?, hh * 2, &stream)?;
+        let logits = self.lm_head.forward(&mixed)?.to_dtype(DType::F32)?.contiguous()?;
         let v = cfg.vocab_size;
-        dtod_raw(slice_ptr_mut(&mut mb.logits_buf, &stream), cuda_ptr::<f32>(&logits, &stream)? + ((rows - 1) * v * 4) as u64, v * 4, &stream)?;
+        dtod_raw(slice_ptr_mut(&mut mb.logits_buf, &stream), cuda_ptr::<f32>(&logits, &stream)?, v * 4, &stream)?;
         Ok(())
     }
 
     fn mtp_step_run(&self, state: &mut Qwen4ExpState, g: &mut Qwen4ExpDecodeGraph, mb: &mut MtpBufs, rows: usize, captured: bool) -> Result<()> {
         let mtp = self.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no mtp head loaded"))?;
-        let Qwen4ExpDecodeGraph { runner, bufs, verify_ctx, .. } = g;
-        let ctx: &Mutex<GroupedDecodeContext> = if rows == 1 { &self.decode_ctx } else { &verify_ctx[rows - 2] };
+        let Qwen4ExpDecodeGraph { runner, bufs, .. } = g;
         let stream = runner.stream().clone();
         if !captured {
-            return nv_layers::cuda_stream::with_stream(stream, || self.mtp_step_captured(mtp, state, bufs, mb, rows, ctx));
+            return nv_layers::cuda_stream::with_stream(stream, || self.mtp_step_captured(mtp, state, bufs, mb, rows));
         }
         runner
             .run(MTP_GRAPH_SHAPE_TOKEN_BASE_0X5E0_PLUS_ROWS + rows as u64, |s| {
-                nv_layers::cuda_stream::with_stream(s.clone(), || self.mtp_step_captured(mtp, state, bufs, mb, rows, ctx))
+                nv_layers::cuda_stream::with_stream(s.clone(), || self.mtp_step_captured(mtp, state, bufs, mb, rows))
             })
             .context("qwen4_exp mtp graph")
+    }
+
+    fn mtp_chain_captured(
+        &self,
+        mtp: &MtpHead,
+        state: &mut Qwen4ExpState,
+        g: &mut DecodeBufs,
+        mb: &mut MtpBufs,
+        c: usize,
+        k: usize,
+    ) -> Result<()> {
+        let cfg = &self.cfg;
+        let stream = stream_of(&self.device)?;
+        ensure!(c >= 1 && c <= g.rows_cap, "mtp chain c={c} outside 1..={}", g.rows_cap);
+        ensure!(k >= 1 && k + 1 == g.rows_cap, "mtp chain k={k} mismatches rows_cap {}", g.rows_cap);
+        stream.memcpy_htod(&mb.host_tok[..c], &mut mb.tok_buf.slice_mut(0..c))?;
+        stream.memcpy_htod(&mb.host_pos_chain[..k], &mut mb.pos_chain_buf.slice_mut(0..k))?;
+        stream.memcpy_htod(&g.host_tok[..1], &mut g.tok_buf.slice_mut(0..1))?;
+        let mb_tok_ptr = slice_ptr(&mb.tok_buf, &stream);
+        let pos_chain_base = slice_ptr(&mb.pos_chain_buf, &stream);
+        let round_io_base = slice_ptr(&g.tok_buf, &stream);
+        let reuse_topk_enabled = std::env::var("NV_Q4EXP_MTP_REUSE_TOPK").as_deref() == Ok("1");
+        let topk_pair = (slice_ptr(&mb.topk_blocks, &stream), slice_ptr(&mb.topk_count, &stream));
+        let hidden0 = g.hidden_buf.as_ref().context("mtp chain needs the hidden rows buffer")?.narrow(0, 0, c)?;
+        let (mut prev_hc, mixed) = self.mtp_forward_mixed(
+            mtp,
+            &hidden0,
+            mb_tok_ptr,
+            c,
+            0,
+            None,
+            Some(pos_chain_base),
+            Some(&self.decode_ctx),
+            true,
+            None,
+            (reuse_topk_enabled && k > 1).then_some(topk_pair),
+            state,
+        )?;
+        if let Some(dlm) = &mtp.draft_lm_head {
+            let mixed_c = mixed.contiguous()?;
+            let rc = if let (Some(ws), Some(rs)) = (&dlm.w_sign, &dlm.row_scale) {
+                if let (false, Some((fp8_wq, fp8_rs))) = (
+                    self.lm_head.has_lora(),
+                    self.lm_head.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+                ) {
+                    unsafe {
+                        nvk::q4exp_lm_head_sign_screen_fp8_argmax_mt(
+                            stream.cu_stream() as *mut c_void,
+                            slice_ptr(ws, &stream) as *const u32,
+                            slice_ptr(rs, &stream) as *const f32,
+                            slice_ptr(fp8_wq, &stream) as *const u8,
+                            slice_ptr(fp8_rs, &stream) as *const f32,
+                            cuda_ptr::<bf16>(&mixed_c, &stream)? as *const u16,
+                            slice_ptr_mut(&mut mb.draft_cand_ids, &stream) as *mut u32,
+                            slice_ptr_mut(&mut mb.draft_packed_best, &stream) as *mut u64,
+                            (round_io_base + 4) as *mut u32,
+                            1,
+                            dlm.vocab as i32,
+                            dlm.hidden as i32,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        nvk::q4exp_lm_head_sign_screen_argmax_m1(
+                            stream.cu_stream() as *mut c_void,
+                            slice_ptr(ws, &stream) as *const u32,
+                            slice_ptr(rs, &stream) as *const f32,
+                            slice_ptr(&dlm.wq, &stream) as *const u8,
+                            slice_ptr(&dlm.scales, &stream) as *const u8,
+                            cuda_ptr::<bf16>(&mixed_c, &stream)? as *const u16,
+                            slice_ptr_mut(&mut mb.draft_cand_ids, &stream) as *mut u32,
+                            slice_ptr_mut(&mut mb.draft_packed_best, &stream) as *mut u64,
+                            (round_io_base + 4) as *mut u32,
+                            dlm.vocab as i32,
+                            dlm.hidden as i32,
+                        )
+                    }
+                }
+            } else {
+                unsafe {
+                    nvk::q4exp_lm_head_nvfp4_argmax_m1(
+                        stream.cu_stream() as *mut c_void,
+                        slice_ptr(&dlm.wq, &stream) as *const u8,
+                        slice_ptr(&dlm.scales, &stream) as *const u8,
+                        cuda_ptr::<bf16>(&mixed_c, &stream)? as *const u16,
+                        slice_ptr_mut(&mut mb.draft_packed_best, &stream) as *mut u64,
+                        (round_io_base + 4) as *mut u32,
+                        dlm.vocab as i32,
+                        dlm.hidden as i32,
+                    )
+                }
+            };
+            ensure!(rc == 0, "q4exp_lm_head_nvfp4_argmax_m1 rc={rc}");
+        } else {
+            let logits_bf16 = self.lm_head.forward(&mixed)?;
+            argmax_bf16_rows(
+                &logits_bf16,
+                1,
+                cfg.vocab_size,
+                &mut g.argmax_part_val,
+                &mut g.argmax_part_idx,
+                round_io_base + 4,
+                &stream,
+            )?;
+        }
+        for j in 1..k {
+            let (hc, mixed) = self.mtp_forward_mixed(
+                mtp,
+                &prev_hc,
+                round_io_base + (j * 4) as u64,
+                1,
+                0,
+                None,
+                Some(pos_chain_base + (j * 4) as u64),
+                Some(&self.decode_ctx),
+                true,
+                Some(topk_pair),
+                None,
+                state,
+            )?;
+            if let Some(dlm) = &mtp.draft_lm_head {
+                let mixed_c = mixed.contiguous()?;
+                let rc = if let (Some(ws), Some(rs)) = (&dlm.w_sign, &dlm.row_scale) {
+                    if let (false, Some((fp8_wq, fp8_rs))) = (
+                        self.lm_head.has_lora(),
+                        self.lm_head.fp8_e4m3_row_weight_and_scales_so_gdn_prenorm_folds_into_gemv_e4m3_mk_h(),
+                    ) {
+                        unsafe {
+                            nvk::q4exp_lm_head_sign_screen_fp8_argmax_mt(
+                                stream.cu_stream() as *mut c_void,
+                                slice_ptr(ws, &stream) as *const u32,
+                                slice_ptr(rs, &stream) as *const f32,
+                                slice_ptr(fp8_wq, &stream) as *const u8,
+                                slice_ptr(fp8_rs, &stream) as *const f32,
+                                cuda_ptr::<bf16>(&mixed_c, &stream)? as *const u16,
+                                slice_ptr_mut(&mut mb.draft_cand_ids, &stream) as *mut u32,
+                                slice_ptr_mut(&mut mb.draft_packed_best, &stream) as *mut u64,
+                                (round_io_base + ((j + 1) * 4) as u64) as *mut u32,
+                                1,
+                                dlm.vocab as i32,
+                                dlm.hidden as i32,
+                            )
+                        }
+                    } else {
+                        unsafe {
+                            nvk::q4exp_lm_head_sign_screen_argmax_m1(
+                                stream.cu_stream() as *mut c_void,
+                                slice_ptr(ws, &stream) as *const u32,
+                                slice_ptr(rs, &stream) as *const f32,
+                                slice_ptr(&dlm.wq, &stream) as *const u8,
+                                slice_ptr(&dlm.scales, &stream) as *const u8,
+                                cuda_ptr::<bf16>(&mixed_c, &stream)? as *const u16,
+                                slice_ptr_mut(&mut mb.draft_cand_ids, &stream) as *mut u32,
+                                slice_ptr_mut(&mut mb.draft_packed_best, &stream) as *mut u64,
+                                (round_io_base + ((j + 1) * 4) as u64) as *mut u32,
+                                dlm.vocab as i32,
+                                dlm.hidden as i32,
+                            )
+                        }
+                    }
+                } else {
+                    unsafe {
+                        nvk::q4exp_lm_head_nvfp4_argmax_m1(
+                            stream.cu_stream() as *mut c_void,
+                            slice_ptr(&dlm.wq, &stream) as *const u8,
+                            slice_ptr(&dlm.scales, &stream) as *const u8,
+                            cuda_ptr::<bf16>(&mixed_c, &stream)? as *const u16,
+                            slice_ptr_mut(&mut mb.draft_packed_best, &stream) as *mut u64,
+                            (round_io_base + ((j + 1) * 4) as u64) as *mut u32,
+                            dlm.vocab as i32,
+                            dlm.hidden as i32,
+                        )
+                    }
+                };
+                ensure!(rc == 0, "q4exp_lm_head_nvfp4_argmax_m1 rc={rc}");
+            } else {
+                let logits_bf16 = self.lm_head.forward(&mixed)?;
+                argmax_bf16_rows(
+                    &logits_bf16,
+                    1,
+                    cfg.vocab_size,
+                    &mut g.argmax_part_val,
+                    &mut g.argmax_part_idx,
+                    round_io_base + ((j + 1) * 4) as u64,
+                    &stream,
+                )?;
+            }
+            prev_hc = hc;
+        }
+        Ok(())
+    }
+
+    fn mtp_chain_run(
+        &self,
+        state: &mut Qwen4ExpState,
+        g: &mut Qwen4ExpDecodeGraph,
+        mb: &mut MtpBufs,
+        c: usize,
+        k: usize,
+        captured: bool,
+    ) -> Result<()> {
+        let mtp = self.mtp.as_ref().ok_or_else(|| anyhow::anyhow!("no mtp head loaded"))?;
+        let Qwen4ExpDecodeGraph { runner, bufs, .. } = g;
+        let stream = runner.stream().clone();
+        if !captured {
+            return nv_layers::cuda_stream::with_stream(stream, || self.mtp_chain_captured(mtp, state, bufs, mb, c, k));
+        }
+        runner
+            .run(MTP_CHAIN_GRAPH_SHAPE_TOKEN_BASE + c as u64, |s| {
+                nv_layers::cuda_stream::with_stream(s.clone(), || self.mtp_chain_captured(mtp, state, bufs, mb, c, k))
+            })
+            .context("qwen4_exp mtp chain graph")
     }
 
     pub fn session_begin(&self, sess: &mut Qwen4ExpSession, prompt: &[u32]) -> Result<u32> {
@@ -3503,7 +4766,59 @@ impl Qwen4Exp {
     }
 
     pub fn session_round(&self, sess: &mut Qwen4ExpSession) -> Result<Vec<u32>> {
-        self.session_round_with(sess, &mut GreedyPick)
+        if self.ple_layer().is_some_and(|p| p.table.is_none()) {
+            return self.session_round_with(sess, &mut GreedyPick);
+        }
+        let k = sess.k;
+        ensure!(k >= 1 && sess.mtp.is_some(), "session_round needs a speculative session");
+        let stream = stream_of(&self.device)?;
+        let l = sess.state.pos;
+        let rows = k + 1;
+        ensure!(l + k < sess.state.max_len, "verify overflow: {l} + {rows} rows > {}", sess.state.max_len);
+        let c = sess.pending.len();
+        ensure!(c >= 1 && c <= rows && c <= l, "pending rows {c} out of range (l={l}, k={k})");
+        let t0 = std::time::Instant::now();
+        let Qwen4ExpSession { state, graph, mtp, pending, anchor, stats, .. } = sess;
+        let mb = mtp.as_mut().unwrap();
+        mb.host_tok[..c].copy_from_slice(pending);
+        mb.host_pos_chain[0] = (l - c) as i32;
+        for j in 1..k {
+            mb.host_pos_chain[j] = (l - 1 + j) as i32;
+        }
+        graph.bufs.host_tok[0] = *anchor;
+        graph.bufs.host_pos[0] = l as i32;
+        self.mtp_chain_run(state, graph, mb, c, k, true)?;
+        self.verify_argmax_run(state, graph, rows, true)?;
+        let out: Vec<u32> = stream.clone_dtoh(&graph.bufs.tok_buf.slice(1..2 * rows))?;
+        let round_dt = t0.elapsed().as_secs_f64();
+        let t2 = std::time::Instant::now();
+        let drafts = &out[..k];
+        let targets = &out[k..k + rows];
+        let mut accepted = 0usize;
+        while accepted < k && drafts[accepted] == targets[accepted] {
+            accepted += 1;
+        }
+        let bonus = targets[accepted];
+        let consumed = accepted + 1;
+        let mut emitted = Vec::with_capacity(consumed);
+        emitted.extend_from_slice(&drafts[..accepted]);
+        emitted.push(bonus);
+        let mut block = Vec::with_capacity(consumed);
+        block.push(*anchor);
+        block.extend_from_slice(&drafts[..accepted]);
+        let tok_ptr = slice_ptr(&graph.bufs.tok_buf, &stream);
+        self.commit_rows(state, &block, Some(tok_ptr), rows)?;
+        pending.clear();
+        pending.extend_from_slice(&drafts[..accepted]);
+        pending.push(bonus);
+        *anchor = bonus;
+        stats.rounds += 1;
+        stats.drafted += k;
+        stats.accepted += accepted;
+        stats.emitted += emitted.len();
+        stats.verify_ms += 1000.0 * round_dt;
+        stats.commit_ms += 1000.0 * t2.elapsed().as_secs_f64();
+        Ok(emitted)
     }
 
     pub fn session_round_with(&self, sess: &mut Qwen4ExpSession, pick: &mut dyn SpecPick) -> Result<Vec<u32>> {
@@ -3553,11 +4868,11 @@ impl Qwen4Exp {
         let mut emitted: Vec<u32> = drafts[..accepted].to_vec();
         emitted.push(bonus);
         let block: Vec<u32> = std::iter::once(*anchor).chain(drafts.iter().copied()).collect();
-        self.commit_rows(state, &block[..consumed])?;
+        let tok_ptr = slice_ptr(&graph.bufs.tok_buf, &stream);
+        self.commit_rows(state, &block[..consumed], Some(tok_ptr), rows)?;
         *pending = block[1..consumed].to_vec();
         pending.push(bonus);
         *anchor = bonus;
-        stream.synchronize()?;
         stats.rounds += 1;
         stats.drafted += k;
         stats.accepted += accepted;
@@ -3568,23 +4883,41 @@ impl Qwen4Exp {
         Ok(emitted)
     }
 
-    fn commit_rows(&self, state: &mut Qwen4ExpState, tokens: &[u32]) -> Result<()> {
+    fn commit_rows(
+        &self,
+        state: &mut Qwen4ExpState,
+        tokens: &[u32],
+        tokens_dev_ptr: Option<u64>,
+        verified_rows: usize,
+    ) -> Result<()> {
         let cfg = &self.cfg;
         let consumed = tokens.len();
-        ensure!(consumed >= 1, "commit_rows: nothing consumed");
+        ensure!(
+            consumed >= 1 && consumed <= verified_rows,
+            "commit_rows: consumed {consumed} outside 1..={verified_rows}"
+        );
         let stream = stream_of(&self.device)?;
-        let pairs: Vec<(&LinAttnState, &LinAttnState)> = state
-            .gdn
-            .iter()
-            .zip(state.gdn_ckpts.iter())
-            .map(|(live, ck)| (live, &ck[consumed - 1]))
-            .collect();
-        nv_layers::linear_attn::batched_rollback_copy(&pairs)?;
+        if consumed < verified_rows {
+            if let Some(plan) = state.gdn_rollback_plans.get(consumed - 1) {
+                plan.launch(&stream)?;
+            } else {
+                let pairs: Vec<(&LinAttnState, &LinAttnState)> = state
+                    .gdn
+                    .iter()
+                    .zip(state.gdn_ckpts.iter())
+                    .map(|(live, ck)| (live, &ck[consumed - 1]))
+                    .collect();
+                nv_layers::linear_attn::batched_rollback_copy(&pairs)?;
+            }
+        }
         if let (Some(ple), Some(slab)) = (self.ple_layer(), state.ple_gvn.as_ref()) {
             ple.advance_window(&state.ple_conv, slab, consumed, cfg)?;
         }
         self.push_history_host(state, tokens);
-        stream.memcpy_htod(&state.ple_history, &mut state.ple_history_dev)?;
+        match tokens_dev_ptr {
+            Some(ptr) => self.push_history_device_ptr(state, ptr, consumed)?,
+            None => stream.memcpy_htod(&state.ple_history, &mut state.ple_history_dev)?,
+        }
         state.pos += consumed;
         Ok(())
     }

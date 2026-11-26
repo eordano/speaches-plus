@@ -11,10 +11,11 @@ crates=(
   "wgpu-hal 30.0.0 cf765132d8d5f50e192e7880464890c13f4e7457aafe8e5466e8174586e9f101"
   "candle-core 0.11.0 5ecb245093b0f791b89d3420c3df9c6d49c60ab63ba54db896bf8a3baf486706"
   "candle-metal-kernels 0.11.0 242e83c6acf639bb273c929d73c67a882bb4dd08a140f121096e19ba2f213d3e"
+  "onednn-src 0.1.21 93648e98a6283e211c0aaa7c241041aa94ae0a65037a1e449e6e182261eb44e1"
 )
 mlx_tag=v0.32.2
-forge=${FORGE_URL:-https://git.decent.foundation}
-upstream=${THIRD_PARTY_UPSTREAM:-0}
+forge=${FORGE_URL:-}
+upstream=${THIRD_PARTY_UPSTREAM:-1}
 [ "${1:-}" = --upstream ] && upstream=1
 
 crate_url() {

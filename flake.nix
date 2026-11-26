@@ -4,7 +4,6 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
   inputs.nix-hug.url = "github:eordano/nix-hug";
   inputs.nix-hug.inputs.nixpkgs.follows = "nixpkgs";
-  inputs.nixpkgs-pyannote3.url = "github:NixOS/nixpkgs/nixos-24.05";
   inputs.crane.url = "github:ipetkov/crane";
 
   outputs =
@@ -12,7 +11,6 @@
       self,
       nixpkgs,
       nix-hug,
-      nixpkgs-pyannote3,
       crane,
     }:
     let
@@ -77,6 +75,8 @@
         "12.0"
       ];
 
+      cudaPackagesTheDriverCanJit = pkgs: pkgs.cudaPackages_13_4;
+
       skipPy =
         pkg:
         pkg.overridePythonAttrs (_: {
@@ -88,6 +88,7 @@
         pkg.overridePythonAttrs (old: {
           disabledTests = (old.disabledTests or [ ]) ++ tests;
         });
+      loopbackPy = pkg: pkg.overridePythonAttrs { __darwinAllowLocalNetworking = true; };
 
       unbreakDlinfoOverlay = _final: prev: {
         python314Packages = prev.python314Packages.override {
@@ -117,12 +118,15 @@
               nltk = skipPy pyPrev.nltk;
               google-api-core = disablePy [ "test_apply_passthrough" ] pyPrev.google-api-core;
               moto = disablePy [ "test_state_machine_with_parallel_states" ] pyPrev.moto;
-              openai = disablePy [
-                "test_mtls_example_presents_full_client_chain"
-                "test_default_chain_uses_container_credentials"
-                "test_default_chain_uses_ec2_instance_metadata"
-                "test_existing_aiohttp_adapter_is_unchanged_when_installed"
-              ] pyPrev.openai;
+              openai = loopbackPy (
+                disablePy [
+                  "test_mtls_example_presents_full_client_chain"
+                  "test_default_chain_uses_container_credentials"
+                  "test_default_chain_uses_ec2_instance_metadata"
+                  "test_existing_aiohttp_adapter_is_unchanged_when_installed"
+                ] pyPrev.openai
+              );
+              requests-cache = loopbackPy pyPrev.requests-cache;
             })
           ];
       };
@@ -238,6 +242,7 @@
         {
           cudaPackages = fixCudaScope prev.cudaPackages;
           cudaPackages_12 = fixCudaScope prev.cudaPackages_12;
+          cudaPackages_13_4 = fixCudaScope prev.cudaPackages_13_4;
         };
 
       onnxruntimeNoNcclOverlay = _final: prev: {
@@ -411,9 +416,9 @@
           };
 
           parakeet-tdt = {
-            url = "istupakov/parakeet-tdt-0.6b-v2-onnx";
-            rev = "0bbb45a3365852604aef28b538a8f066f4ccaa85";
-            fileTreeHash = "sha256-5aifgY0uAwcmavrGsFnttD76IaB9justp+yecnOHQ00=";
+            url = "istupakov/parakeet-tdt-0.6b-v3-onnx";
+            rev = "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce";
+            fileTreeHash = "sha256-hD/Z8q5e7CeUbpV6lxRNWbBl/79LCQgRlRDm7HIu3/E=";
             filters.exclude = [ ".*int8.*" ];
             envVars = [ "STT_PARAKEET_DIR" ];
           };
@@ -630,7 +635,7 @@
         let
           pkgs = mkPkgs system;
           isLinux = pkgs.stdenv.hostPlatform.isLinux;
-          cudaPackages = pkgs.cudaPackages_12;
+          cudaPackages = cudaPackagesTheDriverCanJit pkgs;
           speachesModelsHub =
             if profile != null && !localHub then mkSpeachesModelsHub system profile else null;
           profileEnv =
@@ -776,6 +781,8 @@
             if [ -d "$HOME/.cargo/registry/src" ]; then
               bash "${./rust/scripts/patch-ct2rs-cuda.sh}" >/dev/null 2>&1 || true
               bash "${./rust/scripts/patch-ct2rs-cmake-min.sh}" >/dev/null 2>&1 || true
+              bash "${./rust/scripts/patch-ct2rs-arch-fallback.sh}" >/dev/null 2>&1 || true
+              bash "${./rust/scripts/patch-whisper-rs-sys-culibos.sh}" >/dev/null 2>&1 || true
             fi
           ''
           + pkgs.lib.optionalString (localHub && profile != null) (localHubHook system profile)
@@ -806,7 +813,7 @@
         {
           pkgs,
           withCUDA ? false,
-          cudaPackages ? pkgs.cudaPackages_12,
+          cudaPackages ? cudaPackagesTheDriverCanJit pkgs,
         }:
         let
           ctranslate2 = ctranslate2For pkgs withCUDA cudaPackages;
@@ -865,7 +872,7 @@
           system ? pkgs.stdenv.hostPlatform.system,
           withCUDA ? false,
           withVulkan ? false,
-          cudaPackages ? pkgs.cudaPackages_12,
+          cudaPackages ? cudaPackagesTheDriverCanJit pkgs,
           profile ? "full",
           crate ? null,
           cudaComputeCap ? null,
@@ -876,6 +883,9 @@
           modelsHub = if profile != null then mkSpeachesModelsHub system profile else null;
           profileEnv = if profile != null then mkProfileEnv system profile modelsHub else { };
 
+          # 16 parallel cicc runs of the flash-attn kernels can OOM alongside other
+          # concurrent builds; changing this value alters the derivation hash, so
+          # keep the cap at 16 and serialize builds on memory-constrained hosts.
           cudaforgeThreadsBoundSoParallelNvccFitsInRam = "16";
 
           cutlassForCudaforge = pkgs.fetchgit {
@@ -924,6 +934,13 @@
                   postInstall = (old.postInstall or "") + ''
                     CT2_HELPERS_OVERRIDE="$out/CTranslate2/src/cuda/helpers.h" \
                       bash ${./rust/scripts/patch-ct2rs-cuda.sh}
+                  '';
+                })
+              else if withCUDA && p.name == "whisper-rs-sys" then
+                drv.overrideAttrs (old: {
+                  postInstall = (old.postInstall or "") + ''
+                    WHISPER_RS_SYS_BUILD_RS_OVERRIDE="$out/build.rs" \
+                      bash ${./rust/scripts/patch-whisper-rs-sys-culibos.sh}
                   '';
                 })
               else
@@ -1109,7 +1126,7 @@
               cargoArtifacts
               ;
           }
-          // lib.optionalAttrs withCUDA { inherit cudaKernels; };
+          // lib.optionalAttrs withCUDA { inherit cudaKernels cudaPackages; };
         in
         craneLib.buildPackage (
           applicationArgs
@@ -1247,7 +1264,7 @@
       mkDiarizenExporter =
         system:
         let
-          pkgs3 = import nixpkgs-pyannote3 { inherit system; };
+          pkgs3 = import nixpkgs { inherit system; };
           diarizenCkpt = cpuPythonPackages.${system}.models.diarizen;
           diarizenSrc = pkgs3.fetchFromGitHub {
             owner = "BUTSpeechFIT";
@@ -1256,9 +1273,39 @@
             hash = "sha256-i6IsyJz63vshkXmOqWZjZ+nPHe6i9YKLu5nzE+NtLgA=";
           };
           pyannoteFork = pkgs3.python3Packages.pyannote-audio.overridePythonAttrs (_: {
-            version = "3.1.1-diarizen";
+            version = "3.1.1";
             src = diarizenSrc;
             sourceRoot = "${diarizenSrc.name}/pyannote-audio";
+            build-system = [ pkgs3.python3Packages.setuptools ];
+            dependencies = with pkgs3.python3Packages; [
+              asteroid-filterbanks
+              einops
+              huggingface-hub
+              lightning
+              omegaconf
+              pyannote-core
+              pyannote-database
+              pyannote-metrics
+              pyannote-pipeline
+              pytorch-metric-learning
+              rich
+              semver
+              soundfile
+              speechbrain
+              tensorboardx
+              torch
+              torch-audiomentations
+              torchaudio
+              torchmetrics
+            ];
+            postPatch = ''
+              sed -i '/pkg_resources/d; /^try:$/,/^    sys.exit(1)$/d; /namespace_packages=/d' setup.py
+              sed -i '/^setup_requires/d' setup.cfg
+              rm pyannote/__init__.py
+              grep -rl 'np\.NaN' pyannote | xargs sed -i 's/np\.NaN/np.nan/g'
+              sed -i 's/from setuptools import find_packages, setup/from setuptools import find_namespace_packages, setup/; s/packages=find_packages(),/packages=find_namespace_packages(include=["pyannote.*"]),/' setup.py
+              sed -i 's/"setuptools>=61.0.0, <82.0.0"/"setuptools"/' pyproject.toml
+            '';
             doCheck = false;
             dontCheckRuntimeDeps = true;
             pythonImportsCheck = [ ];
@@ -1307,7 +1354,6 @@
           inherit (pkgs) lib;
           thirdParty =
             let
-              forge = "https://git.decent.foundation";
               crate =
                 {
                   name,
@@ -1317,7 +1363,6 @@
                 let
                   tarball = pkgs.fetchurl {
                     urls = [
-                      "${forge}/api/packages/mirrors/generic/${name}/${version}/${name}-${version}.crate"
                       "https://static.crates.io/crates/${name}/${name}-${version}.crate"
                     ];
                     inherit hash;
@@ -1330,7 +1375,6 @@
                 '';
               mlx = pkgs.fetchzip {
                 urls = [
-                  "${forge}/mirrors/mlx/archive/1f8e74e3f12f31365464a6867c6579f0e9b29d85.tar.gz"
                   "https://github.com/ml-explore/mlx/archive/1f8e74e3f12f31365464a6867c6579f0e9b29d85.tar.gz"
                 ];
                 hash = "sha256-pAQZ1RJq9Mb66qXMdZUt3znNKY+bhpxYckY708i0CmY=";
@@ -1361,6 +1405,11 @@
                 name = "candle-metal-kernels";
                 version = "0.11.0";
                 hash = "sha256-JC6Dxqz2ObsnPJKdc8Z6iCu03QihQPEhCW4Zui8hPT4=";
+              }}
+              ${crate {
+                name = "onednn-src";
+                version = "0.1.21";
+                hash = "sha256-k2SOmKYoPiEcCqp8JBBBqpSuCmUDeh5Enm4YImHrROE=";
               }}
               for f in ATTRIBUTION LICENSE FILES; do
                 cp ${mlxDir}/$f $out/mlx-steel-attn/$f

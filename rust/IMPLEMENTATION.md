@@ -616,11 +616,51 @@ Drain status is inspector-only, never on the wire.
 
 Off by default; `PARTIAL_STT_ENABLED=1` enables.
 `VadProcessor::current_speech_audio()` returns `Some((item_id, audio))`
-while Speaking. `spawn_vad_task` keeps a `total_samples` counter; every
-`defaults::buffer::PARTIAL_INTERVAL_MS` (500 ms) of audio, if Speaking
-and no partial in flight (`partial_in_progress: AtomicBool`, one at a
-time), snapshot and spawn `run_partial_transcription`. Results are
-checked against `current_speech_item()` and dropped if stale.
+while Speaking. Each partial transcribes the whole utterance so far, so
+`partial_interval_samples` spaces them by a third of that utterance
+(`PARTIAL_INTERVAL_UTTERANCE_DIVISOR`), clamped to
+`PARTIAL_INTERVAL_MIN_MS` (500) .. `PARTIAL_INTERVAL_MAX_MS` (2000) of
+audio: a fixed 500 ms grows with the square of the utterance length.
+
+A due partial replaces one that has not reached the STT yet (aborted:
+the newest audio wins) and waits while one is transcribing. Partials
+share one server-wide turn, `STT_PRIORITY.partial_turn()`, which also
+waits while any final is pending (`STT_PRIORITY.final_pending()` in the
+final STT call), so a final queues behind at most one partial pass.
+The turn and the pending mark move into the blocking STT closure
+(`spawn_blocking_holding`): CTranslate2's whisper `generate` cannot be
+interrupted, so an aborted partial keeps its turn until the C++ call
+returns, and its result is dropped. Results are checked against
+`current_speech_item()` and dropped if stale.
+
+## Early final and beam width
+
+Three session options, each with a server-wide default from the
+environment (unset leaves today's behaviour):
+
+| session field | env default | effect |
+|---|---|---|
+| `turn_detection.early_final_ms` (0..5000) | `REALTIME_EARLY_FINAL_MS` (0 = off) | start the final STT after this much trailing silence |
+| `input_audio_transcription.beam_size` (1..10) | `REALTIME_FINAL_BEAM_SIZE` (5) | beam of realtime finals, eager-EOU finals included |
+| `input_audio_transcription.partial_beam_size` (1..10) | `PARTIAL_STT_BEAM_SIZE` (5) | beam of partials |
+
+A turn closes only once its silence reaches `silence_duration_ms` plus the
+speech padding (`prefix_padding_ms`, which pads the speech end): with
+recgo's 900 + 300 ms, 1.2 s after the last word. `VadProcessor` tracks the
+first window below the negative threshold since the last one above the
+threshold (the same point `speech_timestamps_from_probs` closes the
+segment at); when that silence reaches `early_final_ms` it emits
+`SpeechPaused` with the audio the commit would transcribe
+(`[start, silence + pad)`), and `SpeechResumed` if speech comes back.
+`start_early_final` runs the final STT under `final_pending()` and keeps
+the handle in `Session::early_finals`; a resume aborts it; the commit
+(`process_utterance`) takes it and awaits it instead of a fresh STT, so
+the noise gate and confidence still apply. A finished early final that
+passes the noise gate is sent at once as
+`input_audio_buffer.partial_transcription` with `"final_candidate": true`,
+up to `silence_duration_ms + pad - early_final_ms` before the commit. No
+partial is scheduled while paused. A pause that speech ends costs one
+wasted final pass, which `early final dropped` in the log counts.
 
 ## Error envelope (§10.5)
 
@@ -753,16 +793,38 @@ Two backends in one binary, picked at startup via
 | `whisper-cpp` | `whisper-rs` | GGML (`ggml-large-v3-turbo.bin`) | yes (Metal) | ~9 s |
 | `ct2` | `ct2rs` | CT2 dir (`whisper-ct2/`) | no (CPU only) | ~30-40 s |
 
-`ct2`: `Whisper::generate(samples, lang, timestamp, opts)` runs
-mel-spec -> encode -> detect-lang -> decode -> tokenizer.decode
-end-to-end and takes `&self` (no Mutex on the inference path);
-`beam_size = 1` (greedy) for realtime. `CT2_COMPUTE_TYPE` picks the
+`ct2`: `transcribe_ct2` pads to 30 s, computes the log-mel
+(`stt/mel.rs`), runs `encode` once and hands that encoder output to both
+`detect_language` and `generate` (beam `defaults::stt::BEAM_SIZE`), then
+splits on timestamp tokens; it takes `&self` (no Mutex on the inference
+path). On Linux x86_64 ct2rs builds CTranslate2 with oneDNN and OpenMP (the
+`dnnl` feature; `third-party/onednn-src-0.1.21` installs into `lib/`, where
+the crate links, on hosts whose GNUInstallDirs picks `lib64/`); elsewhere it
+builds Ruy (plus Accelerate under `metal`). oneDNN dispatches AVX2,
+AVX-512 and VNNI at runtime and runs int8 GEMMs on VNNI, which Ruy's x86
+path does not. `ct2_threads` sizes CTranslate2's thread team to one per
+physical core, capped by the cpuset/quota (`num_cpus`); CTranslate2's own
+default is min(4, cores). `CT2_COMPUTE_TYPE` picks the
 precision (`int8`, `int8_float16`, `int8_float32`, `int8_bfloat16`,
 `float16`, `bfloat16`, `float32`, `int16`, `auto`, `default`); CTranslate2
 quantizes a float checkpoint at load, so one `whisper-ct2/` dir serves
-int8 too. Unset (`default`), it runs at the checkpoint's saved precision on
-every device: an int8 conversion runs int8, a float16 one float16. An
-unknown value fails the load. Model dir requires `model.bin`,
+int8 too, and on CPU int8 is the fast path. Unset (`default`), it runs at
+the checkpoint's saved precision where the device supports it: an int8
+conversion runs int8; a float16 one runs float16 on CUDA and float32 on
+CPU. An unknown value fails the load.
+
+CPU levers that do not pay, so the path does not use them: a mel shorter
+than 30 s (CTranslate2 accepts it, but large-v3-turbo then repeats
+sentences and multiplies its token count on short clips; the encoder
+always sees the padded window); greedy instead of beam 5 (the decode step
+costs oneDNN's small-N GEMM plus OpenMP barriers, nearly independent of
+beam width, and the words change); `CT2_FORCE_CPU_ISA=AVX512` and
+`OMP_PROC_BIND` (no change; oneDNN already dispatches AVX-512/VNNI for the
+GEMMs); glibc's `hugetlb` tunable (compaction stalls on a fragmented
+host). One request stops scaling at about one CCD's worth of cores, so
+throughput under concurrent load is a replica question, not a thread
+question; a second ct2rs replica (`device_indices = [0, 0]`) deep-copies
+the weights. Model dir requires `model.bin`,
 `config.json`, `tokenizer.json`, `vocabulary.json`,
 `preprocessor_config.json`. Raw output may include `<|...|>` markers;
 `strip_special_tokens` peels them.

@@ -957,10 +957,10 @@ mod tests {
             return;
         }
         let max = super::super::vocab::MAX_PHONEME_LENGTH;
-        let chunk = "Port the existing Sites or rebuild them on UI3 (ts 1792601761.126239, \
-                     1792607280.931949). Agents: subscriptions or API tokens. Jarvis already \
-                     rotates 5 accounts (ts 1792753560.912979). Esteban: we can drop it; Mikhail \
-                     will reconcile (ts 1793103721.979819, 1793104960.937549).";
+        let chunk = "Port the existing widgets or rebuild them on v3 (ts 1700001761.126239, \
+                     1700007280.931949). Workers: subscriptions or API tokens. Worker pool already \
+                     rotates 5 accounts (ts 1700053560.912979). Alice: we can drop it; Bob \
+                     will reconcile (ts 1700103721.979819, 1700104960.937549).";
         assert!(
             phoneme_token_count(chunk, "en-us").unwrap() > max,
             "Slack timestamps read out as numbers must push this chunk over the limit"

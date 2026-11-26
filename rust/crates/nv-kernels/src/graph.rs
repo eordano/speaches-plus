@@ -5,11 +5,6 @@ use cudarc::driver::sys::{self, CUgraphInstantiate_flags_enum, CUstreamCaptureMo
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub fn capture_lock() -> &'static std::sync::Mutex<()> {
-    static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    L.get_or_init(|| std::sync::Mutex::new(()))
-}
-
 static MEMPOOL_TRIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn mempool_trims() -> u64 {
@@ -240,13 +235,23 @@ impl CudaGraphRunner {
                 }
                 let mut ndep: usize = 0;
                 let _ = unsafe {
-                    sys::cuGraphNodeGetDependencies(*node, std::ptr::null_mut(), &mut ndep)
+                    sys::cuGraphNodeGetDependencies_v2(
+                        *node,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut ndep,
+                    )
                 };
                 let mut pred = String::from("<root>");
                 if ndep > 0 {
                     let mut deps: Vec<sys::CUgraphNode> = vec![std::ptr::null_mut(); ndep];
                     if unsafe {
-                        sys::cuGraphNodeGetDependencies(*node, deps.as_mut_ptr(), &mut ndep)
+                        sys::cuGraphNodeGetDependencies_v2(
+                            *node,
+                            deps.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                            &mut ndep,
+                        )
                     } == sys::CUresult::CUDA_SUCCESS
                     {
                         pred = first_kernel_name_in(&deps[..ndep]);
@@ -303,9 +308,6 @@ impl CudaGraphRunner {
 
     pub fn probe_capture(&self) -> Result<()> {
         let _capture_in_flight = crate::capture_exclusion::capture_in_flight();
-        let _capture_guard = capture_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.stream
             .synchronize()
             .map_err(|e| anyhow!("probe pre-capture synchronize failed: {e:?}"))?;
@@ -353,9 +355,6 @@ impl CudaGraphRunner {
         }
 
         let _capture_in_flight = crate::capture_exclusion::capture_in_flight();
-        let _capture_guard = capture_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         self.stream
             .synchronize()
@@ -643,13 +642,26 @@ fn first_kernel_name_in(nodes: &[sys::CUgraphNode]) -> String {
 
 fn first_dependent_kernel_name(node: sys::CUgraphNode) -> String {
     let mut ndep: usize = 0;
-    let _ = unsafe { sys::cuGraphNodeGetDependentNodes(node, std::ptr::null_mut(), &mut ndep) };
+    let _ = unsafe {
+        sys::cuGraphNodeGetDependentNodes_v2(
+            node,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut ndep,
+        )
+    };
     if ndep == 0 {
         return String::from("<terminal>");
     }
     let mut deps: Vec<sys::CUgraphNode> = vec![std::ptr::null_mut(); ndep];
-    if unsafe { sys::cuGraphNodeGetDependentNodes(node, deps.as_mut_ptr(), &mut ndep) }
-        != sys::CUresult::CUDA_SUCCESS
+    if unsafe {
+        sys::cuGraphNodeGetDependentNodes_v2(
+            node,
+            deps.as_mut_ptr(),
+            std::ptr::null_mut(),
+            &mut ndep,
+        )
+    } != sys::CUresult::CUDA_SUCCESS
     {
         return String::from("<terminal>");
     }

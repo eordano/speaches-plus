@@ -65,7 +65,7 @@ prose states the relationship a measurement evidenced, never the figure.
 ## Building: always `rust/scripts/nvk.sh`
 
 Never bare `cargo` or per-command `nix develop` for Rust. The wrapper owns the
-cached devshell, `TMPDIR`, `CUDA_ARCH_LIST=12.0` (single Blackwell sm_120 box),
+cached devshell, `TMPDIR`, `CUDA_ARCH_LIST=12.0` (Blackwell sm_120),
 per-lane `CARGO_TARGET_DIR`, ccache, and the Vulkan loader wgpu tests need.
 
 ```sh

@@ -1924,11 +1924,38 @@ pub(crate) fn with_system_directive(
     out
 }
 
+pub(crate) fn fold_system_messages_into_one_leading_turn_and_in_place_user_reminders(
+    messages: &[ChatMessageIn],
+) -> Vec<ChatMessageIn> {
+    let lead = messages.iter().take_while(|m| m.role == "system").count();
+    let mut out: Vec<ChatMessageIn> = Vec::with_capacity(messages.len());
+    if lead > 0 {
+        let text: Vec<String> = messages[..lead].iter().map(|m| m.text()).collect();
+        out.push(ChatMessageIn {
+            content: Some(MessageContent::Text(text.join("\n\n"))),
+            ..messages[0].clone()
+        });
+    }
+    out.extend(messages[lead..].iter().map(|m| match m.role.as_str() {
+        "system" => ChatMessageIn {
+            role: "user".into(),
+            content: Some(MessageContent::Text(format!(
+                "<system-reminder>\n{}\n</system-reminder>",
+                m.text()
+            ))),
+            ..Default::default()
+        },
+        _ => m.clone(),
+    }));
+    out
+}
+
 pub(crate) fn template_messages_json(
     messages: &[ChatMessageIn],
 ) -> anyhow::Result<serde_json::Value> {
-    let flattened: Vec<ChatMessageIn> = messages
-        .iter()
+    let flattened: Vec<ChatMessageIn> =
+        fold_system_messages_into_one_leading_turn_and_in_place_user_reminders(messages)
+            .iter()
         .map(|m| match m.content {
             Some(MessageContent::Parts(_)) => ChatMessageIn {
                 content: Some(MessageContent::Text(m.text())),
@@ -2116,6 +2143,7 @@ async fn chat_completions_impl(
     crate::oapi::cold_tier::ensure_free_async(
         crate::oapi::cold_tier::chat_min_free_bytes(),
         "chat",
+        Some(crate::oapi::chat_engine::QWEN4_EXP_SESSIONS_COLD_TIER_NAME),
     )
     .await;
 

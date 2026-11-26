@@ -500,6 +500,7 @@ pub async fn handle_fit_start(
     crate::oapi::cold_tier::ensure_free_async(
         crate::oapi::cold_tier::fit_min_free_bytes(),
         "voice fit",
+        None,
     )
     .await;
     tokio::task::spawn_blocking(move || {

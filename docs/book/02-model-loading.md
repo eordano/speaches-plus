@@ -299,6 +299,19 @@ and `eos_token` come from `tokenizer_config.json` and are injected alongside
 object; invalid values logged and ignored), then per-request
 `chat_template_kwargs`.
 
+Messages reach the template with their system turns folded
+(`fold_system_messages_into_one_leading_turn_and_in_place_user_reminders`, on
+both the CUDA and wgpu paths): a leading run of system messages becomes one,
+joined by a blank line, and every later system message becomes a user turn of
+its own, `<system-reminder>…</system-reminder>`, where it stood. HF templates
+such as Qwen's raise on any system message that is not first, and Claude Code
+sends its system prompt as several blocks and its reminders between turns, so
+without the fold such a conversation never reaches the official template. The
+reminder stays in place rather than joining a neighbouring user turn because
+the prefix cache resumes only below the first differing token: a reminder that
+moved into a later turn once one arrived would rewrite an earlier turn and send
+every following request back to a checkpoint below it.
+
 Three predicates read the template rather than a hardcoded model list:
 `declares_thinking_switch()` (source mentions `enable_thinking`),
 `uses_tool_responses()`, and `supports_tools()` — the last renders a probe

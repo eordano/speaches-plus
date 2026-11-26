@@ -878,7 +878,12 @@ owns one resident and the registry in `oapi::cold_tier` is the eviction order,
 least recently used first. Laguna with its caches and graphs, and the realtime
 speech stack (whisper, kokoro, VAD, diarization) are never in it: the chat engine
 is the product and takes minutes to come back, and a websocket session cannot
-wait for a reload.
+wait for a reload. The chat engine's session cache is a resident
+(`qwen4exp-sessions`), even though the weights are not one. Its idle limit is
+300 s per session slot (`Resident::idle_after`, capped by `NV_COLD_TIER_IDLE_SECS`).
+When a slot reaches it, or another resident needs the memory, the long
+conversation parks to disk and the slot frees its KV. A chat request's own pressure check skips it
+(05.9-prefix-cache-scope.md, "Residency policy").
 
 Eviction drops the shared reference. An in-flight request keeps its own `Arc`
 and finishes, so the memory returns when the last holder drops;

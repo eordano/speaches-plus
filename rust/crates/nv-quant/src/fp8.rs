@@ -24,25 +24,50 @@ fn e4m3_scale_for(amax: f32) -> f32 {
     }
 }
 
-fn e4m3_bytes_with_scale(values: &[bf16], scale: f32, out: &mut Vec<u8>) {
+const FP8_QUANT_PARALLEL_MIN_ELEMS: usize = 65_536;
+const FP8_QUANT_MAX_THREADS: usize = 32;
+
+fn fp8_quant_threads(rows: usize, elems: usize) -> usize {
+    if cfg!(target_arch = "wasm32") || rows < 2 || elems < FP8_QUANT_PARALLEL_MIN_ELEMS {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, FP8_QUANT_MAX_THREADS)
+        .min(rows)
+}
+
+fn e4m3_write_row_with_scale(values: &[bf16], scale: f32, out: &mut [u8]) {
     use float8::F8E4M3;
     let inv = if scale == 0.0 || !scale.is_finite() {
         1.0
     } else {
         1.0 / scale
     };
-    out.extend(
-        values
-            .iter()
-            .map(|x| F8E4M3::from(x.to_f32() * inv).to_bits()),
-    );
+    for (dst, x) in out.iter_mut().zip(values.iter()) {
+        *dst = F8E4M3::from(x.to_f32() * inv).to_bits();
+    }
+}
+
+fn e4m3_write_row_from_bf16_le_bytes_with_scale(raw_row: &[u8], scale: f32, out: &mut [u8]) {
+    use float8::F8E4M3;
+    let inv = if scale == 0.0 || !scale.is_finite() {
+        1.0
+    } else {
+        1.0 / scale
+    };
+    for (dst, pair) in out.iter_mut().zip(raw_row.chunks_exact(2)) {
+        let x = bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32();
+        *dst = F8E4M3::from(x * inv).to_bits();
+    }
 }
 
 pub fn quantize_e4m3_per_tensor(values: &[bf16]) -> (Vec<u8>, f32) {
     let amax = values.iter().map(|x| x.to_f32().abs()).fold(0f32, f32::max);
     let scale = e4m3_scale_for(amax);
-    let mut bytes = Vec::with_capacity(values.len());
-    e4m3_bytes_with_scale(values, scale, &mut bytes);
+    let mut bytes = vec![0u8; values.len()];
+    e4m3_write_row_with_scale(values, scale, &mut bytes);
     (bytes, scale)
 }
 
@@ -57,15 +82,123 @@ pub fn quantize_e4m3_per_row(
             values.len()
         );
     }
-    let mut bytes = Vec::with_capacity(values.len());
-    let mut scales = Vec::with_capacity(rows);
-    for r in 0..rows {
-        let row = &values[r * cols..(r + 1) * cols];
-        let amax = row.iter().map(|x| x.to_f32().abs()).fold(0f32, f32::max);
-        let scale = e4m3_scale_for(amax);
-        e4m3_bytes_with_scale(row, scale, &mut bytes);
-        scales.push(scale);
+    if rows == 0 {
+        return Ok((Vec::new(), Vec::new()));
     }
+    if cols == 0 {
+        return Ok((Vec::new(), vec![1.0; rows]));
+    }
+    let mut bytes = vec![0u8; values.len()];
+    let mut scales = vec![0f32; rows];
+    let threads = fp8_quant_threads(rows, values.len());
+    if threads == 1 {
+        for ((row, out_row), scale_slot) in values
+            .chunks_exact(cols)
+            .zip(bytes.chunks_exact_mut(cols))
+            .zip(scales.iter_mut())
+        {
+            let amax = row.iter().map(|x| x.to_f32().abs()).fold(0f32, f32::max);
+            let scale = e4m3_scale_for(amax);
+            e4m3_write_row_with_scale(row, scale, out_row);
+            *scale_slot = scale;
+        }
+        return Ok((bytes, scales));
+    }
+    let chunk_rows = rows.div_ceil(threads);
+    std::thread::scope(|sc| {
+        for ((in_chunk, out_chunk), scale_chunk) in values
+            .chunks(chunk_rows * cols)
+            .zip(bytes.chunks_mut(chunk_rows * cols))
+            .zip(scales.chunks_mut(chunk_rows))
+        {
+            sc.spawn(move || {
+                for ((row, out_row), scale_slot) in in_chunk
+                    .chunks_exact(cols)
+                    .zip(out_chunk.chunks_exact_mut(cols))
+                    .zip(scale_chunk.iter_mut())
+                {
+                    let amax = row.iter().map(|x| x.to_f32().abs()).fold(0f32, f32::max);
+                    let scale = e4m3_scale_for(amax);
+                    e4m3_write_row_with_scale(row, scale, out_row);
+                    *scale_slot = scale;
+                }
+            });
+        }
+    });
+    Ok((bytes, scales))
+}
+
+pub fn quantize_e4m3_per_row_from_bf16_le_bytes(
+    raw: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Result<(Vec<u8>, Vec<f32>)> {
+    let elems = rows
+        .checked_mul(cols)
+        .ok_or_else(|| anyhow::anyhow!("quantize_e4m3_per_row_from_bf16_le_bytes: {rows}x{cols} overflows usize"))?;
+    let expected_bytes = elems
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("quantize_e4m3_per_row_from_bf16_le_bytes: {rows}x{cols} byte size overflows usize"))?;
+    if raw.len() != expected_bytes {
+        bail!(
+            "quantize_e4m3_per_row_from_bf16_le_bytes: {} bytes do not form a {rows}x{cols} bf16 matrix",
+            raw.len()
+        );
+    }
+    if rows == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if cols == 0 {
+        return Ok((Vec::new(), vec![1.0; rows]));
+    }
+    let row_bytes = cols * 2;
+    let mut bytes = vec![0u8; elems];
+    let mut scales = vec![0f32; rows];
+    let threads = fp8_quant_threads(rows, elems);
+    if threads == 1 {
+        for ((raw_row, out_row), scale_slot) in raw
+            .chunks_exact(row_bytes)
+            .zip(bytes.chunks_exact_mut(cols))
+            .zip(scales.iter_mut())
+        {
+            let amax = raw_row
+                .chunks_exact(2)
+                .map(|pair| bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32().abs())
+                .fold(0f32, f32::max);
+            let scale = e4m3_scale_for(amax);
+            e4m3_write_row_from_bf16_le_bytes_with_scale(raw_row, scale, out_row);
+            *scale_slot = scale;
+        }
+        return Ok((bytes, scales));
+    }
+    let chunk_rows = rows.div_ceil(threads);
+    std::thread::scope(|sc| {
+        for ((in_chunk, out_chunk), scale_chunk) in raw
+            .chunks(chunk_rows * row_bytes)
+            .zip(bytes.chunks_mut(chunk_rows * cols))
+            .zip(scales.chunks_mut(chunk_rows))
+        {
+            sc.spawn(move || {
+                for ((raw_row, out_row), scale_slot) in in_chunk
+                    .chunks_exact(row_bytes)
+                    .zip(out_chunk.chunks_exact_mut(cols))
+                    .zip(scale_chunk.iter_mut())
+                {
+                    let amax = raw_row
+                        .chunks_exact(2)
+                        .map(|pair| {
+                            bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]]))
+                                .to_f32()
+                                .abs()
+                        })
+                        .fold(0f32, f32::max);
+                    let scale = e4m3_scale_for(amax);
+                    e4m3_write_row_from_bf16_le_bytes_with_scale(raw_row, scale, out_row);
+                    *scale_slot = scale;
+                }
+            });
+        }
+    });
     Ok((bytes, scales))
 }
 
@@ -87,10 +220,39 @@ pub fn quantize_e4m3_with_row_scales(
             scales.len()
         );
     }
-    let mut bytes = Vec::with_capacity(values.len());
-    for (r, scale) in scales.iter().enumerate() {
-        e4m3_bytes_with_scale(&values[r * cols..(r + 1) * cols], *scale, &mut bytes);
+    if rows == 0 || cols == 0 {
+        return Ok(Vec::new());
     }
+    let mut bytes = vec![0u8; values.len()];
+    let threads = fp8_quant_threads(rows, values.len());
+    if threads == 1 {
+        for ((row, out_row), &scale) in values
+            .chunks_exact(cols)
+            .zip(bytes.chunks_exact_mut(cols))
+            .zip(scales.iter())
+        {
+            e4m3_write_row_with_scale(row, scale, out_row);
+        }
+        return Ok(bytes);
+    }
+    let chunk_rows = rows.div_ceil(threads);
+    std::thread::scope(|sc| {
+        for ((in_chunk, out_chunk), scale_chunk) in values
+            .chunks(chunk_rows * cols)
+            .zip(bytes.chunks_mut(chunk_rows * cols))
+            .zip(scales.chunks(chunk_rows))
+        {
+            sc.spawn(move || {
+                for ((row, out_row), &scale) in in_chunk
+                    .chunks_exact(cols)
+                    .zip(out_chunk.chunks_exact_mut(cols))
+                    .zip(scale_chunk.iter())
+                {
+                    e4m3_write_row_with_scale(row, scale, out_row);
+                }
+            });
+        }
+    });
     Ok(bytes)
 }
 
@@ -1082,5 +1244,59 @@ mod tests {
             src.contains("#define NV_UE4M3_SUBNORMAL_STEP  0.001953125f"),
             "the subnormal step must stay 2^-9 to match nv_quant::nvfp4::decode_ue4m3"
         );
+    }
+
+    #[test]
+    fn parallel_per_row_and_raw_bf16_le_quantization_match_the_sequential_reference_bit_for_bit() {
+        let (rows, cols) = (257usize, 300usize);
+        let vals: Vec<bf16> = (0..rows * cols)
+            .map(|i| {
+                let r = i / cols;
+                let c = i % cols;
+                if r == 17 {
+                    bf16::from_f32(0.0)
+                } else {
+                    let mag = 2f32.powi((r % 9) as i32 - 4);
+                    bf16::from_f32(mag * ((c as f32) * 0.17 + (r as f32) * 0.03).sin())
+                }
+            })
+            .collect();
+        let raw_le: Vec<u8> = vals
+            .iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .collect();
+
+        let mut want_bytes = Vec::with_capacity(vals.len());
+        let mut want_scales = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let row = &vals[r * cols..(r + 1) * cols];
+            let amax = row.iter().map(|x| x.to_f32().abs()).fold(0f32, f32::max);
+            let scale = e4m3_scale_for(amax);
+            let mut row_out = vec![0u8; cols];
+            e4m3_write_row_with_scale(row, scale, &mut row_out);
+            want_bytes.extend_from_slice(&row_out);
+            want_scales.push(scale);
+        }
+
+        let (par_bytes, par_scales) = quantize_e4m3_per_row(&vals, rows, cols).unwrap();
+        assert_eq!(par_bytes, want_bytes);
+        let par_scale_bits: Vec<u32> = par_scales.iter().map(|s| s.to_bits()).collect();
+        let want_scale_bits: Vec<u32> = want_scales.iter().map(|s| s.to_bits()).collect();
+        assert_eq!(par_scale_bits, want_scale_bits);
+
+        let (raw_bytes, raw_scales) =
+            quantize_e4m3_per_row_from_bf16_le_bytes(&raw_le, rows, cols).unwrap();
+        assert_eq!(raw_bytes, want_bytes);
+        let raw_scale_bits: Vec<u32> = raw_scales.iter().map(|s| s.to_bits()).collect();
+        assert_eq!(raw_scale_bits, want_scale_bits);
+
+        let scaled_bytes =
+            quantize_e4m3_with_row_scales(&vals, rows, cols, &want_scales).unwrap();
+        assert_eq!(scaled_bytes, want_bytes);
+
+        let (empty_b, empty_s) = quantize_e4m3_per_row(&[], 0, 16).unwrap();
+        assert!(empty_b.is_empty() && empty_s.is_empty());
+        let (zero_col_b, zero_col_s) = quantize_e4m3_per_row(&[], 4, 0).unwrap();
+        assert!(zero_col_b.is_empty() && zero_col_s == vec![1.0; 4]);
     }
 }

@@ -22,6 +22,9 @@ pub trait Resident: Send + Sync {
     fn last_used(&self) -> Option<Instant>;
     fn evict(&self, reason: &str) -> bool;
     fn load_blocking(&self) -> bool;
+    fn idle_after(&self) -> Option<Duration> {
+        None
+    }
 }
 
 type Loader<T> = Arc<dyn Fn() -> Option<Arc<T>> + Send + Sync>;
@@ -202,7 +205,7 @@ impl<T: Send + Sync + 'static> Resident for ColdSlot<T> {
 
 static REGISTRY: Mutex<Vec<Arc<dyn Resident>>> = Mutex::new(Vec::new());
 
-fn register(r: Arc<dyn Resident>) {
+pub(crate) fn register(r: Arc<dyn Resident>) {
     REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(r);
 }
 
@@ -298,7 +301,7 @@ pub fn ensure_free(need_bytes: u64, reason: &str, exclude: Option<&str>) -> Free
     report
 }
 
-pub async fn ensure_free_async(need_bytes: u64, reason: &'static str) -> FreeReport {
+pub async fn ensure_free_async(need_bytes: u64, reason: &'static str, exclude: Option<&'static str>) -> FreeReport {
     let any_loaded = residents().iter().any(|r| r.is_loaded());
     if need_bytes == 0 || !any_loaded {
         return FreeReport {
@@ -308,7 +311,7 @@ pub async fn ensure_free_async(need_bytes: u64, reason: &'static str) -> FreeRep
             satisfied: true,
         };
     }
-    tokio::task::spawn_blocking(move || ensure_free(need_bytes, reason, None))
+    tokio::task::spawn_blocking(move || ensure_free(need_bytes, reason, exclude))
         .await
         .unwrap_or(FreeReport {
             free_before: None,
@@ -318,16 +321,26 @@ pub async fn ensure_free_async(need_bytes: u64, reason: &'static str) -> FreeRep
         })
 }
 
+pub const IDLE_REASON: &str = "idle";
+
+pub fn idle_limit(r: &dyn Resident) -> Option<Duration> {
+    let global = env_u64(IDLE_SECS_ENV, DEFAULT_IDLE_SECS);
+    (global > 0).then(|| {
+        let global = Duration::from_secs(global);
+        r.idle_after().map_or(global, |own| own.min(global))
+    })
+}
+
 pub fn sweep_idle() -> Vec<&'static str> {
-    let idle = env_u64(IDLE_SECS_ENV, DEFAULT_IDLE_SECS);
-    if idle == 0 {
-        return Vec::new();
-    }
-    let idle = Duration::from_secs(idle);
     residents()
         .into_iter()
-        .filter(|r| r.is_loaded() && r.last_used().is_some_and(|t| t.elapsed() >= idle))
-        .filter(|r| r.evict("idle"))
+        .filter(|r| {
+            r.is_loaded()
+                && idle_limit(r.as_ref())
+                    .zip(r.last_used())
+                    .is_some_and(|(limit, t)| t.elapsed() >= limit)
+        })
+        .filter(|r| r.evict(IDLE_REASON))
         .map(|r| r.name())
         .collect()
 }
@@ -471,6 +484,44 @@ mod tests {
             assert!(report.satisfied);
             assert!(report.evicted.is_empty());
         }
+    }
+
+    #[test]
+    fn a_residents_own_idle_limit_caps_the_global_one_and_zero_still_disables_the_sweep() {
+        struct Own(Option<Duration>);
+        impl Resident for Own {
+            fn name(&self) -> &'static str {
+                "own"
+            }
+            fn estimate_bytes(&self) -> u64 {
+                0
+            }
+            fn is_loaded(&self) -> bool {
+                false
+            }
+            fn last_used(&self) -> Option<Instant> {
+                None
+            }
+            fn evict(&self, _: &str) -> bool {
+                false
+            }
+            fn load_blocking(&self) -> bool {
+                true
+            }
+            fn idle_after(&self) -> Option<Duration> {
+                self.0
+            }
+        }
+        let _env = crate::oapi::lock_serializing_every_test_that_mutates_the_process_global_env();
+        let five_min = Own(Some(Duration::from_secs(300)));
+        unsafe { std::env::remove_var(IDLE_SECS_ENV) };
+        assert_eq!(idle_limit(&five_min), Some(Duration::from_secs(300)));
+        assert_eq!(idle_limit(&Own(None)), Some(Duration::from_secs(DEFAULT_IDLE_SECS)));
+        unsafe { std::env::set_var(IDLE_SECS_ENV, "120") };
+        assert_eq!(idle_limit(&five_min), Some(Duration::from_secs(120)), "a shorter global idle still wins");
+        unsafe { std::env::set_var(IDLE_SECS_ENV, "0") };
+        assert_eq!(idle_limit(&five_min), None, "0 disables the sweep for every resident");
+        unsafe { std::env::remove_var(IDLE_SECS_ENV) };
     }
 
     #[test]

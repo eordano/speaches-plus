@@ -1,8 +1,8 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::conversation::llm::{self, ChatMessage};
@@ -406,21 +406,34 @@ pub(super) async fn process_utterance(
     }
     let speaker_audio = super::speaker_id::SpeakerIdentifier::global(&session.models)
         .map(|identifier| (identifier, audio.clone()));
+    let early = session.take_early_final(&item_id);
     let mut confidence = super::wire::TranscriptConfidence::default();
     let transcript = if let Some(cached) = cached_transcript {
+        if let Some(e) = early {
+            e.handle.abort();
+        }
         debug!(%item_id, len = cached.len(), "using speculative STT result");
         cached
     } else {
-        let stt_result = match match session.models.whisper() {
-            Ok(w) => {
-                run_stt_full(
-                    w,
-                    crate::types::MonoF32At16k::new(audio),
-                    session.stt_language(),
-                )
-                .await
-            }
-            Err(e) => Err(e),
+        let early_result = match early {
+            Some(e) => await_early_final(&item_id, e).await,
+            None => None,
+        };
+        let stt_result = match match early_result {
+            Some(r) => Ok(r),
+            None => match session.models.whisper() {
+                Ok(w) => {
+                    run_stt_full(
+                        w,
+                        crate::types::MonoF32At16k::new(audio),
+                        session.stt_language(),
+                        session.final_beam_size(),
+                        STT_PRIORITY.final_pending(),
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            },
         } {
             Ok(t) => t,
             Err(err) => {
@@ -1241,6 +1254,173 @@ async fn synthesize_and_play(
     }
 }
 
+pub(super) struct SttPriority {
+    finals_pending: AtomicUsize,
+    finals_drained: Notify,
+    partial_slot: Arc<Semaphore>,
+}
+
+pub(super) static STT_PRIORITY: LazyLock<SttPriority> = LazyLock::new(SttPriority::new);
+
+pub(super) struct FinalPending(&'static SttPriority);
+
+impl Drop for FinalPending {
+    fn drop(&mut self) {
+        if self.0.finals_pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.finals_drained.notify_waiters();
+        }
+    }
+}
+
+impl SttPriority {
+    fn new() -> Self {
+        Self {
+            finals_pending: AtomicUsize::new(0),
+            finals_drained: Notify::new(),
+            partial_slot: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    pub(super) fn final_pending(&'static self) -> FinalPending {
+        self.finals_pending.fetch_add(1, Ordering::AcqRel);
+        FinalPending(self)
+    }
+
+    pub(super) async fn partial_turn(&'static self) -> Option<OwnedSemaphorePermit> {
+        let turn = self.partial_slot.clone().acquire_owned().await.ok()?;
+        loop {
+            let drained = self.finals_drained.notified();
+            if self.finals_pending.load(Ordering::Acquire) == 0 {
+                return Some(turn);
+            }
+            drained.await;
+        }
+    }
+}
+
+async fn spawn_blocking_holding<H, T>(
+    held: H,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T>
+where
+    H: Send + 'static,
+    T: Send + 'static,
+{
+    Ok(tokio::task::spawn_blocking(move || {
+        let _held_until_the_blocking_work_returns = held;
+        work()
+    })
+    .await?)
+}
+
+pub(super) const EARLY_FINAL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub(super) struct EarlyFinal {
+    pub item_id: String,
+    pub started: std::time::Instant,
+    pub handle: tokio::task::JoinHandle<anyhow::Result<crate::stt::TranscriptionResult>>,
+}
+
+pub(super) fn start_early_final(
+    session: &Arc<Session>,
+    item_id: String,
+    audio: Vec<f32>,
+    audio_end_ms: u64,
+) {
+    let Ok(whisper) = session.models.whisper() else {
+        return;
+    };
+    let whisper = whisper.clone();
+    let audio_ms = (audio.len() as u64) * 1000 / 16_000;
+    let language = session.stt_language();
+    let beam_size = session.final_beam_size();
+    let session_for_task = session.clone();
+    let item_for_task = item_id.clone();
+    let handle = tokio::spawn(async move {
+        let result = run_stt_full(
+            &whisper,
+            crate::types::MonoF32At16k::new(audio),
+            language,
+            beam_size,
+            STT_PRIORITY.final_pending(),
+        )
+        .await;
+        if let Ok(r) = &result {
+            emit_final_candidate(&session_for_task, &item_for_task, r, audio_ms, audio_end_ms)
+                .await;
+        }
+        result
+    });
+    info!(%item_id, audio_ms, "early final started");
+    session.put_early_final(EarlyFinal {
+        item_id,
+        started: std::time::Instant::now(),
+        handle,
+    });
+}
+
+async fn emit_final_candidate(
+    session: &Arc<Session>,
+    item_id: &str,
+    r: &crate::stt::TranscriptionResult,
+    audio_ms: u64,
+    audio_end_ms: u64,
+) {
+    if r.text.trim().is_empty() {
+        return;
+    }
+    if crate::stt::noise_gate::evaluate(
+        r.no_speech_prob,
+        r.avg_logprob,
+        audio_ms as u32,
+        session.noise_gate_thresholds(),
+    )
+    .is_some()
+    {
+        return;
+    }
+    let still_current = matches!(session.current_speech_item().await, Some(c) if c == item_id);
+    if !still_current || !session.has_early_final(item_id) {
+        return;
+    }
+    session
+        .inspector
+        .emit(InspectorEvent::PartialTranscription {
+            session_id: session.id.as_str().to_string(),
+            item_id: item_id.to_string(),
+            transcript: r.text.clone(),
+            ms: audio_end_ms,
+        });
+    session
+        .send_to_client(&json!({
+            "type": "input_audio_buffer.partial_transcription",
+            "item_id": item_id,
+            "transcript": r.text,
+            "audio_end_ms": audio_end_ms,
+            "final_candidate": true,
+        }))
+        .await;
+}
+
+async fn await_early_final(
+    item_id: &str,
+    early: EarlyFinal,
+) -> Option<crate::stt::TranscriptionResult> {
+    let ready = early.handle.is_finished();
+    let lead_ms = early.started.elapsed().as_millis() as u64;
+    match early.handle.await {
+        Ok(Ok(r)) => {
+            info!(%item_id, lead_ms, ready, "early final used");
+            Some(r)
+        }
+        Ok(Err(err)) => {
+            warn!(%item_id, error = %err, "early final failed; running a fresh STT");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 #[tracing::instrument(
     target = "speaches/realtime",
     name = "stt.dispatch",
@@ -1251,26 +1431,30 @@ pub(super) async fn run_stt(
     whisper: &WhisperHandle,
     audio: crate::types::MonoF32At16k,
     language: Option<String>,
+    beam_size: Option<usize>,
+    held: impl Send + 'static,
 ) -> anyhow::Result<String> {
-    Ok(run_stt_full(whisper, audio, language).await?.text)
+    Ok(run_stt_full(whisper, audio, language, beam_size, held).await?.text)
 }
 
 pub(super) async fn run_stt_full(
     whisper: &WhisperHandle,
     audio: crate::types::MonoF32At16k,
     language: Option<String>,
+    beam_size: Option<usize>,
+    held: impl Send + 'static,
 ) -> anyhow::Result<crate::stt::TranscriptionResult> {
     let whisper = whisper.clone();
     let samples = audio.into_vec();
     let opts = crate::stt::SttRequestOptions {
         language,
         initial_prompt: None,
+        beam_size,
     };
-    let result = tokio::task::spawn_blocking(move || {
+    spawn_blocking_holding(held, move || {
         whisper.transcribe_full_with_opts(&samples, crate::stt::WhisperTask::Transcribe, &opts)
     })
-    .await??;
-    Ok(result)
+    .await?
 }
 
 pub(super) fn promoted_turn_wire_id(
@@ -1308,4 +1492,55 @@ mod wire_id_tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod stt_priority_tests {
+    use super::{spawn_blocking_holding, SttPriority};
+    use std::time::Duration;
+
+    fn isolated_priority() -> &'static SttPriority {
+        Box::leak(Box::new(SttPriority::new()))
+    }
+
+    #[tokio::test]
+    async fn partials_wait_while_a_final_is_pending() {
+        let priority = isolated_priority();
+        let final_stt = priority.final_pending();
+        let partial = tokio::spawn(priority.partial_turn());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !partial.is_finished(),
+            "a partial must not reach the STT while a final is pending"
+        );
+        drop(final_stt);
+        let turn = tokio::time::timeout(Duration::from_secs(1), partial)
+            .await
+            .expect("the partial must start once the final has returned")
+            .expect("partial task");
+        assert!(turn.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_aborted_partial_keeps_its_turn_until_the_blocking_stt_returns() {
+        let priority = isolated_priority();
+        let turn = priority.partial_turn().await.expect("first turn");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let transcribing = tokio::spawn(spawn_blocking_holding(turn, move || released.recv().ok()));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        transcribing.abort();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), priority.partial_turn())
+                .await
+                .is_err(),
+            "a second partial must not start while the aborted one's STT still runs"
+        );
+        release.send(()).expect("release the blocking STT");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), priority.partial_turn())
+                .await
+                .expect("the turn must free once the blocking STT returns")
+                .is_some()
+        );
+    }
 }

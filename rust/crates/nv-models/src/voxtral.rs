@@ -511,13 +511,49 @@ pub const THE_LM_HEAD_READS_A_QUARTER_OF_EACH_STEP_SO_IT_QUANTIZES_WITH_THE_DECO
      of a decode step, so under NV_VOXTRAL_QUANT=nvfp4 the head gets its own NVFP4 copy while \
      the embedding table it is tied to stays bf16";
 
+pub const Q8_0_IS_THE_DEFAULT_ON_CUDA_WITHOUT_NVFP4_KERNELS_BY_THE_LIBRISPEECH_73_CLIP_WER_INSTRUMENT: &str =
+    "NVFP4's GEMV kernels exist only from compute capability 10, so the NVFP4 default answered every \
+     transcription on an RTX 4090 (sm_89) with nvfp4_gemv_bf16act rc=500. There, the 73 clips of \
+     hf-internal-testing/librispeech_asr_dummy through /v1/audio/transcriptions (lowercase, \
+     punctuation-free) scored 57 word errors of 1150 for Q8_0 against 56 for bf16, with 71 of 73 \
+     transcripts identical, at 452 (240 once Q8_0 drafts four rows) against 747 ms a clip, and \
+     the serving process held 13.3 GB \
+     against 22.1 GB; NV_VOXTRAL_QUANT=bf16 still selects the dense weights";
+
+fn default_quant(on_cpu: bool, cuda_without_nvfp4_kernels: bool) -> VoxtralQuant {
+    if on_cpu {
+        VoxtralQuant::GgmlQ4K
+    } else if cuda_without_nvfp4_kernels {
+        VoxtralQuant::GgmlQ8_0
+    } else {
+        VoxtralQuant::Nvfp4
+    }
+}
+
+fn cuda_without_nvfp4_kernels(device: &Device) -> bool {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(d) = device {
+        let major = d
+            .cuda_stream()
+            .context()
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )
+            .unwrap_or(0);
+        return !nv_quant::nvfp4::supports_nvfp4(major);
+    }
+    let _ = device;
+    false
+}
+
 impl VoxtralQuant {
     pub fn from_env_for(device: &Device) -> Result<Self> {
         let _ = CPU_SERVES_GGML_QUANTS_BECAUSE_F32_WEIGHTS_READ_TWELVE_GIGABYTES_A_STEP;
         let _ = NVFP4_IS_THE_CUDA_DEFAULT_BY_THE_LIBRISPEECH_73_CLIP_WER_INSTRUMENT;
+        let _ = Q8_0_IS_THE_DEFAULT_ON_CUDA_WITHOUT_NVFP4_KERNELS_BY_THE_LIBRISPEECH_73_CLIP_WER_INSTRUMENT;
         let on_cpu = matches!(device, Device::Cpu);
         match std::env::var(VOXTRAL_QUANT_ENV).ok().as_deref() {
-            None | Some("") => Ok(if on_cpu { Self::GgmlQ4K } else { Self::Nvfp4 }),
+            None | Some("") => Ok(default_quant(on_cpu, cuda_without_nvfp4_kernels(device))),
             Some("bf16") | Some("f32") => Ok(Self::Bf16),
             Some("nvfp4") => Ok(Self::Nvfp4),
             Some("q8_0") => Ok(Self::GgmlQ8_0),
@@ -1793,6 +1829,13 @@ pub fn text_token_count(tokens: &[u32]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_is_q4k_on_cpu_nvfp4_where_cuda_has_its_kernels_and_q8_0_on_older_cuda() {
+        assert_eq!(default_quant(true, false), VoxtralQuant::GgmlQ4K);
+        assert_eq!(default_quant(false, false), VoxtralQuant::Nvfp4);
+        assert_eq!(default_quant(false, true), VoxtralQuant::GgmlQ8_0);
+    }
 
     #[test]
     #[ignore]

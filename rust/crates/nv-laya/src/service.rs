@@ -135,6 +135,19 @@ impl Service {
         self.checkpoint_at(model, &self.models_dir.join(router::directory(model)))
     }
 
+    /// A fine-tuned checkpoint by its served id (`ft:<base>:<suffix>:<job>`), loaded the way a
+    /// request naming it loads it, so a preload list can name adapters beside the bases.
+    pub fn fine_tuned_checkpoint(&self, id: &str) -> Result<Arc<Checkpoint>, Failure> {
+        let dir = self
+            .fine_tuned
+            .read()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| Failure::invalid(format!("unknown fine-tuned checkpoint {id:?}")))?;
+        self.checkpoint_at(id, &dir)
+    }
+
     fn checkpoint_at(&self, model: &str, dir: &Path) -> Result<Arc<Checkpoint>, Failure> {
         if let Some(hit) = self.checkpoints.read().unwrap().get(model) {
             return Ok(hit.clone());

@@ -118,17 +118,18 @@ impl Qwen4Exp {
         }
         let stream = stream_of(&self.device)?;
         let tokens_dev: CudaSlice<u32> = stream.clone_htod(tokens)?;
+        let tokens_ptr = slice_ptr(&tokens_dev, &stream);
         let t = tokens.len();
         let positions = Tensor::from_vec((0..t as i32).collect::<Vec<_>>(), (t,), &self.device)?;
         let staged = self.staged_moe_ctx_for_rows(t)?;
         let mode = FwdMode {
-            pos_buf: None,
+            pos_ptr: None,
             moe_ctx: if t == 1 { Some(&self.decode_ctx) } else { staged.as_deref() },
             verify_rows: false,
             last_layer: Some(first_trainable - 1),
         };
         let mut prof = PhaseProf::disabled();
-        let (hc, pending) = self.layers_forward(hc, tokens, &tokens_dev, state, 0, &positions, mode, &mut prof, false)?;
+        let (hc, pending) = self.layers_forward(hc, Some(tokens), tokens_ptr, t, state, 0, Some(&positions), mode, &mut prof, false)?;
         super::hc_settle(hc, pending, &self.cfg)
     }
 
@@ -1140,7 +1141,7 @@ pub fn bench_real_layer(base: &Path, gdn_layer: usize, tokens: usize, experts: u
         out["attn_twin_graph_gib"] = serde_json::json!(take_graph_gib());
     }
     {
-        let gate = HcGate::load(&weights, &format!("{}.attn_hyper_connection", p(gdn_layer)), &cfg, true)?;
+        let gate = HcGate::load(&weights, &format!("{}.attn_hyper_connection", p(gdn_layer)), &cfg, true, None, device)?;
         let hc = randn_bf16((t, cfg.hc_hidden()), 1.0, device)?;
         let y = randn_bf16((t, h), 1.0, device)?;
         out["hc_engine_mix_combine_ms"] = serde_json::json!(timed(device, 3, || {

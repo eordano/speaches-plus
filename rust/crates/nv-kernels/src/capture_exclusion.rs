@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, ThreadId};
 
@@ -14,22 +13,28 @@ pub const A_DEVICE_WIDE_SYNCHRONIZE_ON_ANY_THREAD_INVALIDATES_EVERY_CAPTURE_IN_F
      intact. Every capture therefore holds a CaptureInFlight and every one of those calls holds a \
      NoCaptureInFlight, so the two never overlap";
 
+pub const ONE_THREAD_AT_A_TIME_OWNS_CAPTURES_AND_EXCLUSIONS_SO_A_WAITER_ONLY_WAITS_ON_THE_OWNER:
+    &str = "capture_in_flight and no_capture_in_flight wait for the same condition, that no other \
+     thread holds a capture or an exclusion, and then take theirs; one thread may nest both. One \
+     thread at a time therefore owns the capture machinery, every waiting thread waits on that \
+     owner, and these guards never make the owner wait, so they cannot deadlock. Nothing is \
+     counted or claimed while waiting: a capture counted before it queues on a separate lock, or an \
+     exclusion claimed before the captures drain, lets an exclusion taken inside a capture hang on \
+     a capture queued behind it or on an excluder waiting for that very capture \
+     (projects/speaches-plus/proof, finding F01)";
+
 struct State {
+    owner: Option<ThreadId>,
     captures: usize,
-    excluder: Option<ThreadId>,
-    depth: usize,
+    exclusions: usize,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
+    owner: None,
     captures: 0,
-    excluder: None,
-    depth: 0,
+    exclusions: 0,
 });
 static CHANGED: Condvar = Condvar::new();
-
-thread_local! {
-    static CAPTURES_ON_THIS_THREAD: Cell<usize> = const { Cell::new(0) };
-}
 
 fn state() -> MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
@@ -39,29 +44,41 @@ fn wait(s: MutexGuard<'static, State>) -> MutexGuard<'static, State> {
     CHANGED.wait(s).unwrap_or_else(PoisonError::into_inner)
 }
 
-fn another_thread_excludes_captures(s: &State, me: ThreadId) -> bool {
-    s.excluder.is_some_and(|d| d != me)
+fn another_thread_owns(s: &State, me: ThreadId) -> bool {
+    s.owner.is_some_and(|o| o != me)
+}
+
+fn own() -> MutexGuard<'static, State> {
+    let me = thread::current().id();
+    let mut s = state();
+    while another_thread_owns(&s, me) {
+        s = wait(s);
+    }
+    s.owner = Some(me);
+    s
+}
+
+fn disown(release: impl FnOnce(&mut State)) {
+    let mut s = state();
+    release(&mut s);
+    if s.captures == 0 && s.exclusions == 0 {
+        s.owner = None;
+    }
+    drop(s);
+    CHANGED.notify_all();
 }
 
 #[must_use = "hold the CaptureInFlight from begin_capture until the capture has ended"]
 pub struct CaptureInFlight(());
 
 pub fn capture_in_flight() -> CaptureInFlight {
-    let me = thread::current().id();
-    let mut s = state();
-    while another_thread_excludes_captures(&s, me) {
-        s = wait(s);
-    }
-    s.captures += 1;
-    CAPTURES_ON_THIS_THREAD.with(|c| c.set(c.get() + 1));
+    own().captures += 1;
     CaptureInFlight(())
 }
 
 impl Drop for CaptureInFlight {
     fn drop(&mut self) {
-        CAPTURES_ON_THIS_THREAD.with(|c| c.set(c.get() - 1));
-        state().captures -= 1;
-        CHANGED.notify_all();
+        disown(|s| s.captures -= 1);
     }
 }
 
@@ -69,29 +86,13 @@ impl Drop for CaptureInFlight {
 pub struct NoCaptureInFlight(());
 
 pub fn no_capture_in_flight() -> NoCaptureInFlight {
-    let me = thread::current().id();
-    let mine = CAPTURES_ON_THIS_THREAD.with(Cell::get);
-    let mut s = state();
-    while another_thread_excludes_captures(&s, me) {
-        s = wait(s);
-    }
-    s.excluder = Some(me);
-    s.depth += 1;
-    while s.captures > mine {
-        s = wait(s);
-    }
+    own().exclusions += 1;
     NoCaptureInFlight(())
 }
 
 impl Drop for NoCaptureInFlight {
     fn drop(&mut self) {
-        let mut s = state();
-        s.depth -= 1;
-        if s.depth == 0 {
-            s.excluder = None;
-        }
-        drop(s);
-        CHANGED.notify_all();
+        disown(|s| s.exclusions -= 1);
     }
 }
 
@@ -159,5 +160,80 @@ mod tests {
         worker.join().unwrap();
         let _after = no_capture_in_flight();
         let _capture_after = capture_in_flight();
+    }
+
+    #[test]
+    fn two_threads_never_hold_captures_at_once() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let capture = capture_in_flight();
+        let (began, captured) = mpsc::channel();
+        let second = thread::spawn(move || {
+            let _c = capture_in_flight();
+            began.send(()).unwrap();
+        });
+        assert!(
+            captured.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a second thread's capture must wait for the first to end: captures are serialized here, not by a separate lock"
+        );
+        drop(capture);
+        captured.recv_timeout(Duration::from_secs(5)).unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn an_exclusion_inside_a_capture_does_not_wait_on_a_capture_queued_behind_it() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let (capturing, is_capturing) = mpsc::channel();
+        let (go, wait_go) = mpsc::channel::<()>();
+        let (done, is_done) = mpsc::channel();
+        let (ended, has_ended) = mpsc::channel::<()>();
+        let first = thread::spawn(move || {
+            {
+                let _capture = capture_in_flight();
+                capturing.send(()).unwrap();
+                wait_go.recv().unwrap();
+                let _nested = no_capture_in_flight();
+                done.send(()).unwrap();
+            }
+            let _ = ended.send(());
+        });
+        is_capturing.recv_timeout(Duration::from_secs(5)).unwrap();
+        let queued = thread::spawn(move || {
+            let _capture = capture_in_flight();
+            let _ = has_ended.recv_timeout(Duration::from_secs(10));
+        });
+        thread::sleep(Duration::from_millis(100));
+        go.send(()).unwrap();
+        is_done.recv_timeout(Duration::from_secs(5)).expect(
+            "an exclusion taken inside a capture must not wait for a capture queued behind it: that capture waits for the first to end",
+        );
+        first.join().unwrap();
+        queued.join().unwrap();
+    }
+
+    #[test]
+    fn an_exclusion_inside_a_capture_does_not_wait_on_an_excluder_waiting_for_that_capture() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        let (capturing, is_capturing) = mpsc::channel();
+        let (go, wait_go) = mpsc::channel::<()>();
+        let (done, is_done) = mpsc::channel();
+        let first = thread::spawn(move || {
+            let _capture = capture_in_flight();
+            capturing.send(()).unwrap();
+            wait_go.recv().unwrap();
+            let _nested = no_capture_in_flight();
+            done.send(()).unwrap();
+        });
+        is_capturing.recv_timeout(Duration::from_secs(5)).unwrap();
+        let excluder = thread::spawn(|| {
+            let _d = no_capture_in_flight();
+        });
+        thread::sleep(Duration::from_millis(100));
+        go.send(()).unwrap();
+        is_done.recv_timeout(Duration::from_secs(5)).expect(
+            "an exclusion taken inside a capture must not wait on another thread's exclusion that is itself waiting for this capture",
+        );
+        first.join().unwrap();
+        excluder.join().unwrap();
     }
 }

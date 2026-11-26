@@ -32,6 +32,7 @@ mod lora_cuda;
 mod omni_loop;
 mod qwen;
 mod qwen4_exp_loop;
+pub(crate) use qwen4_exp_loop::QWEN4_EXP_SESSIONS_COLD_TIER_NAME;
 #[cfg(feature = "cuda")]
 mod qwen4_exp_mm;
 mod qwen38_sched;

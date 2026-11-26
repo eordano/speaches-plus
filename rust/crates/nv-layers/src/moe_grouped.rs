@@ -12,7 +12,7 @@ use crate::mlp::Mlp;
 const MIN_TILE: usize = nv_quant::nvfp4::MIN_TILE;
 const BLOCK_SIZE: usize = nv_quant::nvfp4::BLOCK_SIZE;
 
-const ROUTE_QUANT_SPLIT_CTAS_UNDER_CHAIN_SLIM: i32 = 8;
+const ROUTE_QUANT_SPLIT_CTAS_UNDER_CHAIN_SLIM: i32 = 10;
 
 const ROUTE_FUSE_SINGLE_CTA_TOPK_HOLDS_UP_TO_512_EXPERTS: usize = 512;
 
@@ -54,6 +54,21 @@ pub struct MoeGroupedWeights {
     pub input_globals_down_host: Vec<f32>,
     pub marlin_moe_twin_built_once_from_the_resident_grouped_buffers:
         std::sync::OnceLock<Option<Arc<MarlinMoeTwin>>>,
+    pub linear_decode_scales: Option<Arc<MoeLinearDecodeScales>>,
+}
+
+pub struct MoeLinearDecodeScales {
+    pub gate: CudaSlice<u8>,
+    pub up: CudaSlice<u8>,
+    pub down: CudaSlice<u8>,
+}
+
+fn moe_lin_scales_enabled() -> bool {
+    std::env::var("NV_MOE_LIN_SCALES").as_deref() != Ok("0")
+}
+
+fn moe_dp4a_enabled() -> bool {
+    std::env::var("NV_MOE_FP4_DP4A").as_deref() == Ok("1")
 }
 
 pub struct MarlinMoeStack {
@@ -406,11 +421,98 @@ impl MoeGroupedWeights {
             input_globals_down_host: globals_down_host,
             marlin_moe_twin_built_once_from_the_resident_grouped_buffers: std::sync::OnceLock::new(
             ),
+            linear_decode_scales: None,
         };
         if marlin_moe_route_opt_in() {
             let _ = built.marlin_moe_twin(stream);
         }
         Ok(built)
+    }
+
+    pub fn build_linear_decode_scales(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        min_free_bytes: usize,
+    ) -> Result<bool> {
+        if !moe_lin_scales_enabled() || self.linear_decode_scales.is_some() {
+            return Ok(self.linear_decode_scales.is_some());
+        }
+        let h = self.hidden_size;
+        let inter = self.intermediate_size;
+        if !h.is_multiple_of(32) || !inter.is_multiple_of(32) {
+            return Ok(false);
+        }
+        let experts_total = self.gate_w.len() * 2 / (inter * h);
+        let gu_bytes = experts_total * inter * (h / 16);
+        let dn_bytes = experts_total * h * (inter / 16);
+        let needed = gu_bytes * 2 + dn_bytes;
+        if let Ok((free, _total)) = cudarc::driver::result::mem_get_info() {
+            if free < needed + min_free_bytes {
+                return Ok(false);
+            }
+        }
+        let mut gate = unsafe {
+            stream
+                .alloc::<u8>(gu_bytes)
+                .map_err(|e| anyhow::anyhow!("alloc gate lin scales: {e:?}"))?
+        };
+        let mut up = unsafe {
+            stream
+                .alloc::<u8>(gu_bytes)
+                .map_err(|e| anyhow::anyhow!("alloc up lin scales: {e:?}"))?
+        };
+        let mut down = unsafe {
+            stream
+                .alloc::<u8>(dn_bytes)
+                .map_err(|e| anyhow::anyhow!("alloc down lin scales: {e:?}"))?
+        };
+        {
+            let (gs, _g1) = self.gate_w_scales.device_ptr(stream);
+            let (gl, _g2) = gate.device_ptr_mut(stream);
+            let rc = unsafe {
+                nv_kernels::cuda::moe_unswizzle_scales(
+                    stream.cu_stream() as *mut c_void,
+                    gs as *const u8,
+                    gl as *mut u8,
+                    experts_total as i32,
+                    inter as i32,
+                    h as i32,
+                )
+            };
+            anyhow::ensure!(rc == 0, "moe_unswizzle_scales gate rc={rc}");
+        }
+        {
+            let (us, _g1) = self.up_w_scales.device_ptr(stream);
+            let (ul, _g2) = up.device_ptr_mut(stream);
+            let rc = unsafe {
+                nv_kernels::cuda::moe_unswizzle_scales(
+                    stream.cu_stream() as *mut c_void,
+                    us as *const u8,
+                    ul as *mut u8,
+                    experts_total as i32,
+                    inter as i32,
+                    h as i32,
+                )
+            };
+            anyhow::ensure!(rc == 0, "moe_unswizzle_scales up rc={rc}");
+        }
+        {
+            let (ds, _g1) = self.down_w_scales.device_ptr(stream);
+            let (dl, _g2) = down.device_ptr_mut(stream);
+            let rc = unsafe {
+                nv_kernels::cuda::moe_unswizzle_scales(
+                    stream.cu_stream() as *mut c_void,
+                    ds as *const u8,
+                    dl as *mut u8,
+                    experts_total as i32,
+                    h as i32,
+                    inter as i32,
+                )
+            };
+            anyhow::ensure!(rc == 0, "moe_unswizzle_scales down rc={rc}");
+        }
+        self.linear_decode_scales = Some(Arc::new(MoeLinearDecodeScales { gate, up, down }));
+        Ok(true)
     }
 
     pub fn append_shared_expert_as_tile_e_costs_one_extra_expert_copy_on_top_of_the_cached_base(
@@ -543,6 +645,7 @@ impl MoeGroupedWeights {
             input_globals_down_host: globals_down_host,
             marlin_moe_twin_built_once_from_the_resident_grouped_buffers: std::sync::OnceLock::new(
             ),
+            linear_decode_scales: None,
         })
     }
 }
@@ -2027,12 +2130,18 @@ pub fn forward_grouped_decode(
     }
     prof_mark("silu_quant", &mut prof_times, &mut prof_last);
 
-    grouped_gemm_decode(
+    let down_lin = if moe_lin_scales_enabled() && moe_dp4a_enabled() {
+        w.linear_decode_scales.as_ref().map(|l| &l.down)
+    } else {
+        None
+    };
+    grouped_gemm_decode_with_lin(
         &stream,
         &ctx.y_act_fp4,
         &ctx.y_act_sf,
         &w.down_w,
         &w.down_w_scales,
+        down_lin,
         &w.down_alphas,
         &mut ctx.y_down,
         &ctx.chunk_meta,
@@ -2321,36 +2430,90 @@ pub fn forward_grouped_decode_into(
         let (xf, _g1) = ctx.x_fp4.device_ptr(&stream);
         let (xs, _g2) = ctx.x_sf.device_ptr(&stream);
         let (gw, _g3) = w.gate_w.device_ptr(&stream);
-        let (gs, _g4) = w.gate_w_scales.device_ptr(&stream);
         let (ga, _g5) = w.gate_alphas.device_ptr(&stream);
         let (uw, _g6) = w.up_w.device_ptr(&stream);
-        let (us, _g7) = w.up_w_scales.device_ptr(&stream);
         let (ua, _g8) = w.up_alphas.device_ptr(&stream);
         let (dm, _g9) = ctx.input_dn_mini.device_ptr(&stream);
         let (ip, _g10) = ctx.topk_ids.device_ptr(&stream);
         let (yf, _g11) = ctx.y_act_fp4.device_ptr_mut(&stream);
         let (ys, _g12) = ctx.y_act_sf.device_ptr_mut(&stream);
-        let rc = unsafe {
-            nv_kernels::cuda::moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
-                stream.cu_stream() as *mut c_void,
-                xf as *const u8,
-                xs as *const u8,
-                gw as *const u8,
-                gs as *const u8,
-                ga as *const f32,
-                uw as *const u8,
-                us as *const u8,
-                ua as *const f32,
-                dm as *const f32,
-                ip as *const i32,
-                yf as *mut u8,
-                ys as *mut u8,
-                tiles as i32,
-                experts_total_gu as i32,
-                inter as i32,
-                hidden as i32,
-                MIN_TILE as i32,
-            )
+        let rc = if moe_lin_scales_enabled() && moe_dp4a_enabled() {
+            if let Some(lin) = w.linear_decode_scales.as_ref() {
+                let (gsl, _g4l) = lin.gate.device_ptr(&stream);
+                let (usl, _g7l) = lin.up.device_ptr(&stream);
+                unsafe {
+                    nv_kernels::cuda::moe_grouped_fp4_gemv_gate_up_silu_quant_small_m_lin(
+                        stream.cu_stream() as *mut c_void,
+                        xf as *const u8,
+                        xs as *const u8,
+                        gw as *const u8,
+                        gsl as *const u8,
+                        ga as *const f32,
+                        uw as *const u8,
+                        usl as *const u8,
+                        ua as *const f32,
+                        dm as *const f32,
+                        ip as *const i32,
+                        yf as *mut u8,
+                        ys as *mut u8,
+                        tiles as i32,
+                        experts_total_gu as i32,
+                        inter as i32,
+                        hidden as i32,
+                        MIN_TILE as i32,
+                    )
+                }
+            } else {
+                let (gs, _g4) = w.gate_w_scales.device_ptr(&stream);
+                let (us, _g7) = w.up_w_scales.device_ptr(&stream);
+                unsafe {
+                    nv_kernels::cuda::moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
+                        stream.cu_stream() as *mut c_void,
+                        xf as *const u8,
+                        xs as *const u8,
+                        gw as *const u8,
+                        gs as *const u8,
+                        ga as *const f32,
+                        uw as *const u8,
+                        us as *const u8,
+                        ua as *const f32,
+                        dm as *const f32,
+                        ip as *const i32,
+                        yf as *mut u8,
+                        ys as *mut u8,
+                        tiles as i32,
+                        experts_total_gu as i32,
+                        inter as i32,
+                        hidden as i32,
+                        MIN_TILE as i32,
+                    )
+                }
+            }
+        } else {
+            let (gs, _g4) = w.gate_w_scales.device_ptr(&stream);
+            let (us, _g7) = w.up_w_scales.device_ptr(&stream);
+            unsafe {
+                nv_kernels::cuda::moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
+                    stream.cu_stream() as *mut c_void,
+                    xf as *const u8,
+                    xs as *const u8,
+                    gw as *const u8,
+                    gs as *const u8,
+                    ga as *const f32,
+                    uw as *const u8,
+                    us as *const u8,
+                    ua as *const f32,
+                    dm as *const f32,
+                    ip as *const i32,
+                    yf as *mut u8,
+                    ys as *mut u8,
+                    tiles as i32,
+                    experts_total_gu as i32,
+                    inter as i32,
+                    hidden as i32,
+                    MIN_TILE as i32,
+                )
+            }
         };
         anyhow::ensure!(
             rc == 0,
@@ -2463,12 +2626,18 @@ pub fn forward_grouped_decode_into(
         prof_mark(3, &stream)?;
     }
 
-    grouped_gemm_decode(
+    let down_lin = if moe_lin_scales_enabled() && moe_dp4a_enabled() {
+        w.linear_decode_scales.as_ref().map(|l| &l.down)
+    } else {
+        None
+    };
+    grouped_gemm_decode_with_lin(
         &stream,
         &ctx.y_act_fp4,
         &ctx.y_act_sf,
         &w.down_w,
         &w.down_w_scales,
+        down_lin,
         &w.down_alphas,
         &mut ctx.y_down,
         &ctx.chunk_meta,
@@ -2733,6 +2902,42 @@ fn grouped_gemm_decode(
     b_row_stride_elems: i64,
     c_row_stride_elems: i64,
 ) -> Result<()> {
+    grouped_gemm_decode_with_lin(
+        stream,
+        a_packed,
+        a_scales,
+        b_packed,
+        b_scales,
+        None,
+        alphas,
+        d_bf16,
+        chunk_meta,
+        topk_ids,
+        n,
+        k_dim,
+        a_row_stride_elems,
+        b_row_stride_elems,
+        c_row_stride_elems,
+    )
+}
+
+fn grouped_gemm_decode_with_lin(
+    stream: &Arc<CudaStream>,
+    a_packed: &CudaSlice<u8>,
+    a_scales: &CudaSlice<u8>,
+    b_packed: &CudaSlice<u8>,
+    b_scales: &CudaSlice<u8>,
+    b_scales_lin: Option<&CudaSlice<u8>>,
+    alphas: &CudaSlice<f32>,
+    d_bf16: &mut CudaSlice<bf16>,
+    chunk_meta: &[DecodeChunkMeta],
+    topk_ids: &CudaSlice<i32>,
+    n: i32,
+    k_dim: i32,
+    a_row_stride_elems: i64,
+    b_row_stride_elems: i64,
+    c_row_stride_elems: i64,
+) -> Result<()> {
     let n_us = n as usize;
     let k_us = k_dim as usize;
     let half_k = k_us / 2;
@@ -2753,6 +2958,7 @@ fn grouped_gemm_decode(
     let (a_sf_base, _gas) = a_scales.device_ptr(stream);
     let (b_base, _gb) = b_packed.device_ptr(stream);
     let (b_sf_base, _gbs) = b_scales.device_ptr(stream);
+    let b_sf_lin_guard = b_scales_lin.map(|s| s.device_ptr(stream));
     let (al_base, _gal) = alphas.device_ptr(stream);
     let (ids_base, _gi) = topk_ids.device_ptr(stream);
     let (d_base, _gd) = d_bf16.device_ptr_mut(stream);
@@ -2764,23 +2970,66 @@ fn grouped_gemm_decode(
         let a_sf_chunk_ptr = a_sf_base + (chunk_start_rows * group_k) as u64;
         let d_chunk_ptr = d_base + (chunk_start_rows * n_us * 2) as u64;
         let aid_ptr = ids_base + (chunk_start * std::mem::size_of::<i32>()) as u64;
-        let rc = unsafe {
-            nv_kernels::cuda::moe_grouped_fp4_gemv_m1_bf16(
-                stream.cu_stream() as *mut c_void,
-                a_chunk_ptr as *const u8,
-                a_sf_chunk_ptr as *const u8,
-                b_base as *const u8,
-                b_sf_base as *const u8,
-                al_base as *const f32,
-                d_chunk_ptr as *mut u16,
-                aid_ptr as *const i32,
-                meta.chunk_size as i32,
-                num_experts_total as i32,
-                n,
-                k_dim,
-                MIN_TILE as i32,
-                (MIN_TILE * n_us) as i64,
-            )
+        let rc = if let Some((lin_ptr, _)) = b_sf_lin_guard.as_ref() {
+            let r = unsafe {
+                nv_kernels::cuda::moe_grouped_fp4_gemv_m1_bf16_lin(
+                    stream.cu_stream() as *mut c_void,
+                    a_chunk_ptr as *const u8,
+                    a_sf_chunk_ptr as *const u8,
+                    b_base as *const u8,
+                    *lin_ptr as *const u8,
+                    al_base as *const f32,
+                    d_chunk_ptr as *mut u16,
+                    aid_ptr as *const i32,
+                    meta.chunk_size as i32,
+                    num_experts_total as i32,
+                    n,
+                    k_dim,
+                    MIN_TILE as i32,
+                    (MIN_TILE * n_us) as i64,
+                )
+            };
+            if r == -1 {
+                unsafe {
+                    nv_kernels::cuda::moe_grouped_fp4_gemv_m1_bf16(
+                        stream.cu_stream() as *mut c_void,
+                        a_chunk_ptr as *const u8,
+                        a_sf_chunk_ptr as *const u8,
+                        b_base as *const u8,
+                        b_sf_base as *const u8,
+                        al_base as *const f32,
+                        d_chunk_ptr as *mut u16,
+                        aid_ptr as *const i32,
+                        meta.chunk_size as i32,
+                        num_experts_total as i32,
+                        n,
+                        k_dim,
+                        MIN_TILE as i32,
+                        (MIN_TILE * n_us) as i64,
+                    )
+                }
+            } else {
+                r
+            }
+        } else {
+            unsafe {
+                nv_kernels::cuda::moe_grouped_fp4_gemv_m1_bf16(
+                    stream.cu_stream() as *mut c_void,
+                    a_chunk_ptr as *const u8,
+                    a_sf_chunk_ptr as *const u8,
+                    b_base as *const u8,
+                    b_sf_base as *const u8,
+                    al_base as *const f32,
+                    d_chunk_ptr as *mut u16,
+                    aid_ptr as *const i32,
+                    meta.chunk_size as i32,
+                    num_experts_total as i32,
+                    n,
+                    k_dim,
+                    MIN_TILE as i32,
+                    (MIN_TILE * n_us) as i64,
+                )
+            }
         };
         anyhow::ensure!(rc == 0, "moe_grouped_fp4_gemv_m1_bf16 rc={rc}");
         chunk_start += meta.chunk_size;

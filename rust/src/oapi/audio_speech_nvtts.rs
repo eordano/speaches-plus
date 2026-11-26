@@ -1694,7 +1694,7 @@ mod tests {
 
     async fn transcribe(wav: Vec<u8>) -> String {
         let url = std::env::var("NV_TTS_STT_URL")
-            .expect("NV_TTS_STT_URL: an OpenAI /v1/audio/transcriptions endpoint (the fleet STT)");
+            .expect("NV_TTS_STT_URL: an OpenAI /v1/audio/transcriptions endpoint");
         let model = std::env::var("NV_TTS_STT_MODEL").unwrap_or_else(|_| "voxtral".into());
         let part = reqwest::multipart::Part::bytes(wav)
             .file_name("sample.wav")
@@ -1715,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "real Qwen3-TTS VoiceDesign and Base weights plus the fleet STT: \
+    #[ignore = "real Qwen3-TTS VoiceDesign and Base weights plus an STT endpoint: \
                 NV_TTS_VOICE_DESIGN_TEST=1, NV_TTS_VOICE_DESIGN_DIR, NV_TTS_STT_URL"]
     fn real_voice_design_follows_the_description_repeats_by_seed_and_clones_onto_base() {
         if std::env::var("NV_TTS_VOICE_DESIGN_TEST").as_deref() != Ok("1") {
@@ -1931,7 +1931,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "real Qwen3-TTS Base weights, reference clips and the fleet STT: \
+    #[ignore = "real Qwen3-TTS Base weights, reference clips and an STT endpoint: \
                 NV_TTS_BASE_PRECISION_TEST=1, NV_TTS_BASE_TALKER_DIR, NV_TTS_CLONE_REFS, \
                 NV_TTS_STT_URL"]
     fn real_base_talker_precisions_keep_the_anchors_words_pitch_and_clone_likeness() {

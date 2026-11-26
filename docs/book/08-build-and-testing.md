@@ -104,9 +104,11 @@ source first and override second.
 `speaches-plus-go-cuda`; the Python multimodal nano-vLLM as
 `speaches-plus-python`, `speaches-plus-python-pkg` (and `-cuda` variants) with
 `hf-cache`; every `speaches-models-hub-<profile>`; and the DiariZen ONNX
-toolchain (`diarizen-onnx-exporter`, `diarizen-segmentation-onnx`) built from a
-separate nixos-24.05 pin because DiariZen vendors a pyannote.audio 3.1 fork the
-unstable python set cannot satisfy. The ONNX artifact is produced reproducibly in
+toolchain (`diarizen-onnx-exporter`, `diarizen-segmentation-onnx`), built from the
+same nixpkgs as everything else: `mkDiarizenExporter` patches DiariZen's vendored
+pyannote.audio 3.1 fork to build on current setuptools and NumPy 2, gives it its
+own dependency list, and exports with the TorchScript exporter (`dynamo=False`),
+which the script's `layer_norm` patch is written for. The ONNX artifact is produced reproducibly in
 a sandbox from the nix-hug weights — no manual export step, no network.
 
 **A profile picks weights, not code, so every `speaches-plus-<profile>` of one

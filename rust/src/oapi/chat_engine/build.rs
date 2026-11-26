@@ -1948,6 +1948,7 @@ impl NvEngineChat {
                 let bos_token_id = bos_id_from_dir(model_dir);
                 let kv_max_seq_len = kv_max_seq_len_for_unplanned_family("qwen4_exp", max_pos);
                 let model = Arc::new(model);
+                super::qwen4_exp_loop::register_idle_session_release(&model);
                 if let Err(e) = super::qwen4_exp_mm::register_vision(&model, model_dir, &raw_cfg, &tokenizer, &device) {
                     tracing::warn!(error = %format!("{e:#}"), "qwen4_exp native vision unavailable; image parts go through the OCR bridge");
                 }

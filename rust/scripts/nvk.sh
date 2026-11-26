@@ -97,9 +97,7 @@ env:
                 '#$ compiler-bindir=' line nixpkgs cuda_nvcc's nvcc.profile adds
                 to --dryrun output (is_envvar_line_re wants [_A-Z]+=) and dies
                 with 'cannot find binary path'
-  NVK_SCCACHE_DIR   sccache storage (default: $HOME/build/sccache -- /tank is
-                root-owned and root is tmpfs, so the usr-owned build area is the
-                only writable pool; capped to keep zroot headroom)
+  NVK_SCCACHE_DIR   sccache storage (default: $HOME/build/sccache)
   NVK_SCCACHE_SIZE  sccache cap (default: 20G)
   NVK_SCCACHE_BIN   sccache binary (default: PATH, else newest /nix/store match;
                 provision via: nix build --inputs-from . nixpkgs#sccache)

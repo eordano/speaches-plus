@@ -109,6 +109,7 @@ def main() -> int:
         },
         opset_version=args.opset,
         do_constant_folding=True,
+        dynamo=False,
     )
 
     size_mb = args.output.stat().st_size / 1e6

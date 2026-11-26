@@ -256,6 +256,16 @@ pub enum VadEvent {
         speech_samples: usize,
     },
 
+    SpeechPaused {
+        item_id: String,
+        audio_end_ms: u64,
+        audio: Vec<f32>,
+    },
+
+    SpeechResumed {
+        item_id: String,
+    },
+
     Failed {
         reason: String,
     },
@@ -274,6 +284,9 @@ pub trait TurnDetectionRead: Send + Sync {
         MIN_SPEECH_DURATION_MS
     }
 
+    fn early_final_samples(&self) -> usize {
+        0
+    }
     fn max_speech_duration_s(&self) -> f32 {
         MAX_SPEECH_DURATION_S
     }
@@ -367,9 +380,7 @@ pub fn speech_timestamps_from_probs(
     opts: &VadOptions,
     sample_rate: usize,
 ) -> Vec<SpeechTimestamp> {
-    let neg_threshold = opts
-        .neg_threshold
-        .unwrap_or_else(|| (opts.threshold - NEG_THRESHOLD_DELTA).max(NEG_THRESHOLD_FLOOR));
+    let neg_threshold = effective_neg_threshold(opts);
 
     let window_size = WINDOW_SAMPLES;
     let min_speech_samples = sample_rate * opts.min_speech_duration_ms as usize / 1000;
@@ -532,6 +543,14 @@ pub struct VadProcessor<M: VadInfer = VadModel> {
     carry_over_samples: usize,
     carry_grace_until_samples: usize,
     td: Option<Arc<dyn TurnDetectionRead>>,
+
+    low_since: Option<usize>,
+    pause_emitted: bool,
+}
+
+fn effective_neg_threshold(opts: &VadOptions) -> f32 {
+    opts.neg_threshold
+        .unwrap_or_else(|| (opts.threshold - NEG_THRESHOLD_DELTA).max(NEG_THRESHOLD_FLOOR))
 }
 
 const MAX_PROB_RING: usize = MAX_VAD_WINDOW_SAMPLES.div_ceil(WINDOW_SAMPLES);
@@ -552,6 +571,8 @@ impl<M: VadInfer> VadProcessor<M> {
             carry_over_samples: 0,
             carry_grace_until_samples: 0,
             td: None,
+            low_since: None,
+            pause_emitted: false,
         }
     }
 
@@ -603,6 +624,9 @@ impl<M: VadInfer> VadProcessor<M> {
         }
 
         self.pending_audio.extend_from_slice(samples);
+        let opts = self.options();
+        let neg_threshold = effective_neg_threshold(&opts);
+        let mut window_start = self.buffer.len() - self.pending_audio.len();
         while self.pending_audio.len() >= WINDOW_SAMPLES {
             let prob = self
                 .model
@@ -613,13 +637,25 @@ impl<M: VadInfer> VadProcessor<M> {
                 self.probs_start_window += 1;
             }
             self.probs.push_back(prob);
+            if self.audio_start_ms.is_some() {
+                if prob >= opts.threshold {
+                    if self.pause_emitted {
+                        if let Some(item_id) = self.current_item.clone() {
+                            self.pending.push(VadEvent::SpeechResumed { item_id });
+                        }
+                    }
+                    self.low_since = None;
+                    self.pause_emitted = false;
+                } else if prob < neg_threshold && self.low_since.is_none() {
+                    self.low_since = Some(window_start);
+                }
+            }
+            window_start += WINDOW_SAMPLES;
         }
 
         if self.probs.is_empty() {
             return Ok(());
         }
-
-        let opts = self.options();
 
         let ring_samples = self.probs.len() * WINDOW_SAMPLES;
         let probs_vec: Vec<f32> = self.probs.iter().copied().collect();
@@ -641,6 +677,8 @@ impl<M: VadInfer> VadProcessor<M> {
                 );
                 self.audio_start_ms = Some(audio_start_ms);
                 self.current_item = Some(item_id.clone());
+                self.low_since = None;
+                self.pause_emitted = false;
                 self.pending.push(VadEvent::SpeechStarted {
                     item_id,
                     audio_start_ms,
@@ -687,10 +725,49 @@ impl<M: VadInfer> VadProcessor<M> {
                 );
                 self.seal_utterance(duration_ms);
                 self.carry_over_samples = SAMPLE_RATE * MAX_SPEECH_CARRY_OVER_MS as usize / 1000;
+                return Ok(());
             }
         }
 
+        self.maybe_emit_pause(&opts);
         Ok(())
+    }
+
+    fn maybe_emit_pause(&mut self, opts: &VadOptions) {
+        if self.pause_emitted || self.audio_end_ms.is_some() {
+            return;
+        }
+        let (Some(low), Some(start_ms), Some(td)) = (self.low_since, self.audio_start_ms, &self.td)
+        else {
+            return;
+        };
+        let early = td.early_final_samples();
+        let consumed = self.buffer.len() - self.pending_audio.len();
+        if early == 0 || consumed.saturating_sub(low) < early {
+            return;
+        }
+        let Some(item_id) = self.current_item.clone() else {
+            return;
+        };
+        let pad = SAMPLE_RATE * opts.speech_pad_ms as usize / 1000;
+        let start = (start_ms as usize) * (SAMPLE_RATE / 1000);
+        let end = (low + pad).min(self.buffer.len());
+        if end <= start {
+            return;
+        }
+        self.pause_emitted = true;
+        let audio_end_ms = (end * 1000 / SAMPLE_RATE) as u64;
+        debug!(
+            item_id = %item_id,
+            audio_end_ms,
+            silence_ms = (consumed - low) * 1000 / SAMPLE_RATE,
+            "speech paused"
+        );
+        self.pending.push(VadEvent::SpeechPaused {
+            item_id,
+            audio_end_ms,
+            audio: self.buffer[start..end].to_vec(),
+        });
     }
 
     fn seal_utterance(&mut self, stop_ms: u64) {
@@ -738,6 +815,8 @@ impl<M: VadInfer> VadProcessor<M> {
             self.probs_start_window = 0;
             self.audio_end_ms = None;
             self.model.reset();
+            self.low_since = None;
+            self.pause_emitted = false;
 
             if carry > 0 {
                 let drop_n = self.buffer.len() - carry;
@@ -945,6 +1024,7 @@ mod tests {
         prefix_padding_ms: u32,
         silence_duration_ms: u32,
         min_speech_duration_ms: u32,
+        early_final_ms: u32,
     }
     impl TurnDetectionRead for FakeTd {
         fn threshold(&self) -> f32 {
@@ -959,15 +1039,94 @@ mod tests {
         fn min_speech_duration_ms(&self) -> u32 {
             self.min_speech_duration_ms
         }
+        fn early_final_samples(&self) -> usize {
+            (self.early_final_ms as usize) * SAMPLE_RATE / 1000
+        }
     }
 
     fn td(silence_ms: u32, min_speech_ms: u32, pad_ms: u32) -> Arc<dyn TurnDetectionRead> {
+        td_early(silence_ms, min_speech_ms, pad_ms, 0)
+    }
+
+    fn td_early(
+        silence_ms: u32,
+        min_speech_ms: u32,
+        pad_ms: u32,
+        early_final_ms: u32,
+    ) -> Arc<dyn TurnDetectionRead> {
         Arc::new(FakeTd {
             threshold: 0.5,
             prefix_padding_ms: pad_ms,
             silence_duration_ms: silence_ms,
             min_speech_duration_ms: min_speech_ms,
+            early_final_ms,
         })
+    }
+
+    fn replay(pattern: &[(f32, usize)]) -> (ProbReplay, usize) {
+        let probs: Vec<f32> = pattern
+            .iter()
+            .flat_map(|&(p, n)| std::iter::repeat(p).take(n))
+            .collect();
+        let n = probs.len();
+        (ProbReplay { probs, idx: 0 }, n)
+    }
+
+    fn kinds(evs: &[VadEvent]) -> Vec<&'static str> {
+        evs.iter()
+            .map(|e| match e {
+                VadEvent::SpeechStarted { .. } => "started",
+                VadEvent::SpeechPaused { .. } => "paused",
+                VadEvent::SpeechResumed { .. } => "resumed",
+                VadEvent::SpeechCommitted { .. } => "committed",
+                VadEvent::Failed { .. } => "failed",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pause_carries_the_audio_the_commit_will_transcribe() {
+        let (m, n) = replay(&[(0.0, 2), (0.7, 8), (0.0, 30)]);
+        let mut p = VadProcessor::new(m).with_turn_detection(td_early(480, 0, 64, 96));
+        push_n_windows(&mut p, n);
+        let evs = p.take_events();
+        assert_eq!(kinds(&evs), ["started", "paused", "committed"], "{evs:?}");
+        let paused = match &evs[1] {
+            VadEvent::SpeechPaused { audio, .. } => audio.len(),
+            _ => unreachable!(),
+        };
+        let speech = match &evs[2] {
+            VadEvent::SpeechCommitted { speech_samples, .. } => *speech_samples,
+            _ => unreachable!(),
+        };
+        assert!(
+            paused.abs_diff(speech) <= SAMPLE_RATE / 1000,
+            "pause audio {paused} samples, commit speech {speech} samples"
+        );
+    }
+
+    #[test]
+    fn speech_after_a_pause_resumes_and_the_next_pause_fires_again() {
+        let (m, n) = replay(&[(0.0, 2), (0.7, 8), (0.0, 4), (0.7, 3), (0.0, 30)]);
+        let mut p = VadProcessor::new(m).with_turn_detection(td_early(480, 0, 64, 96));
+        push_n_windows(&mut p, n);
+        let evs = p.take_events();
+        assert_eq!(
+            kinds(&evs),
+            ["started", "paused", "resumed", "paused", "committed"],
+            "{evs:?}"
+        );
+    }
+
+    #[test]
+    fn no_pause_without_early_final_or_when_the_commit_comes_first() {
+        for early in [0, 2000] {
+            let (m, n) = replay(&[(0.0, 2), (0.7, 8), (0.0, 30)]);
+            let mut p = VadProcessor::new(m).with_turn_detection(td_early(480, 0, 64, early));
+            push_n_windows(&mut p, n);
+            let evs = p.take_events();
+            assert_eq!(kinds(&evs), ["started", "committed"], "early {early}: {evs:?}");
+        }
     }
 
     fn push_n_windows<M: VadInfer>(p: &mut VadProcessor<M>, n: usize) {

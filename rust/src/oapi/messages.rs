@@ -670,6 +670,12 @@ pub async fn handle_messages(
         Ok(e) => e,
         Err(resp) => return resp,
     };
+    crate::oapi::cold_tier::ensure_free_async(
+        crate::oapi::cold_tier::chat_min_free_bytes(),
+        "messages",
+        Some(crate::oapi::chat_engine::QWEN4_EXP_SESSIONS_COLD_TIER_NAME),
+    )
+    .await;
 
     let mut tr = match translate(&req) {
         Ok(t) => t,

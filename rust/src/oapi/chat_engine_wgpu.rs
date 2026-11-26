@@ -1537,7 +1537,9 @@ pub fn render_official_with_tools_kwargs(
     tools: &[Tool],
     extra: &TemplateKwargs,
 ) -> anyhow::Result<String> {
-    let msgs = serde_json::to_value(messages)?;
+    let msgs = serde_json::to_value(
+        crate::oapi::chat::fold_system_messages_into_one_leading_turn_and_in_place_user_reminders(messages),
+    )?;
     let kw = crate::oapi::chat::merged_template_kwargs(template, extra);
     if tools.is_empty() {
         return template.render_with_kwargs(&msgs, None, true, &kw);

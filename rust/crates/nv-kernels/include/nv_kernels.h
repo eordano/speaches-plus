@@ -1452,6 +1452,53 @@ int nv_kernels_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m(
     int a_tile_stride_rows
 );
 
+int nv_kernels_moe_unswizzle_scales(
+    void* stream,
+    const uint8_t* swizzled,
+    uint8_t* linear,
+    int num_experts,
+    int n_dim,
+    int k_dim
+);
+
+int nv_kernels_moe_grouped_fp4_gemv_m1_bf16_lin(
+    void* stream,
+    const uint8_t* a_packed,
+    const uint8_t* a_scales,
+    const uint8_t* b_packed,
+    const uint8_t* b_scales_lin,
+    const float* alphas,
+    uint16_t* d_bf16,
+    const int32_t* group_expert_ids,
+    int num_groups,
+    int num_experts_total,
+    int n,
+    int k,
+    int a_tile_stride_rows,
+    long long d_group_stride_elems
+);
+
+int nv_kernels_moe_grouped_fp4_gemv_gate_up_silu_quant_small_m_lin(
+    void* stream,
+    const uint8_t* a_packed,
+    const uint8_t* a_scales,
+    const uint8_t* gate_w,
+    const uint8_t* gate_sf_lin,
+    const float* gate_alphas,
+    const uint8_t* up_w,
+    const uint8_t* up_sf_lin,
+    const float* up_alphas,
+    const float* dn_mini,
+    const int32_t* group_expert_ids,
+    uint8_t* y_act_fp4,
+    uint8_t* y_act_sf,
+    int num_groups,
+    int num_experts_total,
+    int n,
+    int k,
+    int a_tile_stride_rows
+);
+
 int nv_kernels_moe_router_gemv_sg_xstage_small_m(
     void* stream,
     const uint16_t* x_bf16,
@@ -1797,7 +1844,7 @@ int nv_kernels_q4exp_hc_up_mix(void* stream, const float* lora, const uint16_t* 
 
 int nv_kernels_q4exp_hc_combine(void* stream, uint16_t* hc, const uint16_t* y, const float* inject, int m, int h, int nb);
 
-int nv_kernels_q4exp_qsa_compress(void* stream, const uint16_t* raw_k, int b0, int nblocks, const float* k_norm_w, const float* cos_t, const float* sin_t, uint16_t* out, int ratio, int hd, int rot, float eps);
+int nv_kernels_q4exp_qsa_compress(void* stream, const uint16_t* raw_k, int raw_cap, int b0, int nblocks, const float* k_norm_w, const float* cos_t, const float* sin_t, uint16_t* out, int ratio, int hd, int rot, float eps);
 
 int nv_kernels_q4exp_qsa_scores(void* stream, const uint16_t* q, const uint16_t* cmp_k, const int32_t* nb_per_row, int m, int nh, int hd, int nb_stride, float scale, float* scores);
 
@@ -1813,11 +1860,11 @@ int nv_kernels_q4exp_decode_meta(void* stream, const int32_t* pos, int t, int ra
 
 int nv_kernels_q4exp_history_push(void* stream, uint32_t* history, const uint32_t* tokens, int ctx, int t);
 
-int nv_kernels_q4exp_qsa_compress_devpos(void* stream, const uint16_t* raw_k, const int32_t* pos, int t, const float* k_norm_w, const float* cos_t, const float* sin_t, uint16_t* out, int ratio, int hd, int rot, float eps);
+int nv_kernels_q4exp_qsa_compress_devpos(void* stream, const uint16_t* raw_k, int raw_cap, const int32_t* pos, int t, const float* k_norm_w, const float* cos_t, const float* sin_t, uint16_t* out, int ratio, int hd, int rot, float eps);
 
 int nv_kernels_q4exp_embed_hc(void* stream, const uint16_t* embed, const uint32_t* tokens, int t, int h, int nb, uint16_t* out);
 
-int nv_kernels_q4exp_attn_prep(void* stream, const uint16_t* q_raw, const uint16_t* k_raw, const uint16_t* v_raw, const uint16_t* idx_raw, const float* q_norm_w, const float* k_norm_w, const float* iq_norm_w, const float* cos_t, const float* sin_t, const int32_t* pos_dev, int t, int nq, int nkv, int hd, int inh, int ih, int rot, float eps, uint16_t* q_out, uint16_t* gate_out, uint16_t* k_cache, uint16_t* v_cache, uint16_t* raw_idx_cache, uint16_t* iq_out);
+int nv_kernels_q4exp_attn_prep(void* stream, const uint16_t* q_raw, const uint16_t* k_raw, const uint16_t* v_raw, const uint16_t* idx_raw, const float* q_norm_w, const float* k_norm_w, const float* iq_norm_w, const float* cos_t, const float* sin_t, const int32_t* pos_dev, int t, int nq, int nkv, int hd, int inh, int ih, int rot, float eps, uint16_t* q_out, uint16_t* gate_out, uint16_t* k_cache, uint16_t* v_cache, uint16_t* raw_idx_cache, int raw_idx_cap, uint16_t* iq_out);
 
 int nv_kernels_q4exp_ple_gate(void* stream, const uint16_t* key, const uint16_t* value, const uint16_t* hc, const float* norm_key_w, const float* norm_query_w, const float* norm_conv_w, int t, int h, int nb, float eps, uint16_t* gv_out, float* gvn_out);
 
@@ -1830,6 +1877,9 @@ int nv_kernels_gather_rows_bf16_real_rows(void* stream, const uint16_t* x_bf16, 
 int nv_kernels_quantize_nvfp4_bf16_per_expert_real_rows(void* stream, const uint16_t* x_bf16, uint8_t* packed_out, uint8_t* scales_out_swizzled, const float* stored_globals, int m_per_expert, int m_total, int k, const int32_t* row_src);
 int nv_kernels_silu_mul_quantize_nvfp4_bf16_per_expert_real_rows(void* stream, const uint16_t* y_gate_bf16, const uint16_t* y_up_bf16, uint8_t* packed_out, uint8_t* scales_out_swizzled, const float* stored_globals, int m_per_expert, int m_total, int k, const int32_t* row_src);
 int nv_kernels_q4exp_hc_down(void* stream, const uint16_t* xn, const uint16_t* w_down, const uint16_t* w_inject, float* lora_out, float* inject_out, int m, int hh, int nb, int rank);
+int nv_kernels_q4exp_hc_down_fp8(void* stream, const uint16_t* xn, const uint8_t* w_down, const float* rs_down, const uint16_t* w_inject, float* lora_out, float* inject_out, int m, int hh, int nb, int rank);
+int nv_kernels_q4exp_hc_up_mix_fp8(void* stream, const float* lora, const uint8_t* w_up, const float* rs_up, const uint16_t* xn, uint16_t* mixed, int m, int h, int nb, int rank);
+int nv_kernels_q4exp_fp8_qkv_idx_gemv(void* stream, const uint8_t* wq, const float* rsq, const uint8_t* wk, const float* rsk, const uint8_t* wv, const float* rsv, const uint8_t* wi, const float* rsi, const uint16_t* x, uint16_t* yq, uint16_t* yk, uint16_t* yv, uint16_t* yi, int nq, int nk, int nv, int ni, int k, int m);
 int nv_kernels_q4exp_hc_combine_norm(void* stream, const uint16_t* hc_in, const uint16_t* y, const float* inject, const float* norm_w, uint16_t* hc_out, uint16_t* xn_out, int m, int hh, int h, int nb, float eps);
 int nv_kernels_q4exp_fp8_gateup_silu(void* stream, const uint8_t* wg, const float* rsg, const uint8_t* wu, const float* rsu, const uint16_t* x, uint16_t* act, int m, int n, int k);
 int nv_kernels_q4exp_fp8_down_tail(void* stream, const uint8_t* wq, const float* rs, const uint16_t* act, const uint16_t* y_down, long long slot_stride, const float* topk_w, int topk, const uint16_t* sg, uint16_t* out, int m, int n, int k);
@@ -3024,6 +3074,54 @@ int nv_kernels_e4b_prefill_qkv_prep(
     int HD, float eps);
 
 int nv_kernels_q4exp_qsa_tc_rows(void* stream, const uint16_t* q, const uint16_t* gate, const uint16_t* k_cache, const uint16_t* v_cache, const int32_t* idx, const int32_t* count, int m, int nq, int nkv, int hd, int idx_stride, float scale, uint16_t* out);
+int nv_kernels_q4exp_argmax_bf16_rows(void* stream, const uint16_t* logits, int rows, int n, float* part_val, int* part_idx, uint32_t* out);
+int nv_kernels_q4exp_argmax_bf16_rows_parts(void);
+int nv_kernels_q4exp_lm_head_nvfp4_argmax_m1(void* stream, const uint8_t* wq, const uint8_t* scales, const uint16_t* x, uint64_t* packed_best, uint32_t* out_id, int n, int k);
+int nv_kernels_q4exp_lm_head_sign_screen_argmax_m1(void* stream, const uint32_t* w_sign, const float* row_scale, const uint8_t* wq, const uint8_t* scales, const uint16_t* x, uint32_t* cand_ids, uint64_t* packed_best, uint32_t* out_id, int n, int k);
+int nv_kernels_q4exp_lm_head_sign_screen_fp8_argmax_mt(void* stream, const uint32_t* w_sign, const float* row_scale, const uint8_t* wq, const float* rs, const uint16_t* x, uint32_t* cand_ids, uint64_t* packed_best, uint32_t* out_ids, int m, int n, int k);
+int nv_kernels_q4exp_lm_head_nvfp4_argmax_mt(void* stream, const uint8_t* wq, const uint8_t* scales, const uint16_t* x, uint64_t* packed_best, uint32_t* out_ids, int m, int n, int k);
+int nv_kernels_q4exp_requant_fp8_to_nvfp4(void* stream, const uint8_t* fp8_w, const float* fp8_rs, uint8_t* wq_out, uint8_t* sc_out, int n, int k, float stored_global);
+int nv_kernels_q4exp_nvfp4_gemv_mt(void* stream, const uint8_t* wq, const uint8_t* scales, const uint16_t* x, uint16_t* y, float alpha_over_2g, int m, int n, int k);
+int nv_kernels_q4exp_nvfp4_dual_gemv_mt(void* stream, const uint8_t* wq_a, const uint8_t* sc_a, float alpha_a, const uint8_t* wq_b, const uint8_t* sc_b, float alpha_b, const uint16_t* x, uint16_t* y_a, uint16_t* y_b, int na, int nb, int k, int m);
+int nv_kernels_q4exp_nvfp4_qkv_idx_gemv_mt(void* stream, const uint8_t* wq, const uint8_t* scq, float aq, const uint8_t* wk, const uint8_t* sck, float ak, const uint8_t* wv, const uint8_t* scv, float av, const uint8_t* wi, const uint8_t* sci, float ai, const uint16_t* x, uint16_t* yq, uint16_t* yk, uint16_t* yv, uint16_t* yi, int nq, int nk, int nv, int ni, int k, int m);
+int nv_kernels_q4exp_hc_down_nvfp4(void* stream, const uint16_t* xn, const uint8_t* wq, const uint8_t* sc, float alpha, const uint16_t* w_inject, float* lora_out, float* inject_out, int m, int hh, int nb, int rank);
+int nv_kernels_q4exp_hc_up_mix_nvfp4(void* stream, const float* lora, const uint8_t* wq, const uint8_t* sc, float alpha, const uint16_t* xn, uint16_t* mixed, int m, int h, int nb, int rank);
+int nv_kernels_q4exp_nvfp4_down_tail(void* stream, const uint8_t* wq, const uint8_t* sc, float alpha, const uint16_t* act, const uint16_t* y_down, long long slot_stride, const float* topk_w, int topk, const uint16_t* sg, uint16_t* out, int m, int n, int k);
+int nv_kernels_q4exp_lm_head_fp8_argmax_mt(void* stream, const uint8_t* wq, const float* rs, const uint16_t* x, uint64_t* packed_best, uint32_t* out_ids, int m, int n, int k);
+int nv_kernels_q4exp_quant_rows_to_i8(void* stream, const uint16_t* src_bf16, uint8_t* dst_i8, float* dst_sc, const int32_t* pos_dev, int row_offset, int n_rows, int rows_per_tok, int row_elems);
+int nv_kernels_q4exp_qsa_scores_i8_hd128(void* stream, const uint16_t* q, const uint8_t* cmp_k_i8, const float* cmp_k_sc, const int32_t* nb_per_row, int m, int nh, int nb_stride, float scale, float* scores);
+int nv_kernels_q4exp_nvfp4_gateup_silu(void* stream, const uint8_t* wq_g, const uint8_t* sc_g, float alpha_g, const uint8_t* wq_u, const uint8_t* sc_u, float alpha_u, const uint16_t* x, uint16_t* act, int m, int n, int k);
+int nv_kernels_gdn_decode_chunk_conv_split_bf16(
+    void* stream,
+    const uint16_t* qkv,
+    const uint16_t* conv_state,
+    const uint16_t* conv_w,
+    uint16_t* mixed_scratch,
+    uint16_t* ckpt_conv,
+    const uint16_t* z,
+    const uint16_t* a,
+    const uint16_t* b,
+    const uint16_t* A_log,
+    const uint16_t* dt_bias,
+    const uint16_t* norm_w,
+    const float* state_in,
+    float* ckpt_state,
+    float* live_state_out,
+    uint16_t* out,
+    float* qn_scratch,
+    float* kn_scratch,
+    float* g_exp_scratch,
+    float* beta_scratch,
+    uint16_t* core_scratch,
+    int n_k,
+    int n_v,
+    int d_k,
+    int d_v,
+    int conv_k,
+    float rms_eps,
+    int t,
+    int ab_row_stride
+);
 
 #ifdef __cplusplus
 }

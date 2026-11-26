@@ -2,19 +2,123 @@
 use super::*;
 
 #[cfg(any(feature = "cuda", test))]
-pub(super) async fn acquire_qwen4_exp_permit(
-    queue: std::time::Duration,
-) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+fn qwen4_exp_gate() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
     static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
-    let sem = GATE.get_or_init(|| {
+    GATE.get_or_init(|| {
         tracing::info!(
             permits = 1,
             "qwen4_exp chat serialized across session reuse and CUDA graph capture"
         );
         std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+    })
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(super) async fn acquire_qwen4_exp_permit(
+    queue: std::time::Duration,
+) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+    super::spec_env::acquire_permit_bounded(qwen4_exp_gate().clone(), 1, queue).await
+}
+
+pub(crate) const QWEN4_EXP_SESSIONS_COLD_TIER_NAME: &str = "qwen4exp-sessions";
+
+pub(crate) const QWEN4_EXP_SESSION_SLOT_PARKS_AFTER_300_IDLE_SECS_BECAUSE_A_DISK_RESTORE_COSTS_ABOUT_A_SECOND: u64 = 300;
+
+#[cfg(feature = "cuda")]
+struct IdleSessionsSpillToDiskUnderTheEnginePermit(
+    std::sync::Mutex<std::sync::Weak<nv_models::qwen4_exp::Qwen4Exp>>,
+);
+
+#[cfg(feature = "cuda")]
+impl IdleSessionsSpillToDiskUnderTheEnginePermit {
+    fn model(&self) -> Option<Arc<nv_models::qwen4_exp::Qwen4Exp>> {
+        self.0.lock().ok()?.upgrade()
+    }
+
+    fn held(&self) -> Vec<(usize, u64, std::time::Instant)> {
+        let Some(m) = self.model() else { return Vec::new() };
+        [0, 1, nv_models::qwen4_exp::ADAPTER_SESSION_IS_HELD_SLOT_2_AGED_AND_RELEASED_BY_THE_COLD_TIER_LIKE_THE_TWO_BASE_SLOTS].into_iter().filter_map(|i| m.held_session(i).map(|(b, t)| (i, b, t))).collect()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl crate::oapi::cold_tier::Resident for IdleSessionsSpillToDiskUnderTheEnginePermit {
+    fn name(&self) -> &'static str {
+        QWEN4_EXP_SESSIONS_COLD_TIER_NAME
+    }
+
+    fn estimate_bytes(&self) -> u64 {
+        self.held().iter().map(|h| h.1).sum()
+    }
+
+    fn is_loaded(&self) -> bool {
+        !self.held().is_empty()
+    }
+
+    fn last_used(&self) -> Option<std::time::Instant> {
+        self.held().iter().map(|h| h.2).min()
+    }
+
+    fn idle_after(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(
+            QWEN4_EXP_SESSION_SLOT_PARKS_AFTER_300_IDLE_SECS_BECAUSE_A_DISK_RESTORE_COSTS_ABOUT_A_SECOND,
+        ))
+    }
+
+    fn evict(&self, reason: &str) -> bool {
+        let Some(model) = self.model() else { return false };
+        let Ok(_permit) = qwen4_exp_gate().try_acquire() else { return false };
+        let held = self.held();
+        let limit = (reason == crate::oapi::cold_tier::IDLE_REASON)
+            .then(|| crate::oapi::cold_tier::idle_limit(self))
+            .flatten();
+        let slots: Vec<usize> = held
+            .iter()
+            .filter(|h| limit.is_none_or(|l| h.2.elapsed() >= l))
+            .map(|h| h.0)
+            .collect();
+        if slots.is_empty() {
+            return false;
+        }
+        let bytes: u64 = held.iter().filter(|h| slots.contains(&h.0)).map(|h| h.1).sum();
+        let before = crate::oapi::cold_tier::device_free_bytes();
+        let _no_capture = nv_kernels::capture_exclusion::no_capture_in_flight();
+        let t0 = std::time::Instant::now();
+        let freed = model.release_sessions_to_disk(&slots);
+        let gib = |b: Option<u64>| b.map_or("?".into(), |b| format!("{:.2}", b as f64 / (1u64 << 30) as f64));
+        tracing::info!(
+            resident = QWEN4_EXP_SESSIONS_COLD_TIER_NAME,
+            reason,
+            slots = ?slots,
+            held_gib = gib(Some(bytes)),
+            free_gib_before = gib(before),
+            free_gib_after = gib(crate::oapi::cold_tier::device_free_bytes()),
+            release_ms = t0.elapsed().as_millis() as u64,
+            "cold tier: qwen4_exp sessions parked to disk and their device memory freed"
+        );
+        freed
+    }
+
+    fn load_blocking(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "cuda")]
+pub(super) fn register_idle_session_release(model: &Arc<nv_models::qwen4_exp::Qwen4Exp>) {
+    static RESIDENT: std::sync::OnceLock<Arc<IdleSessionsSpillToDiskUnderTheEnginePermit>> =
+        std::sync::OnceLock::new();
+    let r = RESIDENT.get_or_init(|| {
+        let r = Arc::new(IdleSessionsSpillToDiskUnderTheEnginePermit(std::sync::Mutex::new(
+            std::sync::Weak::new(),
+        )));
+        crate::oapi::cold_tier::register(r.clone());
+        r
     });
-    super::spec_env::acquire_permit_bounded(sem.clone(), 1, queue).await
+    if let Ok(mut m) = r.0.lock() {
+        *m = Arc::downgrade(model);
+    }
 }
 
 #[cfg(test)]
@@ -477,13 +581,17 @@ async fn run_plain(
         }
 
         let nv_models::qwen4_exp::Qwen4ExpSession { state, graph, .. } = &mut *session;
-        let step_logits = model.decode_graphed(last, state, graph)?;
-        last_out = sampler.sample(&step_logits);
-        last = last_out.token;
-        if last_out.exhausted {
-            anyhow::bail!(
-                "no legal token at step {step}: the sampling mask left every candidate at -inf"
-            );
+        if sampler.fast_greedy() && !req.logprobs {
+            last = model.decode_graphed_argmax(last, state, graph)?;
+        } else {
+            let step_logits = model.decode_graphed(last, state, graph)?;
+            last_out = sampler.sample(&step_logits);
+            last = last_out.token;
+            if last_out.exhausted {
+                anyhow::bail!(
+                    "no legal token at step {step}: the sampling mask left every candidate at -inf"
+                );
+            }
         }
     }
 

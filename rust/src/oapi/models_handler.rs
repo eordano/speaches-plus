@@ -138,7 +138,13 @@ fn build_models(models: &Arc<Models>) -> Vec<Model> {
             id: whisper_id,
             created: 1,
             owned_by: whisper_owner,
-            languages: Some(WHISPER_LANGUAGES.iter().map(|s| s.to_string()).collect()),
+            languages: Some(
+                w.languages()
+                    .unwrap_or(WHISPER_LANGUAGES)
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
             task: task::ASR.into(),
             max_model_len: None,
             extras: Map::new(),

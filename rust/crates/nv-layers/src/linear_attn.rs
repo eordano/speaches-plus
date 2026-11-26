@@ -546,6 +546,80 @@ thread_local! {
 }
 
 #[cfg(feature = "cuda")]
+pub struct BatchedRollbackPlan {
+    dsts: cudarc::driver::CudaSlice<u64>,
+    srcs: cudarc::driver::CudaSlice<u64>,
+    nwords: cudarc::driver::CudaSlice<u32>,
+    count: i32,
+}
+
+#[cfg(feature = "cuda")]
+impl BatchedRollbackPlan {
+    pub fn build(pairs: &[(&LinAttnState, &LinAttnState)], device: &Device) -> Result<Self> {
+        let Device::Cuda(dev) = device else {
+            anyhow::bail!("BatchedRollbackPlan requires a CUDA device");
+        };
+        let stream = crate::cuda_stream::current_stream(dev);
+        let mut dsts: Vec<u64> = Vec::with_capacity(pairs.len() * 2);
+        let mut srcs: Vec<u64> = Vec::with_capacity(pairs.len() * 2);
+        let mut nwords: Vec<u32> = Vec::with_capacity(pairs.len() * 2);
+        for (live, ckpt) in pairs {
+            for (dst_t, src_t) in [
+                (&live.conv_state, &ckpt.conv_state),
+                (&live.recurrent_state, &ckpt.recurrent_state),
+            ] {
+                anyhow::ensure!(
+                    src_t.dtype() == dst_t.dtype() && src_t.elem_count() == dst_t.elem_count(),
+                    "batched rollback plan size/dtype mismatch"
+                );
+                let (_d1, src_ptr, bytes) = cuda_tensor_raw(src_t)?;
+                let (_d2, dst_ptr, b2) = cuda_tensor_raw(dst_t)?;
+                anyhow::ensure!(
+                    bytes == b2 && bytes % 4 == 0,
+                    "batched rollback plan byte mismatch"
+                );
+                srcs.push(src_ptr);
+                dsts.push(dst_ptr);
+                nwords.push((bytes / 4) as u32);
+            }
+        }
+        let count = nwords.len() as i32;
+        let d_dsts = stream.clone_htod(&dsts)?;
+        let d_srcs = stream.clone_htod(&srcs)?;
+        let d_nw = stream.clone_htod(&nwords)?;
+        Ok(Self {
+            dsts: d_dsts,
+            srcs: d_srcs,
+            nwords: d_nw,
+            count,
+        })
+    }
+
+    pub fn launch(&self, stream: &std::sync::Arc<cudarc::driver::CudaStream>) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        if self.count == 0 {
+            return Ok(());
+        }
+        let rc = {
+            let (pd, _a) = self.dsts.device_ptr(stream);
+            let (ps, _b) = self.srcs.device_ptr(stream);
+            let (pn, _c) = self.nwords.device_ptr(stream);
+            unsafe {
+                nv_kernels::cuda::batched_copy_u32(
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                    pd as *const u64,
+                    ps as *const u64,
+                    pn as *const u32,
+                    self.count,
+                )
+            }
+        };
+        anyhow::ensure!(rc == 0, "batched_copy_u32 rc={rc}");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
 fn zero_tensor_data(t: &Tensor) -> Result<()> {
     let (dev, ptr, bytes) = cuda_tensor_raw(t)?;
     let stream = crate::cuda_stream::current_stream(&dev);
@@ -1055,16 +1129,7 @@ fn qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
 ) -> Result<Option<(Tensor, Tensor)>> {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
 
-    if !gdn_qkvz_one_env_read_per_call_so_the_kill_switch_works_mid_process() {
-        return Ok(None);
-    }
     if m == 0 || m > 16 || x.dtype() != DType::BF16 {
-        return Ok(None);
-    }
-    if m >= 2
-        && crate::linear::verify_tc_fp8_lt_gemm_scope_active()
-        && !gdn_qkvz_one_under_verify_tc_env_opt_in_1_reread_every_call()
-    {
         return Ok(None);
     }
     if in_proj_qkv.has_lora() || in_proj_z.has_lora() {
@@ -1072,6 +1137,78 @@ fn qkv_z_pair_one_dual_gemv_launch_bit_identical_to_two_gemv_e4m3_mk_calls(
     }
     let k = in_proj_qkv.in_features();
     if in_proj_z.in_features() != k || x.elem_count() != m * k {
+        return Ok(None);
+    }
+    let qkv_nv4 = in_proj_qkv.nvfp4_fast_twin();
+    let z_nv4 = in_proj_z.nvfp4_fast_twin();
+    if qkv_nv4.is_some() != z_nv4.is_some() {
+        return Ok(None);
+    }
+    if let (Some(ta), Some(tb)) = (qkv_nv4, z_nv4) {
+        if m <= 8 && k % 16 == 0 {
+            let x_c = x.contiguous()?;
+            let n_a = in_proj_qkv.out_features();
+            let n_b = in_proj_z.out_features();
+            let stream = crate::cuda_stream::current_stream(dev);
+            let (_dx, x_ptr, _lx) = cuda_tensor_raw(&x_c)?;
+            let mut y_a: cudarc::driver::CudaSlice<half::bf16> = unsafe {
+                stream
+                    .alloc::<half::bf16>(m * n_a)
+                    .map_err(|e| anyhow::anyhow!("alloc qkvz-nv4 qkv: {e:?}"))?
+            };
+            let mut y_b: cudarc::driver::CudaSlice<half::bf16> = unsafe {
+                stream
+                    .alloc::<half::bf16>(m * n_b)
+                    .map_err(|e| anyhow::anyhow!("alloc qkvz-nv4 z: {e:?}"))?
+            };
+            let rc = {
+                let (wa, _ga) = ta.wq.device_ptr(&stream);
+                let (sa, _gsa) = ta.scales.device_ptr(&stream);
+                let (wb, _gb) = tb.wq.device_ptr(&stream);
+                let (sb, _gsb) = tb.scales.device_ptr(&stream);
+                let (pa, _gpa) = y_a.device_ptr_mut(&stream);
+                let (pb, _gpb) = y_b.device_ptr_mut(&stream);
+                unsafe {
+                    nv_kernels::cuda::q4exp_nvfp4_dual_gemv_mt(
+                        stream.cu_stream() as *mut std::ffi::c_void,
+                        wa as *const u8,
+                        sa as *const u8,
+                        ta.alpha_over_2g,
+                        wb as *const u8,
+                        sb as *const u8,
+                        tb.alpha_over_2g,
+                        x_ptr as *const u16,
+                        pa as *mut u16,
+                        pb as *mut u16,
+                        n_a as i32,
+                        n_b as i32,
+                        k as i32,
+                        m as i32,
+                    )
+                }
+            };
+            if rc != -3 {
+                anyhow::ensure!(rc == 0, "q4exp_nvfp4_dual_gemv_mt rc={rc}");
+                let wrap = |slice: cudarc::driver::CudaSlice<half::bf16>, cols: usize| -> Tensor {
+                    let storage = candle_core::CudaStorage::wrap_cuda_slice(slice, dev.clone());
+                    Tensor::from_storage(
+                        candle_core::Storage::Cuda(storage),
+                        (1usize, m, cols),
+                        candle_core::op::BackpropOp::none(),
+                        false,
+                    )
+                };
+                return Ok(Some((wrap(y_a, n_a), wrap(y_b, n_b))));
+            }
+        }
+    }
+    if !gdn_qkvz_one_env_read_per_call_so_the_kill_switch_works_mid_process() {
+        return Ok(None);
+    }
+    if m >= 2
+        && crate::linear::verify_tc_fp8_lt_gemm_scope_active()
+        && !gdn_qkvz_one_under_verify_tc_env_opt_in_1_reread_every_call()
+    {
         return Ok(None);
     }
     let x_c = x.contiguous()?;
@@ -1623,6 +1760,26 @@ impl LinearAttention {
         self.in_proj_b = b;
         self.ab_concat_one_gemv_when_both_bf16_because_two_48_row_launches_paid_double_latency =
             None;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn build_nvfp4_fast_twins(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        include_qkv: bool,
+        include_z: bool,
+        include_out: bool,
+    ) -> Result<()> {
+        if include_qkv {
+            self.in_proj_qkv.build_nvfp4_fast_twin(stream)?;
+        }
+        if include_z {
+            self.in_proj_z.build_nvfp4_fast_twin(stream)?;
+        }
+        if include_out {
+            self.out_proj.build_nvfp4_fast_twin(stream)?;
+        }
         Ok(())
     }
 
@@ -3831,7 +3988,14 @@ impl LinearAttention {
                 }
                 None => None,
             };
-        {
+        let use_fused_conv_split = tree_parents_ptr.is_none()
+            && n_k == 16
+            && n_v == 48
+            && d_k == 128
+            && d_v == 128
+            && kernel == 4
+            && m <= 8;
+        if !use_fused_conv_split {
             let mp = mixed_ptr;
             let cp = ckpt_conv_base;
             let rc = match tree_parents_ptr {
@@ -3870,6 +4034,7 @@ impl LinearAttention {
         }
         gdn_stage_hook::mark(1);
         let mut chunk_split_wrote_live_state = false;
+        let mut chunk_split_wrote_i8 = false;
         {
             let mut owned_split: Option<(
                 cudarc::driver::CudaSlice<f32>,
@@ -3914,40 +4079,15 @@ impl LinearAttention {
             let mp = mixed_ptr;
             let rp = ckpt_rec_base;
             let (gp, _gg) = gated.device_ptr_mut(&stream);
-            let rc = match tree_parents_ptr {
-                Some(pp) => unsafe {
-                    nv_kernels::cuda::gdn_decode_chunk_split_tree_bf16(
+            let rc = if use_fused_conv_split {
+                let r = unsafe {
+                    nv_kernels::cuda::gdn_decode_chunk_conv_split_bf16(
                         stream.cu_stream() as *mut std::ffi::c_void,
-                        mp as *const u16,
-                        z_ptr as *const u16,
-                        a_ptr as *const u16,
-                        b_ptr as *const u16,
-                        a_log_ptr as *const u16,
-                        dt_ptr as *const u16,
-                        nw_ptr as *const u16,
-                        rec_state_ptr as *const f32,
-                        rp as *mut f32,
-                        rec_state_ptr as *mut f32,
-                        gp as *mut u16,
-                        qp as *mut f32,
-                        kp as *mut f32,
-                        gep as *mut f32,
-                        bep as *mut f32,
-                        cp as *mut u16,
-                        pp as *const i32,
-                        n_k as i32,
-                        n_v as i32,
-                        d_k as i32,
-                        d_v as i32,
-                        self.cfg.rms_eps as f32,
-                        m as i32,
-                        ab_row_stride as i32,
-                    )
-                },
-                None => unsafe {
-                    nv_kernels::cuda::gdn_decode_chunk_split_bf16(
-                        stream.cu_stream() as *mut std::ffi::c_void,
-                        mp as *const u16,
+                        qkv_ptr as *const u16,
+                        conv_state_ptr as *const u16,
+                        w_ptr as *const u16,
+                        mp as *mut u16,
+                        ckpt_conv_base as *mut u16,
                         z_ptr as *const u16,
                         a_ptr as *const u16,
                         b_ptr as *const u16,
@@ -3967,11 +4107,76 @@ impl LinearAttention {
                         n_v as i32,
                         d_k as i32,
                         d_v as i32,
+                        kernel as i32,
                         self.cfg.rms_eps as f32,
                         m as i32,
                         ab_row_stride as i32,
                     )
-                },
+                };
+                if r == 0 {
+                    chunk_split_wrote_i8 = true;
+                }
+                r
+            } else {
+                match tree_parents_ptr {
+                    Some(pp) => unsafe {
+                        nv_kernels::cuda::gdn_decode_chunk_split_tree_bf16(
+                            stream.cu_stream() as *mut std::ffi::c_void,
+                            mp as *const u16,
+                            z_ptr as *const u16,
+                            a_ptr as *const u16,
+                            b_ptr as *const u16,
+                            a_log_ptr as *const u16,
+                            dt_ptr as *const u16,
+                            nw_ptr as *const u16,
+                            rec_state_ptr as *const f32,
+                            rp as *mut f32,
+                            rec_state_ptr as *mut f32,
+                            gp as *mut u16,
+                            qp as *mut f32,
+                            kp as *mut f32,
+                            gep as *mut f32,
+                            bep as *mut f32,
+                            cp as *mut u16,
+                            pp as *const i32,
+                            n_k as i32,
+                            n_v as i32,
+                            d_k as i32,
+                            d_v as i32,
+                            self.cfg.rms_eps as f32,
+                            m as i32,
+                            ab_row_stride as i32,
+                        )
+                    },
+                    None => unsafe {
+                        nv_kernels::cuda::gdn_decode_chunk_split_bf16(
+                            stream.cu_stream() as *mut std::ffi::c_void,
+                            mp as *const u16,
+                            z_ptr as *const u16,
+                            a_ptr as *const u16,
+                            b_ptr as *const u16,
+                            a_log_ptr as *const u16,
+                            dt_ptr as *const u16,
+                            nw_ptr as *const u16,
+                            rec_state_ptr as *const f32,
+                            rp as *mut f32,
+                            rec_state_ptr as *mut f32,
+                            gp as *mut u16,
+                            qp as *mut f32,
+                            kp as *mut f32,
+                            gep as *mut f32,
+                            bep as *mut f32,
+                            cp as *mut u16,
+                            n_k as i32,
+                            n_v as i32,
+                            d_k as i32,
+                            d_v as i32,
+                            self.cfg.rms_eps as f32,
+                            m as i32,
+                            ab_row_stride as i32,
+                        )
+                    },
+                }
             };
             anyhow::ensure!(
                 tree_parents_ptr.is_none() || rc == 0,
@@ -4085,15 +4290,24 @@ impl LinearAttention {
                 false,
             )
         };
-        let out = match e4m3_mrows_f16mma_projection(
-            &self.out_proj,
-            &flat,
-            m,
-            &dev,
-            true,
-        )? {
-            Some(t) => t,
-            None => self.out_proj.forward(&flat)?,
+        let out = if chunk_split_wrote_i8 && self.out_proj.nvfp4_fast_twin().is_some() && !self.out_proj.has_lora() {
+            match self.out_proj.forward_nvfp4_prequant(m, value_dim, &dev)? {
+                Some(t) => t.reshape((1usize, m, self.cfg.hidden_size))?,
+                None => self.out_proj.forward(&flat)?,
+            }
+        } else if m <= 8 && self.out_proj.nvfp4_fast_twin().is_some() && !self.out_proj.has_lora() {
+            self.out_proj.forward(&flat)?
+        } else {
+            match e4m3_mrows_f16mma_projection(
+                &self.out_proj,
+                &flat,
+                m,
+                &dev,
+                true,
+            )? {
+                Some(t) => t,
+                None => self.out_proj.forward(&flat)?,
+            }
         };
         if let Some(p) = prof.as_mut() {
             p.lap("mrow_out_proj");
@@ -4943,22 +5157,36 @@ fn load_linear_fp8_resident_quantizing_bf16_checkpoint_modules_because_qwen36_sh
             fp8_runner.clone(),
         );
     }
-    let w = weights
-        .get(&resolved, DType::BF16)
-        .with_context(|| format!("load {resolved}"))?;
-    let d = w.dims();
-    anyhow::ensure!(
-        d.len() == 2 && d[0] == out_features && d[1] == in_features,
-        "linear {resolved}: expected [{out_features}, {in_features}], got {d:?}"
-    );
-    let weight_host: Vec<half::bf16> = w.flatten_all()?.to_vec1()?;
-    let (weight_bytes, row_scales) = crate::linear::fp8_weight_payload(
-        &weight_host,
-        out_features,
-        in_features,
-        None,
-        nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
-    )?;
+    let direct_bf16 = (weights.dtype_of(&resolved) == Some(DType::BF16))
+        .then(|| weights.raw_bytes(&resolved).ok())
+        .flatten();
+    let (weight_bytes, row_scales) = if let Some(raw) = direct_bf16 {
+        let d = weights
+            .shape_of(&resolved)
+            .ok_or_else(|| anyhow::anyhow!("missing shape for {resolved}"))?;
+        anyhow::ensure!(
+            d.len() == 2 && d[0] == out_features && d[1] == in_features,
+            "linear {resolved}: expected [{out_features}, {in_features}], got {d:?}"
+        );
+        nv_quant::fp8::quantize_e4m3_per_row_from_bf16_le_bytes(raw, out_features, in_features)?
+    } else {
+        let w = weights
+            .get(&resolved, DType::BF16)
+            .with_context(|| format!("load {resolved}"))?;
+        let d = w.dims();
+        anyhow::ensure!(
+            d.len() == 2 && d[0] == out_features && d[1] == in_features,
+            "linear {resolved}: expected [{out_features}, {in_features}], got {d:?}"
+        );
+        let weight_host: Vec<half::bf16> = w.flatten_all()?.to_vec1()?;
+        crate::linear::fp8_weight_payload(
+            &weight_host,
+            out_features,
+            in_features,
+            None,
+            nv_quant::fp8::Fp8ScaleMode::PerOuterRow,
+        )?
+    };
     let dev = match device {
         Device::Cuda(d) => d.clone(),
         _ => anyhow::bail!("fp8 resident linear requires a CUDA device"),

@@ -1038,6 +1038,7 @@ dependencies = [
  "cxx-build",
  "mel_spec",
  "ndarray 0.16.1",
+ "onednn-src",
  "sentencepiece",
  "serde",
  "serde_json",
@@ -3502,6 +3503,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "onednn-src"
+version = "0.1.21"
+dependencies = [
+ "cmake",
+]
+
+[[package]]
 name = "onig"
 version = "6.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5263,6 +5271,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "ndarray 0.17.2",
+ "num_cpus",
  "nv-aligner",
  "nv-config",
  "nv-engine",

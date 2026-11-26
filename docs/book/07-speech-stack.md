@@ -91,18 +91,26 @@ that is why the unset default prefers the GPU lane. **The Go default is
 ct2** (`go/cmd/server/main.go`) — a real divergence, not a documented
 choice.
 
-Parakeet-TDT (`rust/src/stt/parakeet.rs`) is the CPU-fast English lane:
-NVIDIA parakeet-tdt-0.6b-v2 via the istupakov ONNX export (nemo128 mel
-preprocessor + conformer encoder + TDT decoder_joint greedy loop over 1024
-sentencepiece tokens, blank 1024, five duration bins), on the same `ort`
-runtime as VAD/EOU. Transcribe-only English (`/v1/audio/translations` refuses
-via `TranslateUnsupported`), one proportional-word segment per request, and
+Parakeet-TDT (`rust/src/stt/parakeet.rs`) is the CPU-fast lane: NVIDIA
+parakeet-tdt-0.6b v3 (25 European languages, auto-detected) or v2 (English)
+via the istupakov ONNX exports (nemo128 mel preprocessor + conformer encoder +
+TDT decoder_joint greedy loop, five duration bins), on the same `ort` runtime
+as VAD/EOU. Both checkpoints share the network shapes (encoder 1024, decoder
+state 2 x 640) and differ in the head: v2 has 1025 token logits, v3 8193 with
+262 `<|...|>` control tokens. `vocab.txt` sets the head width and the blank
+(`<blk>`, last in both); the joint's output must match it, and control tokens
+never reach the text. A `<|es|>` tag in the vocabulary marks the multilingual
+head: it accepts a request `language` among its 25 and reports it back (it
+cannot be steered, the model detects the language itself); v2 accepts only
+`en`. Transcribe-only (`/v1/audio/translations` refuses via
+`TranslateUnsupported`), one proportional-word segment per request, and
 conformer full-attention cost bounded by 60-second decode windows
 (`WINDOW_SAMPLES_BOUNDS_FULL_ATTENTION_COST`). Checkpoint resolution:
 `STT_PARAKEET_DIR`, else the newest hub snapshot of
-`istupakov/parakeet-tdt-0.6b-v2-onnx`. No real-checkpoint suite covers it; the
-unit tests in `stt/parakeet.rs` cover the decoder's log-softmax and head-width
-checks. The model applies its own inverse text normalization
+`istupakov/parakeet-tdt-0.6b-v3-onnx`, then of the v2 export. The unit tests
+in `stt/parakeet.rs` cover both vocabulary layouts, the control-token filter
+and the log-softmax; `a_real_checkpoint_transcribes_each_clip` (ignored; set
+`PARAKEET_TEST_DIR` and `PARAKEET_TEST_F32`) runs a real checkpoint. The model applies its own inverse text normalization
 ("seventeen" -> "17"). Its three
 sessions load through the shared EP ladder
 (`crate::diarization::ep::load_session`), so they engage the CUDA EP whenever
@@ -339,7 +347,17 @@ instrument is `voxtral-tune eval` over the 73 clips of
 unpunctuated transcripts), on which bf16 graphed, bf16 eager and NVFP4 score
 the same word-error count; the bitwise gates in `tests/voxtral_realtime.rs`
 pin `NV_VOXTRAL_QUANT=bf16` explicitly, and that value restores dense weights
-in serving.
+in serving. NVFP4's kernels need compute capability 10, so a CUDA device below
+that (an RTX 4090 is 8.9) defaults to GGML Q8_0 for the decoder linears and the
+lm_head instead
+(`Q8_0_IS_THE_DEFAULT_ON_CUDA_WITHOUT_NVFP4_KERNELS_BY_THE_LIBRISPEECH_73_CLIP_WER_INSTRUMENT`):
+on the same 73 clips, sent through `/v1/audio/transcriptions` on a 4090, Q8_0
+and bf16 transcribe 71 alike and differ by one word error, and Q8_0 is faster
+and holds about 9 GB less. Q8_0 drafts four rows a step as NVFP4 does
+(`Q8_0_DRAFTS_FOUR_PADS_BY_THE_LIBRISPEECH_73_CLIP_TRANSCRIPTS`): its m-row
+linear stays on the GGML kernels, so 2 and 4 rows transcribe the 73 clips
+exactly as 1 row does, and 4 rows cut `voxtral-tune eval` from 334 to 222 ms a
+clip on an RTX PRO 6000 Blackwell.
 
 Model resolution is by path convention, not model id: `ct2_model_dir`
 requires `<models>/whisper-ct2/model.bin`; `whisper_cpp_model_path` probes
@@ -371,7 +389,10 @@ gated to `Ct2Device::CUDA`); **quantization control** — Rust
 (`ct2_compute_type` in `rust/src/stt/mod.rs`) and Go
 (`ctranslate2::str_to_compute_type`) both read `CT2_COMPUTE_TYPE`, so `int8`
 / `int8_float16` / `float16` are reachable, with no whisper.cpp analogue;
-unset, Rust runs the checkpoint at its saved precision; word timestamps — whisper.cpp
+unset, Rust runs the checkpoint at its saved precision; CPU GEMM backend —
+the Rust ct2rs build is oneDNN + OpenMP on Linux x86_64 (int8 on VNNI) and
+Ruy elsewhere, with one CTranslate2 thread per physical core
+(`ct2_threads`); word timestamps — whisper.cpp
 exposes per-token timings, ct2rs does not; artifact format — ggml `.bin`
 and CT2 `model.bin` + `tokenizer.json` are disjoint, so the checkpoint forces
 the backend; concurrency — whisper.cpp needs `ctx.create_state()` per

@@ -72,6 +72,14 @@ pub fn layout_present(dir: &std::path::Path) -> bool {
     dir.join(FIRST_CHECKPOINT_PROBED).is_file()
 }
 
+fn preload_names(preload: &str, registered: impl Fn(&str) -> bool) -> (Vec<&str>, Vec<&str>) {
+    preload
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .partition(|n| !n.starts_with("ft:") || registered(n))
+}
+
 fn load_from_env() -> Option<Arc<Service>> {
     let dir = model_dir()?;
     let settings = match pick_devices(
@@ -96,10 +104,24 @@ fn load_from_env() -> Option<Arc<Service>> {
         fine_tuned(),
     );
     let preload = std::env::var(ENV_PRELOAD).unwrap_or_else(|_| "english".into());
-    for name in preload.split(',').filter(|n| !n.trim().is_empty()) {
-        let loaded = normalise(name)
-            .map_err(|e| e.to_string())
-            .and_then(|m| service.checkpoint(m).map_err(|e| e.message));
+    let (names, unregistered) =
+        preload_names(&preload, |id| fine_tuned().read().unwrap().contains_key(id));
+    for id in unregistered {
+        warn!(
+            checkpoint = id,
+            "systemone: preload skips a fine-tuned id no job directory registers; the bases still serve"
+        );
+    }
+    for name in names {
+        // A base by any name the router accepts, or a fine-tuned id (`ft:...`) the jobs
+        // directory registered above, so an adapter a gate relies on is warm from boot.
+        let loaded = match normalise(name) {
+            Ok(m) => service.checkpoint(m).map_err(|e| e.message),
+            Err(_) if name.trim().starts_with("ft:") => service
+                .fine_tuned_checkpoint(name.trim())
+                .map_err(|e| e.message),
+            Err(e) => Err(e.to_string()),
+        };
         if let Err(error) = loaded {
             warn!(checkpoint = name, error, "systemone: preload failed");
             return None;
@@ -320,6 +342,23 @@ async fn presets() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fine_tuned_preload_id_no_job_registers_is_skipped_and_the_bases_still_load() {
+        let (load, skipped) = preload_names(
+            " english,ft:typed-decisions:gate:gone ,typed-decisions,ft:typed-decisions:gate:apiary,,",
+            |id| id == "ft:typed-decisions:gate:apiary",
+        );
+        assert_eq!(
+            load,
+            [
+                "english",
+                "typed-decisions",
+                "ft:typed-decisions:gate:apiary"
+            ]
+        );
+        assert_eq!(skipped, ["ft:typed-decisions:gate:gone"]);
+    }
 
     #[test]
     fn the_route_is_absent_until_a_checkpoint_directory_is_configured_and_populated() {

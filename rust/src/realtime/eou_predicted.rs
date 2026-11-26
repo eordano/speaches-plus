@@ -16,6 +16,7 @@ pub(super) fn spawn_predicted_stt(
     whisper: WhisperHandle,
     audio: MonoF32At16k,
     language: Option<String>,
+    beam_size: Option<usize>,
 ) -> PredictedRunner {
     let shared = Arc::new(PredictedSharedState::new());
     let shared_for_task = shared.clone();
@@ -24,6 +25,7 @@ pub(super) fn spawn_predicted_stt(
         let opts = crate::stt::SttRequestOptions {
             language,
             initial_prompt: None,
+            beam_size,
         };
         let result = tokio::task::spawn_blocking(move || {
             whisper

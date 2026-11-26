@@ -907,10 +907,10 @@ __global__ void gdn_decode_chunk_split_lanecol_kernel(
     __nv_bfloat16* __restrict__ core,
     int n_k, int n_v, int t
 ) {
-    NVK_PDL_PROLOG();
     const int VSPLIT = V_DIM / COLS;
     const int KPS = K_DIM / SUBS;
-    __shared__ float red[COLS * SUBS];
+    __shared__ float red_kv[COLS * SUBS];
+    __shared__ float red_ov[COLS * SUBS];
     int vblock = blockIdx.x % VSPLIT;
     int h = blockIdx.x / VSPLIT;
     int v_per_k = n_v / n_k;
@@ -926,63 +926,62 @@ __global__ void gdn_decode_chunk_split_lanecol_kernel(
     float st[KPS];
 #pragma unroll
     for (int j = 0; j < KPS; ++j) {
-        st[j] = g_state[(size_t)(sub * KPS + j) * V_DIM + v_glob];
+        st[j] = __ldg(&g_state[(size_t)(sub * KPS + j) * V_DIM + v_glob]);
     }
+    NVK_PDL_PROLOG();
 
     for (int i = 0; i < t; ++i) {
         const float* q_head = qn + (size_t)i * key_dim + (size_t)kh * K_DIM;
         const float* k_head = kn + (size_t)i * key_dim + (size_t)kh * K_DIM;
-        float ge = g_exp[(size_t)i * n_v + h];
-        float bt = beta[(size_t)i * n_v + h];
+        float ge = __ldg(&g_exp[(size_t)i * n_v + h]);
+        float bt = __ldg(&beta[(size_t)i * n_v + h]);
         float v_t = __bfloat162float(
-            mixed[(size_t)i * mixed_stride + (size_t)2 * key_dim + (size_t)h * V_DIM + v_glob]);
+            __ldg(&mixed[(size_t)i * mixed_stride + (size_t)2 * key_dim + (size_t)h * V_DIM + v_glob]));
 
+        float kf[KPS];
         float kv = 0.f;
 #pragma unroll
         for (int j = 0; j < KPS; ++j) {
+            float k_val = __ldg(&k_head[sub * KPS + j]);
+            kf[j] = k_val;
             float s = st[j] * ge;
             st[j] = s;
-            kv += s * k_head[sub * KPS + j];
+            kv += s * k_val;
         }
-        red[sub * COLS + col] = kv;
+        red_kv[sub * COLS + col] = kv;
         __syncthreads();
+        float kv_tot = 0.f;
 #pragma unroll
-        for (int off = SUBS / 2; off > 0; off >>= 1) {
-            if (sub < off) red[sub * COLS + col] += red[(sub + off) * COLS + col];
-            __syncthreads();
-        }
-        kv = red[col];
-        __syncthreads();
-        float delta = (v_t - kv) * bt;
+        for (int s_i = 0; s_i < SUBS; ++s_i) kv_tot += red_kv[s_i * COLS + col];
+        float delta = (v_t - kv_tot) * bt;
         float ov = 0.f;
 #pragma unroll
         for (int j = 0; j < KPS; ++j) {
-            float s = st[j] + k_head[sub * KPS + j] * delta;
+            float s = st[j] + kf[j] * delta;
             st[j] = s;
-            ov += s * q_head[sub * KPS + j];
+            ov += s * __ldg(&q_head[sub * KPS + j]);
         }
-        red[sub * COLS + col] = ov;
+        red_ov[sub * COLS + col] = ov;
         __syncthreads();
-#pragma unroll
-        for (int off = SUBS / 2; off > 0; off >>= 1) {
-            if (sub < off) red[sub * COLS + col] += red[(sub + off) * COLS + col];
-            __syncthreads();
-        }
         if (sub == 0) {
-            core[(size_t)i * n_v * V_DIM + (size_t)h * V_DIM + v_glob] =
-                __float2bfloat16(red[col]);
-        }
-        __syncthreads();
-        float* ck = ckpt_state + ((size_t)i * n_v + h) * K_DIM * V_DIM;
+            float ov_tot = 0.f;
 #pragma unroll
-        for (int j = 0; j < KPS; ++j) {
-            ck[(size_t)(sub * KPS + j) * V_DIM + v_glob] = st[j];
+            for (int s_i = 0; s_i < SUBS; ++s_i) ov_tot += red_ov[s_i * COLS + col];
+            core[(size_t)i * n_v * V_DIM + (size_t)h * V_DIM + v_glob] =
+                __float2bfloat16(ov_tot);
+        }
+        if (i + 1 < t) {
+            float* ck = ckpt_state + ((size_t)i * n_v + h) * K_DIM * V_DIM;
+#pragma unroll
+            for (int j = 0; j < KPS; ++j) {
+                __stcs(&ck[(size_t)(sub * KPS + j) * V_DIM + v_glob], st[j]);
+            }
         }
     }
     float* live = live_state_out + (size_t)h * K_DIM * V_DIM;
 #pragma unroll
     for (int j = 0; j < KPS; ++j) {
-        live[(size_t)(sub * KPS + j) * V_DIM + v_glob] = st[j];
+        __stcs(&live[(size_t)(sub * KPS + j) * V_DIM + v_glob], st[j]);
     }
     NVK_PDL_EPILOG();
 }
@@ -1116,6 +1115,266 @@ __global__ void gdn_decode_chunk_split_gate_kernel(
     NVK_PDL_EPILOG();
 }
 
+extern "C" void nvk_q4exp_get_i8_scratch(int** buf, float** sc);
+
+__global__ void __launch_bounds__(128) gdn_conv_prep_chunk_bf16_kernel(
+    const __nv_bfloat16* __restrict__ qkv,
+    const __nv_bfloat16* __restrict__ conv_state,
+    const __nv_bfloat16* __restrict__ conv_w,
+    __nv_bfloat16* __restrict__ mixed,
+    __nv_bfloat16* __restrict__ ckpt_conv,
+    const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b,
+    const __nv_bfloat16* __restrict__ A_log,
+    const __nv_bfloat16* __restrict__ dt_bias,
+    float* __restrict__ qn,
+    float* __restrict__ kn,
+    float* __restrict__ g_exp,
+    float* __restrict__ beta,
+    int n_k, int n_v, int d_k, int d_v, int conv_k, int t, int ab_row_stride
+) {
+    __shared__ float red32[32];
+    NVK_PDL_PROLOG();
+    int blk = blockIdx.x;
+    int tid = threadIdx.x;
+    int key_dim = n_k * d_k;
+    int C = 2 * key_dim + n_v * d_v;
+    int c = blk * 128 + tid;
+    const __nv_bfloat16* w_row = conv_w + (size_t)c * conv_k;
+    const __nv_bfloat16* s_row = conv_state + (size_t)c * (conv_k - 1);
+    __nv_bfloat16 win[3];
+    win[0] = __ldg(&s_row[0]);
+    win[1] = __ldg(&s_row[1]);
+    win[2] = __ldg(&s_row[2]);
+    float w0 = __bfloat162float(__ldg(&w_row[0]));
+    float w1 = __bfloat162float(__ldg(&w_row[1]));
+    float w2 = __bfloat162float(__ldg(&w_row[2]));
+    float w3 = __bfloat162float(__ldg(&w_row[3]));
+    bool is_q = blk < n_k;
+    bool is_k = (blk >= n_k) && (blk < 2 * n_k);
+    int kh = is_q ? blk : (blk - n_k);
+    int v_per_k = n_v / n_k;
+
+    for (int i = 0; i < t; ++i) {
+        __nv_bfloat16 xb = __ldg(&qkv[(size_t)i * C + c]);
+        float acc = __bfloat162float(win[0]) * w0
+                  + __bfloat162float(win[1]) * w1
+                  + __bfloat162float(win[2]) * w2
+                  + __bfloat162float(xb) * w3;
+        float silu_v = acc / (1.f + expf(-acc));
+        __nv_bfloat16 y_bf = __float2bfloat16(silu_v);
+        win[0] = win[1];
+        win[1] = win[2];
+        win[2] = xb;
+        __nv_bfloat16* ck = ckpt_conv + ((size_t)i * C + c) * 3;
+        ck[0] = win[0];
+        ck[1] = win[1];
+        ck[2] = win[2];
+
+        if (is_q || is_k) {
+            float v = __bfloat162float(y_bf);
+            float ss = gdn_block_sum(v * v, red32);
+            if (is_q) {
+                float q_mul = (1.f / sqrtf(ss + 1e-6f)) * (1.f / sqrtf((float)d_k));
+                qn[(size_t)i * key_dim + (size_t)kh * d_k + tid] = v * q_mul;
+                if (tid < v_per_k) {
+                    int h = kh * v_per_k + tid;
+                    float a_v = __bfloat162float(__ldg(&a[(size_t)i * ab_row_stride + h]))
+                        + __bfloat162float(__ldg(&dt_bias[h]));
+                    float sp = gdn_softplus_safe(a_v);
+                    float g = -__expf(__bfloat162float(__ldg(&A_log[h]))) * sp;
+                    g_exp[(size_t)i * n_v + h] = expf(g);
+                    beta[(size_t)i * n_v + h] = __bfloat162float(
+                        __float2bfloat16(1.f / (1.f + expf(-__bfloat162float(__ldg(&b[(size_t)i * ab_row_stride + h]))))));
+                }
+            } else {
+                float k_mul = 1.f / sqrtf(ss + 1e-6f);
+                kn[(size_t)i * key_dim + (size_t)kh * d_k + tid] = v * k_mul;
+            }
+        } else {
+            mixed[(size_t)i * C + c] = y_bf;
+        }
+    }
+    NVK_PDL_EPILOG();
+}
+
+__global__ void __launch_bounds__(768) gdn_decode_chunk_split_gate_i8_kernel(
+    const __nv_bfloat16* __restrict__ core,
+    const __nv_bfloat16* __restrict__ z,
+    const __nv_bfloat16* __restrict__ norm_w,
+    __nv_bfloat16* __restrict__ out,
+    int* __restrict__ i8_buf,
+    float* __restrict__ i8_sc,
+    int n_v, int d_v, float rms_eps
+) {
+    __shared__ float s_amax[24];
+    __shared__ float s_inv;
+    NVK_PDL_PROLOG();
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int K = n_v * d_v;
+    float nw[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) nw[j] = __bfloat162float(__ldg(&norm_w[lane * 4 + j]));
+
+    float out_f[2][4];
+    float local_max = 0.f;
+    #pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+        int h = warp * 2 + pass;
+        size_t base = (size_t)row * K + (size_t)h * d_v + lane * 4;
+        float cf[4];
+        float ss = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            cf[j] = __bfloat162float(__ldg(&core[base + j]));
+            ss += cf[j] * cf[j];
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, off);
+        float denom = sqrtf(ss / (float)d_v + rms_eps);
+        __align__(8) __nv_bfloat16 ob[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float normed = __bfloat162float(__float2bfloat16(cf[j] / denom * nw[j]));
+            float zv = __bfloat162float(__ldg(&z[base + j]));
+            float gate = gdn_output_gate_bf16_rounded(zv);
+            ob[j] = __float2bfloat16(normed * gate);
+            float ov = __bfloat162float(ob[j]);
+            out_f[pass][j] = ov;
+            local_max = fmaxf(local_max, fabsf(ov));
+        }
+        *reinterpret_cast<uint2*>(out + base) = *reinterpret_cast<const uint2*>(ob);
+    }
+    if (i8_buf != nullptr) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, off));
+        if (lane == 0) s_amax[warp] = local_max;
+        __syncthreads();
+        if (warp == 0) {
+            float mx = (lane < 24) ? s_amax[lane] : 0.f;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+            if (lane == 0) {
+                s_inv = (mx > 0.f) ? (127.f / mx) : 0.f;
+                i8_sc[row] = mx * (1.f / 127.f);
+            }
+        }
+        __syncthreads();
+        float inv = s_inv;
+        int* dst_row = i8_buf + (size_t)row * (K >> 2);
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            int h = warp * 2 + pass;
+            int q0 = __float2int_rn(fminf(fmaxf(out_f[pass][0] * inv, -127.f), 127.f)) & 0xFF;
+            int q1 = __float2int_rn(fminf(fmaxf(out_f[pass][1] * inv, -127.f), 127.f)) & 0xFF;
+            int q2 = __float2int_rn(fminf(fmaxf(out_f[pass][2] * inv, -127.f), 127.f)) & 0xFF;
+            int q3 = __float2int_rn(fminf(fmaxf(out_f[pass][3] * inv, -127.f), 127.f)) & 0xFF;
+            dst_row[h * 32 + lane] = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+        }
+    }
+    NVK_PDL_EPILOG();
+}
+
+extern "C" int nv_kernels_gdn_decode_chunk_conv_split_bf16(
+    void* stream,
+    const uint16_t* qkv,
+    const uint16_t* conv_state,
+    const uint16_t* conv_w,
+    uint16_t* mixed_scratch,
+    uint16_t* ckpt_conv,
+    const uint16_t* z,
+    const uint16_t* a,
+    const uint16_t* b,
+    const uint16_t* A_log,
+    const uint16_t* dt_bias,
+    const uint16_t* norm_w,
+    const float* state_in,
+    float* ckpt_state,
+    float* live_state_out,
+    uint16_t* out,
+    float* qn_scratch,
+    float* kn_scratch,
+    float* g_exp_scratch,
+    float* beta_scratch,
+    uint16_t* core_scratch,
+    int n_k,
+    int n_v,
+    int d_k,
+    int d_v,
+    int conv_k,
+    float rms_eps,
+    int t,
+    int ab_row_stride
+) {
+    cudaStream_t s = (cudaStream_t)stream;
+    if (n_v <= 0 || t <= 0) return 0;
+    if (n_k != 16 || n_v != 48 || d_k != 128 || d_v != 128 || conv_k != 4 || t > 8 || ab_row_stride < n_v) return -1;
+    int* i8_buf = nullptr;
+    float* i8_sc = nullptr;
+    nvk_q4exp_get_i8_scratch(&i8_buf, &i8_sc);
+    unsigned conv_blks = (unsigned)(2 * n_k + n_v);
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(c1, dim3(conv_blks), dim3(128), 0, s);
+        cudaLaunchKernelEx(&c1, gdn_conv_prep_chunk_bf16_kernel,
+            reinterpret_cast<const __nv_bfloat16*>(qkv),
+            reinterpret_cast<const __nv_bfloat16*>(conv_state),
+            reinterpret_cast<const __nv_bfloat16*>(conv_w),
+            reinterpret_cast<__nv_bfloat16*>(mixed_scratch),
+            reinterpret_cast<__nv_bfloat16*>(ckpt_conv),
+            reinterpret_cast<const __nv_bfloat16*>(a),
+            reinterpret_cast<const __nv_bfloat16*>(b),
+            reinterpret_cast<const __nv_bfloat16*>(A_log),
+            reinterpret_cast<const __nv_bfloat16*>(dt_bias),
+            qn_scratch, kn_scratch, g_exp_scratch, beta_scratch,
+            n_k, n_v, d_k, d_v, conv_k, t, ab_row_stride);
+        NVK_PDL_ATTR(c2, dim3((unsigned)(n_v * (128 / 32))), dim3(256), 0, s);
+        cudaLaunchKernelEx(&c2, gdn_decode_chunk_split_lanecol_kernel<128, 128, 32, 8>,
+            qn_scratch, kn_scratch,
+            reinterpret_cast<const __nv_bfloat16*>(mixed_scratch),
+            g_exp_scratch, beta_scratch,
+            state_in, ckpt_state, live_state_out,
+            reinterpret_cast<__nv_bfloat16*>(core_scratch),
+            n_k, n_v, t);
+        NVK_PDL_ATTR(c3, dim3((unsigned)t), dim3(768), 0, s);
+        cudaLaunchKernelEx(&c3, gdn_decode_chunk_split_gate_i8_kernel,
+            reinterpret_cast<const __nv_bfloat16*>(core_scratch),
+            reinterpret_cast<const __nv_bfloat16*>(z),
+            reinterpret_cast<const __nv_bfloat16*>(norm_w),
+            reinterpret_cast<__nv_bfloat16*>(out),
+            i8_buf, i8_sc, n_v, d_v, rms_eps);
+    } else {
+        gdn_conv_prep_chunk_bf16_kernel<<<conv_blks, 128, 0, s>>>(
+            reinterpret_cast<const __nv_bfloat16*>(qkv),
+            reinterpret_cast<const __nv_bfloat16*>(conv_state),
+            reinterpret_cast<const __nv_bfloat16*>(conv_w),
+            reinterpret_cast<__nv_bfloat16*>(mixed_scratch),
+            reinterpret_cast<__nv_bfloat16*>(ckpt_conv),
+            reinterpret_cast<const __nv_bfloat16*>(a),
+            reinterpret_cast<const __nv_bfloat16*>(b),
+            reinterpret_cast<const __nv_bfloat16*>(A_log),
+            reinterpret_cast<const __nv_bfloat16*>(dt_bias),
+            qn_scratch, kn_scratch, g_exp_scratch, beta_scratch,
+            n_k, n_v, d_k, d_v, conv_k, t, ab_row_stride);
+        gdn_decode_chunk_split_lanecol_kernel<128, 128, 32, 8><<<n_v * (128 / 32), 256, 0, s>>>(
+            qn_scratch, kn_scratch,
+            reinterpret_cast<const __nv_bfloat16*>(mixed_scratch),
+            g_exp_scratch, beta_scratch,
+            state_in, ckpt_state, live_state_out,
+            reinterpret_cast<__nv_bfloat16*>(core_scratch),
+            n_k, n_v, t);
+        gdn_decode_chunk_split_gate_i8_kernel<<<t, 768, 0, s>>>(
+            reinterpret_cast<const __nv_bfloat16*>(core_scratch),
+            reinterpret_cast<const __nv_bfloat16*>(z),
+            reinterpret_cast<const __nv_bfloat16*>(norm_w),
+            reinterpret_cast<__nv_bfloat16*>(out),
+            i8_buf, i8_sc, n_v, d_v, rms_eps);
+    }
+    return (int)cudaGetLastError();
+}
+
 extern "C" int nv_kernels_gdn_decode_chunk_split_bf16(
     void* stream,
     const uint16_t* mixed,
@@ -1170,14 +1429,25 @@ extern "C" int nv_kernels_gdn_decode_chunk_split_bf16(
         qn_scratch, kn_scratch, g_exp_scratch, beta_scratch,
         n_k, n_v, d_k, d_v, ab_row_stride);
     }
-    gdn_decode_chunk_split_lanecol_kernel<128, 128, 32, 8>
-        <<<n_v * (128 / 32), 256, 0, s>>>(
+    if (nvk_pdl_enabled()) {
+        NVK_PDL_ATTR(pdl_cfg_lc, dim3((unsigned)(n_v * (128 / 32))), dim3(256), 0, s);
+        cudaLaunchKernelEx(&pdl_cfg_lc, gdn_decode_chunk_split_lanecol_kernel<128, 128, 32, 8>,
             qn_scratch, kn_scratch,
             reinterpret_cast<const __nv_bfloat16*>(mixed),
             g_exp_scratch, beta_scratch,
             state_in, ckpt_state, live_state_out,
             reinterpret_cast<__nv_bfloat16*>(core_scratch),
             n_k, n_v, t);
+    } else {
+        gdn_decode_chunk_split_lanecol_kernel<128, 128, 32, 8>
+            <<<n_v * (128 / 32), 256, 0, s>>>(
+                qn_scratch, kn_scratch,
+                reinterpret_cast<const __nv_bfloat16*>(mixed),
+                g_exp_scratch, beta_scratch,
+                state_in, ckpt_state, live_state_out,
+                reinterpret_cast<__nv_bfloat16*>(core_scratch),
+                n_k, n_v, t);
+    }
     if (nvk_pdl_enabled()) {
         NVK_PDL_ATTR(pdl_cfg_36407, dim3((unsigned)n_v, (unsigned)t), d_v, red_smem, s);
         cudaLaunchKernelEx(&pdl_cfg_36407, gdn_decode_chunk_split_gate_kernel,

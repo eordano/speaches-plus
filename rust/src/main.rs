@@ -1482,6 +1482,7 @@ async fn do_stt_post(
         initial_prompt: prompt
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty()),
+        beam_size: None,
     };
     let Some(bytes) = audio_bytes else {
         return oapi::fastapi_validation_error(vec![oapi::missing_field(&["body", "file"])]);

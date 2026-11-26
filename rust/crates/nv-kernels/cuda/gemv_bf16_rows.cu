@@ -64,7 +64,79 @@ __global__ void __launch_bounds__(kBlockDim) gemv_bf16_rows_kernel(
 }
 
 template <int ROWS>
+__global__ void __launch_bounds__(128) gemv_bf16_rows_small_n_kernel(
+    const __nv_bfloat16* __restrict__ W,
+    const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ y,
+    int N,
+    int K
+) {
+    __shared__ float s_red[ROWS][4];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int Kv = K >> 3;
+    const uint4* w4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x);
+    uint4 wcur = (tid < Kv) ? __ldcs(&w4[tid]) : make_uint4(0u, 0u, 0u, 0u);
+    NVK_PDL_PROLOG();
+    float acc[ROWS];
+    #pragma unroll
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+    for (int v = tid; v < Kv; v += 128) {
+        int vn = v + 128;
+        uint4 wnxt = (vn < Kv) ? __ldcs(&w4[vn]) : make_uint4(0u, 0u, 0u, 0u);
+        const __nv_bfloat162* wp = reinterpret_cast<const __nv_bfloat162*>(&wcur);
+        float wf[8];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float2 f = __bfloat1622float2(wp[j]);
+            wf[2 * j] = f.x;
+            wf[2 * j + 1] = f.y;
+        }
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            uint4 px = __ldg(&x4[(size_t)r * Kv + v]);
+            const __nv_bfloat162* xp = reinterpret_cast<const __nv_bfloat162*>(&px);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float2 xf = __bfloat1622float2(xp[j]);
+                acc[r] += wf[2 * j] * xf.x + wf[2 * j + 1] * xf.y;
+            }
+        }
+        wcur = wnxt;
+    }
+    #pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc[r] += __shfl_xor_sync(0xffffffffu, acc[r], offset);
+        }
+        if (lane == 0) s_red[r][warp] = acc[r];
+    }
+    __syncthreads();
+    if (tid < ROWS) {
+        float tot = s_red[tid][0] + s_red[tid][1] + s_red[tid][2] + s_red[tid][3];
+        y[(size_t)tid * N + n] = __float2bfloat16(tot);
+    }
+    NVK_PDL_EPILOG();
+}
+
+template <int ROWS>
 static int launch(dim3 grid, cudaStream_t s, const __nv_bfloat16* W, const __nv_bfloat16* x, __nv_bfloat16* y, int N, int K) {
+    if (N <= 192 && K >= 512) {
+        dim3 g1((unsigned)N);
+        auto kern = gemv_bf16_rows_small_n_kernel<ROWS>;
+        if (nvk_pdl_enabled()) {
+            NVK_PDL_ATTR(cfg, g1, dim3(128), 0, s);
+            cudaLaunchKernelEx(&cfg, kern, W, x, y, N, K);
+        } else {
+            kern<<<g1, 128, 0, s>>>(W, x, y, N, K);
+        }
+        return (int)cudaGetLastError();
+    }
     auto kern = gemv_bf16_rows_kernel<ROWS>;
     if (nvk_pdl_enabled()) {
         NVK_PDL_ATTR(cfg, grid, dim3(kBlockDim), 0, s);

@@ -107,13 +107,7 @@ func ALawBytesToF32(b []byte) MonoF32 {
 func F32ToULawBytes(samples MonoF32) []byte {
 	out := make([]byte, len(samples))
 	for i, s := range samples {
-		v := int32(clampF32_(s, -1.0, 1.0) * 32767.0)
-		if v > 32767 {
-			v = 32767
-		} else if v < -32768 {
-			v = -32768
-		}
-		out[i] = linearToUlaw(int16(v))
+		out[i] = linearToUlaw(F32ToI16(s))
 	}
 	return out
 }
@@ -121,23 +115,7 @@ func F32ToULawBytes(samples MonoF32) []byte {
 func F32ToALawBytes(samples MonoF32) []byte {
 	out := make([]byte, len(samples))
 	for i, s := range samples {
-		v := int32(clampF32_(s, -1.0, 1.0) * 32767.0)
-		if v > 32767 {
-			v = 32767
-		} else if v < -32768 {
-			v = -32768
-		}
-		out[i] = linearToAlaw(int16(v))
+		out[i] = linearToAlaw(F32ToI16(s))
 	}
 	return out
-}
-
-func clampF32_(v, lo, hi float32) float32 {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
 }

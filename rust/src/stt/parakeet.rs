@@ -10,11 +10,12 @@ use crate::diarization::ep;
 use crate::vad::ort_err;
 
 pub const PARAKEET_DIR_ENV: &str = "STT_PARAKEET_DIR";
-pub const PARAKEET_HUB_REPO: &str = "models--istupakov--parakeet-tdt-0.6b-v2-onnx";
+pub const PARAKEET_HUB_REPOS: [&str; 2] = [
+    "models--istupakov--parakeet-tdt-0.6b-v3-onnx",
+    "models--istupakov--parakeet-tdt-0.6b-v2-onnx",
+];
 
 const SR: usize = 16_000;
-const BLANK_ID: i32 = 1024;
-const TOKEN_LOGITS: usize = 1025;
 const TDT_DURATION_BINS: [usize; 5] = [0, 1, 2, 3, 4];
 const STATE_LAYERS: usize = 2;
 const STATE_DIM: usize = 640;
@@ -26,8 +27,71 @@ pub struct ParakeetTdt {
     pre: Mutex<Session>,
     encoder: Mutex<Session>,
     joint: Mutex<Session>,
-    vocab: Vec<String>,
+    vocab: Vocab,
     encoder_ep: &'static str,
+}
+
+#[derive(Debug)]
+struct Vocab {
+    pieces: Vec<String>,
+    special: Vec<bool>,
+    blank: usize,
+    multilingual: bool,
+}
+
+pub const V3_LANGUAGES: [&str; 25] = [
+    "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr", "hu", "it", "lt", "lv", "mt",
+    "nl", "pl", "pt", "ro", "ru", "sk", "sl", "sv", "uk",
+];
+
+fn parse_vocab(raw: &str) -> Result<Vocab> {
+    let mut pieces = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        let (piece, id) = line
+            .rsplit_once(' ')
+            .ok_or_else(|| anyhow!("vocab.txt line {}: expected `<piece> <id>`", i + 1))?;
+        if id.trim().parse::<usize>().ok() != Some(i) {
+            return Err(anyhow!("vocab.txt line {}: id {id:?} is not {i}", i + 1));
+        }
+        pieces.push(piece.to_string());
+    }
+    let blank = pieces
+        .iter()
+        .position(|p| p == "<blk>")
+        .ok_or_else(|| anyhow!("vocab.txt has no <blk> token"))?;
+    let special = pieces
+        .iter()
+        .map(|p| {
+            matches!(p.as_str(), "<unk>" | "<pad>" | "<blk>") || (p.starts_with("<|") && p.ends_with("|>"))
+        })
+        .collect();
+    let multilingual = pieces.iter().any(|p| p == "<|es|>");
+    Ok(Vocab {
+        pieces,
+        special,
+        blank,
+        multilingual,
+    })
+}
+
+fn detokenize(vocab: &Vocab, ids: &[i32]) -> String {
+    let mut out = String::new();
+    for &id in ids {
+        let id = id as usize;
+        if vocab.special[id] {
+            continue;
+        }
+        let piece = &vocab.pieces[id];
+        if let Some(rest) = piece.strip_prefix('\u{2581}') {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(rest);
+        } else {
+            out.push_str(piece);
+        }
+    }
+    out.trim().to_string()
 }
 
 pub fn parakeet_dir() -> Result<PathBuf> {
@@ -35,10 +99,12 @@ pub fn parakeet_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(d));
     }
     let home = std::env::var("HOME").context("HOME unset")?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub")
-        .join(PARAKEET_HUB_REPO)
-        .join("snapshots");
+    let hub = PathBuf::from(home).join(".cache/huggingface/hub");
+    let snaps = PARAKEET_HUB_REPOS
+        .iter()
+        .map(|repo| hub.join(repo).join("snapshots"))
+        .find(|p| p.is_dir())
+        .unwrap_or_else(|| hub.join(PARAKEET_HUB_REPOS[0]).join("snapshots"));
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&snaps)
         .with_context(|| {
             format!(
@@ -59,6 +125,12 @@ pub fn parakeet_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("empty snapshots dir {}", snaps.display()))
 }
 
+pub fn hub_id(snapshot: &Path) -> Option<String> {
+    let repo = snapshot.parent()?.parent()?.file_name()?.to_str()?;
+    let rest = repo.strip_prefix("models--")?;
+    Some(rest.replacen("--", "/", 1))
+}
+
 fn load_session(dir: &Path, file: &str) -> Result<ep::Loaded> {
     ep::load_session(&dir.join(file), file)
         .with_context(|| format!("load parakeet {file} from {}", dir.display()))
@@ -68,16 +140,14 @@ impl ParakeetTdt {
     pub fn load(dir: &Path) -> Result<Self> {
         let vocab_raw = std::fs::read_to_string(dir.join("vocab.txt"))
             .with_context(|| format!("read {}/vocab.txt", dir.display()))?;
-        let vocab: Vec<String> = vocab_raw
-            .lines()
-            .map(|l| l.split(' ').next().unwrap_or_default().to_string())
-            .collect();
-        if vocab.len() != TOKEN_LOGITS {
-            return Err(anyhow!(
-                "vocab.txt has {} entries, the TDT head emits {TOKEN_LOGITS} token logits",
-                vocab.len()
-            ));
-        }
+        let vocab = parse_vocab(&vocab_raw).with_context(|| format!("{}/vocab.txt", dir.display()))?;
+        tracing::info!(
+            tokens = vocab.pieces.len(),
+            blank = vocab.blank,
+            multilingual = vocab.multilingual,
+            dir = %dir.display(),
+            "parakeet vocabulary loaded"
+        );
         let pre = load_session(dir, "nemo128.onnx")?;
         let encoder = load_session(dir, "encoder-model.onnx")?;
         let joint = load_session(dir, "decoder_joint-model.onnx")?;
@@ -95,6 +165,26 @@ impl ParakeetTdt {
         self.encoder_ep
     }
 
+    pub fn multilingual(&self) -> bool {
+        self.vocab.multilingual
+    }
+
+    pub fn default_id(&self) -> &'static str {
+        if self.vocab.multilingual {
+            "nvidia/parakeet-tdt-0.6b-v3"
+        } else {
+            "nvidia/parakeet-tdt-0.6b-v2"
+        }
+    }
+
+    pub fn supports_language(&self, lang: &str) -> bool {
+        if self.vocab.multilingual {
+            V3_LANGUAGES.contains(&lang)
+        } else {
+            lang == "en"
+        }
+    }
+
     pub fn transcribe(&self, audio_16k_mono: &[f32]) -> Result<String> {
         Ok(self.transcribe_scored(audio_16k_mono)?.0)
     }
@@ -105,17 +195,22 @@ impl ParakeetTdt {
         for window in audio_16k_mono.chunks(WINDOW_SAMPLES_BOUNDS_FULL_ATTENTION_COST) {
             let scored = self.decode_window(window)?;
             let ids: Vec<i32> = scored.iter().map(|(id, _)| *id).collect();
-            let part = self.detokenize(&ids);
+            let part = detokenize(&self.vocab, &ids);
             if !part.is_empty() {
                 if !text.is_empty() {
                     text.push(' ');
                 }
                 text.push_str(&part);
             }
-            tokens.extend(scored.into_iter().map(|(id, logprob)| TokenLogprob {
-                token: self.vocab[id as usize].replace('\u{2581}', " "),
-                logprob,
-            }));
+            tokens.extend(
+                scored
+                    .into_iter()
+                    .filter(|(id, _)| !self.vocab.special[*id as usize])
+                    .map(|(id, logprob)| TokenLogprob {
+                        token: self.vocab.pieces[id as usize].replace('\u{2581}', " "),
+                        logprob,
+                    }),
+            );
         }
         Ok((text, tokens))
     }
@@ -176,7 +271,9 @@ impl ParakeetTdt {
             .map_err(|_| anyhow!("parakeet joint poisoned"))?;
         let mut s1 = vec![0f32; STATE_LAYERS * STATE_DIM];
         let mut s2 = vec![0f32; STATE_LAYERS * STATE_DIM];
-        let mut last = BLANK_ID;
+        let token_logits = self.vocab.pieces.len();
+        let blank = self.vocab.blank as i32;
+        let mut last = blank;
         let mut ids: Vec<(i32, f32)> = Vec::new();
         let mut t = 0usize;
         let mut symbols_this_frame = 0usize;
@@ -213,11 +310,19 @@ impl ParakeetTdt {
             let (_, logits) = out["outputs"]
                 .try_extract_tensor::<f32>()
                 .map_err(ort_err)?;
-            let tok = argmax(&logits[..TOKEN_LOGITS]);
-            let dur = argmax(&logits[TOKEN_LOGITS..TOKEN_LOGITS + TDT_DURATION_BINS.len()]);
+            if logits.len() != token_logits + TDT_DURATION_BINS.len() {
+                return Err(anyhow!(
+                    "parakeet joint emits {} logits; vocab.txt gives {token_logits} tokens + {} \
+                     durations: vocab.txt and decoder_joint-model.onnx are from different checkpoints",
+                    logits.len(),
+                    TDT_DURATION_BINS.len()
+                ));
+            }
+            let tok = argmax(&logits[..token_logits]);
+            let dur = argmax(&logits[token_logits..]);
             let mut skip = TDT_DURATION_BINS[dur];
-            if tok as i32 != BLANK_ID {
-                ids.push((tok as i32, log_softmax_at(&logits[..TOKEN_LOGITS], tok)));
+            if tok as i32 != blank {
+                ids.push((tok as i32, log_softmax_at(&logits[..token_logits], tok)));
                 last = tok as i32;
                 let (_, o1) = out["output_states_1"]
                     .try_extract_tensor::<f32>()
@@ -240,25 +345,6 @@ impl ParakeetTdt {
             }
         }
         Ok(ids)
-    }
-
-    fn detokenize(&self, ids: &[i32]) -> String {
-        let mut out = String::new();
-        for &id in ids {
-            let piece = &self.vocab[id as usize];
-            if piece == "<unk>" {
-                continue;
-            }
-            if let Some(rest) = piece.strip_prefix('\u{2581}') {
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push_str(rest);
-            } else {
-                out.push_str(piece);
-            }
-        }
-        out.trim().to_string()
     }
 }
 
@@ -283,23 +369,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vocab_size_mismatch_names_the_head_width_and_log_softmax_is_a_probability() {
-        let dir = std::env::temp_dir().join("parakeet-vocab-mismatch-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("vocab.txt"), "a 0\nb 1\n").unwrap();
-        let Err(err) = ParakeetTdt::load(&dir) else {
-            panic!("a 2-entry vocab must fail to load")
-        };
-        let err = err.to_string();
-        assert!(err.contains("1025"), "unexpected error: {err}");
-        {
-            let logits = [1.0f32, 2.0, 3.0];
-            let total: f32 = (0..3)
-                .map(|i| super::log_softmax_at(&logits, i).exp())
-                .sum();
-            assert!((total - 1.0).abs() < 1e-5, "probabilities sum to {total}");
-            assert!(super::log_softmax_at(&logits, 2) > super::log_softmax_at(&logits, 0));
-            assert!(super::log_softmax_at(&[0.0f32, 0.0], 0) < 0.0);
+    fn both_vocab_layouts_parse_and_special_tokens_never_reach_the_text() {
+        let v2 = "<unk> 0\n\u{2581}t 1\nh 2\n\u{2581}a 3\n<blk> 4\n";
+        let v = parse_vocab(v2).unwrap();
+        assert_eq!((v.pieces.len(), v.blank, v.multilingual), (5, 4, false));
+        assert_eq!(detokenize(&v, &[1, 2, 3]), "th a");
+
+        let v3 = "<unk> 0\n<|nospeech|> 1\n<pad> 2\n<|es|> 3\n\u{2581}hola 4\n\u{2581}mundo 5\n<blk> 6\n";
+        let v = parse_vocab(v3.replace("<|es|>", "<|en|>").as_str()).unwrap();
+        assert!(!v.multilingual, "only a <|es|> tag marks the multilingual head");
+        let v = parse_vocab(v3).unwrap();
+        assert_eq!((v.pieces.len(), v.blank, v.multilingual), (7, 6, true));
+        assert_eq!(detokenize(&v, &[3, 4, 1, 5, 0, 2]), "hola mundo");
+
+        assert!(parse_vocab("a 0\nb 1\n").unwrap_err().to_string().contains("<blk>"));
+        assert!(parse_vocab("a 0\n<blk> 2\n").unwrap_err().to_string().contains("line 2"));
+    }
+
+    #[test]
+    fn the_model_id_comes_from_a_hub_snapshot_path_only() {
+        let hub = Path::new("/c/hub/models--istupakov--parakeet-tdt-0.6b-v3-onnx/snapshots/8f23f0c");
+        assert_eq!(hub_id(hub).as_deref(), Some("istupakov/parakeet-tdt-0.6b-v3-onnx"));
+        assert_eq!(hub_id(Path::new("/var/lib/speaches/models/parakeet-tdt")), None);
+        assert_eq!(
+            hub_id(Path::new("/nix/store/r1k44-hf-model-istupakov-parakeet-tdt-0.6b-v3-onnx-8f23f0c")),
+            None
+        );
+    }
+
+    #[test]
+    fn log_softmax_is_a_probability() {
+        let logits = [1.0f32, 2.0, 3.0];
+        let total: f32 = (0..3).map(|i| log_softmax_at(&logits, i).exp()).sum();
+        assert!((total - 1.0).abs() < 1e-5, "probabilities sum to {total}");
+        assert!(log_softmax_at(&logits, 2) > log_softmax_at(&logits, 0));
+        assert!(log_softmax_at(&[0.0f32, 0.0], 0) < 0.0);
+    }
+
+    #[test]
+    #[ignore = "needs PARAKEET_TEST_DIR (a checkpoint) and PARAKEET_TEST_F32 (16 kHz mono f32le files, comma separated)"]
+    fn a_real_checkpoint_transcribes_each_clip() {
+        let dir = std::env::var("PARAKEET_TEST_DIR").expect("PARAKEET_TEST_DIR");
+        let model = ParakeetTdt::load(Path::new(&dir)).unwrap();
+        for f in std::env::var("PARAKEET_TEST_F32").expect("PARAKEET_TEST_F32").split(',') {
+            let bytes = std::fs::read(f).unwrap();
+            let audio: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let started = std::time::Instant::now();
+            let text = model.transcribe(&audio).unwrap();
+            eprintln!(
+                "parakeet {f}: {:.1} s audio in {} ms ({}): {text}",
+                audio.len() as f32 / SR as f32,
+                started.elapsed().as_millis(),
+                model.ep()
+            );
+            assert!(!text.is_empty(), "{f}: empty transcript");
+            assert!(!text.contains("<|"), "{f}: special token leaked: {text}");
         }
     }
 }

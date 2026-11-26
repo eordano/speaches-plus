@@ -683,6 +683,14 @@ struct Fp8Storage {
         std::sync::OnceLock<Option<Arc<MarlinFp8Prepared>>>,
     dx_fp8_twin_of_the_transposed_weight_bytes_with_the_channel_scale_folded_into_dy:
         std::sync::OnceLock<Option<Arc<Fp8DxTwin>>>,
+    nvfp4_fast_twin: std::sync::OnceLock<Option<Arc<Nvfp4FastTwin>>>,
+}
+
+#[cfg(feature = "cuda")]
+pub struct Nvfp4FastTwin {
+    pub wq: cudarc::driver::CudaSlice<u8>,
+    pub scales: cudarc::driver::CudaSlice<u8>,
+    pub alpha_over_2g: f32,
 }
 
 #[cfg(feature = "cuda")]
@@ -3031,6 +3039,9 @@ impl Linear {
             self.in_features,
             &format!("scale_mode={:?} xdtype={:?}", s.scale_mode, x2.dtype()),
         );
+        if let Some(out) = self.matmul_fp8_nvfp4_fast_twin(s, x2, leading, &dev)? {
+            return Ok(out);
+        }
         if let Some(out) = self.matmul_fp8_marlin_rows(s, x2, leading, &dev)? {
             return Ok(out);
         }
@@ -3098,6 +3109,194 @@ impl Linear {
             false,
         );
         Ok(out)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn build_nvfp4_fast_twin(&self, stream: &Arc<cudarc::driver::CudaStream>) -> Result<bool> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let LinearStorage::Fp8E4m3(s) = &self.storage else {
+            return Ok(false);
+        };
+        if s.scale_mode != nv_quant::fp8::Fp8ScaleMode::PerOuterRow
+            || self.in_features % 16 != 0
+            || self.out_features == 0
+        {
+            return Ok(false);
+        }
+        if let Some(existing) = s.nvfp4_fast_twin.get() {
+            return Ok(existing.is_some());
+        }
+        let n = self.out_features;
+        let k = self.in_features;
+        let stored_global = 32.0f32;
+        let mut wq: cudarc::driver::CudaSlice<u8> = unsafe {
+            stream
+                .alloc::<u8>(n * (k / 2))
+                .map_err(|e| anyhow::anyhow!("alloc nvfp4_fast_twin wq: {e:?}"))?
+        };
+        let mut scales: cudarc::driver::CudaSlice<u8> = unsafe {
+            stream
+                .alloc::<u8>(n * (k / 16))
+                .map_err(|e| anyhow::anyhow!("alloc nvfp4_fast_twin scales: {e:?}"))?
+        };
+        let rc = {
+            let (wp, _gw) = s.weight_u8.device_ptr(stream);
+            let (rp, _gr) = s.b_scale_rows_dev.device_ptr(stream);
+            let (qp, _gq) = wq.device_ptr_mut(stream);
+            let (sp, _gs) = scales.device_ptr_mut(stream);
+            unsafe {
+                nv_kernels::cuda::q4exp_requant_fp8_to_nvfp4(
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                    wp as *const u8,
+                    rp as *const f32,
+                    qp as *mut u8,
+                    sp as *mut u8,
+                    n as i32,
+                    k as i32,
+                    stored_global,
+                )
+            }
+        };
+        anyhow::ensure!(rc == 0, "q4exp_requant_fp8_to_nvfp4 rc={rc} n={n} k={k}");
+        let twin = Arc::new(Nvfp4FastTwin {
+            wq,
+            scales,
+            alpha_over_2g: 0.5f32 / stored_global,
+        });
+        let _ = s.nvfp4_fast_twin.set(Some(twin));
+        Ok(true)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn nvfp4_fast_twin(&self) -> Option<Arc<Nvfp4FastTwin>> {
+        let LinearStorage::Fp8E4m3(s) = &self.storage else {
+            return None;
+        };
+        s.nvfp4_fast_twin.get().cloned().flatten()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn matmul_fp8_nvfp4_fast_twin(
+        &self,
+        s: &Fp8Storage,
+        x2: &Tensor,
+        leading: usize,
+        dev: &candle_core::CudaDevice,
+    ) -> Result<Option<Tensor>> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use half::bf16;
+        if !(1..=8).contains(&leading)
+            || x2.dtype() != DType::BF16
+            || self.has_lora()
+            || self.in_features % 16 != 0
+        {
+            return Ok(None);
+        }
+        let Some(tw) = s.nvfp4_fast_twin.get().and_then(|o| o.as_ref()) else {
+            return Ok(None);
+        };
+        let n = self.out_features;
+        let k = self.in_features;
+        let stream = crate::cuda_stream::current_stream(dev);
+        let x_bf = x2.contiguous()?;
+        let mut c_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(leading * n)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        let rc = {
+            let (x_storage, xl) = x_bf.storage_and_layout();
+            let x_cuda = match &*x_storage {
+                candle_core::Storage::Cuda(st) => st,
+                _ => anyhow::bail!("expected cuda storage for nvfp4 fast twin input"),
+            };
+            let x_slice = x_cuda.as_cuda_slice::<bf16>()?;
+            let x_view = x_slice.slice(xl.start_offset()..);
+            let (xp, _gx) = x_view.device_ptr(&stream);
+            let (wp, _gw) = tw.wq.device_ptr(&stream);
+            let (sp, _gs) = tw.scales.device_ptr(&stream);
+            let (cp, _gc) = c_dev.device_ptr_mut(&stream);
+            unsafe {
+                nv_kernels::cuda::q4exp_nvfp4_gemv_mt(
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                    wp as *const u8,
+                    sp as *const u8,
+                    xp as *const u16,
+                    cp as *mut u16,
+                    tw.alpha_over_2g,
+                    leading as i32,
+                    n as i32,
+                    k as i32,
+                )
+            }
+        };
+        if rc == -3 {
+            return Ok(None);
+        }
+        anyhow::ensure!(rc == 0, "q4exp_nvfp4_gemv_mt rc={rc} m={leading} n={n} k={k}");
+        let out_storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, dev.clone());
+        Ok(Some(candle_core::Tensor::from_storage(
+            candle_core::Storage::Cuda(out_storage),
+            (leading, n),
+            candle_core::op::BackpropOp::none(),
+            false,
+        )))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn forward_nvfp4_prequant(
+        &self,
+        m: usize,
+        k_in: usize,
+        dev: &candle_core::CudaDevice,
+    ) -> Result<Option<Tensor>> {
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        use half::bf16;
+        if m == 0 || m > 8 || self.has_lora() || self.bias.is_some() {
+            return Ok(None);
+        }
+        let Some(tw) = self.nvfp4_fast_twin() else {
+            return Ok(None);
+        };
+        if self.in_features != k_in || (k_in & 15) != 0 {
+            return Ok(None);
+        }
+        let n = self.out_features;
+        let stream = crate::cuda_stream::current_stream(dev);
+        let mut c_dev: cudarc::driver::CudaSlice<bf16> = unsafe {
+            stream
+                .alloc::<bf16>(m * n)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        let rc = {
+            let (wp, _gw) = tw.wq.device_ptr(&stream);
+            let (sp, _gs) = tw.scales.device_ptr(&stream);
+            let (cp, _gc) = c_dev.device_ptr_mut(&stream);
+            unsafe {
+                nv_kernels::cuda::q4exp_nvfp4_gemv_mt(
+                    stream.cu_stream() as *mut std::ffi::c_void,
+                    wp as *const u8,
+                    sp as *const u8,
+                    std::ptr::null(),
+                    cp as *mut u16,
+                    tw.alpha_over_2g,
+                    m as i32,
+                    n as i32,
+                    k_in as i32,
+                )
+            }
+        };
+        if rc == -3 {
+            return Ok(None);
+        }
+        anyhow::ensure!(rc == 0, "q4exp_nvfp4_gemv_mt prequant rc={rc} m={m} n={n} k={k_in}");
+        let out_storage = candle_core::CudaStorage::wrap_cuda_slice(c_dev, dev.clone());
+        Ok(Some(candle_core::Tensor::from_storage(
+            candle_core::Storage::Cuda(out_storage),
+            (m, n),
+            candle_core::op::BackpropOp::none(),
+            false,
+        )))
     }
 
     #[cfg(feature = "cuda")]
@@ -4153,6 +4352,7 @@ impl Linear {
             marlin_fp8_twin_built_once_from_the_resident_e4m3_rows: std::sync::OnceLock::new(),
             dx_fp8_twin_of_the_transposed_weight_bytes_with_the_channel_scale_folded_into_dy:
                 std::sync::OnceLock::new(),
+            nvfp4_fast_twin: std::sync::OnceLock::new(),
         }));
         if marlin_fp8_rows_opt_in() && out_features % 64 == 0 && in_features % 16 == 0 {
             if let LinearStorage::Fp8E4m3(st) = &storage {

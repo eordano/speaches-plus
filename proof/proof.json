@@ -1,0 +1,383 @@
+{
+  "scope": "Whether the cold tier can free a qwen4_exp session that something on the CPU side still uses, and whether graph captures and device-synchronizing calls can deadlock each other: the engine permit and idle-age selection in evict, the held slots (two base sessions and the kept adapter session) that release_sessions_to_disk may drop, and the capture-ownership protocol in capture_exclusion.rs, for two threads. GPU-side ordering of frees against queued kernels, the CUDA driver, cudarc and the spill format are left out.",
+  "roots": {
+    "code": ".."
+  },
+  "anchors": [
+    [
+      "A01",
+      "code",
+      "rust/crates/nv-kernels/src/capture_exclusion.rs",
+      "pub fn capture_in_flight()",
+      "A capture takes the ownership"
+    ],
+    [
+      "A02",
+      "code",
+      "rust/crates/nv-kernels/src/capture_exclusion.rs",
+      "pub fn no_capture_in_flight()",
+      "An exclusion takes the ownership"
+    ],
+    [
+      "A03",
+      "code",
+      "rust/crates/nv-kernels/src/capture_exclusion.rs",
+      "impl Drop for NoCaptureInFlight",
+      "An exclusion gives its share of the ownership back"
+    ],
+    [
+      "A04",
+      "code",
+      "rust/crates/nv-kernels/src/capture_exclusion.rs",
+      "fn another_thread_owns(",
+      "The one condition both calls wait on"
+    ],
+    [
+      "A05",
+      "code",
+      "rust/crates/nv-kernels/src/graph.rs",
+      "pub fn run_on<F>(",
+      "A capture holds capture_in_flight and no separate lock"
+    ],
+    [
+      "A06",
+      "code",
+      "rust/crates/nv-kernels/src/graph.rs",
+      "pub fn probe_capture(",
+      "The probe capture does the same"
+    ],
+    [
+      "A07",
+      "code",
+      "rust/src/oapi/chat_engine/qwen4_exp_loop.rs",
+      "fn evict(&self, reason: &str) -> bool {",
+      "Eviction: try the engine permit, select held slots by idle age, hold the exclusion, release"
+    ],
+    [
+      "A08",
+      "code",
+      "rust/src/oapi/chat_engine/qwen4_exp_loop.rs",
+      "pub(crate) const QWEN4_EXP_SESSION_SLOT_PARKS_AFTER_300",
+      "A session slot's own idle limit"
+    ],
+    [
+      "A09",
+      "code",
+      "rust/src/oapi/chat_engine/qwen4_exp_loop.rs",
+      "pub(crate) async fn run_sampling_qwen4_exp(",
+      "A request holds the engine permit from take_session to put_session"
+    ],
+    [
+      "A10",
+      "code",
+      "rust/src/oapi/cold_tier.rs",
+      "pub fn idle_limit(",
+      "The idle limit: the shorter of the global limit and the resident's own; off when the global is 0"
+    ],
+    [
+      "A11",
+      "code",
+      "rust/crates/nv-models/src/qwen4_exp_residency.rs",
+      "pub fn release_sessions_to_disk(",
+      "Release drops exactly the listed held slots"
+    ],
+    [
+      "A12",
+      "code",
+      "rust/crates/nv-models/src/qwen4_exp_residency.rs",
+      "pub fn held_session(",
+      "A held slot's bytes and last put time"
+    ],
+    [
+      "A13",
+      "code",
+      "rust/crates/nv-kernels/src/capture_exclusion.rs",
+      "fn own()",
+      "Wait until no other thread owns, then own"
+    ],
+    [
+      "A14",
+      "code",
+      "rust/crates/nv-kernels/src/capture_exclusion.rs",
+      "fn disown(",
+      "The last capture or exclusion released frees the ownership"
+    ],
+    [
+      "A15",
+      "code",
+      "rust/crates/nv-kernels/src/capture_exclusion.rs",
+      "impl Drop for CaptureInFlight",
+      "A capture gives its share of the ownership back"
+    ],
+    [
+      "A16",
+      "code",
+      "rust/src/oapi/chat_engine/qwen4_exp_loop.rs",
+      "fn held(&self)",
+      "What eviction sees: base slots 0 and 1 and the adapter slot"
+    ],
+    [
+      "A17",
+      "code",
+      "rust/crates/nv-models/src/qwen4_exp_residency.rs",
+      "fn held_slot(",
+      "Slot index to session: the adapter slot maps to the kept adapter session"
+    ],
+    [
+      "A18",
+      "code",
+      "rust/crates/nv-models/src/qwen4_exp.rs",
+      "pub const ADAPTER_SESSION_IS_HELD_SLOT_2_AGED_AND_RELEASED_BY_THE_COLD_TIER_LIKE_THE_TWO_BASE_SLOTS",
+      "The adapter session's held-slot index"
+    ],
+    [
+      "A19",
+      "code",
+      "rust/crates/nv-models/src/qwen4_exp.rs",
+      "pub fn put_adapter_session(",
+      "Keeping an adapter session records its put time"
+    ]
+  ],
+  "claims": [
+    {
+      "id": "C01",
+      "theorem": "Findings.shipped_exclusive",
+      "anchors": [
+        "A01",
+        "A02",
+        "A03",
+        "A04",
+        "A13",
+        "A14",
+        "A15"
+      ],
+      "says": "While a thread holds a NoCaptureInFlight, no other thread holds a capture."
+    },
+    {
+      "id": "C02",
+      "theorem": "Findings.shipped_never_both_blocked",
+      "anchors": [
+        "A01",
+        "A02",
+        "A04",
+        "A05",
+        "A06",
+        "A13"
+      ],
+      "says": "Two threads are never both blocked in capture_in_flight or no_capture_in_flight."
+    },
+    {
+      "id": "C03",
+      "theorem": "Findings.own_capture_nests",
+      "anchors": [
+        "A01",
+        "A02",
+        "A03",
+        "A13",
+        "A14",
+        "A15"
+      ],
+      "says": "One thread can nest exclusions and a capture without waiting on itself, and releasing them all frees the ownership."
+    },
+    {
+      "id": "C04",
+      "theorem": "Findings.shipped_waits_on_the_owner",
+      "anchors": [
+        "A04",
+        "A13"
+      ],
+      "says": "A thread blocked in either call waits on the other thread, which holds a capture or the exclusion; by C02 that thread is not blocked, so it can go on and release."
+    },
+    {
+      "id": "C05",
+      "theorem": "Findings.blocking_is_not_vacuous",
+      "anchors": [
+        "A04",
+        "A13"
+      ],
+      "says": "A thread does block while another holds the exclusion, so C02 and C04 constrain states that occur."
+    },
+    {
+      "id": "C06",
+      "theorem": "Findings.shipped_no_release_under_request",
+      "anchors": [
+        "A07",
+        "A09"
+      ],
+      "says": "An eviction that cannot take the engine permit releases nothing; a request holds that permit from take_session to put_session, so eviction never frees a session a request is using."
+    },
+    {
+      "id": "C07",
+      "theorem": "Findings.shipped_idle_releases_only_idle_slots",
+      "anchors": [
+        "A07",
+        "A08",
+        "A10",
+        "A12",
+        "A16",
+        "A17"
+      ],
+      "says": "An idle eviction releases only held slots whose last put is at least the shorter of 300 s and the global idle limit old."
+    },
+    {
+      "id": "C08",
+      "theorem": "Findings.shipped_pressure_releases_every_slot",
+      "anchors": [
+        "A07",
+        "A16"
+      ],
+      "says": "A pressure eviction releases every held slot."
+    },
+    {
+      "id": "C09",
+      "theorem": "Findings.idle_edges",
+      "anchors": [
+        "A07",
+        "A08",
+        "A10"
+      ],
+      "says": "The idle comparison includes its edge: a slot idle exactly the limit is released, one second less is kept, and a shorter global limit wins."
+    },
+    {
+      "id": "C10",
+      "theorem": "Findings.shipped_adapter_released_only_when_idle",
+      "anchors": [
+        "A11",
+        "A16",
+        "A17",
+        "A18",
+        "A19"
+      ],
+      "says": "An idle eviction releases the kept adapter session only when its last put is at least the idle limit old."
+    },
+    {
+      "id": "C11",
+      "theorem": "Findings.adapter_slot_edges",
+      "anchors": [
+        "A11",
+        "A16",
+        "A17",
+        "A18"
+      ],
+      "says": "A fresh adapter session survives an idle eviction of base slot 0, an idle one is released with it, and pressure eviction releases it when it is the only session held."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F01",
+      "priority": "P3",
+      "status": "repaired",
+      "evidence": "model",
+      "title": "A thread that takes the exclusion inside its own capture could deadlock the capture machinery",
+      "trigger": "Old design: a capture counted itself, then queued on capture_lock; an exclusion claimed the excluder, then waited for other threads' captures. A thread inside its capture that took the exclusion waited on a capture queued behind it, or on an excluder waiting for that very capture.",
+      "consequence": "Both threads hung, and every later capture or exclusion in the process blocked behind them.",
+      "anchors": [
+        "A01",
+        "A02",
+        "A04",
+        "A05",
+        "A06",
+        "A13"
+      ],
+      "counterexample": "Findings.old_design_deadlocks",
+      "repair": "capture_in_flight and no_capture_in_flight wait on one condition, that no other thread holds a capture or an exclusion, and only then take theirs; capture_lock is gone. One thread at a time owns the capture machinery, re-entrantly.",
+      "test": "nv-kernels capture_exclusion tests an_exclusion_inside_a_capture_does_not_wait_on_a_capture_queued_behind_it and an_exclusion_inside_a_capture_does_not_wait_on_an_excluder_waiting_for_that_capture, which timed out on the old code",
+      "claim": "C02"
+    },
+    {
+      "id": "F02",
+      "priority": "P3",
+      "status": "repaired",
+      "evidence": "model",
+      "title": "Any eviction dropped the kept adapter session whatever its age, and the cold tier never released it on its own",
+      "trigger": "NV_Q4EXP_LORA_SESSION_CACHE=1 (set by no deployment), base slot 0 idle for 300 s, the adapter session put 1 s ago.",
+      "consequence": "The next adapter request prefilled cold; with only the adapter session held, is_loaded() was false, so pressure eviction could not reclaim its device memory.",
+      "anchors": [
+        "A11",
+        "A16",
+        "A17",
+        "A18",
+        "A19"
+      ],
+      "counterexample": "Findings.old_release_drops_fresh_adapter",
+      "repair": "The kept adapter session is held slot 2 with its own put time; held() reports it, and release_sessions_to_disk takes it only when slot 2 is listed.",
+      "test": "nv-models qwen4_exp_session_residency releasing_a_base_slot_keeps_a_fresh_adapter_session_which_the_cold_tier_sees_as_its_own_slot",
+      "claim": "C10"
+    }
+  ],
+  "trusted": [],
+  "generate": [
+    {
+      "module": "Shipped",
+      "run": [
+        "python3",
+        "bind.py"
+      ]
+    }
+  ],
+  "checks": [],
+  "mutants": [
+    {
+      "why": "eviction stops taking the engine permit",
+      "in": "code:rust/src/oapi/chat_engine/qwen4_exp_loop.rs",
+      "find": "        let Ok(_permit) = qwen4_exp_gate().try_acquire() else { return false };\n",
+      "replace": ""
+    },
+    {
+      "why": "the idle edge becomes strict",
+      "in": "code:rust/src/oapi/chat_engine/qwen4_exp_loop.rs",
+      "find": "h.2.elapsed() >= l",
+      "replace": "h.2.elapsed() > l"
+    },
+    {
+      "why": "a session slot's idle limit moves",
+      "in": "code:rust/src/oapi/chat_engine/qwen4_exp_loop.rs",
+      "find": "A_SECOND: u64 = 300;",
+      "replace": "A_SECOND: u64 = 301;"
+    },
+    {
+      "why": "the ownership test admits another thread",
+      "in": "code:rust/crates/nv-kernels/src/capture_exclusion.rs",
+      "find": "    s.owner.is_some_and(|o| o != me)",
+      "replace": "    s.owner.is_some_and(|o| o == me)"
+    },
+    {
+      "why": "a separate capture lock comes back",
+      "in": "code:rust/crates/nv-kernels/src/graph.rs",
+      "find": "pub fn mempool_trims() -> u64 {",
+      "replace": "pub fn capture_lock() {}\n\npub fn mempool_trims() -> u64 {"
+    },
+    {
+      "why": "release drops the adapter session unconditionally again",
+      "in": "code:rust/crates/nv-models/src/qwen4_exp_residency.rs",
+      "find": "        let freed = !held.is_empty();",
+      "replace": "        held.extend(self.adapter_session.lock().ok().and_then(|mut s| s.take()));\n        let freed = !held.is_empty();"
+    },
+    {
+      "why": "eviction stops seeing the adapter slot",
+      "in": "code:rust/src/oapi/chat_engine/qwen4_exp_loop.rs",
+      "find": "[0, 1, nv_models::qwen4_exp::ADAPTER_SESSION_IS_HELD_SLOT_2_AGED_AND_RELEASED_BY_THE_COLD_TIER_LIKE_THE_TWO_BASE_SLOTS].into_iter()",
+      "replace": "[0, 1].into_iter()"
+    },
+    {
+      "why": "the model lets a capture start while another thread owns",
+      "in": "Exclusion.v",
+      "find": "if other_holds p (owner s) t then None else Some (set_cap (set_cl s t Free) t true)",
+      "replace": "Some (set_cap (set_cl s t Free) t true)"
+    }
+  ],
+  "uncovered": [
+    "GPU-side ordering: whether a freed session buffer can still be read by kernels or graph replays queued on the model stream or the MoE auxiliary stream (cudarc frees with cuMemFreeAsync on the slice's stream; event tracking is off).",
+    "That only cuCtxSynchronize-class calls invalidate a capture in flight is taken from the probe recorded in A_DEVICE_WIDE_SYNCHRONIZE_ON_ANY_THREAD_INVALIDATES_EVERY_CAPTURE_IN_FLIGHT_IN_THE_PROCESS, not modeled.",
+    "More than two threads: the model has two. The argument (the owner never waits on these guards, every waiter waits on the owner) does not depend on the count, but it is proven for two.",
+    "Fairness: nothing bounds how long a waiting thread waits while other threads keep taking turns as owner.",
+    "A CaptureInFlight or NoCaptureInFlight dropped on another thread than took it: both are Send, and the ownership is keyed by ThreadId at acquisition only.",
+    "gemma4_e4b captures under its own private capture_lock, outside this protocol.",
+    "Parked-session contents: the spill format, the residency LRU and its budgets, install_parked.",
+    "Whether parked_bytes at max_len matches the adapter session's real device footprint.",
+    "Mutex poisoning, which the guard recovers from with into_inner."
+  ],
+  "budget": {
+    "lines": 320
+  }
+}

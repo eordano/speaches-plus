@@ -80,6 +80,9 @@ pub struct Session {
     pub conversation_model: std::sync::Mutex<Option<String>>,
     pub transcription_model: std::sync::Mutex<Option<String>>,
     pub stt_language: std::sync::Mutex<Option<String>>,
+    pub partial_beam_size: AtomicU32,
+    pub final_beam_size: AtomicU32,
+    pub(super) early_finals: std::sync::Mutex<Vec<super::pipeline::EarlyFinal>>,
 
     pub eou_runtime: std::sync::Mutex<EouRuntime>,
     pub relay: Arc<InspectorRelay>,
@@ -180,6 +183,7 @@ pub struct TurnDetectionConfig {
     pub silence_duration_ms: AtomicU32,
     pub barge_in_delay_ms: AtomicU32,
     pub create_response: AtomicBool,
+    pub early_final_ms: AtomicU32,
 }
 
 const NEG_THRESHOLD_AUTO_SENTINEL: u32 = 0;
@@ -225,6 +229,9 @@ impl TurnDetectionRead for TurnDetectionConfig {
     fn min_speech_duration_ms(&self) -> u32 {
         self.min_speech_duration_ms.load(Ordering::Relaxed)
     }
+    fn early_final_samples(&self) -> usize {
+        (self.early_final_ms.load(Ordering::Relaxed) as usize) * VAD_SAMPLE_RATE / 1000
+    }
 }
 
 impl TurnDetectionConfig {
@@ -234,6 +241,11 @@ impl TurnDetectionConfig {
             .and_then(|s| s.parse::<u32>().ok())
             .map(|v| v.min(defaults::turn_detection::BARGE_IN_DELAY_MS_MAX))
             .unwrap_or(defaults::turn_detection::BARGE_IN_DELAY_MS);
+        let early_final_ms = std::env::var(defaults::env::REALTIME_EARLY_FINAL_MS)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|v| v.min(defaults::turn_detection::EARLY_FINAL_MS_MAX))
+            .unwrap_or(defaults::turn_detection::EARLY_FINAL_MS);
         Self {
             kind: std::sync::Mutex::new(TurnDetectionKind::ServerVad),
             threshold: AtomicU32::new(defaults::turn_detection::THRESHOLD.to_bits()),
@@ -243,6 +255,7 @@ impl TurnDetectionConfig {
             silence_duration_ms: AtomicU32::new(defaults::turn_detection::SILENCE_DURATION_MS),
             barge_in_delay_ms: AtomicU32::new(barge_in_delay_ms),
             create_response: AtomicBool::new(defaults::turn_detection::CREATE_RESPONSE),
+            early_final_ms: AtomicU32::new(early_final_ms),
         }
     }
 
@@ -275,6 +288,7 @@ impl TurnDetectionConfig {
             "silence_duration_ms": self.silence_duration_ms.load(Ordering::Relaxed),
             "barge_in_delay_ms": self.barge_in_delay_ms(),
             "create_response": self.create_response.load(Ordering::Relaxed),
+            "early_final_ms": self.early_final_ms.load(Ordering::Relaxed),
         })
     }
 }
@@ -452,6 +466,9 @@ impl Session {
             conversation_model: std::sync::Mutex::new(None),
             transcription_model: std::sync::Mutex::new(transcription_model_label),
             stt_language: std::sync::Mutex::new(None),
+            partial_beam_size: AtomicU32::new(env_beam_size(defaults::env::PARTIAL_STT_BEAM_SIZE)),
+            final_beam_size: AtomicU32::new(env_beam_size(defaults::env::REALTIME_FINAL_BEAM_SIZE)),
+            early_finals: std::sync::Mutex::new(Vec::new()),
             eou_runtime: std::sync::Mutex::new(eou_runtime_init),
             relay,
             audio_store,
@@ -905,6 +922,12 @@ impl Session {
                     .expect("transcription_model poisoned") = Some(m);
             }
             *self.stt_language.lock().expect("stt_language poisoned") = iat.language;
+            if let Some(n) = iat.partial_beam_size {
+                self.partial_beam_size.store(n, Ordering::Relaxed);
+            }
+            if let Some(n) = iat.beam_size {
+                self.final_beam_size.store(n, Ordering::Relaxed);
+            }
         }
         if let Some(n) = staged.min_speech_ms {
             self.min_speech_ms.store(n, Ordering::Relaxed);
@@ -979,6 +1002,48 @@ impl Session {
             .clone()
     }
 
+    pub fn partial_beam_size(&self) -> Option<usize> {
+        beam_from_bits(self.partial_beam_size.load(Ordering::Relaxed))
+    }
+
+    pub fn final_beam_size(&self) -> Option<usize> {
+        beam_from_bits(self.final_beam_size.load(Ordering::Relaxed))
+    }
+
+    pub(super) fn put_early_final(&self, early: super::pipeline::EarlyFinal) {
+        let mut slot = self.early_finals.lock().expect("early_finals poisoned");
+        slot.retain(|e| {
+            let keep = e.item_id != early.item_id
+                && e.started.elapsed() < super::pipeline::EARLY_FINAL_MAX_AGE;
+            if !keep {
+                e.handle.abort();
+            }
+            keep
+        });
+        slot.push(early);
+    }
+
+    pub(super) fn take_early_final(&self, item_id: &str) -> Option<super::pipeline::EarlyFinal> {
+        let mut slot = self.early_finals.lock().expect("early_finals poisoned");
+        let i = slot.iter().position(|e| e.item_id == item_id)?;
+        Some(slot.swap_remove(i))
+    }
+
+    pub(super) fn has_early_final(&self, item_id: &str) -> bool {
+        self.early_finals
+            .lock()
+            .expect("early_finals poisoned")
+            .iter()
+            .any(|e| e.item_id == item_id)
+    }
+
+    pub(super) fn drop_early_final(&self, item_id: &str, reason: &'static str) {
+        if let Some(e) = self.take_early_final(item_id) {
+            e.handle.abort();
+            info!(%item_id, reason, "early final dropped");
+        }
+    }
+
     pub fn noise_gate_thresholds(&self) -> crate::stt::noise_gate::GateThresholds {
         let nsp = f32::from_bits(self.no_speech_prob_threshold_bits.load(Ordering::Relaxed));
         let lp = f32::from_bits(self.avg_logprob_threshold_bits.load(Ordering::Relaxed));
@@ -1040,13 +1105,25 @@ impl Session {
                 obj.insert("voice".into(), serde_json::Value::String(v));
             }
             let stt_language = self.stt_language();
-            if transcription_model.is_some() || stt_language.is_some() {
+            let partial_beam = self.partial_beam_size();
+            let final_beam = self.final_beam_size();
+            if transcription_model.is_some()
+                || stt_language.is_some()
+                || partial_beam.is_some()
+                || final_beam.is_some()
+            {
                 let mut iat = serde_json::Map::new();
                 if let Some(m) = transcription_model {
                     iat.insert("model".into(), serde_json::Value::String(m));
                 }
                 if let Some(l) = stt_language {
                     iat.insert("language".into(), serde_json::Value::String(l));
+                }
+                if let Some(n) = partial_beam {
+                    iat.insert("partial_beam_size".into(), json!(n));
+                }
+                if let Some(n) = final_beam {
+                    iat.insert("beam_size".into(), json!(n));
                 }
                 obj.insert(
                     "input_audio_transcription".into(),
@@ -1136,6 +1213,11 @@ impl Session {
         if let Some(n) = parsed.barge_in_delay_ms {
             self.turn_detection
                 .barge_in_delay_ms
+                .store(n, Ordering::Relaxed);
+        }
+        if let Some(n) = parsed.early_final_ms {
+            self.turn_detection
+                .early_final_ms
                 .store(n, Ordering::Relaxed);
         }
         if let Some(b) = parsed.create_response {
@@ -1819,7 +1901,7 @@ impl Session {
         self.state.lock().await.current_speech_item = item_id;
     }
 
-    async fn current_speech_item(&self) -> Option<String> {
+    pub(super) async fn current_speech_item(&self) -> Option<String> {
         self.state.lock().await.current_speech_item.clone()
     }
 
@@ -2305,16 +2387,15 @@ fn spawn_vad_task(mut rx: mpsc::Receiver<AudioIn>, model: VadModel, session: Arc
     let partial_enabled = std::env::var(defaults::env::PARTIAL_STT_ENABLED)
         .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false);
-    let partial_interval_samples =
-        VAD_SAMPLE_RATE * defaults::buffer::PARTIAL_INTERVAL_MS as usize / 1000;
     let td_for_vad: Arc<dyn TurnDetectionRead> = session.turn_detection.clone();
     let vad_cancel = session.cancel.clone();
     tokio::spawn(vad_cancel.wrap_unit(async move {
         let mut processor = VadProcessor::new(model).with_turn_detection(td_for_vad);
-        let partial_in_progress = Arc::new(AtomicBool::new(false));
-        let mut partial_task: Option<JoinHandle<()>> = None;
+        let mut partial: Option<(JoinHandle<()>, Arc<AtomicBool>)> = None;
         let mut total_samples: usize = 0;
         let mut last_partial_at: usize = 0;
+        let mut speech_started_at: usize = 0;
+        let mut paused = false;
         let mut consecutive_errors: u32 = 0;
         let mut failed_emitted = false;
         let mut clear_epoch = session.input_clear_epoch.load(Ordering::Acquire);
@@ -2329,12 +2410,13 @@ fn spawn_vad_task(mut rx: mpsc::Receiver<AudioIn>, model: VadModel, session: Arc
                 };
                 processor = VadProcessor::new(VadModel::from_session(vad))
                     .with_turn_detection(session.turn_detection.clone());
-                if let Some(prev) = partial_task.take() {
+                if let Some((prev, _)) = partial.take() {
                     prev.abort();
                 }
-                partial_in_progress.store(false, Ordering::SeqCst);
                 total_samples = 0;
                 last_partial_at = 0;
+                speech_started_at = 0;
+                paused = false;
                 consecutive_errors = 0;
                 debug!("input buffer cleared; VAD processor reset");
             }
@@ -2363,11 +2445,25 @@ fn spawn_vad_task(mut rx: mpsc::Receiver<AudioIn>, model: VadModel, session: Arc
                     ev,
                     VadEvent::SpeechCommitted { .. } | VadEvent::SpeechStarted { .. }
                 ) {
-                    if let Some(prev) = partial_task.take() {
+                    if let Some((prev, _)) = partial.take() {
                         prev.abort();
                     }
-                    partial_in_progress.store(false, Ordering::SeqCst);
                     last_partial_at = total_samples;
+                    speech_started_at = total_samples;
+                    paused = false;
+                }
+                match &ev {
+                    VadEvent::SpeechPaused { .. } => {
+                        if let Some((prev, _)) = partial.take() {
+                            prev.abort();
+                        }
+                        paused = true;
+                    }
+                    VadEvent::SpeechResumed { .. } => {
+                        paused = false;
+                        last_partial_at = total_samples;
+                    }
+                    _ => {}
                 }
                 let is_failed = matches!(ev, VadEvent::Failed { .. });
                 if is_failed && failed_emitted {
@@ -2382,33 +2478,57 @@ fn spawn_vad_task(mut rx: mpsc::Receiver<AudioIn>, model: VadModel, session: Arc
                     return;
                 }
             }
+            let previous_partial_is_transcribing = partial
+                .as_ref()
+                .is_some_and(|(h, transcribing)| !h.is_finished() && transcribing.load(Ordering::Acquire));
             if partial_enabled
-                && total_samples.saturating_sub(last_partial_at) >= partial_interval_samples
-                && !partial_in_progress.load(Ordering::SeqCst)
+                && !paused
+                && !previous_partial_is_transcribing
+                && total_samples.saturating_sub(last_partial_at)
+                    >= partial_interval_samples(total_samples.saturating_sub(speech_started_at))
             {
                 if let Some((item_id, audio)) = processor.current_speech_audio() {
                     last_partial_at = total_samples;
-                    partial_in_progress.store(true, Ordering::SeqCst);
                     let session_for_task = session.clone();
-                    let flag = partial_in_progress.clone();
+                    let transcribing = Arc::new(AtomicBool::new(false));
                     let audio_end_ms = (total_samples * 1000 / VAD_SAMPLE_RATE) as u64;
                     let partial_cancel = session_for_task.cancel.clone();
-                    let h = tokio::spawn(partial_cancel.wrap_unit(async move {
-                        run_partial_transcription(session_for_task, item_id, audio, audio_end_ms)
-                            .await;
-                        flag.store(false, Ordering::SeqCst);
-                    }));
-                    if let Some(prev) = partial_task.replace(h) {
-                        prev.abort();
+                    let h = tokio::spawn(partial_cancel.wrap_unit(run_partial_transcription(
+                        session_for_task,
+                        item_id,
+                        audio,
+                        audio_end_ms,
+                        transcribing.clone(),
+                    )));
+                    if let Some((superseded, _)) = partial.replace((h, transcribing)) {
+                        superseded.abort();
                     }
                 }
             }
         }
-        if let Some(prev) = partial_task.take() {
+        if let Some((prev, _)) = partial.take() {
             prev.abort();
         }
         info!("VAD task ended");
     }));
+}
+
+fn env_beam_size(var: &str) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|n| (1..=defaults::stt::BEAM_SIZE_MAX as u32).contains(n))
+        .unwrap_or(0)
+}
+
+fn beam_from_bits(n: u32) -> Option<usize> {
+    (n > 0).then_some(n as usize)
+}
+
+fn partial_interval_samples(utterance_samples: usize) -> usize {
+    let floor = VAD_SAMPLE_RATE * defaults::buffer::PARTIAL_INTERVAL_MIN_MS as usize / 1000;
+    let ceiling = VAD_SAMPLE_RATE * defaults::buffer::PARTIAL_INTERVAL_MAX_MS as usize / 1000;
+    (utterance_samples / defaults::buffer::PARTIAL_INTERVAL_UTTERANCE_DIVISOR).clamp(floor, ceiling)
 }
 
 async fn run_partial_transcription(
@@ -2416,15 +2536,22 @@ async fn run_partial_transcription(
     item_id: String,
     audio: Vec<f32>,
     audio_end_ms: u64,
+    transcribing: Arc<AtomicBool>,
 ) {
     let Ok(whisper) = session.models.whisper() else {
         tracing::error!("partial transcription requested but speech-to-text is unavailable");
         return;
     };
+    let Some(turn) = super::pipeline::STT_PRIORITY.partial_turn().await else {
+        return;
+    };
+    transcribing.store(true, Ordering::Release);
     let transcript = match super::pipeline::run_stt(
         whisper,
         crate::types::MonoF32At16k::new(audio),
         session.stt_language(),
+        session.partial_beam_size(),
+        turn,
     )
     .await
     {
@@ -2578,6 +2705,7 @@ async fn handle_vad_event(session: &Arc<Session>, ev: VadEvent) {
                     min_speech_ms = MIN_SPEECH_MS,
                     "rejecting commit: buffer below min_speech_ms",
                 );
+                session.drop_early_final(&item_id, "below_min_speech");
                 super::events::emit_error(
                     session,
                     errcode::INPUT_AUDIO_BUFFER_COMMIT_EMPTY,
@@ -2645,6 +2773,16 @@ async fn handle_vad_event(session: &Arc<Session>, ev: VadEvent) {
             super::pipeline::commit_after_eou(session, item_id, audio, audio_ms, suppress_response)
                 .await;
         }
+        VadEvent::SpeechPaused {
+            item_id,
+            audio_end_ms,
+            audio,
+        } => {
+            super::pipeline::start_early_final(session, item_id, audio, audio_end_ms);
+        }
+        VadEvent::SpeechResumed { item_id } => {
+            session.drop_early_final(&item_id, "speech_resumed");
+        }
         VadEvent::Failed { reason } => {
             session.inspector.emit(InspectorEvent::VadFailed {
                 session_id: session.id.as_str().to_string(),
@@ -2706,6 +2844,18 @@ async fn terminate_with_error(session: Arc<Session>, code: &'static str, message
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_interval_is_a_third_of_the_utterance_between_half_a_second_and_two() {
+        let ms = |m: usize| VAD_SAMPLE_RATE * m / 1000;
+        assert_eq!(partial_interval_samples(0), ms(500), "a fresh utterance updates every 500 ms");
+        assert_eq!(partial_interval_samples(ms(3_000)), ms(1_000), "3 s in, every third of it");
+        assert_eq!(
+            partial_interval_samples(ms(60_000)),
+            ms(2_000),
+            "a long monologue still updates every 2 s"
+        );
+    }
 
     #[tokio::test]
     async fn session_update_model_selects_the_conversation_upstream_model() {

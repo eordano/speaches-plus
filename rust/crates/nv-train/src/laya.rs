@@ -743,22 +743,74 @@ impl Twin {
                 proj.merged()?.to_dtype(stored)?.to_device(&Device::Cpu)?,
             );
         }
-        for dir in ["encoder", "tokenizer"] {
-            std::fs::create_dir_all(out.join(dir))?;
-            for entry in std::fs::read_dir(base.join(dir))? {
-                let entry = entry?;
-                if entry.path().is_file() {
-                    std::fs::copy(entry.path(), out.join(dir).join(entry.file_name()))?;
-                }
-            }
-        }
-        std::fs::copy(
-            base.join("rl_agent_config.json"),
-            out.join("rl_agent_config.json"),
-        )?;
+        copy_checkpoint_sidecars(base, out)?;
         candle_core::safetensors::save(&tensors, out.join("model.safetensors"))?;
         Ok(())
     }
+}
+
+fn copy_checkpoint_sidecars(base: &Path, out: &Path) -> Result<()> {
+    for dir in ["encoder", "tokenizer"] {
+        std::fs::create_dir_all(out.join(dir))?;
+        for entry in std::fs::read_dir(base.join(dir))? {
+            let entry = entry?;
+            if entry.path().is_file() {
+                std::fs::copy(entry.path(), out.join(dir).join(entry.file_name()))?;
+            }
+        }
+    }
+    std::fs::copy(
+        base.join("rl_agent_config.json"),
+        out.join("rl_agent_config.json"),
+    )?;
+    Ok(())
+}
+
+pub fn merge_saved_adapter_onto_stored_weights(
+    base: &Path,
+    adapter: &Path,
+    out: &Path,
+) -> Result<usize> {
+    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+        adapter.join("adapter_config.json"),
+    )?)?;
+    let rank = cfg["r"]
+        .as_f64()
+        .ok_or_else(|| anyhow!("adapter_config.json has no r"))?;
+    let alpha = cfg["lora_alpha"]
+        .as_f64()
+        .ok_or_else(|| anyhow!("adapter_config.json has no lora_alpha"))?;
+    let lora =
+        candle_core::safetensors::load(adapter.join("adapter_model.safetensors"), &Device::Cpu)?;
+    let mut tensors = candle_core::safetensors::load(base.join("model.safetensors"), &Device::Cpu)?;
+    let mut merged = 0;
+    for (name, a) in &lora {
+        let Some(module) = name
+            .strip_prefix("base_model.model.")
+            .and_then(|n| n.strip_suffix(".lora_A.weight"))
+        else {
+            continue;
+        };
+        let b = lora
+            .get(&format!("base_model.model.{module}.lora_B.weight"))
+            .ok_or_else(|| anyhow!("adapter has {name} without its lora_B"))?;
+        let key = format!("{module}.weight");
+        let stored = tensors
+            .get(&key)
+            .ok_or_else(|| anyhow!("base checkpoint lacks {key}"))?;
+        let delta = (b.to_dtype(DType::F32)?.matmul(&a.to_dtype(DType::F32)?)? * (alpha / rank))?;
+        let sum = (stored.to_dtype(DType::F32)? + delta)?.to_dtype(stored.dtype())?;
+        tensors.insert(key, sum);
+        merged += 1;
+    }
+    ensure!(
+        merged > 0,
+        "{} holds no lora_A/lora_B pairs",
+        adapter.display()
+    );
+    copy_checkpoint_sidecars(base, out)?;
+    candle_core::safetensors::save(&tensors, out.join("model.safetensors"))?;
+    Ok(merged)
 }
 
 fn framing(base: &Path) -> Result<(Checkpoint, usize, usize)> {

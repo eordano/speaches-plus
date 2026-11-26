@@ -215,7 +215,7 @@
     <span class="badge"><span class="dot" style="background:var(--good)"></span>1,436 tests, 0 failures</span>
     <span class="badge"><span class="dot" style="background:var(--good)"></span>27B trains on its serving NVFP4 weights</span>
     <span class="badge"><span class="dot" style="background:var(--series-2)"></span>Rocq audit in flight — 2 real bugs already found</span>
-    <span class="badge"><span class="dot" style="background:var(--baseline)"></span>fleet deploy pending (user-gated)</span>
+    <span class="badge"><span class="dot" style="background:var(--baseline)"></span>production deploy pending (user-gated)</span>
   </div>
 </header>
 
@@ -264,7 +264,7 @@
     <rect class="box" x="524" y="30" width="210" height="92" rx="10"/>
     <text class="stage-tag" x="538" y="50">LABEL</text>
     <text class="box-title" x="538" y="68">Human + machine signal</text>
-    <text class="box-sub" x="538" y="86">portal 👍/👎 · Rock app · client tags</text>
+    <text class="box-sub" x="538" y="86">web 👍/👎 · mobile app · client tags</text>
     <text class="box-code" x="538" y="103">/v1/trajectory/label</text>
   </g>
   <path class="arrow" d="M734,76 L774,76" marker-end="url(#ah)"/>
@@ -319,11 +319,11 @@
   <tr><th style="width:34%">Prime Agent / ecosystem idea</th><th>Our instrumentation</th></tr>
   <tr>
     <td>Trajectories collected during normal operation</td>
-    <td>Capture module inside the server on every completion (<code>oapi/trajectory.rs</code>): prompt, completion, reasoning, finish reason, model — daily JSONL, tmpfiles-pruned at 7 days, on every fleet host.</td>
+    <td>Capture module inside the server on every completion (<code>oapi/trajectory.rs</code>): prompt, completion, reasoning, finish reason, model — daily JSONL, tmpfiles-pruned at 7 days, on every serving host.</td>
   </tr>
   <tr>
     <td>RULER-style LLM-judge rewards, no labeled data</td>
-    <td>Judge filter in consolidation (Qwen judges E4B) — <b>plus</b> the labels the paper doesn't have: portal and Rock-app thumbs and client <code>x-trajectory-tag</code> retro-labels, joined by id or tag with an honesty <code>matched</code> field.</td>
+    <td>Judge filter in consolidation (Qwen judges E4B) — <b>plus</b> the labels the paper doesn't have: web and mobile thumbs and client <code>x-trajectory-tag</code> retro-labels, joined by id or tag with an honesty <code>matched</code> field.</td>
   </tr>
   <tr>
     <td>GRPO RL step per round</td>
@@ -449,7 +449,7 @@
     <h3>One wire vocabulary, four languages</h3>
     <p style="color:var(--text-secondary); margin:6px 0">
       The feedback/trajectory types are defined once in Rust and generated via typeshare into
-      TypeScript (garden), Kotlin (Rock app), and Go, with drift gates in CI — a thumbs-down
+      TypeScript (web client), Kotlin (Android client), and Go, with drift gates in CI — a thumbs-down
       tapped on a phone and a label posted by a script land as the same record.
     </p>
   </div>
@@ -462,7 +462,7 @@
   <tr><th style="width:22%">Gesture</th><th>What happens</th></tr>
   <tr>
     <td><b>Thumb a response</b></td>
-    <td>👍/👎 pills on every portal.decent.* attempt and every Rock (android) message. The tap posts to <code>/v1/trajectory/label</code>, joining by the <code>x-trajectory-tag</code> the client stamped at request time — labels survive LiteLLM rewriting response ids.</td>
+    <td>👍/👎 pills on every web and Android client message. The tap posts to <code>/v1/trajectory/label</code>, joining by the <code>x-trajectory-tag</code> the client stamped at request time — labels survive LiteLLM rewriting response ids.</td>
   </tr>
   <tr>
     <td><b>Run a round</b></td>
@@ -563,7 +563,7 @@
       <li><b>Example batching B≥8</b> — the big full-depth throughput lever (~85 → ~600 tok/s class); fits because the quantized-resident base frees ~40 GB.</li>
       <li><b>W4A4 numerics A/B</b> — our NVFP4 training forward quantizes activations; <i>no upstream precedent</i>. Mandatory before the loop consumes adapters trained through it.</li>
       <li><b>Device NVFP4 dequant kernel</b> — unblocks <code>QuantLinearOp</code> (single-dequant backward fully on-device).</li>
-      <li><b>Deploy</b> (user-gated): internal compute hosts, Rock APK — then the first real judged consolidation round on live traffic.</li>
+      <li><b>Deploy</b> (user-gated): serving hosts and mobile client — then the first real judged consolidation round on live traffic.</li>
     </ol>
   </div>
   <div class="card">
@@ -572,16 +572,15 @@
       <li><b>The demo adapter is degenerate</b> — six rows overfit, as expected. It proves plumbing, not quality.</li>
       <li><b>W4A4 training forward is unprecedented</b> — every upstream QLoRA keeps activations ≥16-bit. The A/B gate stands between it and the loop.</li>
       <li><b>Rocq scope is exact arithmetic</b> — bf16/f32 rounding and split-K reduction order are declared non-claims, not proven.</li>
-      <li><b>Nothing is deployed yet</b> — every number here is from the benchmark host; the fleet rollout is a separate, user-gated step.</li>
+      <li><b>Nothing is deployed yet</b> — every number here is from the benchmark host; production rollout is a separate, user-gated step.</li>
       <li><b>Adapter-shipping policy</b>: flips require landed perplexity rows — an adapter with no eval row does not ship.</li>
     </ul>
   </div>
 </div>
 
 <footer>
-  speaches-plus continual-LoRA program · loop, QLoRA trainer, portal/Rock feedback, typeshare wire
-  types, and Rocq audit all on <code>main</code> (origin @ 4701af08c) · design record and upstream
-  benchmark in the session scratchpad · Prime Agent: arXiv 2608.23552.
+  speaches-plus continual-LoRA program · loop, QLoRA trainer, web/mobile feedback, typeshare wire
+  types, and Rocq audit all on <code>main</code> · Prime Agent: arXiv 2608.23552.
 </footer>
 </main>
 

@@ -101,7 +101,12 @@ allocation) precisely because one is per-replay and the other is per-capture.
 returning `-1` / `Err(-1)`, so downstream crates compile without a GPU toolchain
 and fail at runtime rather than at type-check time. `src/graph.rs` holds
 `CudaGraphRunner`, which caches `CUgraph`/`CUgraphExec` pairs by key and exposes a
-process-wide `capture_lock()`; capture is not re-entrant across threads.
+capture that holds `capture_exclusion::capture_in_flight`. `capture_in_flight` and
+`no_capture_in_flight` (held around every device-wide synchronizing call) wait for the same
+thing, that no other thread holds a capture or an exclusion, so one thread at a time owns
+graph capture, re-entrantly, and a waiting thread only ever waits on that owner
+(`ONE_THREAD_AT_A_TIME_OWNS_CAPTURES_AND_EXCLUSIONS_SO_A_WAITER_ONLY_WAITS_ON_THE_OWNER`;
+`proof/` models it).
 
 ## LinearKind
 

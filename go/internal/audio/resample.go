@@ -1,5 +1,7 @@
 package audio
 
+import "math"
+
 func MonoS16ToF32(samples MonoS16) MonoF32 {
 	out := make(MonoF32, len(samples))
 	for i, s := range samples {
@@ -9,31 +11,21 @@ func MonoS16ToF32(samples MonoS16) MonoF32 {
 }
 
 func LinearResampleF32(in MonoF32, srIn, srOut int) MonoF32 {
-	if srIn == srOut || len(in) == 0 {
-		out := make(MonoF32, len(in))
-		copy(out, in)
-		return out
+	if srIn < MinDecodeSampleRate || srIn > MaxDecodeSampleRate || srOut < MinDecodeSampleRate || srOut > MaxDecodeSampleRate {
+		return MonoF32{}
+	}
+	if srIn == srOut {
+		return append(MonoF32{}, in...)
 	}
 	nIn := len(in)
-	nOut := nIn * srOut / srIn
-	if nOut <= 0 {
-		return nil
-	}
+	nOut := int(uint64(nIn) * uint64(srOut) / uint64(srIn))
 	out := make(MonoF32, nOut)
-	if nOut == 1 {
-		out[0] = in[0]
-		return out
-	}
-	step := float64(nIn-1) / float64(nOut-1)
-	for i := 0; i < nOut; i++ {
-		x := float64(i) * step
-		idx := int(x)
-		if idx >= nIn-1 {
-			out[i] = in[nIn-1]
-			continue
-		}
-		frac := float32(x - float64(idx))
-		out[i] = in[idx]*(1-frac) + in[idx+1]*frac
+	for i := range out {
+		pos := float64(i) * float64(srIn) / float64(srOut)
+		lo := min(int(math.Floor(pos)), nIn-1)
+		hi := min(lo+1, nIn-1)
+		t := pos - float64(lo)
+		out[i] = float32(float64(float64(in[lo])*(1.0-t)) + float64(float64(in[hi])*t))
 	}
 	return out
 }
